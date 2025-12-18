@@ -1,0 +1,5567 @@
+<?php
+if (!defined('_BATCH_CALL_')){
+    include_once('./_common.php');
+}
+if (!defined('_GNUBOARD_')) exit;
+
+use \MatchIsOn\Monitor\Lib4DID;
+include_once("/web/mio.monitor/lib/api/lib_did.php");
+
+$monitor = new Lib4DID();
+
+//------------------------------------------------
+// JSON 문자열 Decode
+//------------------------------------------------
+function json_decode_ex($json_str)
+{
+    $res = array();
+    $res['message'] = "";
+    $res['result' ] = FALSE;
+
+    $decoded = json_decode(stripslashes($json_str), TRUE);
+
+    switch(json_last_error())
+    {
+        case JSON_ERROR_DEPTH:
+            $res['message'] = 'JSON decode error : Maximum stack depth exceeded';
+            break;
+        case JSON_ERROR_CTRL_CHAR:
+            $res['message'] = 'JSON decode error : Unexpected control character found';
+            break;
+        case JSON_ERROR_SYNTAX:
+            $res['message'] = 'JSON decode error : Syntax error, malformed JSON';
+            break;
+        case JSON_ERROR_UTF8:
+            $res['message'] = 'JSON decode error : JSON_ERROR_UTF8';
+            break;
+        case JSON_ERROR_STATE_MISMATCH:
+            $res['message'] = 'JSON decode error : JSON_ERROR_STATE_MISMATCH';
+            break;
+        case JSON_ERROR_NONE:
+            $res['result'] = $decoded;
+            break;
+    }
+
+    return $res;
+}
+
+//------------------------------------------------
+// 업로드 파일 정보
+//------------------------------------------------
+function upload_info($up_id)
+{
+    global $g5;
+
+    if (empty($up_id))
+    {
+        $_SESSION['callfunc_message'] = "업로드 ID가 전달되지 않았습니다.";
+        return FALSE;
+    }
+
+    $sql = "
+        select *
+          from {$g5['upload_table']}
+         where up_id = '{$up_id}'
+        ";
+
+    return sql_fetch($sql);
+}
+
+//------------------------------------------------
+// 업로드 파일 삭제
+//------------------------------------------------
+function upload_delete($up_id)
+{
+    global $g5;
+
+    if (empty($up_id))
+    {
+        $_SESSION['callfunc_message'] = "업로드 ID가 전달되지 않았습니다.";
+        return FALSE;
+    }
+
+    // 기존 업로드 정보 구하기
+    $sql = "
+        select *
+          from {$g5['upload_table']}
+         where up_id = '{$up_id}'
+        ";
+    $upload = sql_fetch($sql);
+    if (!$upload)
+    {
+        $_SESSION['callfunc_message'] = "업로드 정보를 구할 수 없습니다.";
+        return FALSE;
+    }
+
+    // 원본 파일 삭제
+    $fullpath = "{$upload['up_path']}/{$upload['up_file']}";
+    if (file_exists($fullpath))
+        unlink($fullpath);
+
+    // 썸네일 삭제
+    foreach(glob("{$upload['up_path']}/thumb-{$upload['up_id']}_*") as $f){
+        unlink($f);
+    }
+
+    // 업로드 데이터 삭제
+    sql_query(" delete from {$g5['upload_table']} where up_id = '{$up_id}' ");
+
+    return TRUE;
+}
+
+//------------------------------------------------
+// 현재 세션의 업로드 데이터 정리
+//------------------------------------------------
+function upload_clean()
+{
+    global $g5;
+    $ss_id = session_id();
+
+    $sql = "
+        select *
+          from {$g5['upload_table']}
+         where up_session = '{$ss_id}'
+        ";
+
+    $result = sql_query($sql);
+    while ($row = sql_fetch_array($result))
+    {
+        $fullpath = "{$row['up_path']}/{$row['up_file']}";
+        if (file_exists($fullpath))
+        {
+            unlink($fullpath);
+        }
+
+        foreach(glob("{$row['up_path']}/thumb-{$row['up_id']}_*") as $f){
+            unlink($f);
+        }
+    }
+
+    sql_query(" delete from {$g5['upload_table']} where up_session = '{$ss_id}' ");
+}
+
+//------------------------------------------------
+// GUID 구하기
+//------------------------------------------------
+function GUIDv4 ($trim = true)
+{
+    // Windows
+    if (function_exists('com_create_guid') === true) {
+        if ($trim === true)
+            return trim(com_create_guid(), '{}');
+        else
+            return com_create_guid();
+    }
+
+    // OSX/Linux
+    if (function_exists('openssl_random_pseudo_bytes') === true) {
+        $data = openssl_random_pseudo_bytes(16);
+        $data[6] = chr(ord($data[6]) & 0x0f | 0x40);    // set version to 0100
+        $data[8] = chr(ord($data[8]) & 0x3f | 0x80);    // set bits 6-7 to 10
+        return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+    }
+
+    // Fallback (PHP 4.2+)
+    mt_srand((double)microtime() * 10000);
+    $charid = strtolower(md5(uniqid(rand(), true)));
+    $hyphen = chr(45);                  // "-"
+    $lbrace = $trim ? "" : chr(123);    // "{"
+    $rbrace = $trim ? "" : chr(125);    // "}"
+    $guidv4 = $lbrace.
+              substr($charid,  0,  8).$hyphen.
+              substr($charid,  8,  4).$hyphen.
+              substr($charid, 12,  4).$hyphen.
+              substr($charid, 16,  4).$hyphen.
+              substr($charid, 20, 12).
+              $rbrace;
+    return $guidv4;
+}
+
+//------------------------------------------------
+// 팀정보 구하기
+//------------------------------------------------
+function user_info($u_id, $u_pw)
+{
+    global $g5;
+
+    $sql = " select a.u_id
+                  , a.t_code
+                  , b.t_name
+                  , a.u_name
+                  , a.u_hand
+               from ff_user a
+                  , ff_team b
+              where a.t_code = b.t_code
+                and u_id = '{$u_id}'
+                and u_pw = password('{$u_pw}')
+              limit 1
+           ";
+
+    return sql_fetch($sql);
+}
+
+//------------------------------------------------
+// 세션정보 구하기
+//------------------------------------------------
+function session_check($u_id, $ss_device_id)
+{
+    global $g5;
+
+    $sql = " select ss_id
+               from ff_session
+              where u_id = '{$u_id}'
+                and ss_device_id = '{$ss_device_id}'
+              limit 1
+           ";
+
+    $row = sql_fetch($sql);
+
+    if ($row)
+        return $row['ss_id'];
+    else
+        return null;
+}
+
+//------------------------------------------------
+// 세션정보 구하기
+//------------------------------------------------
+function session_check_by_id($ss_id, $ss_device_id)
+{
+    global $g5;
+
+    $sql = " select a.u_id
+                  , b.t_code
+                  , c.t_name
+                  , b.u_name
+                  , b.u_hand
+               from ff_session a
+                  , ff_user    b
+                  , ff_team    c
+              where a.u_id = b.u_id
+                and b.t_code = c.t_code
+                and ss_id = '{$ss_id}'
+                and ss_device_id = '{$ss_device_id}'
+              limit 1
+           ";
+
+    return sql_fetch($sql);
+}
+
+//------------------------------------------------
+// 세션정보 생성
+//------------------------------------------------
+function session_create($u_id, $ss_device_id)
+{
+    global $g5;
+
+    $ss_id = str_replace("-", "", GUIDv4());
+
+    $sql = " insert into ff_session
+                set ss_id        = '{$ss_id       }'
+                  , u_id         = '{$u_id        }'
+                  , ss_device_id = '{$ss_device_id}'
+                  , ss_regdate   = now()
+           ";
+
+    sql_query($sql);
+
+    return $ss_id;
+}
+
+//------------------------------------------------
+// 세션정보 삭제
+//------------------------------------------------
+function session_remove($ss_id)
+{
+    global $g5;
+
+    $sql = " delete from ff_session
+              where ss_id = '{$ss_id}'
+           ";
+
+    sql_query($sql);
+}
+
+//------------------------------------------------
+// Application 통신 로그
+//------------------------------------------------
+function call_log($func, $req, $res)
+{
+    global $g5;
+
+    $req_str = str_replace("'", "''", print_r($req, true));
+    $res_str = str_replace("'", "''", print_r($res, true));
+
+    $sql = "
+        insert into ff_call_log
+           set func     = '{$func   }'
+             , request  = '{$req_str}'
+             , response = '{$res_str}'
+             , datetime = now()
+    ";
+
+    sql_query($sql);
+}
+
+//------------------------------------------------
+// 팀정보 구하기
+//------------------------------------------------
+function team_info($t_code)
+{
+    global $g5;
+
+    $sql = " select *
+               from {$g5['team_table']}
+              where t_code = '{$t_code}'
+           ";
+
+    return sql_fetch($sql);
+}
+
+//------------------------------------------------
+// 선수 목록
+//------------------------------------------------
+function player_list($h_t_code='', $a_t_code='', $basdt='')
+{
+    global $g5;
+
+    if ($h_t_code && $a_t_code)
+        $where = " and o.t_code in ('{$h_t_code}', '{$a_t_code}') ";
+
+    if (empty($basdt))
+        $basdt = date("Y.m.d"); // 기준일자 없으면 현재일 기준
+
+    $sql = "
+        select distinct o.p_id
+             , o.t_code
+             , t.t_name
+             , p.p_name
+             , o.pt_num p_number
+             , power(16, o.pt_pos-1) as p_position
+             , 'R' as p_foot
+          from ff_player_team o
+          join ff_player      p on o.p_id   = p.p_id
+          join ff_team        t on t.t_code = o.t_code and '{$basdt}' between t.t_begin and t.t_end
+         where '{$basdt}' between o.pt_begin and o.pt_end
+                {$where}
+        ";
+
+    $res = sql_query($sql);
+
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $row['p_picture'] = G5_DATA_URL."/player/{$row['p_id']}.png";
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+function player_list_20180828($h_t_code = "", $a_t_code = "")
+{
+    global $g5;
+
+    if ($h_t_code && $a_t_code)
+        $where = "    and (a.t_code = '{$h_t_code}' or a.t_code = '{$a_t_code}')";
+
+    $sql = "
+        select a.p_id
+             , a.t_code
+             , b.t_name
+             , a.p_name
+             , a.p_number
+             , power(16, a.p_position-1) as p_position
+             , a.p_foot
+          from ff_player a
+             , ff_team   b
+         where a.t_code = b.t_code
+       {$where}
+         order by
+               a.t_code
+             , a.p_position
+             , a.p_number
+        ";
+
+    $res = sql_query($sql);
+
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $row['p_picture'] = G5_DATA_URL."/player/{$row['p_id']}.png";
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+//------------------------------------------------
+// 팀별 포메이션 목록
+//------------------------------------------------
+function formation_list()
+{
+    global $g5;
+
+    $sql = "
+        select *
+          from ff_formation
+         order by
+               fm_order asc
+        ";
+
+    $res = sql_query($sql);
+
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+//------------------------------------------------
+// DID-Play gm_id 단일 경기
+//------------------------------------------------
+function dplay_game($gm_id) {
+      global $g5;
+
+      $sql = "
+          select a.*
+          from ff_game a
+          where a.gm_id = '{$gm_id}'
+      ";
+
+      $row = sql_fetch($sql);
+      return $row;
+}
+
+//------------------------------------------------
+// DID-Play 경기 스케듈 목록
+//------------------------------------------------
+function dplay_game_schedule_list($month, $league_code)
+{
+    global $g5;
+
+
+    if (empty($league_code) || $league_code == '000') {
+      $where = "";
+    } else {
+      $where = " and '{$league_code}' = a.gm_league";
+    }
+
+    $sql = "
+        select distinct a.gm_id
+               , b.gi_id
+               , a.gm_date
+               , a.gm_league as gm_league_code
+               , a.is_onair
+               , ifnull(a.gm_state, '000') as gi_state
+            from ff_game a
+            left outer join ff_game_info b
+              on b.gm_id  = a.gm_id
+           where a.gm_date like '{$month}%'
+                 {$where}
+         order by
+               gm_date asc
+    ";
+
+    $res = sql_query($sql);
+    $lst = array();
+
+    while ($row = sql_fetch_array($res)){
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+function dplay_game_schedule($date, $league_code) {
+  global $g5;
+
+  if (empty($league_code) || $league_code=="000") {
+    $where = "";
+  } else {
+    $where = " and '{$league_code}' = a.gm_league";
+  }
+
+  $sql = "
+      select a.gm_id
+           , a.gm_h_t_code
+           , a.gm_a_t_code
+           , ifnull(a.gm_state, '000') as gi_state
+           , c1.t_name gm_h_t_name
+           , c2.t_name gm_a_t_name
+           , ifnull(a.gi_goal_home, 0) as gi_goal_home
+           , ifnull(a.gi_goal_away, 0) as gi_goal_away
+           , d.s_name as gi_s_name
+           , a.gm_date
+           , a.gm_time
+           , e.league_name as gm_league_name
+           , a.gm_league as gm_league_code
+           , a.gm_league
+           , a.gm_s_code
+           , a.gm_round
+           , a.is_onair
+        from ff_game      a
+        join ff_team      c1 on c1.t_code     = a.gm_h_t_code and c1.l_code = a.gm_league and a.gm_date between c1.t_begin and c1.t_end
+        join ff_team      c2 on c2.t_code     = a.gm_a_t_code and c2.l_code = a.gm_league and a.gm_date between c2.t_begin and c2.t_end
+        join ff_stadium   d  on d.s_code      = a.gm_s_code
+        join ff_league    e  on e.league_code = a.gm_league
+       where a.gm_date = '{$date}'
+         {$where}
+         order by
+               gm_time asc
+      ";
+
+      $res = sql_query($sql);
+      $lst = array();
+      while ($row = sql_fetch_array($res)){
+        try{
+          $row['gi_h_t_logo'] = G5_DATA_URL."/team/{$row['gm_h_t_code']}.png";
+        }catch(Exception $e) {}
+          try{
+          $row['gi_a_t_logo'] = G5_DATA_URL."/team/{$row['gm_a_t_code']}.png";
+        }catch(Exception $e) {}
+          $lst[] = $row;
+      }
+
+      return $lst;
+}
+
+//------------------------------------------------
+// DID-Play 경기정보
+//------------------------------------------------
+function dplay_game_info_for_gmid($gm_id)
+{
+    global $g5;
+
+    $sql = "
+        select a.gi_id
+             , b.gm_id
+             , a.gi_user_id
+             , a.gi_write_code
+             , b.gm_h_t_code
+             , b.gm_a_t_code
+             , b.is_onair
+             , a.gi_state
+             , a.gi_part
+             , a.gi_part_ex
+             , a.gi_formation
+             , gi_h1_begin
+             , gi_h2_begin
+             , gi_h3_begin
+             , gi_h4_begin
+             , a.gi_h1_seconds
+             , a.gi_h2_seconds
+             , a.gi_h3_seconds
+             , a.gi_h4_seconds
+             , a.gi_seconds
+             , b.gi_goal_home
+             , b.gi_goal_away
+             , a.gi_regdt
+             , c1.t_name gm_h_t_name
+             , c2.t_name gm_a_t_name
+             , b.gm_date
+             , b.gm_time
+             , b.gm_league
+             , b.gm_league as gm_league_code
+             , e.league_name as gm_league_name
+             , b.gm_s_code
+             , d.s_name gi_s_name
+             , d.s_ground gi_s_ground
+             , b.gm_round
+             , a.gi_tmp
+             , a.gi_tap
+             , a.gi_ctp
+             , a.gi_sht
+             , a.gi_asr
+             , a.gi_gsr
+             , a.gi_ssr
+             , a.gi_bap
+             , a.is_old
+          from ff_game b
+          left outer join ff_game_info a on b.gm_id  = a.gm_id
+             , ff_team      c1
+             , ff_team      c2
+             , ff_stadium   d
+             , ff_league    e
+         where b.gm_id = '{$gm_id}'
+           and c1.t_code = b.gm_h_t_code and c1.l_code = b.gm_league and b.gm_date between c1.t_begin and c1.t_end
+           and c2.t_code = b.gm_a_t_code and c2.l_code = b.gm_league and b.gm_date between c2.t_begin and c2.t_end
+           and d.s_code = b.gm_s_code
+           and e.league_code = b.gm_league
+        ";
+
+    // 경기 별 경기 정보 ID 가져오기
+    $gi_ids = [];
+    if ($res_gi = sql_query("SELECT gi_id FROM ff_game_info WHERE gm_id = '{$gm_id}'")) {
+        while ($row = sql_fetch_array($res_gi)) {
+            $gi_ids[] = $row['gi_id'];
+        }
+    }
+    $gi_str = implode('\', \'', $gi_ids);
+    $sql_cnt = "
+        SELECT gi_id, 
+               IFNULL(SUM(IF(gr_res_code = 'X', 1, 0)), 0) cnt_x, 
+               IFNULL(SUM(IF(gr_res_code = 'B', 1, 0)), 0) cnt_b 
+        FROM ff_game_record 
+        WHERE gi_id IN ('{$gi_str}') 
+          AND gr_act_code != ''
+          AND gr_act_code NOT IN ('S', 'H', 'R') 
+          AND gr_res_code IN ('X', 'B') 
+        GROUP BY gi_id
+    ";
+
+    $res_cnt = sql_query($sql_cnt);
+    $lst_cnt = [];
+    while ($row = sql_fetch_array($res_cnt)) {
+        $lst_cnt[$row['gi_id']] = $row;
+    }
+
+    $res = sql_query($sql);
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $row['gi_h_t_logo'] = G5_DATA_URL."/team/{$row['gm_h_t_code']}.png";
+        $row['gi_a_t_logo'] = G5_DATA_URL."/team/{$row['gm_a_t_code']}.png";
+
+        // cnt 가 있을 경우
+        if (isset($lst_cnt[$row['gi_id']])) {
+            $item = $lst_cnt[$row['gi_id']];
+            $row['gi_cnt_block'] = $item['cnt_b'];
+            $row['gi_cnt_fail'] = $item['cnt_x'];
+        } else {
+            $row['gi_cnt_block'] = "0";
+            $row['gi_cnt_fail'] = "0";
+        }
+
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+function dplay_game_info($gi_id){
+  global $g5;
+
+  $sql = "
+      select a.gm_id
+           , a.gi_id
+           , b.gm_date
+           , b.gm_time
+           , b.gm_league
+           , b.gm_league as gm_league_code
+           , e.league_name as gm_league_name
+           , b.gm_s_code
+           , d.s_name gi_s_name
+           , d.s_ground gi_s_ground
+           , a.gi_user_id
+           , a.gi_write_code
+           , b.gm_h_t_code
+           , b.gm_a_t_code
+           , a.gi_bap
+           , c1.t_name gm_h_t_name
+           , c2.t_name gm_a_t_name
+           , a.gi_state
+           , a.gi_part
+           , a.gi_part_ex
+           , a.gi_formation
+           , gi_h1_begin
+           , gi_h2_begin
+           , gi_h3_begin
+           , gi_h4_begin
+           , a.gi_h1_seconds
+           , a.gi_h2_seconds
+           , a.gi_h3_seconds
+           , a.gi_h4_seconds
+           , a.gi_seconds
+           , b.gi_goal_home
+           , b.gi_goal_away
+           , b.gm_round
+           , a.gi_tmp
+           , a.gi_tap
+           , a.gi_ctp
+           , a.gi_sht
+           , a.gi_asr
+           , a.gi_gsr
+           , a.gi_ssr
+           , a.gi_bap
+           , a.is_old
+        from ff_game_info a
+           , ff_game      b
+           , ff_team      c1
+           , ff_team      c2
+           , ff_stadium   d
+           , ff_league    e
+       where b.gm_id  = a.gm_id
+         and c1.t_code = b.gm_h_t_code
+         and c2.t_code = b.gm_a_t_code
+         and a.gi_id = '{$gi_id}'
+         and d.s_code = b.gm_s_code
+         and e.league_code = b.gm_league
+       limit 1
+      ";
+
+  $row = sql_fetch($sql);
+
+  if ($row){
+      $row['gi_h_t_logo'] = G5_DATA_URL."/team/{$row['gm_h_t_code']}.png";
+      $row['gi_a_t_logo'] = G5_DATA_URL."/team/{$row['gm_a_t_code']}.png";
+  }
+  return $row;
+}
+
+//------------------------------------------------
+// DID-Play 경기정보 저장
+//------------------------------------------------
+function dplay_game_save($data)
+{
+    global $g5;
+
+    if (!empty($data['gi_id']))
+        $gi = dplay_game_info($data['gi_id']);
+
+    if ($gi){
+        $header = "update";
+        $footer = "where gi_id = '{$data['gi_id']}'";
+    }else{
+        $header = "insert into";
+
+        if (empty($data['gi_id']))
+            $data['gi_id'] = str_replace("-", "", GUIDv4());
+    }
+
+    if ($data['gi_state_org'] != "END" && $data['gi_state'] == "END")
+        $data['gi_seconds'] = "gi_h1_seconds + gi_h2_seconds + gi_h4_seconds + gi_h4_seconds";
+
+    $body = "";
+    if ($data['gm_id'         ]) $body .= " , gm_id         = '{$data['gm_id'          ]}' ";
+    if ($data['gi_user_id'    ]) $body .= " , gi_user_id    = '{$data['gi_user_id'     ]}' ";
+    if ($data['gi_write_code' ]) $body .= " , gi_write_code = '{$data['gi_write_code'  ]}' ";
+    if ($data['gi_h_t_code'   ]) $body .= " , gi_h_t_code   = '{$data['gi_h_t_code'    ]}' ";
+    if ($data['gi_a_t_code'   ]) $body .= " , gi_a_t_code   = '{$data['gi_a_t_code'    ]}' ";
+    if ($data['gi_state'      ]) $body .= " , gi_state      = '{$data['gi_state'       ]}' ";
+    if ($data['gi_part'       ]) $body .= " , gi_part       = '{$data['gi_part'        ]}' ";
+    if ($data['gi_part_ex'    ]) $body .= " , gi_part_ex    = '{$data['gi_part_ex'     ]}' ";
+    if ($data['gi_formation'  ]) $body .= " , gi_formation  = '{$data['gi_formation'   ]}' ";
+    if ($data['gi_h1_begin'   ]) $body .= " , gi_h1_begin   = '{$data['gi_h1_begin'    ]}' ";
+    if ($data['gi_h2_begin'   ]) $body .= " , gi_h2_begin   = '{$data['gi_h2_begin'    ]}' ";
+    if ($data['gi_h3_begin'   ]) $body .= " , gi_h3_begin   = '{$data['gi_h3_begin'    ]}' ";
+    if ($data['gi_h4_begin'   ]) $body .= " , gi_h4_begin   = '{$data['gi_h4_begin'    ]}' ";
+    if ($data['gi_h1_seconds' ]) $body .= " , gi_h1_seconds = '{$data['gi_h1_seconds'  ]}' ";
+    if ($data['gi_h2_seconds' ]) $body .= " , gi_h2_seconds = '{$data['gi_h2_seconds'  ]}' ";
+    if ($data['gi_h3_seconds' ]) $body .= " , gi_h3_seconds = '{$data['gi_h3_seconds'  ]}' ";
+    if ($data['gi_h4_seconds' ]) $body .= " , gi_h4_seconds = '{$data['gi_h4_seconds'  ]}' ";
+    if ($data['gi_seconds'    ]) $body .= " , gi_seconds    = '{$data['gi_seconds'     ]}' ";
+
+    $sql = " {$header} ff_game_info set gi_id = '{$data['gi_id']}' {$body} {$footer} ";
+
+    sql_query($sql);
+
+    // TODO state 업데이트시, ff_game 에서 기존 state 정보를 가져와서 더 나중인 정보로 갱신
+    $gm = dplay_game($data['gm_id']);
+    if (  ($gm['gm_state'] == "000" && $data['gi_state']!="000")
+       || ($gm['gm_state'] == "H1B" && $data['gi_state']!="000" && $data['gi_state']!="H1B")
+       || ($gm['gm_state'] == "H1E" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E")
+       || ($gm['gm_state'] == "H2B" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B")
+       || ($gm['gm_state'] == "H2E" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B" && $data['gi_state']!="H2E")
+       || ($gm['gm_state'] == "H3B" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B" && $data['gi_state']!="H2E" && $data['gi_state']!="H3B")
+       || ($gm['gm_state'] == "H3E" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B" && $data['gi_state']!="H2E" && $data['gi_state']!="H3B" && $data['gi_state']!="H3E")
+       || ($gm['gm_state'] == "H4B" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B" && $data['gi_state']!="H2E" && $data['gi_state']!="H3B" && $data['gi_state']!="H3E" && $data['gi_state']!="H4B")
+       || ($gm['gm_state'] == "H4E" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B" && $data['gi_state']!="H2E" && $data['gi_state']!="H3B" && $data['gi_state']!="H3E" && $data['gi_state']!="H4B" && $data['gi_state']!="H4E")
+     ){
+        $gmstate = $data['gi_state'];
+        $sql = " update ff_game set gm_state = '{$gmstate}' where gm_id = '{$data['gm_id']}' ";
+        sql_query($sql);
+     }else{
+        $gmstate = $gm['gm_state'];
+     }
+
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("match", "state", array("gm_id"=>$data['gm_id'], "gi_id"=>$data['gi_id'], "gm_state"=>$gmstate, "gi_state"=>$data['gi_state']));
+}
+
+//------------------------------------------------
+// DID-Play 경기 전/후반전 종료 처리
+//------------------------------------------------
+function dplay_game_finish_half($gi_id, $seconds)
+{
+    global $g5;
+
+    $gi = dplay_game_info($gi_id);
+    if (empty($gi))
+        return "경기 정보를 구할 수 없습니다 : {$gi_id}";
+
+     $MIN45 = 60 * 45;
+     $MIN15 = 60 * 15;
+
+    if ($gi['gi_state'] == "H1B"){
+        $data['gi_state'] = "H1E";
+        $data['gi_h1_seconds'] = ($seconds < $MIN45) ? $MIN45 : $seconds; // (int)(($timestamp*1 - $gi['gi_h1_begin']*1) / 1000);
+    }
+    elseif ($gi['gi_state'] == "H2B"){
+        $data['gi_state'] = "H2E";
+        $data['gi_h2_seconds'] = ($seconds < $MIN45) ? $MIN45 : $seconds; // (int)(($timestamp*1 - $gi['gi_h2_begin']*1) / 1000);
+    }
+    elseif ($gi['gi_state'] == "H3B"){
+        $data['gi_state'] = "H3E";
+        $data['gi_h3_seconds'] = $seconds; // (int)(($timestamp*1 - $gi['gi_h3_begin']*1) / 1000);
+    }
+    elseif ($gi['gi_state'] == "H4B"){
+        $data['gi_state'] = "H4E";
+        $data['gi_h4_seconds'] = $seconds; // (int)(($timestamp*1 - $gi['gi_h4_begin']*1) / 1000);
+    }
+    else return "종료 처리를 진행할 수 없는 상태입니다 : {$gi['gi_state']}";
+
+    $body = "";
+    if ($data['gi_state'     ]) $body .= " , gi_state      = '{$data['gi_state'     ]}' ";
+    if ($data['gi_h1_seconds']) $body .= " , gi_h1_seconds =  {$data['gi_h1_seconds']}  ";
+    if ($data['gi_h2_seconds']) $body .= " , gi_h2_seconds =  {$data['gi_h2_seconds']}  ";
+    if ($data['gi_h3_seconds']) $body .= " , gi_h3_seconds =  {$data['gi_h3_seconds']}  ";
+    if ($data['gi_h4_seconds']) $body .= " , gi_h4_seconds =  {$data['gi_h4_seconds']}  ";
+    if ($data['gi_seconds'   ]) $body .= " , gi_seconds    =  {$data['gi_seconds'   ]}  ";
+
+    $sql = " update ff_game_info set gi_id = '{$gi_id}' {$body} where gi_id = '{$gi_id}' ";
+
+    sql_query($sql);
+
+    // TODO state 업데이트시, ff_game 에서 기존 state 정보를 가져와서 더 나중인 정보로 갱신
+    $gm = dplay_game($gi['gm_id']);
+    if (empty($gm)) {
+       return "통합 경기 정보를 구할 수 없습니다 : {$gm_id}";
+    }
+
+    if (  ($gm['gm_state'] == "000" && $data['gi_state']!="000")
+       || ($gm['gm_state'] == "H1B" && $data['gi_state']!="000" && $data['gi_state']!="H1B")
+       || ($gm['gm_state'] == "H1E" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E")
+       || ($gm['gm_state'] == "H2B" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B")
+       || ($gm['gm_state'] == "H2E" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B" && $data['gi_state']!="H2E")
+       || ($gm['gm_state'] == "H3B" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B" && $data['gi_state']!="H2E" && $data['gi_state']!="H3B")
+       || ($gm['gm_state'] == "H3E" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B" && $data['gi_state']!="H2E" && $data['gi_state']!="H3B" && $data['gi_state']!="H3E")
+       || ($gm['gm_state'] == "H4B" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B" && $data['gi_state']!="H2E" && $data['gi_state']!="H3B" && $data['gi_state']!="H3E" && $data['gi_state']!="H4B")
+       || ($gm['gm_state'] == "H4E" && $data['gi_state']!="000" && $data['gi_state']!="H1B" && $data['gi_state']!="H1E" && $data['gi_state']!="H2B" && $data['gi_state']!="H2E" && $data['gi_state']!="H3B" && $data['gi_state']!="H3E" && $data['gi_state']!="H4B" && $data['gi_state']!="H4E")
+     ){
+        $gmstate = $data['gi_state'];
+        $sql = " update ff_game set gm_state = '{$gmstate}' where gm_id = '{$gi['gm_id']}' ";
+        sql_query($sql);
+     }else{
+        $gmstate = $gm['gm_state'];
+     }
+
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("match", "state", array("gm_id"=>$gi['gm_id'], "gi_id"=>$gi_id, "gm_state"=>$gmstate, "gi_state"=>$data['gi_state']));
+}
+
+//------------------------------------------------
+// DID-Play 경기 종료 처리
+//------------------------------------------------
+function dplay_game_finish($gi_id)
+{
+    global $g5;
+
+    $gi = dplay_game_info($gi_id);
+    if (empty($gi))
+        return "경기 정보를 구할 수 없습니다 : {$gi_id}";
+
+    // 후반종료, 연장 전/후반 종료 상태에서만 경기 종료 가능
+    if ($gi['gi_state'] != "H2E" && $gi['gi_state'] != "H3E" && $gi['gi_state'] != "H4E")
+        return "후반종료, 연장 전/후반 종료 상태에서만 경기 종료할 수 있습니다.";
+
+    // 경기 종료상태 Update
+    $sql = "
+        update ff_game_info
+           set gi_state   = 'END'
+             , gi_seconds = gi_h1_seconds
+                          + gi_h2_seconds
+                          + gi_h3_seconds
+                          + gi_h4_seconds
+         where gi_id = '{$gi_id}'
+        ";
+    sql_query($sql);
+
+    // 경기 종료까지 출전중인 선수들 출장시간 Update
+    $sec = $gi['gi_h1_seconds']
+         + $gi['gi_h2_seconds']
+         + $gi['gi_h3_seconds']
+         + $gi['gi_h4_seconds'];
+
+    $sql = "
+        update ff_game_player
+           set gp_seconds  =  {$sec} - gp_in_seconds
+         where gi_id       = '{$gi_id}'
+           and gp_in_half != '00'
+           and gp_out_half = '00'
+        ";
+    sql_query($sql);
+
+    $sql = " update ff_game set gm_state = 'END' where gm_id = '{$gi['gm_id']}' ";
+    sql_query($sql);
+    
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("match", "state", array("gm_id"=>$gi['gm_id'], "gi_id"=>$gi_id, "gm_state"=>"END", "gi_state"=>"END"));
+    
+    // 양팀 경기가 모두 종료되었으면 AI뉴스 생성
+    // (한쪽 팀 입력만 종료된 경우는 함수 내부에서 거른다)
+    news_create($gi['gm_id']);
+}
+
+//------------------------------------------------
+// DID-Play 경기 출전선수 저장
+//------------------------------------------------
+function dplay_game_player_save($data)
+{
+    global $g5;
+
+    $sql = "
+        insert into ff_game_player
+           set gi_id          = '{$data['gi_id'         ]}'
+             , p_id           = '{$data['p_id'          ]}'
+             , gp_type        = '{$data['gp_type'       ]}'
+             , gp_order       = '{$data['gp_order'      ]}'
+             , gp_in_half     = '{$data['gp_in_half'    ]}'
+             , gp_in_seconds  = '{$data['gp_in_seconds' ]}'
+             , gp_out_half    = '{$data['gp_out_half'   ]}'
+             , gp_out_seconds = '{$data['gp_out_seconds']}'
+             , gp_seconds     = '{$data['gp_seconds'    ]}'
+    ";
+
+    sql_query($sql);
+}
+
+//----------------------------------------------
+// DID-Play 경기 출전선수
+//----------------------------------------------
+function dplay_game_player($gi_id, $p_id)
+{
+    $sql = "
+        select gi.gi_id
+             , gp.p_id
+             , gp.gp_type as gp_type_str
+             , pp.p_name
+             , pt.pt_num as p_number
+             , power(16, pt.pt_pos-1) as p_position
+             , case when gp.gp_type = 'GK' then 1
+                    when gp.gp_type = 'KY' then 16
+                    when gp.gp_type = 'ST' then 256
+                    else 0
+                end gp_type
+             , gp.gp_order
+             , gp.gp_in_half
+             , gp.gp_in_half_seconds
+             , gp.gp_in_seconds
+             , gp.gp_out_half
+             , gp.gp_out_half_seconds
+             , gp.gp_out_seconds
+             , gp.gp_seconds
+          from ff_game_info   gi
+          join ff_game        gm on gm.gm_id   = gi.gm_id
+          join ff_game_player gp on gp.gi_id   = gi.gi_id
+          join ff_player      pp on pp.p_id    = gp.p_id
+          join ff_player_team pt on pt.p_id    = gp.p_id
+                                and pt.t_code in (gi.gi_h_t_code, gi.gi_a_t_code)
+                                and gm.gm_date between pt.pt_begin and pt.pt_end
+         where gi.gi_id = '{$gi_id}' and gp.p_id = '{$p_id}'
+        ";
+    
+    return sql_fetch($sql);
+}
+
+//------------------------------------------------
+// DID-Play 경기 출전선수 목록
+//----------------------------------------------
+function dplay_game_player_list($gi_id)
+{
+    global $g5;
+
+    $sql = "
+        select gi.gi_id
+             , gp.p_id
+             , pp.p_name
+             , pt.pt_num as p_number
+             , power(16, pt.pt_pos-1) as p_position
+             , case when gp.gp_type = 'GK' then 1
+                    when gp.gp_type = 'KY' then 16
+                    when gp.gp_type = 'ST' then 256
+                    else 0
+                end gp_type
+             , gp.gp_order
+             , gp.gp_in_half
+             , gp.gp_in_half_seconds
+             , gp.gp_in_seconds
+             , gp.gp_out_half
+             , gp.gp_out_half_seconds
+             , gp.gp_out_seconds
+             , gp.gp_seconds
+          from ff_game_info   gi
+          join ff_game        gm on gm.gm_id   = gi.gm_id
+          join ff_game_player gp on gp.gi_id   = gi.gi_id
+          join ff_player      pp on pp.p_id    = gp.p_id
+          join ff_player_team pt on pt.p_id    = gp.p_id
+                                and pt.t_code in (gi.gi_h_t_code, gi.gi_a_t_code)
+                                and gm.gm_date between pt.pt_begin and pt.pt_end
+         where gi.gi_id = '{$gi_id}'
+         order by
+               gp.gp_type  asc
+             , gp.gp_order asc
+        ";
+
+    $res = sql_query($sql);
+
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+function dplay_game_player_list_20180828($gi_id)
+{
+    global $g5;
+
+    $sql = "
+        select a.gi_id
+             , a.p_id
+             , b.p_name
+             , b.p_number
+             , power(16, b.p_position-1) as p_position
+             , case when a.gp_type = 'GK' then 1
+                    when a.gp_type = 'KY' then 16
+                    when a.gp_type = 'ST' then 256
+                    else 0
+                end gp_type
+             , a.gp_order
+             , a.gp_in_half
+             , a.gp_in_half_seconds
+             , a.gp_in_seconds
+             , a.gp_out_half
+             , a.gp_out_half_seconds
+             , a.gp_out_seconds
+             , a.gp_seconds
+          from ff_game_player a
+             , ff_player b
+         where a.p_id = b.p_id
+           and a.gi_id = '{$gi_id}'
+         order by
+               gp_type  asc
+             , gp_order asc
+        ";
+
+    $res = sql_query($sql);
+
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+//------------------------------------------------
+// DID-Play 선수 교체 처리
+//------------------------------------------------
+function dplay_game_player_change($gi_id, $p_id_fr, $p_id_to, $half, $haf_seconds, $seconds)
+{
+    global $g5;
+
+    if (empty($gi_id) || empty($p_id_fr) || empty($p_id_to) || empty($half))
+        return "Invalid Arguments";
+    
+    // 숫자는 empty 로 비교하지 말기    
+    if ((isset($haf_seconds) && $haf_seconds < 0) || (isset($seconds) && $seconds < 0)) {
+        return "Invalid Arguments";
+    }
+    
+    $sql = "
+        update ff_game_player
+           set gp_out_half         = '{$half}'
+             , gp_out_half_seconds =  {$haf_seconds}
+             , gp_out_seconds      =  {$seconds}
+             , gp_seconds          =  {$seconds} - gp_in_seconds
+         where gi_id               = '{$gi_id}'
+           and p_id                = '{$p_id_fr}'
+           and gp_in_half         != '00'
+        ";
+
+    sql_query($sql);
+
+    $sql = "
+        update ff_game_player
+           set gp_in_half          = '{$half}'
+             , gp_in_half_seconds  =  {$haf_seconds}
+             , gp_in_seconds       =  {$seconds}
+             , gp_seconds          =  0
+         where gi_id               = '{$gi_id}'
+           and p_id                = '{$p_id_to}'
+           and gp_in_half          = '00'
+        ";
+
+    sql_query($sql);
+}
+
+//------------------------------------------------
+// DID-Play Record 정보
+//------------------------------------------------
+function dplay_game_record_info($gr_id)
+{
+    global $g5;
+
+    $sql = "
+        select gr.*
+             , pp.p_name
+             , pt.pt_num as p_number
+             , pt.pt_pos as p_position
+          from ff_game_record gr
+
+          join ff_game_info gi
+            on gi.gi_id = gr.gi_id
+
+          join ff_game gm
+            on gm.gm_id = gi.gm_id
+
+          left outer join ff_player pp
+            on pp.p_id = gr.p_id
+
+          left outer join ff_player_team pt
+            on pt.p_id = gr.p_id
+           and pt.t_code = gi.gi_h_t_code
+           and gm.gm_date between pt.pt_begin and pt.pt_end
+
+         where gr.gr_id = '{$gr_id}'
+        ";
+
+    $row = sql_fetch($sql);
+    return $row;
+}
+function dplay_game_record_info_20180828($gr_id)
+{
+    global $g5;
+
+    $sql = "
+        select a.*
+             , b.p_name
+             , b.p_number
+             , b.p_position
+          from ff_game_record a
+          left outer join ff_player b
+            on a.p_id = b.p_id
+         where a.gr_id = '{$gr_id}'
+        ";
+
+    $row = sql_fetch($sql);
+    return $row;
+}
+
+//------------------------------------------------
+// DID-Play Record 저장
+//------------------------------------------------
+function dplay_game_record_save($data)
+{
+    global $g5;
+
+    if (!empty($data['gr_id']))
+        $gr = dplay_game_record_info($data['gr_id']);
+
+    if ($gr){
+        $header = "update";
+        $footer = "where gr_id = '{$data['gr_id']}'";
+    }else{
+        $header = "insert into";
+
+        // if (empty($data['gr_id']))
+        //     $data['gr_id'] = str_replace("-", "", GUIDv4());
+    }
+
+    $body = "";
+    if ($data['gi_id'          ]) $body .= " , gi_id           = '{$data['gi_id'          ]}' ";
+    if ($data['p_id'           ]) $body .= " , p_id            = '{$data['p_id'           ]}' ";
+    if ($data['t_code'         ]) $body .= " , t_code          = '{$data['t_code'         ]}' ";
+    if ($data['gr_half'        ]) $body .= " , gr_half         = '{$data['gr_half'        ]}' ";
+    if ($data['gr_half_seconds']) $body .= " , gr_half_seconds =  {$data['gr_half_seconds']}  ";
+    if ($data['gr_seconds'     ]) $body .= " , gr_seconds      =  {$data['gr_seconds'     ]}  ";
+    if ($data['gr_area_code'   ]) $body .= " , gr_area_code    = '{$data['gr_area_code'   ]}' ";
+    if ($data['gr_pos_x'       ]) $body .= " , gr_pos_x        =  {$data['gr_pos_x'       ]}  ";
+    if ($data['gr_pos_y'       ]) $body .= " , gr_pos_y        =  {$data['gr_pos_y'       ]}  ";
+    if ($data['gr_part_pos_x'  ]) $body .= " , gr_part_pos_x   =  {$data['gr_part_pos_x'  ]}  ";
+    if ($data['gr_part_pos_y'  ]) $body .= " , gr_part_pos_y   =  {$data['gr_part_pos_y'  ]}  ";
+                                  $body .= " , gr_act_code     = '{$data['gr_act_code'    ]}' ";
+                                  $body .= " , gr_res_code     = '{$data['gr_res_code'    ]}' ";
+    if ($data['gr_regdt'       ]) $body .= " , gr_regdt        = STR_TO_DATE('{$data['gr_regdt']}', '%Y-%m-%d %H:%i:%s.%f')  ";
+    if ($data['gr_res_code']!="B" && $data['gr_res_code']!="X" && $data['gr_res_code']!="H" && $data['gr_res_code']!="L" && $data['gr_res_code']!="R" && $data['gr_res_code']!="G") {
+      // php 에서, 0 은 null과 동의이므로, 명시적으로 res code를 이용하여 shoot pos 를 처리해준다.
+      $body .= " , gr_shoot_pos_x  = 0 , gr_shoot_pos_y  = 0";
+      $body .= " , gr_shoot_rate_x  = 0.0 , gr_shoot_rate_y  = 0.0";
+    } else{
+      if ($data['gr_shoot_pos_x' ]) $body .= " , gr_shoot_pos_x  =  {$data['gr_shoot_pos_x' ]}  ";
+      if ($data['gr_shoot_pos_y' ]) $body .= " , gr_shoot_pos_y  =  {$data['gr_shoot_pos_y' ]}  ";
+      if ($data['gr_shoot_rate_x' ]) $body .= " , gr_shoot_rate_x  =  {$data['gr_shoot_rate_x' ]}  ";
+      if ($data['gr_shoot_rate_y' ]) $body .= " , gr_shoot_rate_y  =  {$data['gr_shoot_rate_y' ]}  ";
+    }
+
+    $sql = " {$header} ff_game_record set gr_id = '{$data['gr_id']}' {$body} {$footer} ";
+
+    sql_query($sql);
+
+    // Goal 관련 항목이면 경기 및 선수별 Goal 기록 업데이트
+    if ($data['gr_res_code']==="G" || $gr['gr_res_code']==="G"){
+        dplay_game_reload_goal_data($data['gi_id'], TRUE);
+    }
+
+    // X:Failure or B:Blocking 이면 직전 Record의 Result Code를 동일한 값으로 Update
+    if (empty($data['gr_act_code']) && ($data['gr_res_code'] == "X" || $data['gr_res_code'] == "B")){
+
+        $prev = dplay_game_record_prev($data); // 직전 Record 데이터
+
+        if (!empty($prev_gr_id = $prev['gr_id'])){
+            $sql = "
+                update ff_game_record
+                   set gr_res_code = '{$data['gr_res_code']}'
+                 where gr_id = '{$prev_gr_id}'
+                ";
+            sql_query($sql);
+
+            $prev['gr_res_code'] = $data['gr_res_code'];
+
+            return $prev;
+        }
+    }
+    
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("record", "save", $data);
+}
+
+//------------------------------------------------
+// DID-Play 직전 Record 구하기
+//------------------------------------------------
+function dplay_game_record_prev($data)
+{
+    global $g5;
+
+    $sql = "
+        select *
+          from ff_game_record
+         where gr_id      != '{$data['gr_id'     ]}'
+           and gi_id       = '{$data['gi_id'     ]}'
+           and gr_half     = '{$data['gr_half'   ]}'
+           and gr_seconds <=  {$data['gr_seconds']}
+         order by
+               gr_seconds desc
+             , gr_regdt desc
+         limit 1
+        ";
+
+    return sql_fetch($sql);
+    //return $row['gr_id'];
+}
+
+//------------------------------------------------
+// DID-Play Record 목록
+//------------------------------------------------
+function dplay_game_record_list($gi_id, $gr_half)
+{
+    global $g5;
+
+    $whr = empty($gr_half) ? "" : " and gr.gr_half = '{$gr_half}' ";
+
+    $sql = "
+        select gr.*
+             , ifnull(gt.gt_upp     ,  0 ) gt_upp
+             , ifnull(gt.gt_utp     ,  0 ) gt_utp
+             , ifnull(gt.gt_ctp     ,  0 ) gt_ctp
+             , ifnull(gt.gt_ttp     ,  0 ) gt_ttp
+          -- , ifnull(gt.gt_valid   , 'N') gt_valid
+             , ifnull(gt.gt_res_code,  '') gt_res_code
+             , pp.p_name
+             , pt.pt_num as p_number
+             , pt.pt_pos as p_position
+          from ff_game_record gr
+
+          join ff_game_info gi
+            on gi.gi_id = gr.gi_id
+
+          join ff_game gm
+            on gm.gm_id = gi.gm_id
+
+          left outer join ff_game_path gt
+            on gt.gt_id = gr.gt_id
+
+          left outer join ff_player pp
+            on pp.p_id = gr.p_id
+
+          left outer join ff_player_team pt
+            on pt.p_id = gr.p_id
+           and pt.t_code = gi.gi_h_t_code
+           and gm.gm_date between pt.pt_begin and pt.pt_end
+
+         where gr.gi_id = '{$gi_id}' {$whr}
+         order by
+               gr.gr_seconds asc
+            ,  gr.gr_id      asc
+        ";
+
+    $res = sql_query($sql);
+
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+function dplay_game_record_list_20180828($gi_id, $gr_half)
+{
+    global $g5;
+
+    $whr = empty($gr_half) ? "" : " and gr_half = '{$gr_half}' ";
+    $sql = "
+        select a.*
+             , b.p_name
+             , b.p_number
+             , b.p_position
+          from ff_game_record a
+          left outer join ff_player b
+            on a.p_id = b.p_id
+         where a.gi_id = '{$gi_id}'
+               {$whr}
+         order by
+               gr_seconds asc
+            ,  gr_id asc
+        ";
+
+    $res = sql_query($sql);
+
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+//------------------------------------------------
+// DID-Play Record 삭제
+//------------------------------------------------
+function dplay_game_record_delete($gr_id)
+{
+    global $g5;
+
+    $gr = dplay_game_record_info($gr_id);
+    if (empty($gr))
+        return "레코드 정보를 구할 수 없습니다.";
+
+    // Record 삭제
+    $sql = "
+        delete from ff_game_record
+         where gr_id = '{$gr_id}'
+        ";
+
+    sql_query($sql);
+    
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("record", "remove", $gr);
+
+    // Goal Record인 경우에는 전체 Goal 정보 갱신 + Monitor 전송
+    if ($gr['gr_res_code'] === "G"){
+        dplay_game_reload_goal_data($gr['gi_id'], TRUE);
+    }
+}
+
+function dplay_stadium_field_upload($s_code, $s_ground) {
+    if (empty($s_code) || (empty($s_ground) && $s_ground!=0)) {
+      return "Invalid Arguments";
+    }
+
+    $sql = "
+              update ff_stadium
+              set s_ground = '{$s_ground}'
+              where s_code = '{$s_code}'
+           ";
+
+    sql_query($sql);
+}
+
+//------------------------------------------------
+// DID-Play Record 선수 업데이트
+//------------------------------------------------
+function dplay_game_record_player($grid, $pid)
+{
+    // 레코드 선수정보 업데이트
+    $sql = "
+        update ff_game_record
+           set p_id  = '{$pid }'
+         where gr_id = '{$grid}'
+        ";
+
+    sql_query($sql);
+    
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("record", "player", array("gr_id"=>$grid, "p_id"=>$pid));
+    
+    // Goal리뷰 푸시알림 발송
+    fcm_push_goal($grid);
+    
+    // 해당 레코드가 포함된 공격루트 업데이트
+    return dplay_game_path_update_by_record($grid);
+}
+
+//------------------------------------------------
+// 경기 및 선수별 Goal 기록 업데이트
+//------------------------------------------------
+function dplay_game_reload_goal_data($gi_id, $send2monitor=FALSE) {
+    
+    // Monitor 데이터
+    $mdata = array("gi_id"=>$gi_id, "players"=>array());
+    
+    // 전체 선수 Goal 수 우선 0
+    $sql ="
+        update ff_game_player gp
+           set gp_goal =  0
+         where gi_id   = '{$gi_id}'
+        ";
+    sql_query($sql);
+
+    // 선수별 Goal 수 업데이트
+    $tot_cnt = 0;
+    $sql = "
+      select p_id
+           , count(*) cnt
+        from ff_game_record gr
+       where gr_res_code = 'G'
+         and gi_id = '{$gi_id}'
+       group by
+             p_id
+    ";
+
+    $res = sql_query($sql);
+    while ($row = sql_fetch_array($res)){
+        $pid = $row['p_id'];
+        $cnt = $row['cnt' ];
+
+        if (!empty($pid)){
+
+            $sql ="
+                update ff_game_player gp
+                   set gp_goal =  {$cnt  }
+                 where gi_id   = '{$gi_id}'
+                   and p_id    = '{$pid  }'
+                ";
+            sql_query($sql);
+            
+            $mdata['players'][$pid] = $cnt; // monitor data
+        }
+
+        // 전체 Goal 수 계산
+        $tot_cnt += $cnt;
+    }
+
+    // 경기 Goal 데이터 업데이트
+    $gi = dplay_game_info($gi_id);
+    $gm_id = $gi['gm_id'];
+    $f = ($gi['gi_write_code']=='H') ? "home" : "away";
+
+    $sql ="
+        update ff_game
+           set gi_goal_{$f} = {$tot_cnt}
+         where gm_id = '{$gm_id}'
+        ";
+    sql_query($sql);
+    
+    $mdata['wcode'] = $gi['gi_write_code'];
+    $mdata['total'] = $tot_cnt;
+    
+    // Monitor 전송
+    if ($send2monitor){
+        global $monitor;
+        $monitor->event("match", "goal", $mdata);
+    }
+
+    return $tot_cnt;
+}
+
+//------------------------------------------------
+// DID-Play Card 정보
+//------------------------------------------------
+function dplay_game_card_info($c_id)
+{
+    global $g5;
+
+    $sql = "
+        select a.*
+          from ff_game_card a
+         where a.c_id = '{$c_id}'
+        ";
+
+    $row = sql_fetch($sql);
+    return $row;
+}
+
+//------------------------------------------------
+// DID-Play Card 저장
+//------------------------------------------------
+function dplay_game_card_save($data)
+{
+    global $g5;
+
+    if (!empty($data['c_id']))
+        $gr = dplay_game_card_info($data['c_id']);
+
+    if ($gr){
+        $header = "update";
+        $footer = "where c_id = '{$data['c_id']}'";
+    }else{
+        $header = "insert into";
+
+        if (empty($data['c_id']))
+            $data['c_id'] = str_replace("-", "", GUIDv4());
+    }
+
+     $body = "";
+     if ($data['gi_id'        ]) $body .= " , gi_id         = '{$data['gi_id'         ]}' ";
+     if ($data['gp_id'        ]) $body .= " , gp_id         = '{$data['gp_id'         ]}' ";
+   //if ($data['gp_name'      ]) $body .= " , gp_name       = '{$data['gp_name'       ]}' ";
+     if ($data['gp_card_half' ]) $body .= " , gp_card_half  = '{$data['gp_card_half'  ]}' ";
+     if ($data['gp_card_time' ]) $body .= " , gp_card_time  =  {$data['gp_card_time'  ]}  ";
+     if ($data['gr_seconds'   ]) $body .= " , gr_seconds    =  {$data['gr_seconds'    ]}  ";
+     if ($data['gp_card_card' ]) $body .= " , gp_card_card  = '{$data['gp_card_card'  ]}' ";
+
+    $sql = " {$header} ff_game_card set c_id = '{$data['c_id']}' {$body} {$footer} ";
+    sql_query($sql);
+
+    dplay_player_card_save($data['gi_id']);
+    
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("card", "save", $data);
+
+    return $data['c_id'];
+}
+function dplay_game_card_save_20180828($data)
+{
+    global $g5;
+
+    if (!empty($data['c_id']))
+        $gr = dplay_game_card_info($data['c_id']);
+
+    if ($gr){
+        $header = "update";
+        $footer = "where c_id = '{$data['c_id']}'";
+    }else{
+        $header = "insert into";
+
+        if (empty($data['c_id']))
+            $data['c_id'] = str_replace("-", "", GUIDv4());
+    }
+
+     $body = "";
+     if ($data['gi_id'        ]) $body .= " , gi_id         = '{$data['gi_id'         ]}' ";
+     if ($data['gp_id'        ]) $body .= " , gp_id         = '{$data['gp_id'         ]}' ";
+     if ($data['gp_name'      ]) $body .= " , gp_name       = '{$data['gp_name'       ]}' ";
+     if ($data['gp_card_half' ]) $body .= " , gp_card_half  = '{$data['gp_card_half'  ]}' ";
+     if ($data['gp_card_time' ]) $body .= " , gp_card_time  =  {$data['gp_card_time'  ]}  ";
+     if ($data['gr_seconds'   ]) $body .= " , gr_seconds    =  {$data['gr_seconds'    ]}  ";
+     if ($data['gp_card_card' ]) $body .= " , gp_card_card  = '{$data['gp_card_card'  ]}' ";
+
+    $sql = " {$header} ff_game_card set c_id = '{$data['c_id']}' {$body} {$footer} ";
+    //$sql = "insert into ff_game_card set c_id = '{$data['c_id']}' {$body}";
+    //$sql = " {$header} ff_game_card set c_id = '{$data['c_id']}' {$body} {$footer} ";
+
+    sql_query($sql);
+
+    return $data['c_id'];
+}
+
+//------------------------------------------------
+// DID-Play Card 목록
+//------------------------------------------------
+function dplay_game_card_list($gi_id)
+{
+    global $g5;
+
+    $sql = "
+        select gc.*
+             , pp.p_name as gp_name
+          from ff_game_card gc
+
+          join ff_player pp
+            on pp.p_id = gc.gp_id
+
+         where gc.gi_id = '{$gi_id}'
+        ";
+
+    $res = sql_query($sql);
+
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+function dplay_game_card_list_20180828($gi_id)
+{
+    global $g5;
+
+    $sql = "
+        select a.*
+          from ff_game_card a
+         where a.gi_id = '{$gi_id}'
+        ";
+
+    $res = sql_query($sql);
+
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+//------------------------------------------------
+// DID-Play Card 삭제
+//------------------------------------------------
+function dplay_game_card_delete($c_id)
+{
+    global $g5;
+
+    $gr = dplay_game_card_info($c_id);
+    if (empty($gr))
+        return "레코드 정보를 구할 수 없습니다.";
+
+    $sql = "select gi_id
+            from ff_game_card
+            where c_id = '{$c_id}'";
+    $gi_id = sql_fetch($sql)['gi_id'];
+
+    // Record 삭제
+    $sql = "
+        delete from ff_game_card
+         where c_id = '{$c_id}'
+        ";
+    sql_query($sql);
+    
+    dplay_player_card_save($gi_id);
+    
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("card", "remove", $gr);
+}
+
+function dplay_load_league_data()
+{
+    global $g5;
+
+    $sql = "
+        select a.*
+          from ff_league a
+        ";
+
+    $lst = array();
+
+    $res = sql_query($sql);
+
+    while ($row = sql_fetch_array($res)){
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+//------------------------------------------------
+// DID-Play Bap 가져오기
+//------------------------------------------------
+function dplay_game_bap_load($gi_id, $gr_half='')
+{
+    if ($gr_half)
+        $whr = " and gr_half = '{$gr_half}' ";
+
+    $sql = "
+        select count(*) cnt
+          from ff_game_bap
+         where gi_id = '{$gi_id}' {$whr}
+        ";
+
+    $bap = sql_fetch($sql)['cnt'];
+
+    $sql ="
+        update ff_game_info
+           set gi_bap = ( select count(*)
+                                  from ff_game_bap
+                                 where gi_id = '{$gi_id}'
+                              )
+         where gi_id = '{$gi_id}'
+        ";
+
+    sql_query($sql);
+
+    return $bap;
+}
+function dplay_game_bap_load_old($gi_id)
+{
+    $sql = "
+        select count(*)
+          from ff_game_bap
+         where gi_id = '{$gi_id}'
+    ";
+
+    $sqlres = sql_fetch($sql);
+
+    $res = $sqlres['count(*)'];
+
+    $gi = dplay_game_info($gi_id);
+
+    $sql ="
+        update ff_game_info
+           set gi_bap = {$res}
+         where gi_id = '{$gi_id}'";
+
+    sql_query($sql);
+
+    return $res;
+}
+
+//------------------------------------------------
+// DID-Play Bap 건수만 구하기
+//------------------------------------------------
+function dplay_game_bap_count($gi_id, $gr_half='')
+{
+    if ($gr_half)
+        $whr = " and gr_half = '{$gr_half}' ";
+
+    $sql = "
+        select count(*) cnt
+          from ff_game_bap
+         where gi_id = '{$gi_id}' {$whr}
+    ";
+
+    return sql_fetch($sql)['cnt'];
+}
+
+//------------------------------------------------
+// DID-Play Bap 건수 다시 계산 (경기 전체)
+// @@@@ 반드시 전/후반 따로 호출해야 함 !!!!
+//------------------------------------------------
+$g_bap_currR = FALSE;
+$g_bap_lastR = FALSE;
+$g_bap_nextR = FALSE;
+$g_bap_ready = FALSE;
+$g_bap_defer = FALSE;
+$g_bap_count = 0;
+
+function dplay_game_bap_reset($gi_id, $gr_half, $uplast='')
+{
+    global $g_bap_currR;
+    global $g_bap_lastR;
+    global $g_bap_nextR;
+    global $g_bap_ready;
+    global $g_bap_count;
+
+    $g_bap_count = 0;
+
+    // BAP 전체 레코드 삭제
+    $whr = $gr_half ? " and gr_half = '{$gr_half}' " : "";
+
+    $sql = "
+        delete from ff_game_bap
+         where gi_id = '{$gi_id}' {$whr}
+        ";
+
+    sql_fetch($sql);
+
+    // 전체 BAP 레코드 다시 계산
+    $whr = $gr_half ? " and gr.gr_half = '{$gr_half}' " : "";
+
+    $sql = "
+        select gr.*
+             , gb.bap_id
+          from ff_game_record gr
+          left outer join
+               ff_game_bap gb
+            on gb.gi_id = gr.gi_id
+           and gb.gr_id = gr.gr_id
+         where gr.gi_id = '{$gi_id}' {$whr}
+         order by
+               gr.gr_seconds asc
+             , gr.gr_regdt   asc
+        ";
+
+    $res = sql_query($sql);
+
+    //
+    // 1 Step Delay Looping
+    //
+    // >>>> DID 상에서는 ACT를 먼저 누르고 X/B 누르는 구조이기 때문에
+    // >>>> DID와 동일한 기준 및 순서로 판단하기 위한 처리
+    //
+    while ($row = sql_fetch_array($res)){
+
+        $g_bap_lastR = $g_bap_currR;
+        $g_bap_currR = $g_bap_nextR;
+        $g_bap_nextR = $row;
+
+        if ($g_bap_currR){
+            $bap = dplay_game_bap_reset_calc($g_bap_currR, $g_bap_lastR, $g_bap_nextR);
+            if ($bap)
+                dplay_game_bap_reset_save($bap);
+        }
+    }
+
+    // 마지막 남은 레코드 강제 실행
+    if ($g_bap_nextR){
+        $bap = dplay_game_bap_reset_calc($g_bap_nextR, $g_bap_currR, FALSE);
+        if ($bap)
+            dplay_game_bap_reset_save($bap);
+    }
+
+    // READY 상태로 끝났으면 마지막 레코드 UP 처리
+    if ($uplast && $g_bap_ready){
+        $bap = dplay_game_bap_reset_data($g_bap_nextR, "LAST READY");
+        dplay_game_bap_reset_save($bap);
+    }
+
+    // BAP 카운트 업데이트
+    $cnt = dplay_game_bap_load($gi_id, $gr_half);
+    
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("bap", "reset", array("gi_id"=>$gi_id, "gr_half"=>$gr_half));
+    
+    return $cnt;
+}
+
+function dplay_game_bap_reset_calc($currR, $lastR, $nextR)
+{
+    global $g_bap_ready;
+    global $g_bap_defer;
+
+    $bap = FALSE;
+
+    $act = $currR['gr_act_code'];
+    $res = $currR['gr_res_code'];
+
+    $area_curr = $currR['gr_area_code'];
+    $area_last = $lastR ? intval($lastR['gr_area_code']) : 0;
+
+    dplay_game_bap_reset_log("## DAT ##", "{$act}->{$currR['gr_res_code']} {$area_last}->{$area_curr} {$currR['gr_seconds']} {$currR['bap_id']}");
+
+    // DID 상에서는 ACT를 먼저 누르고 X/B 누르는 구조이기 때문에
+    // DID와 동일한 기준 및 순서로 판단하기 위한 처리
+    if (!empty($act)){
+        if ($act=="S" || $act=="H" || $act=="R"){
+            if ($nextR && empty($nextR['gr_act_code'])){
+                $res = "O";
+            }
+        }else $res = "O";
+    }
+
+    // Ready 상태에서
+    if ($g_bap_ready)
+    {
+        // 이전 레코드와 4초 이상 벌어졌으면 UP
+        if ($lastR && intval($currR['gr_seconds']) - intval($lastR['gr_seconds']) > 4){
+            $bap = dplay_game_bap_reset_data($currR, "4 SECONDS");
+        }
+
+        // 진행이 마무리 되었으면 UP
+        elseif (!empty($res) && $res != "O"){
+            $bap = dplay_game_bap_reset_data($currR, "DONE");
+        }
+
+        // 공격영역(1~6)으로 진입했으면 UP
+        elseif ($area_curr < 7){
+            $bap = dplay_game_bap_reset_data($currR, "ATTACK");
+        }
+
+        // Ready 상태 나머지는 경우는 SKIP
+    }
+    // Ready 상태가 아닌 경우
+    else
+    {
+        // 경기 시작(전/후반) 직후 바로 공격 진영으로 진입한 경우이면 Ready
+        if ($lastR === FALSE && $area_curr < 10){
+            $g_bap_ready = TRUE;
+            dplay_game_bap_reset_log("*********", "READY : BEGIN");
+        }
+        // 후방에서 슈팅한 경우이면 Ready
+        // 슈팅의 경우는 Act 및 Res 발생 시 중복 저장이 이루어지므로 Act 발생시에만 Ready 해주면 결과 발생 시 UP 된다
+        elseif($area_curr > 9 && ($act=="S" || $act=="H" || $act=="R")){
+            // 슈팅이 바로 마무리 되었으면 UP
+            if (!empty($res) && $res!="O"){
+                $bap = dplay_game_bap_reset_data($currR, "SHOOT");
+            }
+            // 슈팅 다음 ACT로 이어지는 경우이면 READY
+            else{
+                $g_bap_ready = TRUE;
+                dplay_game_bap_reset_log("*********", "READY : SHOOT");
+            }
+        }
+        // 중앙선을 넘어왔으면
+        elseif ($area_last > 9 && $area_curr < 10){
+
+            // X로 중앙선 넘은건 Ready 보류
+            if (empty($act) && $res=="X"){
+                $g_bap_defer = true;
+                dplay_game_bap_reset_log("*********", "KEEP");
+            }
+            // X 이외로 넘어온건 인정
+            else{
+                // B로 바로 마무리 되었으면 UP
+                if (empty($act) && $res=="B"){
+                    $bap = dplay_game_bap_reset_data($currR, "CROSS B");
+                }
+                // 공격 영역으로 들어왔으면 UP
+                elseif ($area_curr < 7){
+                    $bap = dplay_game_bap_reset_data($currR, "CROSS ATTACK");
+                }
+                // 중앙선만 넘어온 경우이면 Ready
+                else{
+                    $g_bap_ready = TRUE;
+                    dplay_game_bap_reset_log("*********", "READY");
+                }
+            }
+        }
+        // Ready 보류 상태에서 바로 전방 포인트가 발생하면 Ready or UP
+        else if ($g_bap_defer && $area_curr < 10){
+            // 공격 영역이면 바로 UP
+            if ($area_curr < 7){
+                $bap = dplay_game_bap_reset_data($currR, "KEEP");
+            }
+            // 나머지 전방 영역은 경우이면 Ready
+            else{
+                dplay_game_bap_reset_log("*********", "READY : KEEP");
+                $g_bap_ready = true;
+            }
+        }
+    }
+
+    if ($bap) {
+        $g_bap_ready = FALSE;
+        $g_bap_defer = FALSE;
+    }
+    else if ($g_bap_ready){
+        $g_bap_defer = FALSE;
+    }
+
+    return $bap;
+}
+
+function dplay_game_bap_reset_log($tag, $msg)
+{
+    return; // Do Nothing
+
+    echo "<pre style='display:block;margin:0;padding:0;'>";
+    echo "{$tag} {$msg}";
+    echo "</pre>".PHP_EOL;
+}
+
+function dplay_game_bap_reset_data($row, $desc)
+{
+    $bap = array();
+
+    $bap['bap_id'         ] = uniqid('', TRUE);
+    $bap['gi_id'          ] = $row['gi_id'          ];
+    $bap['gr_id'          ] = $row['gr_id'          ];
+    $bap['t_code'         ] = $row['t_code'         ];
+    $bap['gr_half'        ] = $row['gr_half'        ];
+    $bap['gr_half_seconds'] = $row['gr_half_seconds'];
+    $bap['gr_seconds'     ] = $row['gr_seconds'     ];
+    $bap['gr_regdt'       ] = $row['gr_regdt'       ];
+    $bap['desc'           ] = $desc;
+
+    return $bap;
+}
+
+function dplay_game_bap_reset_save($bap)
+{
+    global $g_bap_count;
+
+    ++$g_bap_count;
+
+    dplay_game_bap_reset_log(">>>>>>>>>", "UP : {$bap['desc']} : {$g_bap_count}");
+
+    $sql = "
+        insert into ff_game_bap
+           set bap_id          = '{$bap['bap_id'         ]}'
+             , gi_id           = '{$bap['gi_id'          ]}'
+             , gr_id           = '{$bap['gr_id'          ]}'
+             , t_code          = '{$bap['t_code'         ]}'
+             , gr_half         = '{$bap['gr_half'        ]}'
+             , gr_half_seconds = '{$bap['gr_half_seconds']}'
+             , gr_seconds      = '{$bap['gr_seconds'     ]}'
+             , gr_regdt        = '{$bap['gr_regdt'       ]}'
+        ";
+
+    sql_fetch($sql);
+}
+
+//------------------------------------------------
+// DID-Play Bap 삽입
+//------------------------------------------------
+function dplay_game_bap_save($data)
+{
+    global $g5;
+
+    $header = "insert into";
+    $body = "";
+
+    if ($data['gi_id'          ]) $body .= " , gi_id           = '{$data['gi_id'          ]}' ";
+    if ($data['gr_id'          ]) $body .= " , gr_id           = '{$data['gr_id'          ]}' ";
+    if ($data['t_code'         ]) $body .= " , t_code          = '{$data['t_code'         ]}' ";
+    if ($data['gr_half'        ]) $body .= " , gr_half         = '{$data['gr_half'        ]}' ";
+    if ($data['gr_half_seconds']) $body .= " , gr_half_seconds =  {$data['gr_half_seconds']}  ";
+    if ($data['gr_seconds'     ]) $body .= " , gr_seconds      =  {$data['gr_seconds'     ]}  ";
+    if ($data['gr_regdt'       ]) $body .= " , gr_regdt        = STR_TO_DATE('{$data['gr_regdt']}', '%Y-%m-%d %H:%i:%s.%f')  ";
+
+    $sql = " {$header} ff_game_bap set bap_id = '{$data['bap_id']}' {$body}";
+
+    sql_query($sql);
+
+    try
+    {
+        $bap = dplay_game_bap_load($data['gi_id'], $data['gr_half']);
+        
+        // Monitor 전송
+        global $monitor;
+        $monitor->event("bap", "save", $data);
+        
+        return $bap;
+    }
+    catch(Exception $e)
+    {
+        return "0";
+    }
+}
+
+//------------------------------------------------
+// DID-Play 공격루트 재계산(경기 전체 다시 계산)
+//------------------------------------------------
+$g_path_currR = FALSE;
+$g_path_lastR = FALSE;
+$g_path_nextR = FALSE;
+$g_path_mking = FALSE;
+$g_path_ptype = FALSE;
+$g_path_array = array();
+$g_path_newer = array();
+
+function dplay_game_path_reset($gi_id, $gr_half)
+{
+//    echo "<pre style='display:block;margin:0;padding:0;'>";
+
+    global $g_path_currR;
+    global $g_path_lastR;
+    global $g_path_nextR;
+    global $g_path_mking;
+    global $g_path_array;
+    global $g_path_newer;
+
+    $g_path_currR = FALSE;
+    $g_path_lastR = FALSE;
+    $g_path_nextR = FALSE;
+    $g_path_mking = FALSE;
+    $g_path_ptype = FALSE;
+    $g_path_array = array();
+    $g_path_newer = array();
+
+    // 전체 레코드 다시 계산
+    $sql = "
+        select gr.*
+          -- , gt.gt_valid
+          from ff_game_record gr
+          left outer join ff_game_path gt
+            on gt.gt_id   = gr.gt_id
+         where gr.gi_id   = '{$gi_id  }'
+           and gr.gr_half = '{$gr_half}'
+         order by
+               gr.gr_seconds asc
+             , gr.gr_regdt   asc
+        ";
+
+    $res = sql_query($sql);
+
+    // Path 레코드 초기화를 위해 먼저 메모리에 담아둔다.
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $lst[] = $row;
+    }
+
+    // 해당 경기 전체 PATH 레코드 삭제 (Half 기준)
+    // $$$$ 왠지 모르게 쓰레기 데이터가 쌓인다.
+    // $$$$ 아래와 같이 쓰레기 데이터도 함께 삭제해주어야 전체 건수가 이상이 없다.
+    dplay_game_path_clean($gi_id, $gr_half, FALSE);
+
+    //
+    // 1 Step Delay Looping
+    //
+    // >>>> DID 상에서는 ACT를 먼저 누르고 X/B 누르는 구조이기 때문에
+    // >>>> DID와 동일한 기준 및 순서로 판단하기 위한 처리
+    //
+    foreach ($lst as $row){
+
+        $g_path_lastR = $g_path_currR;
+        $g_path_currR = $g_path_nextR;
+        $g_path_nextR = $row;
+
+        if ($g_path_currR){
+            $bap = dplay_game_path_reset_calc($g_path_currR, $g_path_lastR, $g_path_nextR);
+        }
+    }
+
+    // 마지막 남은 레코드 강제 실행
+    if ($g_path_nextR){
+        $bap = dplay_game_path_reset_calc($g_path_nextR, $g_path_currR, FALSE);
+    }
+
+    // 미처리된 공격루트 저장 처리
+    dplay_game_path_reset_done("WREST");
+    
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("path", "reset", array("gi_id"=>$gi_id, "gr_half"=>$gr_half));
+
+    // 경기평점 다시 계산(팀,선수 전체)
+    dplay_game_rating_update_by_game($gi_id);
+
+//    echo "</pre>".PHP_EOL;
+
+    // 업데이트된 내용이 있는 레코드 반환
+    return $g_path_newer;
+}
+
+function dplay_game_path_reset_calc($currR, $lastR, $nextR)
+{
+    global $g_path_mking;
+    global $g_path_array;
+    global $g_path_ptype;
+
+    $act = $currR['gr_act_code'];
+    $res = $currR['gr_res_code'];
+
+    $area_curr = $currR['gr_area_code'];
+    $area_last = $lastR ? intval($lastR['gr_area_code']) : 0;
+
+    // DID 상에서는 ACT를 먼저 누르고 X/B 누르는 구조이기 때문에
+    // DID와 동일한 기준 및 순서로 판단하기 위한 처리
+    if (!empty($act)){
+        if ($act=="S" || $act=="H" || $act=="R"){
+            if ($nextR && empty($nextR['gr_act_code'])){
+                $res = "O";
+            }
+        }else $res = "O";
+    }
+
+    // 이전 레코드와 4초 이상 벌어졌으면 완료 (이전 루트까지만 적용)
+    if ($g_path_mking && $lastR && (intval($currR['gr_seconds']) - intval($lastR['gr_seconds']) > 4)) {
+        // 완료처리
+        dplay_game_path_reset_done("4 Seconds");
+        // 현재 레코드까지는 완료처리 후 새루운 루트에 분리시킨다. (재귀호출)
+        dplay_game_path_reset_calc($currR, $lastR, $nextR);
+        return TRUE;
+    }
+
+    // Log
+    dplay_game_path_reset_log("## DATA ##", ($act ? $act : " ")."->{$currR['gr_res_code']} "
+        .str_pad($area_last, 2, " ", STR_PAD_LEFT)."->"
+        .str_pad($area_curr, 2, " ", STR_PAD_LEFT)." "
+        .str_pad($currR['gr_seconds'], 7, " ", STR_PAD_LEFT)
+        ." {$currR['gr_path_id']}"
+        );
+
+    // 진행중 표시
+    $making = $g_path_mking;
+    if(!$g_path_mking) {
+        $g_path_mking = TRUE;
+        if ($area_curr > 6){
+            $g_path_ptype = "UPP";
+            dplay_game_path_reset_log(">>>>>>>>>>", $g_path_ptype);
+        }else{
+            dplay_game_path_reset_log(">>>>>>>>>>", "MAKING");
+        }
+    }
+
+    // 루트에 슈팅이 있으면 전/후방 무관하게 유효 표시
+    if (!empty($act) && ($act=="S" || $act=="H" || $act=="R")) {
+        $g_path_ptype = "CTP";
+        dplay_game_path_reset_log(">>>>>>>>>>", $g_path_ptype);
+    }
+    // 공격영역(1~6)으로 진입했으면 유효 표시
+    elseif ($area_curr < 7) {
+        // 이미 CTP로 판정된 공격루트가 아닌 경우에만 UTP 표시
+        if ($g_path_ptype!="CTP"){
+            $g_path_ptype = "UTP";
+            dplay_game_path_reset_log(">>>>>>>>>>", $g_path_ptype);
+        }
+    }
+
+    // 공격루트 추가
+    array_push($g_path_array, $currR);
+
+    // 진행이 마무리 되었으면 완료
+    if (!empty($res) && $res != "O"){
+        dplay_game_path_reset_done("Res = {$res}");
+        return TRUE;
+    }
+
+    // 나머지는 미완료
+    return FALSE;
+}
+
+function dplay_game_path_reset_log($tag, $msg)
+{
+    //echo (($tag=="## DATA ##" OR $tag=="## PATH ##") ? PHP_EOL:' ')."{$tag} {$msg}";
+}
+
+function dplay_game_path_reset_done($desc)
+{
+    global $g_path_mking;
+    global $g_path_array;
+    global $g_path_ptype;
+
+    if (count($g_path_array) > 0){
+
+        dplay_game_path_reset_log("**********", "DONE : {$desc} ptype={$g_path_ptype}");
+
+        // 공격루트 정보
+        reset($g_path_array);
+
+        $gt_info = array();
+        $gt_info['gt_id'      ] = uniqid('',TRUE);
+        $gt_info['gi_id'      ] = current($g_path_array)['gi_id'];
+
+        // 공격 레코드별 업데이트
+        $gr_list = array();
+
+        reset($g_path_array);
+        foreach ($g_path_array as $row){
+
+            // 업데이트 대상에 추가
+            $row['gt_id'] = $gt_info['gt_id'];
+            array_push($gr_list, $row);
+        }
+
+        // 공격루트 저장
+        dplay_game_path_update($gt_info, $gr_list, FALSE);
+    }
+
+    // 초기화
+    $g_path_mking = FALSE;
+    $g_path_ptype = FALSE;
+    $g_path_array = array();
+}
+
+//------------------------------------------------
+// DID-Play 공격루트 Garbage Collectoin
+//------------------------------------------------
+function dplay_game_path_clean($gi_id, $gr_half='', $recalc_rate=FALSE)
+{
+
+    ## 2020.08.06 ##
+    ## MySql 'not in' 구문이 동작하지 않는 경우가 발견되어 'not exists' 구문으로 쿼리문 변경함
+
+    if ($gr_half)
+        $whr = " and gr.gr_half != '{$gr_half}' ";
+
+    $sql = "
+        delete
+          from ff_game_path
+         where gt_id in (SELECT gt_id
+                           FROM (
+                                 SELECT gp.gt_id
+                                   from ff_game_path gp
+	                              where gp.gi_id = '{$gi_id}'
+	                                and not exists (select distinct gt_id
+	                                                  from ff_game_record gr
+	                                                 where gr.gi_id = '{$gi_id}' {$whr}
+	                                                   and gr.gt_id = gp.gt_id
+	                                               )
+	                            ) mm
+                        )
+        ";
+
+    sql_query($sql);
+
+    $cnt = sql_affected_rows();
+
+    // 경기 전체 팀평점 및 선수평점 재계산
+    if ($recalc_rate){
+        dplay_game_rating_update_by_game($gi_id);
+    }
+
+    return $cnt;
+}
+
+//------------------------------------------------
+// DID-Play 공격루트 업데이트 (레코드 기반)
+//------------------------------------------------
+function dplay_game_path_update_by_record($grid)
+{
+    $sql = "
+        select *
+          from ff_game_record
+         where gr_id = '{$grid}'
+        ";
+
+    $gtid = sql_fetch($sql)['gt_id'];
+
+    return dplay_game_path_update_by_id($gtid);
+}
+
+function dplay_game_path_update_by_id($gtid)
+{
+    // 공격루트 정보
+    $sql = "
+        select *
+          from ff_game_path
+         where gt_id = '{$gtid}'
+        ";
+
+    $gtinfo = sql_fetch($sql);
+
+    // 레코드 목록
+    $sql = "
+        select *
+          from ff_game_record
+         where gt_id = '{$gtid}'
+         order by
+               gr_seconds asc
+             , gr_regdt   asc
+        ";
+
+    $res = sql_query($sql);
+
+    $grlist = array();
+    while ($row = sql_fetch_array($res)){
+        $grlist[] = $row;
+    }
+
+    // 공격루트 업데이트
+    return dplay_game_path_update($gtinfo, $grlist, TRUE, TRUE);
+}
+
+//------------------------------------------------
+// DID-Play 공격루트 업데이트
+//------------------------------------------------
+// 2021.12.13 # CSP(유효슈팅 포함하는 CTP) 개념 추가
+//------------------------------------------------
+// 2202.10.25 # 첫 공격지역 진입한 선수() 개념 추가
+// 처음 전술 시작지역이면 카운트 X
+//------------------------------------------------
+function dplay_game_path_update($gtinfo, $grlist, $rating=TRUE, $send2monitor=FALSE)
+{
+    global $g_path_newer;
+
+    $ret = array();
+    $ret['result' ] = TRUE;
+    $ret['message'] = "";
+
+    if (!$gtinfo || !is_array($grlist) || count($grlist) < 1){
+        $ret['result' ] = FALSE;
+        $ret['message'] = "Invalid Arguments";
+        return $ret;
+    }
+
+    // 공격루트 정보 산출
+    $ptype = "UPP";
+    $gtype = "NAN"; // Assist, Maker, Builder 판단 용도
+    $stype = "NAN"; // CSP 판단 용도
+    $count = 0;
+
+    //foreach($grlist as $item){
+    for($i = 0; $i < count($grlist); $i++){
+
+        $item = $grlist[$i];
+
+        $item['gr_is_tap_old'] = $item['gr_is_tap'];
+
+        // 자살골은 분기 (자살골은 TMP, TAP, CTP, Shoot에서 제외)
+        if ($item['gr_res_code']=="G" && $item['p_id']=="OWN"){
+            $item['gr_act_code'] = "";
+        }
+
+        // 함수 내에서 재계산될 필드들 초기화
+        $item['gr_is_tmp'  ] = 0;
+        $item['gr_is_tmp_s'] = 0;
+        $item['gr_is_tap'  ] = 0;
+        $item['gr_is_tap_s'] = 0;
+        $item['gr_is_ast'  ] = 0;
+        $item['gr_is_sht'  ] = 0;
+        $item['gr_is_sht_s'] = 0;
+        $item['gr_is_gol'  ] = 0;
+        $item['gr_is_ctb'  ] = 0;
+        $item['gr_is_ctm'  ] = 0;
+        $item['gr_is_cta'  ] = 0;
+        $item['gr_is_cts'  ] = 0;
+        $item['gr_is_gtb'  ] = 0;
+        $item['gr_is_gtm'  ] = 0;
+
+        $act = $item['gr_act_code'];
+        $res = $item['gr_res_code'];
+        $ara = intval($item['gr_area_code']);
+
+        // 실제 공격 카운트 (단순 X/B 제외)
+        if (!empty($act))
+            ++$count;
+
+        // 슈팅이 있으면 전/후방 무관하게 CTP
+        if (!empty($act) && ($act=="S" || $act=="H" || $act=="R")) {
+            $ptype = "CTP";
+            if ($res=="G"){
+                $gtype = "GOL";
+            }
+            // CSP 여부 (유효슈팅 포함하는 CTP) /* csp = dsp */
+            if ($res=="G" || $res=="R" || $res=="L" || $res=="H" || ($res=="B" && ($item['gr_shoot_pos_x'] > 0 || $item['gr_shoot_pos_y'] > 0))){
+                $stype = "CSP";
+            }
+        }
+        // 공격영역(1~6)으로 진입했으면 유효 표시
+        elseif ($ara < 7 && $ptype == "UPP") {
+            $ptype = "UTP";
+            // UTP 시작지점 표시
+            $item['utp_begin'] = "1";
+        }
+
+        $grlist[$i] = $item;
+    }
+
+    // 단독슛인 경우 별도 처리
+    if ($ptype== "CTP" && $count < 2){
+        $ptype = "STP";
+    }
+    
+    // UTP는 포인트 최소 2개 이상만 인정
+    // 2021.12.13 # 예외 : 레코드 1개이고 해당 레코드가 K(코너킥)/F(프리킥)인 경우는 UTP로 인정
+    if ($ptype== "UTP" && $count < 2 && $grlist[0]['gr_act_code'] != "K" && $grlist[0]['gr_act_code'] != "F"){
+        $ptype = "UPP";
+    }
+
+    // CTP, STP : AST,CTB,CTM,CTA,CTS,GTB,GTM 산출
+    // UTP : TAP 여부 산출
+    if ($ptype == "CTP" || $ptype == "STP" || $ptype == "UTP"){
+
+        $pid_s = FALSE;
+        $pid_a = FALSE;
+        $pid_m = FALSE;
+        $pid_b = FALSE;
+        $utp_n = -1;
+
+        for ($i = count($grlist) - 1; $i >= 0; $i--){
+
+            $item = $grlist[$i];
+
+            $act = $item['gr_act_code'];
+            $res = $item['gr_res_code'];
+
+            if ($ptype == "CTP" || $ptype == "STP"){
+
+                $item['gr_is_tap'] = $act ? "1":"0"; // CTP, STP 레코드는 무조건 TAP
+
+                // Shoot
+                if (!$pid_s && ($act=="S" || $act=="H" || $act=="R")){
+                    if (!empty($item['p_id'])){
+                        $pid_s = $item['p_id'];
+                        $item['gr_is_cts'] = "1";
+                    }
+                }
+                // Assist
+                elseif (!$pid_a && $pid_s && $pid_s != $item['p_id']){
+                    if (!empty($item['p_id'])){
+                        $pid_a = $item['p_id'];
+                        $item['gr_is_cta'] = "1";
+                        $item['gr_is_ast'] = ($gtype == "GOL") ? "1":"0";
+                    }
+                }
+                // Maker
+                elseif (!$pid_m && $pid_a && $pid_a != $item['p_id']){
+                    if (!empty($item['p_id'])){
+                        $pid_m = $item['p_id'];
+                        $item['gr_is_ctm'] = "1";
+                        $item['gr_is_gtm'] = ($gtype == "GOL") ? "1":"0";
+                    }
+                }
+                // Builder (shooter, assister, maker 이후에 모든 선수는 builder)
+                // elseif ($pid_m && $pid_b != $item['p_id']){ # 20201222 - livlybaer@aimbroad.com
+                elseif ($pid_m && ((!$pid_b && $pid_m != $item['p_id']) || ($pid_b && $pid_b != $item['p_id']))){
+                    $pid_b = $item['p_id'];
+                    $item['gr_is_ctb'] = "1";
+                    $item['gr_is_gtb'] = ($gtype == "GOL") ? "1":"0";
+                }
+            }
+            // UTP인 경우에는 TAP 여부 판단 (유효영역 최초 진입 전 2개까지만 TAP로 인정)
+            elseif ($ptype == "UTP"){
+
+                if ($utp_n < 0){
+                    $item['gr_is_tap'] = $act ? "1":"0";
+                }else{
+                    ++$utp_n;
+                    if ($utp_n <= 2)
+                        $item['gr_is_tap'] = $act ? "1":"0";
+                }
+                if ($item['utp_begin'] == "1"){
+                    $utp_n = 0;
+                }
+            }
+
+            $item['gr_is_tap_s'] = ($item['gr_is_tap']=="1" && ($res=="O" || $res=="G")) ? "1":"0";
+
+            $grlist[$i] = $item;
+        }
+    }
+    
+    $gtinfo['gt_upp'     ] = ($ptype == "UPP") ? "1" : "0";
+    $gtinfo['gt_utp'     ] = ($ptype == "UTP") ? "1" : "0";
+    $gtinfo['gt_ctp'     ] = ($ptype == "CTP") ? "1" : "0";
+    $gtinfo['gt_csp'     ] = ($stype == "CSP") ? "1" : "0";
+    $gtinfo['gt_stp'     ] = ($ptype == "STP") ? "1" : "0";
+    $gtinfo['gt_ttp'     ] = ($ptype == "UTP" || $ptype == "CTP") ? "1" : "0";
+    $gtinfo['gt_res_code'] = end($grlist)['gr_res_code'];
+
+    // 공격루트 Insert or Update
+    $set = "
+               gt_id       = '{$gtinfo['gt_id'      ]}'
+             , gi_id       = '{$gtinfo['gi_id'      ]}'
+             , gt_upp      = '{$gtinfo['gt_upp'     ]}'
+             , gt_utp      = '{$gtinfo['gt_utp'     ]}'
+             , gt_ctp      = '{$gtinfo['gt_ctp'     ]}'
+             , gt_csp      = '{$gtinfo['gt_csp'     ]}'
+             , gt_stp      = '{$gtinfo['gt_stp'     ]}'
+             , gt_ttp      = '{$gtinfo['gt_ttp'     ]}'
+             , gt_res_code = '{$gtinfo['gt_res_code']}'
+        ";
+
+    $sql = "
+        insert into ff_game_path
+           set {$set}
+            on duplicate key
+        update {$set}
+        ";
+
+    sql_query($sql);
+    
+    // 레코드 목록 업데이트
+    
+    $grlist_res = array(); // monitor data
+    
+    if (is_array($grlist)){
+        reset($grlist);
+        foreach($grlist as $item){
+
+            // TAP 여부가 변경된 레코드 저장 (UI 업데이트용)
+            if ($item['gr_is_tap_old'] != $item['gr_is_tap']){
+                array_push($g_path_newer, array("gr_id"=>$item['gr_id'], "gr_is_tap"=>$item['gr_is_tap']));
+            }
+
+            $act = $item['gr_act_code'];
+            $res = $item['gr_res_code'];
+
+            $item['gr_is_tmp'  ] =   $act ? "1":"0";
+            $item['gr_is_tmp_s'] = ( $act && ($res=="O" || $res=="G")) ? "1":"0";
+            $item['gr_is_sht'  ] = ( $act=="S" || $act=="H" || $act=="R" ) ? "1":"0";
+            $item['gr_is_sht_s'] = (($act=="S" || $act=="H" || $act=="R" ) &&
+                                    ($res=="G" || $res=="R" || $res=="L" || $res=="H" || (
+                                     $res=="B" && ($item['gr_shoot_pos_x'] > 0 || $item['gr_shoot_pos_y'] > 0))
+                                    )
+                                   ) ? "1":"0";
+            $item['gr_is_gol'  ] = ($res=="G") ? "1":"0";
+
+            $sql = "
+                update ff_game_record
+                   set gt_id       = '{$item['gt_id'      ]}'
+                     , gr_is_tmp   = '{$item['gr_is_tmp'  ]}'
+                     , gr_is_tmp_s = '{$item['gr_is_tmp_s']}'
+                     , gr_is_tap   = '{$item['gr_is_tap'  ]}'
+                     , gr_is_tap_s = '{$item['gr_is_tap_s']}'
+                     , gr_is_ast   = '{$item['gr_is_ast'  ]}'
+                     , gr_is_sht   = '{$item['gr_is_sht'  ]}'
+                     , gr_is_sht_s = '{$item['gr_is_sht_s']}'
+                     , gr_is_gol   = '{$item['gr_is_gol'  ]}'
+                     , gr_is_ctb   = '{$item['gr_is_ctb'  ]}'
+                     , gr_is_ctm   = '{$item['gr_is_ctm'  ]}'
+                     , gr_is_cta   = '{$item['gr_is_cta'  ]}'
+                     , gr_is_cts   = '{$item['gr_is_cts'  ]}'
+                     , gr_is_gtb   = '{$item['gr_is_gtb'  ]}'
+                     , gr_is_gtm   = '{$item['gr_is_gtm'  ]}'
+                 where gr_id       = '{$item['gr_id'      ]}'
+                ";
+
+            sql_query($sql);
+
+            dplay_game_path_reset_log("## PATH ##",
+                str_pad($item['gr_seconds'  ], 7, " ", STR_PAD_LEFT)
+                ." / ".($act ? $act : " ")."->{$res}"
+                ." / ".str_pad($item['gr_area_code'], 2, " ", STR_PAD_LEFT)
+                ." / ".(($item['utp_begin']=="1") ? "1":"0")
+                ." / {$item['gr_is_tap_old']}->".$item['gr_is_tap']
+                ." / ".$item['gr_is_tap_s']
+                );
+                
+            $grlist_res[] = $item; // monitor data
+        }
+    }
+    
+    // Monitor 전송
+    if ($send2monitor){
+        
+        $mdata = $gtinfo;
+        $mdata['gr_list'] = $grlist_res;
+        
+        global $monitor;
+        $monitor->event("path", "save", $mdata);
+    }
+
+    // 경기평점 업데이트 (팀,선수 전체)
+    if ($rating)
+        return dplay_game_rating_update_by_path($gtinfo['gi_id'], $gtinfo['gt_id']);
+    else
+        return $ret;
+}
+
+//------------------------------------------------
+// DID-Play 경기평점 업데이트 (팀 및 선수)
+//------------------------------------------------
+function dplay_game_rating_update_by_game($giid)
+{
+    // 팀평점 업데이트
+    $ret = dplay_game_rating_team_update($giid);
+    if (!$ret['result'])
+        return $ret;
+
+    // 선수평점 업데이트
+    return dplay_game_rating_player_update_by_game($giid, $ret['output']);
+}
+
+function dplay_game_rating_update_by_path($giid, $gtid)
+{
+    // 팀평점 업데이트
+    $ret = dplay_game_rating_team_update($giid);
+    if (!$ret['result'])
+        return $ret;
+
+    // 선수평점 업데이트
+    return dplay_game_rating_player_update_by_path($gtid, $ret['output']);
+}
+
+//------------------------------------------------
+// DID-Play 팀평점 업데이트
+//------------------------------------------------
+function dplay_game_rating_team_update($giid)
+{
+    global $DATA_VERSION;
+
+    $ret = array();
+    $ret['result' ] = TRUE;
+    $ret['message'] = "";
+
+    // 공격루트 기반 산출
+    $sql = "
+        select sum(gt_utp) gi_utp
+             , sum(gt_ctp) gi_ctp
+             , sum(gt_stp) gi_stp
+             , sum(gt_ttp) gi_ttp
+             , sum(gt_ctp) gi_ttp_sc
+             , sum(gt_csp) gi_csp
+          from ff_game_path
+         where gi_id = '{$giid}'
+        ";
+
+    $gt = sql_fetch($sql);
+
+    // 레코드 기반 산출
+    // 자책골 추가 조회 (ssr 자책골 분리) - 20201222 / livlybear@aimbroad.com
+    $sql = "
+        select sum(gr_is_tmp  ) gi_tmp
+             , sum(gr_is_tmp_s) gi_tmp_sc
+             , sum(gr_is_tap  ) gi_tap
+             , sum(gr_is_tap_s) gi_tap_sc
+             , sum(gr_is_sht  ) gi_sht
+             , sum(gr_is_gol  ) gi_gol
+             , sum(gr_is_ctb  ) gi_ctb
+             , sum(gr_is_ctm  ) gi_ctm
+             , sum(gr_is_cta  ) gi_cta
+             , sum(gr_is_cts  ) gi_cts
+             , sum(gr_is_gtb  ) gi_gtb
+             , sum(gr_is_gtm  ) gi_gtm
+             , sum(if(p_id='OWN', gr_is_gol, 0)) gi_gol_own
+          from ff_game_record
+         where gi_id = '{$giid}'
+        ";
+
+    $gi = sql_fetch($sql);
+
+    // BAP 카운트
+    $sql = "
+        select count(*) gi_bap
+          from ff_game_bap
+         where gi_id = '{$giid}'
+        ";
+
+    $bp = sql_fetch($sql);
+
+    // 취합 및 평점산출
+    $res = array();
+
+    $res['gi_id'     ] = $giid;
+    $res['gi_tmp'    ] = floatval($gi['gi_tmp'    ]);
+    $res['gi_tmp_sc' ] = floatval($gi['gi_tmp_sc' ]);
+    $res['gi_tap'    ] = floatval($gi['gi_tap'    ]);
+    $res['gi_tap_sc' ] = floatval($gi['gi_tap_sc' ]);
+    $res['gi_utp'    ] = floatval($gt['gi_utp'    ]);
+    $res['gi_ctp'    ] = floatval($gt['gi_ctp'    ]);
+    $res['gi_stp'    ] = floatval($gt['gi_stp'    ]);
+    $res['gi_ttp'    ] = floatval($gt['gi_ttp'    ]);
+    $res['gi_ttp_sc' ] = floatval($gt['gi_ttp_sc' ]);
+    $res['gi_csp'    ] = floatval($gt['gi_csp'    ]);
+    $res['gi_sht'    ] = floatval($gi['gi_sht'    ]);
+    $res['gi_gol'    ] = floatval($gi['gi_gol'    ]);
+    $res['gi_gol_own'] = floatval($gi['gi_gol_own']);
+    $res['gi_ctb'    ] = floatval($gi['gi_ctb'    ]);
+    $res['gi_ctm'    ] = floatval($gi['gi_ctm'    ]);
+    $res['gi_cta'    ] = floatval($gi['gi_cta'    ]);
+    $res['gi_cts'    ] = floatval($gi['gi_cts'    ]);
+    $res['gi_gtb'    ] = floatval($gi['gi_gtb'    ]);
+    $res['gi_gtm'    ] = floatval($gi['gi_gtm'    ]);
+    $res['gi_bap'    ] = floatval($bp['gi_bap'    ]);
+                                                                       
+    $res['gi_tmp_sr'] = ($res['gi_tmp'] == 0) ? 0 : ( $res['gi_tmp_sc' ] / $res['gi_tmp']);
+    $res['gi_tap_sr'] = ($res['gi_tap'] == 0) ? 0 : ( $res['gi_tap_sc' ] / $res['gi_tap']);
+    $res['gi_ttp_sr'] = ($res['gi_ttp'] == 0) ? 0 : ( $res['gi_ttp_sc' ] / $res['gi_ttp']);
+    $res['gi_ttp_pr'] = ($res['gi_tap'] == 0) ? 0 : ( $res['gi_ttp'    ] / $res['gi_tap']);
+    $res['gi_gsr'   ] = ($res['gi_tap'] == 0) ? 0 : ( $res['gi_gol'    ] / $res['gi_tap']); // GSR = GOAL / TAP
+    $res['gi_asr'   ] = ($res['gi_tap'] == 0) ? 0 : ( $res['gi_tap_sc' ] / $res['gi_tap']); // ASR (공격 성공률) = (1 - ((TAP-TAP_SC)/TAP)) * 100
+    $res['gi_ssr'   ] = ($res['gi_sht'] == 0) ? 0 : (($res['gi_gol'    ] 
+                                                    - $res['gi_gol_own'])/ $res['gi_sht']); // SSR = GOL / SHT * 100
+
+    // 기준값
+    $CONST_BAS_TAP = (float)(($DATA_VERSION=='BIGDB') ? 200 : 300);
+    $CONST_BAS_CTP = (float)(($DATA_VERSION=='BIGDB') ?  15 :  15);
+    $CONST_BAS_BAP = (float)  80;
+    $CONST_BAS_ASR = (float) 0.8;
+    $CONST_BAS_SHT = (float)  20;
+    $CONST_BAS_GOL = (float)  30;
+    $CONST_BAS_GSR = (float)0.02;
+    $CONST_BAS_SSR = (float) 0.2;
+
+    // 가중치
+    $CONST_RAT_TAP = (float)15;
+    $CONST_RAT_CTP = (float)20;
+    $CONST_RAT_BAP = (float)15;
+    $CONST_RAT_ASR = (float) 5;
+    $CONST_RAT_SHT = (float)10;
+    $CONST_RAT_GOL = (float)20;
+    $CONST_RAT_GSR = (float)10;
+    $CONST_RAT_SSR = (float) 5;
+
+    // 평점
+    $rat = array();
+    $rat['tap'] = ($res['gi_tap'] / $CONST_BAS_TAP * 100) / 100 * $CONST_RAT_TAP;
+    $rat['ctp'] = ($res['gi_ctp'] / $CONST_BAS_CTP * 100) / 100 * $CONST_RAT_CTP;
+    $rat['bap'] = ($res['gi_bap'] / $CONST_BAS_BAP * 100) / 100 * $CONST_RAT_BAP;
+    $rat['asr'] = ($res['gi_asr'] / $CONST_BAS_ASR * 100) / 100 * $CONST_RAT_ASR;
+    $rat['sht'] = ($res['gi_sht'] / $CONST_BAS_SHT * 100) / 100 * $CONST_RAT_SHT;
+    $rat['gol'] = ($res['gi_gol'] / $CONST_BAS_GOL * 100) / 100 * $CONST_RAT_GOL;
+    $rat['gsr'] = ($res['gi_gsr'] / $CONST_BAS_GSR * 100) / 100 * $CONST_RAT_GSR;
+    $rat['ssr'] = ($res['gi_ssr'] / $CONST_BAS_SSR * 100) / 100 * $CONST_RAT_SSR;
+
+    $sum = $rat['tap']
+         + $rat['ctp']
+         + $rat['bap']
+         + $rat['asr']
+         + $rat['sht']
+         + $rat['gol']
+         + $rat['gsr']
+         + $rat['ssr'];
+
+    $res['gi_score' ] = ($sum / 2) + 45;
+
+    // Update
+    $sql = "
+        update ff_game_info
+           set gi_tmp    = '{$res['gi_tmp'   ]}'
+             , gi_tmp_sc = '{$res['gi_tmp_sc']}'
+             , gi_tmp_sr = '{$res['gi_tmp_sr']}'
+             , gi_tap    = '{$res['gi_tap'   ]}'
+             , gi_tap_sc = '{$res['gi_tap_sc']}'
+             , gi_tap_sr = '{$res['gi_tap_sr']}'
+             , gi_utp    = '{$res['gi_utp'   ]}'
+             , gi_ctp    = '{$res['gi_ctp'   ]}'
+             , gi_stp    = '{$res['gi_stp'   ]}'
+             , gi_ttp    = '{$res['gi_ttp'   ]}'
+             , gi_ttp_sc = '{$res['gi_ttp_sc']}'
+             , gi_ttp_sr = '{$res['gi_ttp_sr']}'
+             , gi_ttp_pr = '{$res['gi_ttp_pr']}'
+             , gi_csp    = '{$res['gi_csp'   ]}'
+             , gi_sht    = '{$res['gi_sht'   ]}'
+             , gi_gol    = '{$res['gi_gol'   ]}'
+             , gi_ctb    = '{$res['gi_ctb'   ]}'
+             , gi_ctm    = '{$res['gi_ctm'   ]}'
+             , gi_cta    = '{$res['gi_cta'   ]}'
+             , gi_cts    = '{$res['gi_cts'   ]}'
+             , gi_gtb    = '{$res['gi_gtb'   ]}'
+             , gi_gtm    = '{$res['gi_gtm'   ]}'
+             , gi_asr    = '{$res['gi_asr'   ]}'
+             , gi_gsr    = '{$res['gi_gsr'   ]}'
+             , gi_ssr    = '{$res['gi_ssr'   ]}'
+             , gi_score  = '{$res['gi_score' ]}'
+         where gi_id = '{$giid}'
+        ";
+
+    sql_query($sql);
+    
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("score", "team", $res);
+
+    // method return
+    $ret['output'] = $res;
+    return $ret;
+}
+
+//------------------------------------------------
+// DID-Play 선수평점 업데이트
+//------------------------------------------------
+function dplay_game_rating_player_update_by_game($giid, $tinf)
+{
+    // return false;
+    // 사용 안하는 함수인듯?
+    $ret = array();
+    $ret['result' ] = TRUE;
+    $ret['message'] = "";
+
+    $sql = "
+        select gp.*
+             , pt.pt_pos
+          from ff_game_player gp
+          join ff_game_info   gi on gi.gi_id  = gp.gi_id
+          join ff_game        gm on gm.gm_id  = gi.gm_id
+          left outer
+          join ff_player_team pt on pt.p_id   = gp.p_id
+                                and pt.t_code = if(gi.gi_write_code='H', gi.gi_h_t_code, gi.gi_a_t_code)
+                                and gm.gm_date between pt.pt_begin and pt.pt_end
+         where gp.gi_id = '{$giid}'
+        -- and gp.gp_in_half != '00'
+        ";
+
+    $res = sql_query($sql);
+
+    while ($row = sql_fetch_array($res)){
+
+        // 미출전 선수는 0 리셋 (분석관 실수로 레코드가 입력되는 경우가 있었다)
+        if ($row['gp_in_half']=="00"){
+            dplay_game_rating_player_reset($row['gi_id'], $row['p_id']);
+            continue;
+        }
+
+        // 출전 선수는 평점 산출
+        // XXXXX
+        $ret = dplay_game_rating_player_update($row['gi_id'], $row['p_id'], $tinf, $row['pt_pos']);
+        if (!$ret['result'])
+            return $ret;
+    }
+
+    return $ret;
+}
+
+function dplay_game_rating_player_update_by_path($gtid, $tinf)
+{
+    // $$$$
+    // return false;
+    $ret = array();
+    $ret['result' ] = TRUE;
+    $ret['message'] = "";
+
+    $sql = "
+        select gr.*
+             , gp.*
+             , pt.pt_pos
+          from ff_game_record gr
+          join ff_game_player gp on gp.gi_id = gr.gi_id and gp.p_id  = gr.p_id
+          join ff_game_info   gi on gi.gi_id = gr.gi_id
+          join ff_game        gm on gm.gm_id = gi.gm_id
+          left outer
+          join ff_player_team pt on pt.p_id   = gp.p_id
+                                and pt.t_code = if(gi.gi_write_code='H', gi.gi_h_t_code, gi.gi_a_t_code)
+                                and gm.gm_date between pt.pt_begin and pt.pt_end
+         where gr.gt_id = '{$gtid}'
+           and gr.p_id is not null
+           and gr.p_id != ''
+        ";
+
+    $res = sql_query($sql);
+
+    while ($row = sql_fetch_array($res)){
+
+        // 미출전 선수는 건너뛰기
+        if ($row['gp_in_half']=="00"){
+            continue;
+        }
+            
+        // 출전 선수는 평점 산출
+        // 주석처리해도 평점이 계산되어버림.
+        // XXXXXX
+         $ret = dplay_game_rating_player_update($row['gi_id'], $row['p_id'], $tinf, $row['pt_pos']);
+         /*
+        if($row['gr_is_gol'] > 0){
+            $sql = "
+                insert into ff_game_goal
+                   set gr_id    = '{row['gr_id'   ]}'
+                     , gi_id    = '{row['gi_id'   ]}'
+                     , gp_tap   = '{row['gp_tap'  ]}'
+                     , gp_ssr   = '{row['gp_ssr'  ]}'
+                     , gp_ctp   = '{row['gp_ctp'  ]}'
+                     , gp_score = '{row['gp_score']}'
+            ";
+            sql_query($sql);
+        }
+        */
+        if (!$ret['result'])
+            return $ret;
+        /*
+        */
+    }
+
+    return $ret;
+}
+
+function dplay_game_rating_player_reset($giid, $pid)
+{
+    $sql = "
+        update ff_game_player
+           set gp_tmp       =  0
+             , gp_tmp_sc    =  0
+             , gp_tmp_sr    =  0
+             , gp_tmp_tr    =  0
+             , gp_tap       =  0
+             , gp_tap_sc    =  0
+             , gp_tap_sr    =  0
+             , gp_tap_tr    =  0
+             , gp_utp       =  0
+             , gp_ctp       =  0
+             , gp_ttp       =  0
+             , gp_ttp_sc    =  0
+             , gp_ttp_sr    =  0
+             , gp_ttp_tr    =  0
+             , gp_ttp_pr    =  0
+             , gp_sht       =  0
+             , gp_sht_sc    =  0
+             , gp_sht_tr    =  0
+             , gp_ast       =  0
+             , gp_gol       =  0
+             , gp_gol_tr    =  0
+             , gp_ctb       =  0
+             , gp_ctm       =  0
+             , gp_cta       =  0
+             , gp_cts       =  0
+             , gp_gtb       =  0
+             , gp_gtm       =  0
+             , gp_asr       =  0
+             , gp_ssr       =  0
+             , gp_score_rel =  0
+             , gp_score_abs =  0
+             , gp_score     =  0
+         where gi_id        = '{$giid}'
+           and p_id         = '{$pid }'
+        ";
+
+    sql_query($sql);
+
+}
+
+function dplay_game_rating_player_update($giid, $pid, $tinf, $ptpos='')
+{
+    global $DATA_VERSION;
+    // 여기를 호출하는 어딘가.
+    // $$$$ 실제 평점 계산하는곳
+
+    $ret = array();
+    $ret['result' ] = TRUE;
+    $ret['message'] = "";
+
+    // 기본값 산출
+    $sql = "
+        select sum(gr_is_tmp  ) tmp
+             , sum(gr_is_tmp_s) tmp_s
+             , sum(gr_is_tap  ) tap
+             , sum(gr_is_tap_s) tap_s
+             , sum(gr_is_sht  ) sht
+             , sum(gr_is_sht_s) sht_s
+             , sum(gr_is_ctb  ) ctb
+             , sum(gr_is_ctm  ) ctm
+             , sum(gr_is_cta  ) cta
+             , sum(gr_is_cts  ) cts
+             , sum(gr_is_gtm  ) gtm
+             , sum(gr_is_gtb  ) gtb
+             , sum(gr_is_ast  ) ast
+             , sum(gr_is_gol  ) gol
+          from ff_game_record
+         where gi_id = '{$giid}'
+           and p_id  = '{$pid }'
+        ";
+    $bas1 = sql_fetch($sql);
+
+    $sql = "
+        select sum(gt_utp) utp
+             , sum(gt_ctp) ctp
+             , sum(gt_ttp) ttp
+             , sum(gt_ctp) ttp_s
+          from ff_game_path
+         where gt_id in (select distinct gt_id
+                           from ff_game_record
+                          where gi_id = '{$giid}'
+                            and p_id  = '{$pid }'
+                        )
+        ";
+
+    $bas2 = sql_fetch($sql);
+
+    $bas = array_merge($bas1, $bas2);
+
+    // 비율값 산출
+    $bas['tmp_sr'] = (floatval($bas['tmp']    ) == 0) ? 0 : (floatval($bas['tmp_s']) / floatval($bas['tmp']    ));
+    $bas['tap_sr'] = (floatval($bas['tap']    ) == 0) ? 0 : (floatval($bas['tap_s']) / floatval($bas['tap']    ));
+    $bas['ttp_sr'] = (floatval($bas['ttp']    ) == 0) ? 0 : (floatval($bas['ttp_s']) / floatval($bas['ttp']    ));
+    $bas['ttp_pr'] = (floatval($bas['tap']    ) == 0) ? 0 : (floatval($bas['ttp'  ]) / floatval($bas['tap']    ));
+    $bas['tmp_tr'] = (floatval($tinf['gi_tmp']) == 0) ? 0 : (floatval($bas['tmp'  ]) / floatval($tinf['gi_tmp']));
+    $bas['tap_tr'] = (floatval($tinf['gi_tap']) == 0) ? 0 : (floatval($bas['tap'  ]) / floatval($tinf['gi_tap']));
+    $bas['ttp_tr'] = (floatval($tinf['gi_ttp']) == 0) ? 0 : (floatval($bas['ttp'  ]) / floatval($tinf['gi_ttp']));
+    $bas['sht_tr'] = (floatval($tinf['gi_sht']) == 0) ? 0 : (floatval($bas['sht_s']) / floatval($tinf['gi_sht']));
+    $bas['gol_tr'] = (floatval($tinf['gi_gol']) == 0) ? 0 : (floatval($bas['gtb'  ] * 0.5
+                                                                     +$bas['gtm'  ]
+                                                                     +$bas['ast'  ]
+                                                                     +$bas['gol'  ]) / floatval($tinf['gi_gol']));
+    $bas['asr'   ] = (floatval($bas['tap']) == 0) ? 0 : (floatval($bas['tap_s']) / floatval($bas['tap']));
+    $bas['ssr'   ] = (floatval($bas['sht']) == 0) ? 0 : (floatval($bas['gol'  ]) / floatval($bas['sht']));
+
+    // 상대평가
+    $rel['tap_tr'] = 100 *   floatval( $bas['tap_tr'   ]);
+    $rel['tap_sr'] =  10 * ((floatval($tinf['gi_tap_sr']) == 0) ? 0 : (floatval($bas['tap_sr']) * floatval($bas['tap_tr']) / floatval($tinf['gi_tap_sr'])));
+    $rel['ttp_tr'] = 100 *   floatval( $bas['ttp_tr'   ]);
+    $rel['ttp_sr'] =  10 * ((floatval($tinf['gi_ttp_sr']) == 0) ? 0 : (floatval($bas['ttp_sr']) * floatval($bas['tap_tr']) / floatval($tinf['gi_ttp_sr'])));
+    $rel['ttp_pr'] =  10 * ((floatval($tinf['gi_ttp_pr']) == 0) ? 0 : (floatval($bas['ttp_pr']) * floatval($bas['tap_tr']) / floatval($tinf['gi_ttp_pr'])));
+    $rel['sht_tr'] = 100 *   floatval( $bas['sht_tr'   ]);
+    $rel['gol_tr'] =  50 *   floatval( $bas['gol_tr'   ]);
+
+    $rel['score' ] = ( $rel['tap_tr']
+                     + $rel['tap_sr']
+                     + $rel['ttp_tr']
+                     + $rel['ttp_sr']
+                     + $rel['ttp_pr']
+                     + $rel['sht_tr']
+                     + $rel['gol_tr'] ) / 7 * 2;
+
+    // 절대평가
+    $BASE_TTP = ($DATA_VERSION=='BIGDB') ? 15 : 22; // TTP는 포지션별 기준치 적용 보류
+    $BASE_TAP = ($DATA_VERSION=='BIGDB') ? 20 : 30; ## 2020.07.21 ## 포지션별 TAP 기준치 적용
+    /*
+    if ($DATA_VERSION=='BIGDB'){ // BIGDB: FW20 / MF16 / DF12 / GK1
+        switch ($ptpos){
+            case "FW": $BASE_TAP = 20; break;
+            case "MF": $BASE_TAP = 16; break;
+            case "DF": $BASE_TAP = 12; break;
+            case "GK": $BASE_TAP =  1; break;
+            default  : $BASE_TAP = 20; break;
+        }
+    }else{ // MIO : FW30 / MF23 / DF16 / GK5
+        switch ($ptpos){
+            case "FW": $BASE_TAP = 30; break;
+            case "MF": $BASE_TAP = 23; break;
+            case "DF": $BASE_TAP = 16; break;
+            case "GK": $BASE_TAP =  5; break;
+            default  : $BASE_TAP = 30; break;
+        }
+    }
+    */
+
+    $abs['gol'   ] = 40 * floatval($bas['gol'   ]) +  5;
+    $abs['tap'   ] = 10 * floatval($bas['tap'   ]) / $BASE_TAP;
+    $abs['ttp'   ] = 10 * floatval($bas['ttp'   ]) / $BASE_TTP;
+    $abs['ttp_pr'] = 10 * floatval($bas['ttp_pr']);
+
+    $abs['score' ] = ( $abs['gol'   ]
+                     + $abs['tap'   ]
+                     + $abs['ttp'   ]
+                     + $abs['ttp_pr'] ) / 4;
+
+    // 종합평점
+    $sql = "
+        update ff_game_player
+           set gp_tmp       = '{$bas['tmp'   ]}'
+             , gp_tmp_sc    = '{$bas['tmp_s' ]}'
+             , gp_tmp_sr    = '{$bas['tmp_sr']}'
+             , gp_tmp_tr    = '{$bas['tmp_tr']}'
+             , gp_tap       = '{$bas['tap'   ]}'
+             , gp_tap_sc    = '{$bas['tap_s' ]}'
+             , gp_tap_sr    = '{$bas['tap_sr']}'
+             , gp_tap_tr    = '{$bas['tap_tr']}'
+             , gp_utp       = '{$bas['utp'   ]}'
+             , gp_ctp       = '{$bas['ctp'   ]}'
+             , gp_ttp       = '{$bas['ttp'   ]}'
+             , gp_ttp_sc    = '{$bas['ttp_s' ]}'
+             , gp_ttp_sr    = '{$bas['ttp_sr']}'
+             , gp_ttp_tr    = '{$bas['ttp_tr']}'
+             , gp_ttp_pr    = '{$bas['ttp_pr']}'
+             , gp_sht       = '{$bas['sht'   ]}'
+             , gp_sht_sc    = '{$bas['sht_s' ]}'
+             , gp_sht_tr    = '{$bas['sht_tr']}'
+             , gp_ast       = '{$bas['ast'   ]}'
+             , gp_gol       = '{$bas['gol'   ]}'
+             , gp_gol_tr    = '{$bas['gol_tr']}'
+             , gp_ctb       = '{$bas['ctb'   ]}'
+             , gp_ctm       = '{$bas['ctm'   ]}'
+             , gp_cta       = '{$bas['cta'   ]}'
+             , gp_cts       = '{$bas['cts'   ]}'
+             , gp_gtb       = '{$bas['gtb'   ]}'
+             , gp_gtm       = '{$bas['gtm'   ]}'
+             , gp_asr       = '{$bas['asr'   ]}'
+             , gp_ssr       = '{$bas['ssr'   ]}'
+             , gp_score_rel = '{$rel['score' ]}'
+             , gp_score_abs = '{$abs['score' ]}'
+         where gi_id        = '{$giid         }'
+           and p_id         = '{$pid          }'
+        ";
+
+    sql_query($sql);
+
+    $sql = "
+        update ff_game_player
+           set gp_score = ((gp_score_abs / 6) + 2)
+                        + ((gp_score_rel / ((select score
+                                               from (select max(gp_score_rel) score
+                                                       from ff_game_player
+                                                      where gi_id = '{$giid}'
+                                                    ) mm
+                                            ) / 4)) / 2 + 2)
+         where gi_id = '{$giid}'
+           and p_id  = '{$pid }'
+        ";
+
+    sql_query($sql);
+    
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("score", "player", array("gi_id"=>$giid, "p_id"=>$pid));
+
+    return $ret;
+}
+
+//------------------------------------------------
+// DID-Play 평점 계산을 위한 경기정보 불러오기
+//------------------------------------------------
+function dplay_load_game_info_for_score($gi_id)
+{
+    global $g5;
+
+    $sql = "
+        select a.gi_id
+             , b.gm_id
+             , a.gi_user_id
+             , a.gi_write_code
+             , b.gm_h_t_code
+             , b.gm_a_t_code
+             , a.gi_state
+             , a.gi_part
+             , a.gi_part_ex
+             , a.gi_formation
+             , gi_h1_begin
+             , gi_h2_begin
+             , gi_h3_begin
+             , gi_h4_begin
+             , a.gi_h1_seconds
+             , a.gi_h2_seconds
+             , a.gi_h3_seconds
+             , a.gi_h4_seconds
+             , a.gi_seconds
+             , b.gi_goal_home
+             , b.gi_goal_away
+             , a.gi_bap
+             , c1.t_name gm_h_t_name
+             , c2.t_name gm_a_t_name
+             , b.gm_date
+             , b.gm_time
+             , b.gm_league
+             , b.gm_league as gm_league_code
+             , e.league_name as gm_league_name
+             , b.gm_s_code
+             , d.s_name gi_s_name
+             , d.s_ground gi_s_ground
+             , b.gm_round
+          from ff_game b
+          left outer join ff_game_info a on b.gm_id  = a.gm_id
+             , ff_team      c1
+             , ff_team      c2
+             , ff_stadium   d
+             , ff_league    e
+         where a.gi_id = '{$gi_id}'
+           and c1.t_code = b.gm_h_t_code
+           and c2.t_code = b.gm_a_t_code
+           and d.s_code = b.gm_s_code
+           and e.league_code = b.gm_league
+        ";
+
+    $res = sql_query($sql);
+    $lst = array();
+    while ($row = sql_fetch_array($res)){
+        $lst = $row;
+        $lst['gp_list'] = dplay_load_game_player_for_score($row['gi_id'], $row['gi_write_code']==="H" ? $row['gm_h_t_code'] : $row['gm_a_t_code']);
+        $lst['gr_list'] = dplay_load_game_record_for_score($row['gi_id']);
+        $lst[] = $row;
+    }
+    return $lst;
+}
+// ------------------------------------------------
+// 선수 목록
+// ------------------------------------------------
+function dplay_load_game_player_for_score($gi_id, $t_code)
+{
+    $today = date(Y.m.d);
+    $sql = "
+    select gp.*
+         , pl.*
+         , pt.*
+        from ff_game_player gp
+        join ff_player pl on pl.p_id = gp.p_id
+        join ff_player_team pt
+          on (pt.p_id = gp.p_id and t_code = '{$t_code}' )
+        where gp.gi_id = '{$gi_id}'
+        order by
+              gp.gp_type asc
+            , gp.gp_order asc
+        ";
+
+        $res = sql_query($sql);
+        $lst = array();
+        while ($row = sql_fetch_array($res)){
+            $row['gp_player_image_url'] = G5_DATA_URL."/player/{$row['p_id']}.png";
+            $lst[] = $row;
+        }
+        return $lst;
+}
+
+// ------------------------------------------------
+// 레코드목록
+// ------------------------------------------------
+function dplay_load_game_record_for_score($gi_id)
+{
+    $sql = "
+    select gr.*
+        from ff_game_record gr
+        where gr.gi_id = '{$gi_id}'
+        order by gr_seconds asc
+        ";
+
+        $res = sql_query($sql);
+        $lst = array();
+        while ($row = sql_fetch_array($res)){
+            $lst[] = $row;
+        }
+        return $lst;
+}
+
+//------------------------------------------------
+// DID-Play 선수 평점 저장
+//------------------------------------------------
+function dplay_player_score_save($gi_id, $data)
+{
+    global $g5;
+     $body = "";
+     if ($data['tap'             ]) $body .= " , gp_tap             = '{$data['tap'             ]}' ";
+     if ($data['tap_s'           ]) $body .= " , gp_tap_s           = '{$data['tap_s'           ]}' ";
+     if ($data['ttp'             ]) $body .= " , gp_ttp             = '{$data['ttp'             ]}' ";
+
+     if ($data['itm'             ]) $body .= " , gp_itm             = '{$data['itm'             ]}' ";
+     if ($data['itm_s'           ]) $body .= " , gp_itm_s           = '{$data['itm_s'           ]}' ";
+     if ($data['itm_r'           ]) $body .= " , gp_itm_r           = '{$data['itm_r'           ]}' ";
+
+     if ($data['ctm'             ]) $body .= " , gp_ctm             = '{$data['ctm'             ]}' ";
+     if ($data['ctm_s'           ]) $body .= " , gp_ctm_s           = '{$data['ctm_s'           ]}' ";
+     if ($data['ctm_r'           ]) $body .= " , gp_ctm_r           = '{$data['ctm_r'           ]}' ";
+
+     if ($data['utm'             ]) $body .= " , gp_utm             = '{$data['utm'             ]}' ";
+     if ($data['utm_s'           ]) $body .= " , gp_utm_s           = '{$data['utm_s'           ]}' ";
+     if ($data['utm_r'           ]) $body .= " , gp_utm_r           = '{$data['utm_r'           ]}' ";
+
+     if ($data['accuracy'        ]) $body .= " , gp_accuracy        = '{$data['accuracy'        ]}' ";
+     if ($data['assists'         ]) $body .= " , gp_assists         = '{$data['assists'         ]}' ";
+     if ($data['shoot'           ]) $body .= " , gp_shoot           = '{$data['shoot'           ]}' ";
+     if ($data['goal'            ]) $body .= " , gp_goal            = '{$data['goal'            ]}' ";
+
+      $sql = " update ff_game_player
+                  set gp_score = '{$data['score']}' $body
+               where gi_id = '{$gi_id}'
+                  and p_id = '{$data['p_id']}' ";
+
+      sql_query($sql);
+
+      dplay_player_card_save($gi_id);
+      return $gi_id;
+}
+
+function dplay_player_card_save($gi_id) {
+
+  $sql = "update ff_game_player
+            set gp_yellow_card = 0,
+                gp_red_card = 0
+            where gi_id = '{$gi_id}'";
+  sql_query($sql);
+
+      // yellow card
+       $sql = "select gp_id, count(*) cnt
+                from ff_game_card
+                where gi_id = '{$gi_id}'
+                   and gp_card_card ='Y'
+                   group by gp_id";
+
+
+       $res = sql_query($sql);
+       while ($row = sql_fetch_array($res)){
+           $gp_id = $row['gp_id'];
+           $cnt = $row['cnt'];
+
+           $sql = "update ff_game_player
+                     set gp_yellow_card = '{$cnt}'
+                     where p_id = '{$gp_id}'
+                      and gi_id = '{$gi_id}'";
+           sql_query($sql);
+       }
+
+
+       // red card
+        $sql = "select gp_id, count(*) cnt
+                 from ff_game_card
+                 where gi_id = '{$gi_id}'
+                    and gp_card_card ='R'
+                    group by gp_id";
+
+        $res = sql_query($sql);
+        while ($row = sql_fetch_array($res)){
+            $gp_id = $row['gp_id'];
+            $cnt = $row['cnt'];
+
+            $sql = "update ff_game_player
+                      set gp_red_card = '{$cnt}'
+                      where p_id = '{$gp_id}'
+                      and gi_id = '{$gi_id}'";
+            sql_query($sql);
+        }
+        
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("card", "pcount", array("gi_id"=>$gi_id));
+
+    return $gi_id;
+}
+
+function dplay_player_card_save_commit() {
+  $sql = "select gi_id
+           from ff_game_info";
+
+  $res = sql_query($sql);
+  while ($row = sql_fetch_array($res)){
+      dplay_player_card_save($row['gi_id']);
+  }
+}
+
+function dplay_get_all_giid_by_league($league_code) {
+  $sql = "select gi_id
+           from ff_game_info";
+
+   $res = sql_query($sql);
+   $lst = array();
+   while ($row = sql_fetch_array($res)) {
+       $lst[] = $row['gi_id'];
+   }
+
+   return $lst;
+}
+
+//------------------------------------------------
+// 슛 포인트 마이그레이션
+//------------------------------------------------
+function dplay_migration_gr_shoot_rate() {
+  $sql = "update ff_game_record gr
+               set gr.gr_shoot_rate_x = if(gr.gr_shoot_pos_x=0, 0, (gr.gr_shoot_pos_x - 82) / 464)
+                 , gr.gr_shoot_rate_y = if(gr.gr_shoot_pos_y=0, 0, (gr.gr_shoot_pos_y - 82) / 218)
+          where gr.is_old=0
+  ";
+  sql_fetch($sql);
+}
+
+//------------------------------------------------
+// 팀 평점 마이그레이션
+//------------------------------------------------
+function dplay_migration_gi_team_score($gi_id, $gm_seconds=9999)
+{
+    $inf = array();
+    $inf['gm_cnt'  ] = 1; // gm_cnt
+    $inf['tap'     ] = 0; // TAP
+    $inf['tap_a'   ] = 0; // TAP 평균
+    $inf['tap_s'   ] = 0; // TAP 성공건수
+    $inf['tap_r'   ] = 0; // TAP 성공율
+    $inf['cross'   ] = 0; // 크로스
+    $inf['cross_a' ] = 0; // 크로스 평균
+    $inf['cross_s' ] = 0; // 크로스 성공건수
+    $inf['cross_r' ] = 0; // 크로스 성공율
+    $inf['pass'    ] = 0; // 패스
+    $inf['pass_a'  ] = 0; // 패스 평균
+    $inf['pass_s'  ] = 0; // 패스 성공건수
+    $inf['pass_r'  ] = 0; // 패스 성공율
+    $inf['shoot'   ] = 0; // 슛
+    $inf['shoot_a' ] = 0; // 슛 평균
+    $inf['shoot_s' ] = 0; // 슛 성공건수
+    $inf['shoot_r' ] = 0; // 슛 성공율
+    $inf['goal'    ] = 0; // 골
+    $inf['goal_a'  ] = 0; // 골 평균
+    $inf['itm'     ] = 0; // 전술포인트
+    $inf['itm_a'   ] = 0; // 전술포인트 평균
+    $inf['itm_s'   ] = 0; // 전술포인트
+    $inf['ttp'     ] = 0; // 전술
+    $inf['ttp_a'   ] = 0; // 전술 평균
+    $inf['ctp'     ] = 0; // 전술(완결형)
+    $inf['ctp_a'   ] = 0; // 전술(완결형) 평균
+    $inf['utp'     ] = 0; // 전술(미완결형)
+    $inf['utp_a'   ] = 0; // 전술(미완결형) 평균
+
+    $inf['bap'     ] = 0; // bap 개수
+    $inf['bap_a'   ] = 0; // bap 평균
+
+    $inf['utm'     ] = 0; // 전술 포인트(미완결)
+    $inf['utm_s'   ] = 0; // 전술 포인트(미완결) 성공개수 (B/X 제외한 확률) = utm - utp
+    $inf['utr'     ] = 0; // 전술 포인트(미완결) 성공률 (B/X 제외한 확률)
+    $inf['utr_a'   ] = 0; // 전술 포인트(미완결) 성공률 평균 (B/X 제외한 확률)
+    $inf['ctm'     ] = 0; // 전술 포인트(완결형)
+    $inf['ctm_s'   ] = 0; // 전술 포인트(완결형) 성공개수 (B/X 제외한 확률) = ctm - ctp + goal
+    $inf['ctr'     ] = 0; // 전술 포인트(완결형) 성공률 (B/X 제외한 확률)
+    $inf['ctr_a'   ] = 0; // 전술 포인트(완결형) 성공률 평균 (B/X 제외한 확률)
+
+    $inf['rtp'     ] = 0; // 전술연결성 (TAP/TTP)
+    $inf['gsr'     ] = 0; // 골결정력 (goal/tap*100)
+    $inf['ssr'     ] = 0; // 골결정력 (goal/shoot*100)
+    $inf['gat'     ] = 0; // 평균 골당 걸리는 시간 (goal/gi_seconds*100)
+
+    $inf['team_asr'  ] = 0;
+    $inf['team_score'] = 0; // 팀 평점
+/*
+  팀 평점 공식
+    team_tap = (tap_s<180 || tap_s>220) ? 100-((200-tap_s)/1.5) : 100-((200-tap_s)/4);
+    team_ctp = (ctp / 15) * 100;
+    team_bap = (bap / 70) * 100;
+    team_asr = 1 - ((tap - tap_s) / tap_s);
+    team_shooting = (shoot / 15) * 100;
+    team_goal = gaol*20 + 50;
+    team_gsr = 100-(((0.012 - goal/tap_s) * 100) * 50);
+    team_ssr = goal / shoot* 100 / 2 + 50;
+
+    team_score = (teamp_tap + team_ctp + team_bap + team_asr + team_shooting + team_goal + team_gsr + team_ssr) / 8;
+*/
+    $sql = "select gi.gi_bap
+            from ff_game_info gi
+            where gi.gi_id ='{$gi_id}'
+            ";
+    $res = sql_query($sql);
+    $records = array();
+    while ($row = sql_fetch_array($res)){
+        $inf['bap'] += $row['gi_bap'];
+    }
+
+    $sql = "
+        select gr.*
+          from ff_game_record gr
+         where gr.gi_id = '{$gi_id}'
+           and gr.gr_act_code is not null
+           and gr.gr_act_code != ''
+           and gr.gr_seconds < '{$gm_seconds}'
+         order by
+               gr.gi_id
+             , gr.gr_seconds
+             , gr.gr_regdt
+        ";
+    $res = sql_query($sql);
+
+    $records = array();
+    $tactics = "";
+    $lastgid = "";
+    $lastact = "";
+    $lastsec =  0;
+
+    while ($row = sql_fetch_array($res)){
+        $records[] = $row;
+
+        ++$inf['tap'];
+
+        // 경기가 넘어갔거나 이전 Action에서 3초 이상 지났으면 전술 초기화
+        if ($lastgid != $row['gi_id'] || $row['gr_seconds'] - $lastsec > 3){
+            if($lastact && strlen($tactics) > 1){
+                ++$inf['ttp'  ]; // 전술 ++
+                ++$inf['utp'  ]; // 전술(미완결형) ++
+                ++$inf['utp-'.((strlen($tactics)>1) ? substr($tactics,-1) : $tactics).$lastact];
+                $inf['itm'] += strlen($tactics) + 1;
+                $inf['utm'] += strlen($tactics) + 1;
+                //echo "3:".$tactics.PHP_EOL;
+            }
+            $tactics = $lastact = "";
+        }
+        $lastsec = $row['gr_seconds'];
+        $lastgid = $row['gi_id'     ];
+
+        // Cross
+        if ($row['gr_act_code'] == 'C' ||
+            $row['gr_act_code'] == 'K' ||
+            $row['gr_act_code'] == 'F' ){
+            if ($row['gr_res_code'] != 'B' && $row['gr_res_code'] != 'X'){
+                ++$inf['cross_s'];
+                ++$inf['tap_s'  ];
+                $tactics .= $lastact = "C";
+            }
+            else{
+                $lastact = "";
+                if(strlen($tactics) > 0){
+                    ++$inf['ttp'  ]; // 전술 ++
+                    ++$inf['utp'  ]; // 전술(미완결형) ++
+                    ++$inf['utp-'.((strlen($tactics)>1) ? substr($tactics,-1) : $tactics)."C"];
+                    $inf['itm'] += strlen($tactics);
+                    $inf['itm_s'] += strlen($tactics);
+                    $inf['utm'] += strlen($tactics);
+                    //echo $tactics."C".PHP_EOL;
+                    $tactics = "";
+                }
+            }
+            ++$inf['cross'];
+        }
+        // Pass
+        elseif ($row['gr_act_code'] == 'P'){
+            if ($row['gr_res_code'] != 'B' && $row['gr_res_code'] != 'X'){
+                ++$inf['pass_s'];
+                ++$inf['tap_s' ];
+                $tactics .= $lastact = "P";
+            }
+            else{
+                $lastact = "";
+                if(strlen($tactics) > 0){
+                    ++$inf['ttp'  ]; // 전술 ++
+                    ++$inf['utp'  ]; // 전술(미완결형) ++
+                    ++$inf['utp-'.((strlen($tactics)>1) ? substr($tactics,-1) : $tactics)."P"];
+                    $inf['itm'] += strlen($tactics)+1;
+                    $inf['itm_s'] += strlen($tactics);
+                    $inf['utm'] += strlen($tactics)+1;
+                    //echo $tactics."P".PHP_EOL;
+                    $tactics = "";
+                }
+            }
+            ++$inf['pass'];
+        }
+        // Shoot
+        elseif ($row['gr_act_code'] == 'S' ||
+                $row['gr_act_code'] == 'H' ||
+                $row['gr_act_code'] == 'R' ){
+            if ($row['gr_res_code'] == 'G'){
+                ++$inf['shoot_s'];
+                ++$inf['tap_s'  ];
+                ++$inf['goal'   ];
+            }
+            ++$inf['shoot'];
+            $lastact = "S";
+
+            if (strlen($tactics) > 0){ // 단독 슛은 전술건수에서 제외
+                ++$inf['ttp'  ]; // 전술 ++
+                ++$inf['ctp'  ]; // 전술(완결형) ++
+                ++$inf['ctp-'.((strlen($tactics)>2) ? substr($tactics,-2) : $tactics)."S"];
+                $inf['itm'] += strlen($tactics)+1;
+                $inf['itm_s'] += strlen($tactics);
+                $inf['ctm'] += strlen($tactics)+1;
+                //echo $tactics."S".PHP_EOL;
+            }
+            $tactics = "";
+        }
+    }
+
+    // 마지막 처리되지 않은 전술 건수
+    if($lastact && strlen($tactics) > 1){
+        ++$inf['ttp'  ]; // 전술 ++
+        ++$inf['utp'  ]; // 전술(미완결형) ++
+        ++$inf['utp-'.((strlen($tactics)>1) ? substr($tactics,-1) : $tactics).$lastact];
+        $inf['itm'] += strlen($tactics) + 1;
+        $inf['itm_s'] += strlen($tactics) + 1;
+        $inf['utm'] += strlen($tactics) + 1;
+        //echo "L:".$tactics.PHP_EOL;
+    }
+
+    $inf['utm_s'] = $inf['utm'] - $inf['utp'];
+    $inf['ctm_s'] = $inf['ctm'] - $inf['ctp'] + $inf['goal'];
+
+    // 평균
+    $inf['tap_a'   ] = $inf['tap'     ] / $inf['gm_cnt'];
+    $inf['cross_a' ] = $inf['cross'   ] / $inf['gm_cnt'];
+    $inf['pass_a'  ] = $inf['pass'    ] / $inf['gm_cnt'];
+    $inf['shoot_a' ] = $inf['shoot'   ] / $inf['gm_cnt'];
+    $inf['goal_a'  ] = $inf['goal'    ] / $inf['gm_cnt'];
+    $inf['itm_a'   ] = $inf['itm'     ] / $inf['gm_cnt'];
+    $inf['ttp_a'   ] = $inf['ttp'     ] / $inf['gm_cnt'];
+    $inf['ctp_a'   ] = $inf['ctp'     ] / $inf['gm_cnt'];
+    $inf['utp_a'   ] = $inf['utp'     ] / $inf['gm_cnt'];
+    $inf['ctr_a'   ] = $inf['ctr'     ] / $inf['gm_cnt'];
+    $inf['utr_a'   ] = $inf['utr'     ] / $inf['gm_cnt'];
+    $inf['bap_a'   ] = $inf['bap'     ] / $inf['gm_cnt'];
+
+    // 비율산출
+    $inf['tap_r'   ] = $inf['tap_s'   ] / $inf['tap'   ] * 100;
+    $inf['cross_r' ] = $inf['cross_s' ] / $inf['cross' ] * 100;
+    $inf['pass_r'  ] = $inf['pass_s'  ] / $inf['pass'  ] * 100;
+    $inf['shoot_r' ] = $inf['shoot_s' ] / $inf['shoot' ] * 100;
+    $inf['gsr'     ] = $inf['goal'    ] / $inf['tap'   ] * 100;
+    $inf['ssr'     ] = $inf['goal'    ] / $inf['shoot' ] * 100;
+    $inf['ctr'     ] = $inf['ctm_s'   ] / $inf['ctm'   ] * 100;
+    $inf['utr'     ] = $inf['utm_s'   ] / $inf['utm'   ] * 100;
+    $inf['rtp'     ] = $inf['itm'     ] / $inf['ttp'   ];
+
+    // team score 구하기(단일 경기를 구할 때만 사용 하도록 함)
+    $team_tap = ($inf['tap_s']<180 || $inf['tap_s']>220) ? 100-((200-$inf['tap_s'])/1.5) : 100-((200-$inf['tap_s'])/4);
+    $team_ctp = ($inf['ctp'] / 15) * 100;
+    $team_bap = ($inf['bap_a'] / 70) * 100;
+    $team_asr = $inf['tap_s'] / $inf['tap'];
+    $team_shooting = ($inf['shoot'] / 15) * 100;
+    $team_goal = $inf['goal']*20 + 50;
+    $team_gsr = 100-(((0.012 - $inf['goal']/$inf['tap_s']) * 100) * 50);
+    $team_ssr = $inf['goal'] / $inf['shoot'] * 100 / 2 + 50;
+
+    $inf['team_score'] = ($teamp_tap + $team_ctp + $team_bap + $team_asr + $team_shooting + $team_goal + $team_gsr + $team_ssr) / 8;
+    $sql = "update ff_game_info gi
+                 set gi.gi_team_score = {$inf['team_score']}
+                   , gi.gi_team_asr = $team_asr
+              where gi.gi_id = '{$gi_id}'
+    ";
+    sql_fetch($sql);
+
+    return $inf['team_score']." ".$team_asr."|".$inf['tap']." ".$inf['tap_s'];
+}
+
+//
+// 온에어중 시간 변경
+//
+function dplay_game_set_time($gi_id, $half_code, $time){
+    
+    $setQuery = "";
+
+    $time = $time * -1000;
+    if($time > 0) {
+        $time = "+".$time;
+    }
+
+    if($half_code=="H1") {
+        $setQuery = "set gi.gi_h1_begin = gi.gi_h1_begin ".$time;
+    } else if($half_code=="H2") {
+        $setQuery = "set gi.gi_h2_begin = gi.gi_h2_begin ".$time;
+    } else if($half_code=="H3") {
+        $setQuery = "set gi.gi_h3_begin = gi.gi_h3_begin ".$time;
+    } else if($half_code=="H4") {
+        $setQuery = "set gi.gi_h4_begin = gi.gi_h4_begin ".$time;
+    }
+
+    $sql = "
+        update ff_game_info gi
+               {$setQuery}
+         where gi.gi_id = '{$gi_id}'
+         ";
+         
+    sql_fetch($sql);
+
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("match", "time", array("gi_id"=>$gi_id, "half_code"=>$half_code, "time"=>$time));
+
+  return dplay_game_info($gi_id);
+}
+
+//
+// 패스/크로스 좌표 마이그레이션 unused
+//
+function dplay_migration_gr_part_pos() {
+    $sql = "select gr.*
+            from ff_game_record gr
+              join ff_game_info gi on gi.gi_id = gr.gi_id
+            where (gi.gi_part = 'L' and gr.gr_half = 'H1')
+                or(gi.gi_part = 'R' and gr.gr_half = 'H2')
+           ";
+    $res = sql_query($sql);
+    $lst = array();
+    while($row = sql_fetch_array($res)) {
+      dplay_migration_gr_part_pos_calc_l($row['gr_id']);
+    }
+
+    $sql = "select gr.*
+            from ff_game_record gr
+              join ff_game_info gi on gi.gi_id = gr.gi_id
+            where (gi.gi_part = 'R' and gr.gr_half = 'H1')
+                or(gi.gi_part = 'L' and gr.gr_half = 'H2')
+           ";
+    $res = sql_query($sql);
+    $lst = array();
+    while($row = sql_fetch_array($res)) {
+      dplay_migration_gr_part_pos_calc_r($row['gr_id']);
+    }
+
+    return 1;
+}
+
+function dplay_migration_gr_part_pos_calc_l($gr_id) {
+  /*
+            x = (float) posY / (float) cy;
+            y = (float) (cx - posX) / (float) cx;
+  */
+  $sql = "update ff_game_record gr
+               set gr.gr_part_pos_x = (22 + gr.gr_pos_y) / 634
+                 , gr.gr_part_pos_y = (485*2 - (22+gr.gr_pos_x)) / 485
+            where gr.gr_id = '{$gr_id}'
+  ";
+  sql_fetch($sql);
+}
+
+function dplay_migration_gr_part_pos_calc_r($gr_id) {
+  /*
+            x = (float) (cy - posY) / (float) cy;
+            y = (float) posX / (float) cx;
+  */
+  //
+  // gr.gr_part_pos_x = (612 - gr.gr_pos_y) / 612
+  //                  , gr.gr_part_pos_y = (gr.gr_pos_x) / 453
+  $sql = "update ff_game_record gr
+               set gr.gr_part_pos_x = (634 - (22+gr.gr_pos_y)) / (634)
+                 , gr.gr_part_pos_y = (22 + gr.gr_pos_x) / 485
+            where gr.gr_id = '{$gr_id}'
+  ";
+
+
+    sql_fetch($sql);
+}
+
+function dplay_migration_load_gi_id_list($league_code) {
+  if($league_code==null) {
+    $league_sql = "";
+  } else {
+    $league_sql = "and gm.gm_league = '{$league_code}'";
+  }
+  $sql = "select gi.gi_id
+          from ff_game_info gi
+            join ff_game gm on gm.gm_id = gi.gm_id
+          where gm.gm_state = 'END'
+
+  ";
+  $res = sql_query($sql);
+  $lst = array();
+  while($row = sql_fetch_array($res)) {
+    $lst[] = $row['gi_id'];
+  }
+
+  return $lst;
+}
+
+
+
+//------------------------------------------------
+// AI News : Create or Update
+//------------------------------------------------
+function news_create($gmid, $push=TRUE)
+{
+    #### 경기정보 ####
+
+    $sql = "
+        select gm.*
+             , ss.*
+          from ff_game    gm
+          join ff_stadium ss
+            on ss.s_code = gm.gm_s_code
+         where gm.gm_id = '{$gmid}'
+    ";
+
+    $gm = sql_fetch($sql);
+
+    $gi = array();
+
+    $sql = "
+        select tt.*
+             , gi.*
+          from ff_game_info gi
+          join ff_team      tt on tt.t_code = if(gi.gi_write_code = 'H', gi.gi_h_t_code, gi.gi_a_t_code)
+                              and tt.l_code = '{$gm['gm_league']}'
+                              and '{$gm['gm_date']}' between tt.t_begin and tt.t_end
+         where gi.gm_id = '{$gmid}'
+           and gi.gi_state = 'END'
+        ";
+
+    $res = sql_query($sql);
+    while ($row = sql_fetch_array($res)){
+        $row['t_name'     ] = trim($row['t_name'     ]);
+        $row['t_name_full'] = trim($row['t_name_full']);
+
+        if (floatval($row['gi_score']) > 100) // 100점 만점으로 표시
+            $row['gi_score'] = 100;
+
+        $gi[$row['gi_write_code']] = $row;
+    }
+
+    // 양팀 입력 모두 종료되지 않은 경기는 진행 불가
+    if (count($gi) < 2)
+        return FALSE;
+
+    #### 시즌 정보 ####
+
+    $sql = "
+        select *
+          from ff_season
+         where l_code = '{$gm['gm_league']}'
+           and '{$gm['gm_date']}' between s_fr_date and s_to_date
+        ";
+
+    $season = sql_fetch($sql);
+
+    #### 팀별 순위정보 ####
+
+    $gm['gm_begin'  ] = ($gi['H']['gi_h1_begin'] < $gi['A']['gi_h1_begin']) ? $gi['H']['gi_h1_begin'] : $gi['A']['gi_h1_begin'];
+    $gm['gm_seconds'] = ($gi['H']['gi_seconds' ] > $gi['A']['gi_seconds' ]) ? $gi['H']['gi_seconds' ] : $gi['A']['gi_seconds' ];
+    $gm['gm_end'    ] =  $gm['gm_begin'] + ($gm['gm_seconds'] * 1000);
+
+    $ranking['B'] = news_tream_ranking($season, $gm['gm_begin']);
+    $ranking['E'] = news_tream_ranking($season, $gm['gm_end'  ]);
+
+    #### 뉴스 기본정보 ####
+
+    $ns = array();
+    $ns['gm_id'       ] =  $gmid;
+    $ns['gn_round'    ] =  $gm['gm_round'];
+    $ns['gn_pos_h_b'  ] =  $ranking['B'][$gi['H']['t_code']]['rank'];
+    $ns['gn_pos_h_e'  ] =  $ranking['E'][$gi['H']['t_code']]['rank'];
+    $ns['gn_pos_a_b'  ] =  $ranking['B'][$gi['A']['t_code']]['rank'];
+    $ns['gn_pos_a_e'  ] =  $ranking['E'][$gi['A']['t_code']]['rank'];
+    $ns['gn_pos_h_gap'] =  $ns['gn_pos_h_e'] - $ns['gn_pos_h_b'];
+    $ns['gn_pos_a_gap'] =  $ns['gn_pos_a_e'] - $ns['gn_pos_a_b'];
+    $ns['gn_wcode'    ] = ($gm['gi_goal_home']==$gm['gi_goal_away']) ? "D" : (($gm['gi_goal_home'] > $gm['gi_goal_away']) ? "H" : "A");
+    $ns['gn_lcode'    ] = ($ns['gn_wcode']=="D") ? "D" : (($ns['gn_wcode']=="H") ? "A" : "H");
+    $ns['gn_bcode'    ] =  "0";
+    $ns['gn_goal_gap' ] =  abs($gm['gi_goal_home'] - $gm['gi_goal_away']);
+    $ns['gn_goal_sum' ] =  abs($gm['gi_goal_home'] + $gm['gi_goal_away']);
+
+    #### 결과구분(4자리) ####
+
+    // 1st (W|D) : 승리 | 무승부
+    // 2rd (0|1) : 역전승 여부
+    // 3rd (0|1) : 3점차 이상 승리 여부
+    // 4rd (0|1) : 2점차 이상 추격 여부
+
+    // 예) W010 : 3점차 이상 승리
+    // 예) W110 : 3점차 이상 역전승
+    // 예) W111 : 2점차 이상을 추격해서 3점차 이상으로 승리
+    // 예) D001 : 2점차 이상을 축격한 무승부
+
+    $rtype[1] = ($ns['gn_wcode'   ] == "D") ? "D" : "W";
+    $rtype[2] = "0";
+    $rtype[3] = ($ns['gn_goal_gap'] >=  3 ) ? "1" : "0";
+    $rtype[4] = "0";
+
+    #### Goal Records ####
+
+    $sql = "
+        select gi.gi_write_code as wcode
+             , gr.*
+          from ff_game_record gr
+          join ff_game_info   gi
+            on gi.gi_id = gr.gi_id
+         where gr.gi_id in ('{$gi['H']['gi_id']}', '{$gi['A']['gi_id']}')
+           and gr.gr_res_code = 'G'
+         order by
+               gr.gr_seconds asc
+             , gr.gr_regdt   asc
+        ";
+
+    $res = sql_query($sql);
+
+    $cnt = 0;
+    $stt = array();
+    $stt['W'] = "0"; // 리드팀
+    $stt['T'] = "0"; // 추격팀
+    $stt['G'] =  0 ; // 리드골
+    $stt['P'] =  0 ; // 최대골차
+
+    while ($row = sql_fetch_array($res)){
+
+        ++$cnt;
+
+        ## 결승골1 : 1골차 승부, 동점 상황에서 마지막 득점한 선수
+        if ($ns['gn_goal_gap'] == 1 && $stt['W'] == "0" /*&& $cnt > 1*/ && $cnt == $ns['gn_goal_sum']){
+            $ns['gn_wg_p_id' ] = $row['p_id' ];
+        }
+
+        // 현재 득점상태
+        if ($stt['W'] == "0"){
+            $stt['W'] = $row['wcode'];
+            $stt['G'] = 1;
+        }
+        elseif ($stt['W'] == $row['wcode']){
+            $stt['G']++;
+        }
+        elseif ($stt['W'] != $row['wcode']){
+            $stt['G']--;
+            if ($stt['G'] == 0){
+                $stt['W'] = "0";
+            }
+        }
+        if ($stt['G'] > $stt['P'])
+            $stt['P'] = $stt['G'];
+
+        ## 역전승 여부 (무승부가 아닌데 진 팀이 리드하고 있으면 역전)
+        if ($ns['gn_wcode'] != "D" && $stt['W'] != "0" && $stt['W'] != $ns['gn_wcode']){
+            $rtype[2] = "1";
+        }
+
+        ## 2골차 이상 따라잡은 승리 또는 무승부
+        if ($ns['gn_wcode'] != $stt['W'] && $stt['G'] >= 2){
+            $rtype[4] = "1";
+        }
+
+        ## 결승골2 : 2골차 이상 따라잡은 무승부에서 마지막 골 넣은 선수
+        if ($ns['gn_wcode'] == "D" && $rtype[4] == "1" && $cnt == $ns['gn_goal_sum']){
+            $ns['gn_wg_p_id'] = $row['p_id'];
+        }
+
+        ## 동점 승부에서 마지막 추격팀 정의 ##
+        if ($ns['gn_wcode'] == "D" && $cnt == $ns['gn_goal_sum']){
+            $ns['gn_bcode'] = $row['wcode'];
+        }
+
+        //echo "{$row['wcode']} >> 리드팀={$stt['W']} 추격팀={$ns['gn_bcode']} /  / 골차={$stt['G']} / 최대골차={$stt['P']} / {$rtype[1]} / {$rtype[2]} / {$rtype[3]} / {$rtype[4]} / {$row['p_id']}".PHP_EOL;
+    }
+
+    #### 선수 평점 순위 (1~3위) ####
+    $sql = "
+        select @rownum:=@rownum+1 as rank
+             , pp.*
+             , gp.*
+          from ff_game_player gp
+          join ff_game_info   gi on gi.gi_id = gp.gi_id
+          join ff_game        gm on gm.gm_id = gi.gm_id
+          join ff_player      pp on pp.p_id  = gp.p_id
+          join (
+                select @rownum:=0 from dual
+               ) rk
+         where gm.gm_id = '{$gmid}'
+           and gp.gp_in_half != '00'
+         order by
+               gp.gp_score desc
+         limit 3
+        ";
+
+    $res = sql_query($sql);
+    $gp  = array();
+
+    while ($row = sql_fetch_array($res)){
+        if (floatval($row['gp_score']) > 12) // 12점 만점으로 표시
+            $row['gp_score'] = 12;
+        $gp[$row['rank']] = $row;
+    }
+
+    #### 선수 다득점 순위 (승리팀 or 추격팀 2골 이상 1위) ####
+    $sql = "
+        select *
+          from ff_game_player gp
+          join ff_game_info   gi on gi.gi_id = gp.gi_id
+          join ff_player      pp on pp.p_id  = gp.p_id
+         where gi.gm_id          = '{$gmid}'
+           and gi.gi_write_code in ('{$ns['gn_wcode']}', '{$ns['gn_bcode']}')
+           and gp.gp_in_half    != '00'
+           and gp.gp_gol        >=  2
+         order by
+               if(gp.p_id = '{$ns['gn_wg_p_id' ]}', 1, 0) desc
+             , gp.gp_gol   desc
+             , gp.gp_score desc
+         limit 1
+        ";
+
+    $mg = sql_fetch($sql);
+    if ($mg['p_id']){
+        $ns['gn_mg_p_id'] = $mg['p_id'  ];
+        $ns['gn_mg_cnt' ] = $mg['gp_gol'];
+    }
+
+    #### EPL 선수 평균(평점, 시즌기준) ####
+    $sql = "
+        select ifnull(avg(gp.gp_score), 0) scr
+          from ff_game        gm
+          join ff_game_info   gi on gi.gm_id = gm.gm_id
+          join ff_game_player gp on gi.gi_id = gp.gi_id
+         where gm.gm_league   = '{$season['l_code']}'
+           and gm.gm_date     between '{$season['s_fr_date']}' and '{$season['s_to_date']}'
+           and gm.gm_state    = 'END'
+           and gp.gp_in_half != '00'
+        ";
+
+    $avg = sql_fetch($sql)['scr'];
+
+    #### 기사 제목 ####
+    $ns['gn_title'] = news_create_title($gm, $gi, $ns, $rtype);
+
+    #### 기사 본문내용1 ####
+    $txt = array();
+
+    $wc1 = ($ns['gn_wcode'] == "A") ? "A" : "H";
+    $wc2 = ($wc1            == "H") ? "A" : "H";
+
+    $txt[1] = ($wc1 == "H") ? "Home Team" : "Away";
+    $txt[2] = $gi[$wc1]['t_name_full'];
+    $txt[3] = ($ns['gn_wcode'] == "D") ? "draw" : "won";
+    $txt[4] = ($wc2 == "H") ? "home" : "the away";
+    $txt[5] = $gi[$wc2]['t_name_full'];
+    $txt[6] = "{$gi[$wc1]['gi_gol']}-{$gi[$wc2]['gi_gol']}";
+    $txt[7] = "in an {$ns['gn_round']}R";
+    $txt[8] = ($wc1 == "H") ? "home" : "away";
+    $txt[9] = "game in {$season['s_name']}";
+
+    $ns['gn_text01'] = implode(" ", $txt);
+
+    #### 기사 본문내용2 ####
+    $txt = array();
+    // 21.12.29 TAP->DAP 용어 변경.
+    //$txt[1] = "Effective Total attack points(TAP) for both teams were";
+    $txt[1] = "Effective Deep Attack Point(DAP) for both teams were";
+    $txt[2] = "{$gi['H']['gi_tap']} : {$gi['A']['gi_tap']}";
+    $txt[3] = "with the";
+    $txt[4] = ($gi['H']['gi_tap'] >= $gi['A']['gi_tap']) ? "home" : "away";
+    $txt[5] = "team taking the lead.";
+
+    $ns['gn_text02'] = implode(" ", $txt);
+
+    #### 기사 본문내용3 ####
+    $txt = array();
+
+    //$txt[0] = (floor($gi['H']['gi_tap']/$gi['A']['gi_tap'])==floor($gi['H']['gi_score']/$gi['A']['gi_score'])) ? "And" : "However,";
+    $txt[0] = ((($gi['H']['gi_tap'] - $gi['A']['gi_tap']) * ($gi['H']['gi_score'] - $gi['A']['gi_score'])) > 0) ? "And" : "However,";
+    $txt[1] = "The A.I Match Rating was";
+    $txt[2] = number_format($gi['H']['gi_score'],2)." vs ".number_format($gi['A']['gi_score'],2);
+    $txt[3] = "with a high";
+    $txt[4] = ($gi['H']['gi_score'] >= $gi['A']['gi_score']) ? "home" : "away";
+    $txt[5] = "team.";
+
+    $ns['gn_text03'] = implode(" ", $txt);
+
+    #### 기사 본문내용4 ####
+    $txt = array();
+    $rat = $gp[1]['gp_score'] / $avg;
+    $rnk = news_player_raking($season, '', $gm['gm_date'], $gp[1]['p_id']);
+
+    $txt[1 ] = "\"AIOS\", a real-time AI platform, selected";
+    $txt[2 ] = $gp[1]['p_name_full'];
+    $txt[3 ] = "as the highest rated player in the match, with a technical score of";
+    $txt[4 ] = number_format($gp[1]['gp_score'],2).".";
+    $txt[5 ] = $gp[2]['p_name_full']." was second,";
+    $txt[6 ] = "and {$gp[3]['p_name_full']} was third,";
+    $txt[7 ] = "with {$gp[1]['p_name_en']} ranking {$rnk['rank']},";
+    $txt[8 ] = ($gp[1]['gp_ctp'] > 0) ? "Tactical Participation {$gp[1]['gp_ctp']}," : "";
+    $txt[9 ] = ($gp[1]['gp_sht'] > 0) ? "Shooting {$gp[1]['gp_sht']}," : "";
+    $txt[10] = ($gp[1]['gp_gol'] > 0) ? "and Goal {$gp[1]['gp_gol']}," : "";
+    $txt[11] = number_format((($rat >= 1) ? ($rat - 1) : (1 - $rat)) * 100)."%";
+    $txt[12] = ($rat >= 1) ? "higher" : "lower";
+    $txt[13] = "than the overall player average.";
+    
+    $ns['gn_text04'] = implode(" ", $txt);
+
+    #### INSERT or UPDATE ####
+
+    $gnrtype  = implode('', $rtype);
+    $gntitle  = str_replace("'", "''", $ns['gn_title' ]);
+    $gntext01 = str_replace("'", "''", $ns['gn_text01']);
+    $gntext02 = str_replace("'", "''", $ns['gn_text02']);
+    $gntext03 = str_replace("'", "''", $ns['gn_text03']);
+    $gntext04 = str_replace("'", "''", $ns['gn_text04']);
+    $gnregdt  = date("Y-m-d H:i:s", $gm['gm_end'] / 1000);
+
+    $sql_common = "
+               gm_id        = '{$ns['gm_id'       ]}'
+             , gn_round     = '{$ns['gn_round'    ]}'
+             , gn_title     = '{$gntitle           }'
+             , gn_text01    = '{$gntext01          }'
+             , gn_text02    = '{$gntext02          }'
+             , gn_text03    = '{$gntext03          }'
+             , gn_text04    = '{$gntext04          }'
+             , gn_wcode     = '{$ns['gn_wcode'    ]}'
+             , gn_lcode     = '{$ns['gn_lcode'    ]}'
+             , gn_bcode     = '{$ns['gn_bcode'    ]}'
+             , gn_rtype     = '{$gnrtype           }'
+             , gn_pos_h_e   = '{$ns['gn_pos_h_e'  ]}'
+             , gn_pos_h_b   = '{$ns['gn_pos_h_b'  ]}'
+             , gn_pos_h_gap = '{$ns['gn_pos_h_gap']}'
+             , gn_pos_a_e   = '{$ns['gn_pos_a_e'  ]}'
+             , gn_pos_a_b   = '{$ns['gn_pos_a_b'  ]}'
+             , gn_pos_a_gap = '{$ns['gn_pos_a_gap']}'
+             , gn_goal_gap  = '{$ns['gn_goal_gap' ]}'
+             , gn_goal_sum  = '{$ns['gn_goal_sum' ]}'
+             , gn_wg_p_id   = '{$ns['gn_wg_p_id'  ]}'
+             , gn_mg_p_id   = '{$ns['gn_mg_p_id'  ]}'
+             , gn_mg_cnt    = '{$ns['gn_mg_cnt'   ]}'
+             , gn_regdt     = '{$gnregdt           }'
+        ";
+
+    $sql ="
+        insert into ff_game_news
+           set {$sql_common}
+            on duplicate key
+        update {$sql_common}
+        ";
+
+    sql_fetch($sql);
+    
+    #### Monitor 전송 ####
+    global $monitor;
+    $monitor->event("match", "news", array("gm_id"=>$gmid));
+    
+    #### 푸시메시지 전송 ####
+    if ($push){
+        fcm_push_ainews($ns['gm_id']);
+    }
+}
+
+//------------------------------------------------
+// AI News : 기사제목 생상
+//------------------------------------------------
+function news_create_title($gm, $gi, $ns, $rtype)
+{
+    $title = "";
+
+    // 결승골 선수
+    if ($ns['gn_wg_p_id']){
+        $wg_p = news_player_info($ns['gn_wg_p_id']);
+        if (empty($wg_p['p_name_full'])) $wg_p['p_name_full'] = $wg_p['p_id'];
+        if (empty($wg_p['p_name_en'  ])) $wg_p['p_name_en']   = $wg_p['p_id'];
+    }
+
+    // 멀티골 선수
+    if ($ns['gn_mg_p_id']){
+        $mg_p = news_player_info($ns['gn_mg_p_id']);
+        if (empty($mg_p['p_name_full'])) $mg_p['p_name_full'] = $wg_p['p_id'];
+        if (empty($mg_p['p_name_en'  ])) $mg_p['p_name_en']   = $wg_p['p_id'];
+    }
+
+    #### 무승부 ####
+    if ($rtype[1] == "D"){
+
+        // 무득점 무승부
+        // Newcastle and Brighton in goalless Premier League draw
+        if ($gm['gi_goal_home']==0 && $gm['gi_goal_home']==0){
+            $title = "{$gi['H']['t_name']} and {$gi['A']['t_name']} in goalless Premier League draw";
+        }
+        // 2골차 이상에서 따라잡은 경우 (중요골 있음 : 마지막 동점골)
+        // 'Absolutely remarkable scenes!' Tranmere come back from 3-0 down at Watford (어웨이경기)
+        // Paul Mullin's penalty completes an incredible turnaround at Vicarage Road as Tranmere Rovers come back from 3-0 down to draw with Watford in the third round of the FA Cup.
+        // McDaid hits equaliser as Glens draw with Crues
+        // Charlton Athletic 2-2 Hull City: Keane Lewis-Potter grabs Tigers dramatic draw
+        // Mason Greenwood secures draw for Red Devils at Old Trafford (어웨이경기)
+        // Wigan Athletic 1-1 West Bromwich Albion: Charlie Austin rescues draw for Baggies
+        elseif ($rtype[4] == "1"){
+            // 마지막 동점골이 자살골인 경우
+            // Late own goal denies Dortmund win
+            if ($ns['gn_wg_p_id'] == "OWN"){
+                $tname = ($ns['gn_bcode']=="H") ? $gi['A']['t_name'] : $gi['H']['t_name'];
+                $title = "Late own goal denies {$tname} win";
+            }else{
+                $title = "{$wg_p['p_name_full']} secures draw for {$gi[$ns['gn_bcode']]['t_name']} at {$gm['s_name']}";
+            }
+        }
+        // 다득점 선수 존재
+
+        // 한쪽이 강팀 (10위 이상 차이)
+        // Real Madrid frustrated by Athletic Bilbao in goalless La Liga draw
+        elseif (abs($pos_gap = $ns['gn_pos_h_b'] - $ns['gn_pos_a_b']) >= 10){
+            $t1 = ($ns['gn_pos_h_b'] < $ns['gn_pos_a_b']) ? $gi['H'] : $gi['A'];
+            $t2 = ($ns['gn_pos_h_b'] > $ns['gn_pos_a_b']) ? $gi['H'] : $gi['A'];
+            $title = "{$t1['t_name_full']} frustrated by {$t2['t_name']} in Premier League draw";
+        }
+        // 무승부로 순위 상승
+        // Mancity's draw raises the rank by one.
+        elseif ($ns['gn_pos_h_gap'] < 0 || $ns['gn_pos_a_gap'] < 0){
+            $ti = ($ns['gn_pos_h_gap'] < 0) ? $gi['H'] : $gi['A'];
+            $tn = ($ns['gn_pos_h_gap'] < 0) ? $ns['gn_pos_h_gap'] : $ns['gn_pos_a_gap'];
+            $title = "{$ti['t_name_full']}'s draw raises the rank by ".news_num2str(abs($tn));
+        }
+        // 무승부로 순위 하락
+        // Tottenham's draw lowered the rankings.
+        elseif ($ns['gn_pos_h_gap'] > 0 || $ns['gn_pos_a_gap'] > 0){
+            $ti = ($ns['gn_pos_h_gap'] > 0) ? $gi['H'] : $gi['A'];
+            $title = "{$ti['t_name_full']}'s draw lowered the rankings";
+        }
+        // 무승부로 양팀 순위 변동 없음
+        // Blues stay top with late draw against Crues
+        // The draw of both teams remained unchanged.
+        elseif ($ns['gn_pos_h_gap'] == 0 && $ns['gn_pos_a_gap'] == 0){
+            $title = "The draw of both teams remained unchanged";
+        }
+        // 기타 무승부
+        // Coleraine hit back to draw with Linfield
+        else{
+            $ti = ($ns['gn_bcode']=="H") ? $gi['A'] : $gi['H'];
+            $title = "{$gi[$ns['gn_bcode']]['t_name']} hit back to draw with {$ti['t_name']}";
+        }
+    }
+    #### 무승부 아닌 경우 ####
+    else{
+
+        // 역전승
+        if ($rtype[2] == "1"){
+            // 2골 이상 따라잡아 역전한 경우
+            if ($rtype[4] == "1"){
+                // 결승골 있는 경우 (1골차 역전승)
+                // Pierre-Emerick Aubameyang's late free-kick seals comeback win
+                // Glenavon earn dramatic late 2-1 comeback win over Crusaders
+                if ($wg_p['p_id']){
+                    $title = "{$wg_p['p_name_full']} earn dramatic {$gm['gi_goal_home']}-{$gm['gi_goal_away']} comeback win over {$gi[$ns['gn_lcode']]['t_name']}";
+                }
+                // 기타
+                // Linfield earn dramatic comeback win over Warrenpoint
+                else{
+                    $title = "{$gi[$ns['gn_wcode']]['t_name_full']} earn dramatic comeback win over {$gi[$ns['gn_lcode']]['t_name']}";
+                }
+            }
+            // 결승골 존재하는 경우 (1골차 역전승)
+            // Victor Moses hails Fenerbahce's comeback win
+            elseif ($ns['gn_wg_p_id']){
+                // 결승골이 자살골인 경우
+                // Own goal completes comeback win (결승골이 자살골인 경우)
+                if ($ns['gn_wg_p_id']=="OWN"){
+                    $title = "Own goal completes comeback win";
+                }else{
+                    $title = "{$wg_p['p_name_full']} hails {$gi[$ns['gn_wcode']]['t_name']}'s comeback win";
+                }
+            }
+            // 다득점자 있는 경우
+            // Luis Suarez scores twice in comeback win
+            // Moorhouse hat-trick in Glenavon comeback win
+            elseif ($ns['gn_mg_p_id']){
+                if ($ns['gn_mg_cnt' ] >= 3){
+                    $title = "{$mg_p['p_name_full']} hat-trick in {$gi[$ns['gn_wcode']]['t_name']} comeback win";
+                }else{
+                    $title = "{$mg_p['p_name_full']} scores ".news_num2times($ns['gn_mg_cnt' ])." in comeback win";
+                }
+            }
+            // 역전승으로 순위 상승한 경우
+            // Cliftonville moved up to fourth in the table after comeback win over Glenavon
+            elseif ((($ns['gn_wcode']=="H") ? $ns['gn_pos_h_gap'] : $ns['gn_pos_a_gap']) < 0){
+                $rank = news_num2ord(($ns['gn_wcode']=="H") ? $ns['gn_pos_h_e'] : $ns['gn_pos_a_e']);
+                $title = "{$gi[$ns['gn_wcode']]['t_name']} moved up to {$rank} in the table after comeback win over {$gi[$ns['gn_lcode']]['t_name']}";
+            }
+            // 기타 역전승
+            // Barcelona earn comeback win over Monchengladbach
+            // Germany secure comeback win over Great Britain
+            // Tottenham came from behind to win
+            else{
+                $title = "{$gi[$ns['gn_wcode']]['t_name_full']} secure comeback win over {$gi[$ns['gn_lcode']]['t_name']}";
+            }
+        }
+        // 약팀이 강팀을 꺽은 경우 (랭킹 차이 10 이상)
+        // Son Heung Min sank the MAN-U FC with a winning goal.
+        elseif ($ns['gn_pos_'.strtolower($ns['gn_wcode']).'_b'] - $ns['gn_pos_'.strtolower($ns['gn_lcode']).'_b'] >= 10){
+            // 결승골 존재하는 승리 (1골차 승부)
+            if($ns['gn_wg_p_id'] && $ns['gn_wg_p_id'] != "OWN"){
+                $title = "{$wg_p['p_name_full']} sank the {$gi[$ns['gn_lcode']]['t_name']} with a winning goal";
+            }
+            // 기타
+            else{
+                $title = "{$gi[$ns['gn_wcode']]['t_name']} sank the {$gi[$ns['gn_lcode']]['t_name']}";
+            }
+        }
+        // 결승골 존재하는 승리 (1골차 승부)
+        elseif($ns['gn_wg_p_id']){
+            // 자살골이 결승골인 경우
+            // Own goal hands Republic a 3-2 victory over Ukraine in Dublin
+            // St Mirren go behind to a comical own goal against Hearts
+            // Chelsea beat Newcastle 2-1 by own goal
+            if ($ns['gn_wg_p_id'] == "OWN"){
+                $title = "Own goal hands {$gi[$ns['gn_wcode']]['t_name']} {$gi[$ns['gn_wcode']]['gi_gol']}-{$gi[$ns['gn_lcode']]['gi_gol']} victory over {$gi[$ns['gn_lcode']]['t_name']} in {$gm['s_name']}";
+            }
+            // 결승골로 순위 상승한 경우
+            // Son Heung Min maked raised the team's ranking to seventh.
+            elseif ((($ns['gn_wcode']=="H") ? $ns['gn_pos_h_gap'] : $ns['gn_pos_a_gap']) < 0){
+                $pos = ($ns['gn_wcode']=="H") ? $ns['gn_pos_h_e'] : $ns['gn_pos_a_e'];
+                if ($pos == 1){
+                    $title = "{$wg_p['p_name_full']} sends {$gi[$ns['gn_wcode']]['t_name']} top with a winning goal";
+                }else{
+                    $title = "{$wg_p['p_name_full']} maked raised the team's ranking to ".news_num2ord($pos);
+                }
+            }
+            // 기타 결승골 승리
+            // Roberto Firmino scores the winning goal as Liverpool beat Flamengo 1-0
+            // Chelsea's Eden Hazard scores the winning goal v Man Utd
+            // England's Ebony Salmon scores winning goal against Belgium
+            // Italy's Barbara Bonansea scores a dramatic winning goal against Australia
+            // Lewis Grabban goals gives visitors win
+            else{
+                $title = "{$wg_p['p_name_full']} scores the winning goal as {$gi[$ns['gn_wcode']]['t_name']} beat {$gi[$ns['gn_lcode']]['t_name']} {$gi[$ns['gn_wcode']]['gi_gol']}-{$gi[$ns['gn_lcode']]['gi_gol']}";
+            }
+        }
+        // 다득점자 존재
+        // Philippe Coutinho's stunning hat-trick as Bayern thrash Bremen
+        // Mauro Icardi scores hat-trick
+        // Wijnaldum hat-trick as Dutch thrash Estonia
+        // Harry Kane scores hat-trick in 7-0 win
+        elseif ($ns['gn_mg_p_id']){
+            // 해트트릭
+            if ($ns['gn_mg_cnt' ] >= 3){
+                // 순위 상승한 경우
+                if ($ns['gn_pos_'.strtolower($ns['gn_wcode']).'_gap'] < 0){
+                    // Lionel Messi hat-trick sends Barcelona top
+                    if (($pos = $ns['gn_pos_'.strtolower($ns['gn_wcode']).'_e']) == 1){
+                        $title = "{$mg_p['p_name_full']} hat-trick sends {$gi[$ns['gn_wcode']]['t_name']} top";
+                    }else{
+                        $title = "{$mg_p['p_name_full']} hat-trick sends {$gi[$ns['gn_wcode']]['t_name']} ".news_num2ord($pos)." in the table";
+                    }
+                }
+                // 3골차 이상 승부
+                // Owens hat-trick as Crusaders crush Portadown
+                elseif ($ns['gn_goal_gap' ] >= 3){
+                    //$title = "{$mg_p['p_name_full']} scores hat-trick in {$gi[$ns['gn_wcode']]['gi_gol']}-{$gi[$ns['gn_lcode']]['gi_gol']} win";
+                    $title = "{$mg_p['p_name_full']} hat-trick as {$gi[$ns['gn_wcode']]['t_name']} crush {$gi[$ns['gn_lcode']]['t_name']}";
+                }
+                // 기타
+                else{
+                    $title = "{$mg_p['p_name_full']}'s stunning hat-trick as {$gi[$ns['gn_wcode']]['t_name']} thrash {$gi[$ns['gn_lcode']]['t_name']}";
+                }
+            }
+            // 멀티골
+            else{
+                $title = "{$mg_p['p_name_full']} scores ".news_num2times($ns['gn_mg_cnt' ])." as {$gi[$ns['gn_wcode']]['t_name']} beat {$gi[$ns['gn_lcode']]['t_name']}";
+            }
+        }
+        // 3점차 이상 크게 승리
+        elseif ($rtype[3] == "1"){
+
+            // 순위 상승한 경우
+            // Cliftonville moved up to fourth in the table after comeback win over Glenavon
+            // Chesterfield crushed Wrexham to go second in the table
+            if ((($ns['gn_wcode']=="H") ? $ns['gn_pos_h_gap'] : $ns['gn_pos_a_gap']) < 0){
+                $pos = ($ns['gn_wcode']=="H") ? $ns['gn_pos_h_e'] : $ns['gn_pos_a_e'];
+                $title = "{$gi[$ns['gn_wcode']]['t_name_full']} crushed {$gi[$ns['gn_lcode']]['t_name']} to go ".news_num2ord(abs($pos))." in the table";
+            }
+            // 승리팀 어웨이 경기이면
+            // Swansea crushed at home by West Ham
+            elseif ($ns['gn_wcode']=="A"){
+                $title = "{$gi[$ns['gn_lcode']]['t_name_full']} crushed at home by {$gi[$ns['gn_wcode']]['t_name']}";
+            }
+            // 기타
+            // Crues crush Coleraine 6-2 in league
+            // Crusaders crush Coleraine at Seaview
+            else{
+                $title = "{$gi[$ns['gn_wcode']]['t_name_full']} crushed {$gi[$ns['gn_lcode']]['t_name']} {$gi[$ns['gn_wcode']]['gi_gol']}-{$gi[$ns['gn_lcode']]['gi_gol']}";
+            }
+        }
+        // 승리로 순위 상승
+        // Chelsea moved up the table to 11th,
+        // Chelsea moved up to sixth in the table with a 2-0 home win over Brighton, who fall to 16th.
+        // Chelsea moved up to third in the Premier League table
+        // Tottenham raised the team's ranking to seventh.
+        elseif ((($ns['gn_wcode']=="H") ? $ns['gn_pos_h_gap'] : $ns['gn_pos_a_gap']) < 0){
+            $rank = news_num2ord(($ns['gn_wcode']=="H") ? $ns['gn_pos_h_e'] : $ns['gn_pos_a_e']);
+            $desc = ($ns['gn_wcode']=="H") ? "home" : "away";
+            $title = "{$gi[$ns['gn_wcode']]['t_name']} moved up to {$rank} in the table with a {$gm['gi_goal_home']}-{$gm['gi_goal_away']} {$desc} win over {$gi[$ns['gn_lcode']]['t_name']}";
+        }
+        // 승리했지만 순위 변동 없음
+        // Bournemouth earn win, but remained unchanged in the table
+        elseif ($ns['gn_pos_'.strtolower($ns['gn_wcode']).'_gap'] > 0){
+            $title = "{$gi[$ns['gn_lcode']]['t_name_full']} earn won, but remained unchanged in the table";
+        }
+        // 패배로 순위 하락
+        // Tottenham's defeat lowered the rankings.
+        elseif ($ns['gn_pos_'.strtolower($ns['gn_lcode']).'_gap'] > 0){
+            $title = "{$gi[$ns['gn_lcode']]['t_name_full']}'s defeat lowered the rankings";
+        }
+        // 기타
+        // Korea won by four goals to one
+        // Korea beat Germany by four goals to one
+        // Korea defeated Germany by four goals to one
+        else{
+            $g1 = news_num2str($gi[$ns['gn_wcode']]['gi_gol']);
+            $g2 = news_num2str($gi[$ns['gn_lcode']]['gi_gol']);
+            $title = "{$gi[$ns['gn_wcode']]['t_name_full']} defeated {$gi[$ns['gn_lcode']]['t_name']} by {$g1} goals to {$g2}";
+        }
+    }
+
+    return $title;
+}
+
+//------------------------------------------------
+// AI News : 숫자형 문자열
+//------------------------------------------------
+function news_num2str($num)
+{
+    $f = new NumberFormatter("en_US", NumberFormatter::SPELLOUT);
+    return $f->format($num);
+}
+function news_num2ord($num)
+{
+    //$f = new NumberFormatter("en", NumberFormatter::ORDINAL);
+    $f = new NumberFormatter('en_US', NumberFormatter::SPELLOUT);
+    $f->setTextAttribute(NumberFormatter::DEFAULT_RULESET, "%spellout-ordinal");
+    return $f->format($num);
+}
+function news_num2times($num)
+{
+    if     ($num == 1) return "once";
+    elseif ($num == 2) return "twice";
+    else               return news_num2str($num)." times";
+}
+
+//------------------------------------------------
+// AI News : 선수정보
+//------------------------------------------------
+function news_player_info($pid)
+{
+    $sql = "
+        select *
+          from ff_player
+         where p_id = '{$pid}'
+        ";
+
+    $row = sql_fetch($sql);
+
+    $row['p_name'     ] = trim($row['p_name'     ]);
+    $row['p_name_en'  ] = trim($row['p_name_en'  ]);
+    $row['p_name_full'] = trim($row['p_name_full']);
+
+    return $row;
+}
+
+//------------------------------------------------
+// AI News : 팀랭킹 (EPL 방식)
+//------------------------------------------------
+function news_tream_ranking($season, $timestamp)
+{
+    global $g5;
+
+    $sql = "
+        select @rownum:=@rownum+1 as rank
+             , m1.*
+          from (
+                select t_code
+                     , t_name
+                     , t_name_short
+                     , t_name_full
+                     , count(*)   cnt_m
+                     , sum(is_w ) cnt_w
+                     , sum(is_d ) cnt_d
+                     , sum(is_l ) cnt_l
+                     , sum(gf   ) gf
+                     , sum(ga   ) ga
+                     , sum(gd   ) gd
+                     , sum(point) point
+                  from (
+                        select m1.*
+                             , tt.t_name
+                             , tt.t_name_short
+                             , tt.t_name_full
+                             , if (res = 'W', 1, 0) is_w
+                             , if (res = 'D', 1, 0) is_d
+                             , if (res = 'L', 1, 0) is_l
+                             , gf - ga as gd
+                             , case when res = 'W' then 3
+                                    when res = 'D' then 1
+                                    else                0
+                                end point
+                          from (
+                                select gm.gm_id
+                                     , gm.gm_date
+                                     , gm.gm_league
+                                     , if(gi.gi_write_code = 'H', gi_h_t_code, gi_a_t_code) t_code
+                                     , case when gm.gi_goal_home = gm.gi_goal_away                            then 'D'
+                                            when gm.gi_goal_home > gm.gi_goal_away and gi.gi_write_code = 'H' then 'W'
+                                            when gm.gi_goal_home < gm.gi_goal_away and gi.gi_write_code = 'H' then 'L'
+                                            when gm.gi_goal_home < gm.gi_goal_away and gi.gi_write_code = 'A' then 'W'
+                                            when gm.gi_goal_home > gm.gi_goal_away and gi.gi_write_code = 'A' then 'L'
+                                        end res
+                                     , if(gi.gi_write_code = 'H', gi_goal_home , gi_goal_away) gf
+                                     , if(gi.gi_write_code = 'H', gi_goal_away , gi_goal_home) ga
+                                  from ff_game      gm
+                                  join ff_game_info gi on gi.gm_id  = gm.gm_id
+                                 where gm.gm_league = '{$season['l_code']}'
+                                   and gm.gm_state  = 'END'
+                                   and gm.gm_date   between '{$season['s_fr_date']}' and '{$season['s_to_date']}'
+                                   and gi.gi_h1_begin + (gi_seconds * 1000) <= {$timestamp}
+                               ) m1
+                          join ff_team tt
+                            on tt.t_code = m1.t_code
+                           and tt.l_code = m1.gm_league
+                           and m1.gm_date between tt.t_begin and tt.t_end
+                       ) m2
+                 group by
+                       t_code
+                     , t_name
+                     , t_name_short
+                     , t_name_full
+               ) m1
+          join (
+                select @rownum:=0
+                  from dual
+               ) m2
+         order by
+               m1.point desc
+             , m1.gd    desc
+        ";
+
+    $res = sql_query($sql, G5_DISPLAY_SQL_ERROR, $g5['mio_connect']);
+
+    $lst = array();
+
+    while ($row = sql_fetch_array($res)){
+        $lst[$row['t_code']] = $row;
+    }
+
+    return $lst;
+}
+
+//------------------------------------------------
+// AI News : 선수 평균
+//------------------------------------------------
+function news_average_players($season)
+{
+    global $g5;
+
+    $sql = "
+        select ifnull(avg(gp.gp_score), 0) scr
+             /*
+             , ifnull(avg(gp.gp_tmp  ), 0) tmp
+             , ifnull(avg(gp.gp_tap  ), 0) tap
+             , ifnull(avg(gp.gp_ttp  ), 0) ttp
+             , ifnull(avg(gp.gp_ctp  ), 0) ctp
+             , ifnull(avg(gp.gp_asr  ), 0) asr
+             , ifnull(avg(gp.gp_ssr  ), 0) ssr
+             , ifnull(avg(gp.gp_sht  ), 0) sht
+             */
+          from ff_game        gm
+          join ff_game_info   gi on gi.gm_id = gm.gm_id
+          join ff_game_player gp on gi.gi_id = gp.gi_id
+         where gm.gm_league   = '{$season['l_code']}'
+           and gm.gm_date     between '{$season['s_fr_date']}' and '{$season['s_to_date']}'
+           and gm.gm_state    = 'END'
+           and gp.gp_in_half != '00'
+        ";
+
+    return sql_fetch($sql);
+}
+
+//------------------------------------------------
+// AI News : 선수랭킹
+//------------------------------------------------
+function news_player_raking($season, $round='', $date='', $pid='', $tcode='')
+{
+    global $g5;
+
+    // Filters
+    if ($round){
+        $whr .= " and gm.gm_round <= '{$round}' ";
+    }
+    if ($date){
+        $whr .= " and gm.gm_date <= '{$date}' ";
+    }
+    if ($tcode){
+        $whr2 .= " and m1.t_code = '{$tcode}' ";
+    }
+    if ($pid){
+        $whr3 .= " and p_id = '{$pid}' ";
+    }
+
+    $sql = "
+        select *
+          from (
+                select @rownum:=@rownum+1 as rank
+                     , p_id
+                     , t_code
+                     , cnt_p
+                     , cnt_t
+                     , score
+                 from (
+                        select p_id
+                             , m1.t_code
+                             , cnt_p
+                             , cnt_t
+                             , score
+                          from (
+                                select gp.p_id
+                                     , count(*) cnt_p
+                                     , avg(gp.gp_score) score
+                                     , (
+                                        select t_code
+                                          from ff_player_team
+                                         where p_id = gp.p_id
+                                           and('{$season['s_fr_date']}' between pt_begin and pt_end or
+                                               '{$season['s_to_date']}' between pt_begin and pt_end )
+                                         order by
+                                               pt_begin desc
+                                         limit 1
+                                       ) t_code
+                                  from ff_game        gm
+                                  join ff_game_info   gi on gi.gm_id = gm.gm_id
+                                  join ff_game_player gp on gi.gi_id = gp.gi_id
+                                 where gm.gm_league   = '{$season['l_code']}'
+                                   and gm.gm_date     between '{$season['s_fr_date']}' and '{$season['s_to_date']}'
+                                   and gm.gm_state    = 'END'
+                                   and gp.gp_in_half != '00'
+                                   {$whr}
+                                 group by
+                                       gp.p_id
+                               ) m1
+                          left outer
+                          join (
+                                select t_code
+                                     , count(distinct gm_id) cnt_t
+                                  from (
+                                        select if (gi.gi_write_code = 'H', gi.gi_h_t_code, gi.gi_a_t_code) t_code
+                                             , gm.gm_id
+                                          from ff_game        gm
+                                          join ff_game_info   gi on gi.gm_id = gm.gm_id
+                                         where gm.gm_league   = '{$season['l_code']}'
+                                           and gm.gm_date     between '{$season['s_fr_date']}' and '{$season['s_to_date']}'
+                                           and gm.gm_state    = 'END'
+                                           {$whr}
+                                       ) s1
+                                 group by
+                                       t_code
+                               ) m2
+                            on m2.t_code = m1.t_code
+                         where 1=1
+                           and m1.cnt_p / m2.cnt_t >= 0.5 {$whr2}
+                         order by
+                               score desc
+                      ) mm1
+                 join (
+                       select @rownum:=0
+                         from dual
+                      ) mm2
+               ) mmm
+         where 1=1 {$whr3}
+        ";
+
+    //echo $sql;
+
+    if ($pid){
+        $row = sql_fetch($sql, G5_DISPLAY_SQL_ERROR, $g5['mio_connect']);
+        if (floatval($row['score']) > 12) // 12점 만점으로 표시
+            $row['score'] = 12;
+        return $row;
+    }else{
+        $res = sql_query($sql, G5_DISPLAY_SQL_ERROR, $g5['mio_connect']);
+
+        $lst = array();
+
+        while ($row = sql_fetch_array($res)){
+            if (floatval($row['score']) > 12) // 12점 만점으로 표시
+                $row['score'] = 12;
+            $lst[] = $row;
+        }
+
+        return $lst;
+    }
+}
+
+//------------------------------------------------
+// 연봉 : 경기별 연봉정보 업데이트
+//------------------------------------------------
+function salary_reset_game($gmid, $gm=FALSE, $ss=FALSE)
+{
+    //echo "GMID : {$gmid}".PHP_EOL;
+
+    // 경기정보
+    if (empty($gm['gm_id'])){
+
+        $sql = "
+            select *
+              from ff_game
+             where gm_id = '{$gmid}'
+            ";
+
+        $gm = sql_fetch($sql, TRUE);
+    }
+
+    if (empty($gm['gm_id']))
+        return FALSE;
+
+    if ($gm['gm_state'] != "END")
+        return FALSE;
+
+    // 현재 Season
+    if (empty($ss['l_code'])){
+        $sql = "
+            select *
+              from ff_season
+             where l_code = '{$gm['gm_league']}'
+               and '{$gm['gm_date']}' between s_fr_date and s_to_date
+            ";
+
+        $ss = sql_fetch($sql, TRUE);
+    }
+
+    if (empty($ss['l_code'])){
+        echo $sql.PHP_EOL;
+        return FALSE;
+    }
+
+    $sql = "
+        select *
+          from ff_game_info
+         where gm_id = '{$gmid}'
+         order by
+               gi_write_code desc
+        ";
+
+    $res = sql_query($sql, TRUE);
+
+    while ($gi = sql_fetch_array($res)){
+
+        // 경기 팀별 연봉정보 업데이트
+        salary_reset_game_team($gi['gi_id'], FALSE, $gi, $gm, $ss);
+
+    }
+
+    // Round별 연봉랭킹 업데이트
+    salary_reset_rank($ss['l_code'], $ss['s_name'], $gm['gm_round']);
+}
+
+//------------------------------------------------
+// 연봉 : 경기 팀별 연봉정보 업데이트
+//------------------------------------------------
+function salary_reset_game_team($giid, $update_rank=TRUE, $gi=FALSE, $gm=FALSE, $ss=FALSE)
+{
+    //echo "  - GIID : {$giid}".PHP_EOL;
+
+    // 팀 경기정보
+    if (empty($gi['gi_id'])){
+
+        $sql = "
+            select *
+              from ff_game_info
+             where gi_id = '{$giid}'
+            ";
+
+        $gi = sql_fetch($sql, TRUE);
+    }
+
+    if (empty($gi['gi_id']))
+        return "Invalid gi_id";
+
+    // 경기정보
+    if (empty($gm['gm_id'])){
+
+        $sql = "
+            select *
+              from ff_game
+             where gm_id = '{$gi['gm_id']}'
+            ";
+
+        $gm = sql_fetch($sql, TRUE);
+    }
+
+    if (empty($gm['gm_id']))
+        return "Invalid gm_id";
+
+    if ($gm['gm_league'] != "EPL") ## 현재는 EPL만 연봉정보 적용
+        return TRUE;
+
+    if ($gm['gm_state'] != "END")
+        return TRUE;
+
+    // 현재 Season
+    if (empty($ss['l_code'])){
+        $sql = "
+            select *
+              from ff_season
+             where l_code = '{$gm['gm_league']}'
+               and '{$gm['gm_date']}' between s_fr_date and s_to_date
+            ";
+
+        $ss = sql_fetch($sql, TRUE);
+    }
+
+    if (empty($ss['l_code'])){
+        return "Invalid season info".$sql.PHP_EOL;
+    }
+
+    // 현재 Team
+    $tcode = ($gi['gi_write_code'] == "H") ? $gi['gi_h_t_code'] : $gi['gi_a_t_code'];
+
+    // 현재 Team 연봉 가중치
+    $sql = "
+        select *
+          from ff_salary_base_team
+         where l_code = '{$ss['l_code']}'
+           and s_name = '{$ss['s_name']}'
+           and t_code = '{$tcode}'
+        ";
+
+    $st = sql_fetch($sql, TRUE);
+
+    if (empty($st['l_code'])){
+        return $sql.PHP_EOL;
+    }
+
+    // 현재 Team 시즌 평균 평점
+    $sql = "
+        select avg(gp_score) gp_score
+          from ff_game        gm
+          join ff_game_info   gi
+            on gi.gm_id = gm.gm_id
+           and(gi.gi_write_code = 'H' and gi.gi_h_t_code = '{$tcode}' or
+               gi.gi_write_code = 'A' and gi.gi_a_t_code = '{$tcode}' )
+          join ff_game_player gp
+            on gp.gi_id = gi.gi_id
+           and gp.gp_in_half  != '00'
+         where gm.gm_league    = '{$gm['gm_league']}'
+           and gm.gm_state     = 'END'
+           and gm.gm_date      between '{$ss['s_fr_date']}' and '{$gm['gm_date']}'
+        ";
+
+    $st['st_rating_avg'] = sql_fetch($sql, TRUE)['gp_score'];
+
+    // Delete
+    $sql = "
+        delete from ff_salary
+         where l_code   = '{$ss['l_code']}'
+           and s_name   = '{$ss['s_name']}'
+           and sa_round = '{$gm['gm_round']}'
+           and p_id     in (
+                            select pt.p_id
+                              from ff_player_team pt
+                             where pt.t_code = '{$tcode}'
+                               and '{$gm['gm_date']}' between pt.pt_begin and pt.pt_end
+                           )
+        ";
+
+    sql_query($sql, TRUE);
+
+    // Loop
+    $sql = "
+        select gp.*
+             , pt.*
+          from ff_player_team pt
+          left outer join
+               ff_game_player gp
+            on gp.gi_id  = '{$giid}'
+           and gp.p_id   = pt.p_id
+         where pt.t_code = '{$tcode}'
+           and '{$gm['gm_date']}' between pt.pt_begin and pt.pt_end
+         order by
+               pt.pt_pos asc
+             , pt.p_id   asc
+        ";
+
+    $res = sql_query($sql, TRUE);
+
+    while ($gp = sql_fetch_array($res)){
+
+        // 경기 선수별 연봉정보 업데이트
+        salary_reset_game_player($gp, $gi, $gm, $st);
+
+    }
+
+    // Round별 연봉랭킹 업데이트
+    if ($update_rank)
+        salary_reset_rank($ss['l_code'], $ss['s_name'], $gm['gm_round']);
+
+    return TRUE;
+}
+
+//------------------------------------------------
+// 연봉 : 경기 선수별 연봉정보 업데이트
+//------------------------------------------------
+function salary_reset_game_player($gp, $gi, $gm, $st)
+{
+    //echo "    * PID : {$gp['p_id']} / {$gp['pt_pos']} / {$gp['gp_in_half']} / {$gp['gp_score']}".PHP_EOL;
+
+    // 현재 포지션의 연봉 기준정보
+    $sql = "
+        select sb.*
+             , ss.s_fr_date
+             , ss.s_to_date
+          from ff_season      ss
+          join ff_salary_base sb
+            on sb.l_code = ss.l_code
+           and sb.s_name = ss.s_name
+           and sb.sb_pos = '{$gp['pt_pos'   ]}'
+         where ss.l_code = '{$gm['gm_league']}'
+           and '{$gm['gm_date']}' between ss.s_fr_date and ss.s_to_date
+        ";
+
+    $sb = sql_fetch($sql, TRUE);
+
+    if (empty($sb['l_code']))
+        return FALSE;
+
+    // RESULT 초기화
+    $sa = array();
+
+    $sa['l_code'   ] = $sb['l_code'  ];
+    $sa['s_name'   ] = $sb['s_name'  ];
+    $sa['p_id'     ] = $gp['p_id'    ];
+    $sa['sa_round' ] = $gm['gm_round'];
+    $sa['sa_date'  ] = $gm['gm_date' ];
+    $sa['sa_pos'   ] = $gp['pt_pos'  ];
+    $sa['sa_rating'] = $gp['gp_score'];
+
+    // 현재 시즌 통계
+    $sql = "
+        select ifnull(avg(gp_score)  ,0) sa_rating_season
+             , ifnull(count(gm.gm_id),0) sa_games_p
+          from ff_game         gm
+          join ff_game_info    gi
+            on gi.gm_id        = gm.gm_id
+          join ff_game_player  gp
+            on gp.gi_id        = gi.gi_id
+           and gp.p_id         = '{$gp['p_id']}'
+           and gp.gp_in_half  != '00'
+         where gm.gm_league    = '{$gm['gm_league']}'
+           and gm.gm_state     = 'END'
+           and gm.gm_date      between '{$sb['s_fr_date']}' and '{$gm['gm_date']}'
+        ";
+
+    $row = sql_fetch($sql, TRUE);
+
+    $sa['sa_rating_season'] = $row['sa_rating_season'];
+    $sa['sa_games_p'      ] = $row['sa_games_p'      ];
+
+    // 현재 소속팀 경기수
+    $sql = "
+        select count(*) cnt
+          from ff_game        gm
+         where gm.gm_league   = '{$gm['gm_league']}'
+           and gm.gm_state    = 'END'
+           and gm.gm_date     between '{$sb['s_fr_date']}' and '{$gm['gm_date']}'
+           and(gm.gm_h_t_code = '{$gp['t_code']}' or
+               gm.gm_a_t_code = '{$gp['t_code']}' )
+        ";
+
+    $sa['sa_games_t'] = sql_fetch($sql, TRUE)['cnt'];
+
+    $sa['sa_games_r'] =  $sa['sa_games_p'   ] / $sa['sa_games_t']; // 현재 시즌 출전비율
+    $sa['sa_games_n'] = ($sb['sb_games_rate'] - $sa['sa_games_r']) * $sa['sa_games_t']; // 미출전 경기수
+    if ($sa['sa_games_n'] < 0)
+        $sa['sa_games_n'] = 0;
+
+
+    // 현재 시즌 선수연봉
+    $sql = "
+        select *
+          from ff_salary_base_detail
+         where l_code = '{$sb['l_code']}'
+           and s_name = '{$sb['s_name']}'
+           and p_id   = '{$gp['p_id'  ]}'
+        ";
+
+    $sa['sa_salary_base'] = intval(sql_fetch($sql, TRUE)['sd_salary']);
+
+    // 가중치
+
+
+    // AI 연봉산출
+    $sa['sa_salary_rating'] = $sb['sb_salary_rating']
+                            * $sa['sa_rating_season']; // 연봉 - 평점기준
+    $sa['sa_salary_minus' ] = $sb['sb_salary_game'  ]
+                            * $sa['sa_games_n'      ]; // 연봉 - 차감분
+    $sa['sa_salary_extra' ] = 0;                       // 연봉 - 추가분(팀기여도, 인기도 등)
+    $sa['sa_salary'       ] = $sa['sa_salary_rating']
+                            - $sa['sa_salary_minus' ]
+                            + $sa['sa_salary_extra' ]; // 연봉 - AI 예측
+
+    if ($sa['sa_salary'] < 0)
+        $sa['sa_salary'] = 0;
+
+    // 가중치
+    $sa['sa_weight_team'  ] = $st['st_weight'];
+    $sa['sa_weight_rating'] = ($sa['sa_rating_season'] > 0) ? ($sa['sa_rating_season'] / $st['st_rating_avg']) : 0;
+
+    if ($sa['sa_weight_team'] > 0){
+        $sa['sa_salary'] = $sa['sa_salary'] * (((floatval($sa['sa_weight_team']) - 1.0) * 0.75) + 1.0);
+    }
+    if ($sa['sa_weight_rating'] > 0){
+        $sa['sa_salary'] = $sa['sa_salary'] * (((floatval($sa['sa_weight_rating']) - 1.0) * 1.0) + 1.0); // 평점 가중치는 20%만 반영
+    }
+
+    // 연봉 - 경기당 (AI 예측 기준, 포지션별 평균출전경기수 기준)
+    //$sa['sa_salary_game'] = (intval($sa['sa_games_p']) == 0) ? 0 : ($sa['sa_salary'] / $sa['sa_games_p']);
+    $sa['sa_salary_game'] = (intval($sb['sb_games_count']) == 0) ? 0 : ($sa['sa_salary'] / $sb['sb_games_count']);
+
+    // INSERT
+    $sql = "
+        insert into ff_salary
+           set l_code           = '{$sa['l_code'          ]}'
+             , s_name           = '{$sa['s_name'          ]}'
+             , p_id             = '{$sa['p_id'            ]}'
+             , sa_round         = '{$sa['sa_round'        ]}'
+             , sa_date          = '{$sa['sa_date'         ]}'
+             , sa_pos           = '{$sa['sa_pos'          ]}'
+             , sa_rating        = '{$sa['sa_rating'       ]}'
+             , sa_rating_season = '{$sa['sa_rating_season']}'
+             , sa_games_t       = '{$sa['sa_games_t'      ]}'
+             , sa_games_p       = '{$sa['sa_games_p'      ]}'
+             , sa_games_r       = '{$sa['sa_games_r'      ]}'
+             , sa_weight_team   = '{$sa['sa_weight_team'  ]}'
+             , sa_weight_rating = '{$sa['sa_weight_rating']}'
+             , sa_salary_rating = '{$sa['sa_salary_rating']}'
+             , sa_salary_minus  = '{$sa['sa_salary_minus' ]}'
+             , sa_salary_extra  = '{$sa['sa_salary_extra' ]}'
+             , sa_salary        = '{$sa['sa_salary'       ]}'
+             , sa_salary_game   = '{$sa['sa_salary_game'  ]}'
+             , sa_salary_base   = '{$sa['sa_salary_base'  ]}'
+        ";
+
+    //echo $sql.PHP_EOL;
+
+    sql_query($sql, TRUE);
+
+    //print_r($sb);
+    //print_r($sa);
+
+    ob_flush(); flush();
+}
+
+//------------------------------------------------
+// 연봉 : 라운드별 연봉 순위 업데이트
+//------------------------------------------------
+function salary_reset_rank($lcode, $sname, $saround)
+{
+    $sql = "
+        update ff_salary u1
+
+          left outer
+          join (
+                select *
+                  from (
+                        select m1.*
+                             , (case @sapos when sa_pos then @rankpos:=@rankpos+1 else @rankpos := 1 end) sa_rank_salary_pos
+                             , (@sapos := sa_pos)
+                          from (
+                                select sa.l_code
+                                     , sa.s_name
+                                     , sa.p_id
+                                     , sa.sa_round
+                                     , sa.sa_pos
+                                     , sa_salary
+                                     , @rank := @rank + 1 sa_rank_salary_all
+                                  from ff_salary sa
+                                     , (select @sdpos := '', @rank := 0) rnum
+                                 where l_code      = '{$lcode}'
+                                   and s_name      = '{$sname}'
+                                   and sa_round    = '{$saround}'
+                                   and sa_pos     != 'GK' -- 순위에서는 골키퍼 제외
+                                   and sa_games_r  > 0    -- 연봉 순위는 1경기라도 출천한 선수만
+                                 order by
+                                       sa_salary        desc
+                                     , sa_games_r       desc
+                                     , sa_rating_season desc
+                                     , sa_rating        desc
+                                     , sa_salary_base   desc
+                               ) m1
+                             , (select @sapos := '', @rankpos := 0) rnum
+                         order by
+                               m1.sa_pos asc
+                             , m1.sa_rank_salary_all asc
+                       ) m2
+               ) u2
+            on u1.l_code   = u2.l_code
+           and u1.s_name   = u2.s_name
+           and u1.p_id     = u2.p_id
+           and u1.sa_round = u2.sa_round
+
+          left outer
+          join (
+                select *
+                  from (
+                        select m1.*
+                             , (case @sapos when sa_pos then @rankpos:=@rankpos+1 else @rankpos := 1 end) sa_rank_rating_pos
+                             , (@sapos := sa_pos)
+                          from (
+                                select sa.l_code
+                                     , sa.s_name
+                                     , sa.p_id
+                                     , sa.sa_round
+                                     , sa.sa_pos
+                                     , sa_rating_season
+                                     , @rank := @rank + 1 sa_rank_rating_all
+                                  from ff_salary sa
+                                     , (select @sdpos := '', @rank := 0) rnum
+                                 where l_code      = '{$lcode}'
+                                   and s_name      = '{$sname}'
+                                   and sa_round    = '{$saround}'
+                                   and sa_pos     != 'GK' -- 순위에서는 골키퍼 제외
+                                   and sa_games_r >= 0.5  -- 평점 순위는 50% 이상 출전 선수만
+                                 order by
+                                       sa_rating_season desc
+                                     , sa_rating        desc
+                                     , sa_games_r       desc
+                                     , sa_games_p       desc
+                                     , sa_salary        desc
+                                     , sa_salary_base   desc
+                               ) m1
+                             , (select @sapos := '', @rankpos := 0) rnum
+                         order by
+                               m1.sa_pos asc
+                             , m1.sa_rank_rating_all asc
+                       ) m2
+               ) u3
+            on u1.l_code   = u3.l_code
+           and u1.s_name   = u3.s_name
+           and u1.p_id     = u3.p_id
+           and u1.sa_round = u3.sa_round
+
+           set u1.sa_rank_salary_all = u2.sa_rank_salary_all
+             , u1.sa_rank_salary_pos = u2.sa_rank_salary_pos
+             , u1.sa_rank_rating_all = u3.sa_rank_rating_all
+             , u1.sa_rank_rating_pos = u3.sa_rank_rating_pos
+
+         where u1.l_code   = '{$lcode}'
+           and u1.s_name   = '{$sname}'
+           and u1.sa_round = '{$saround}'
+        ";
+
+    //echo $sql.PHP_EOL;
+    sql_query($sql, TRUE);
+}
+
+//------------------------------------------------
+// FCM : AI뉴스 알림 전송
+//------------------------------------------------
+function fcm_push_ainews($gmid)
+{
+    $sql = "
+        insert into `matchison.m`.tb_notification
+           set nt_mode = 'normal'
+             , nt_type = 'ainews'
+             , nt_key  = '{$gmid}'
+        ";
+    
+    sql_query($sql);
+    
+    $ntidx = sql_insert_id();
+        
+    // 서버 FCM 송신 요청
+    $out;
+    $ret;
+    exec(FCM_PROC_FULLPATH." {$ntidx} > /dev/null &", $out, $ret);
+}
+
+//------------------------------------------------
+// FCM : GOAL리뷰 알림 전송 <- 선수 업데이트 시에만 호출됨
+//------------------------------------------------
+function fcm_push_goal($grid)
+{
+    // gm_id, gr_seconds 구하기 (EPL 진행중인 경기, Goal 레코드만)
+    $sql = "
+        select gr.gi_id
+             , gr.gr_id
+             , gr.gr_seconds
+             , gm.gm_id
+          from ff_game_record gr
+          join ff_game_info   gi on gi.gi_id = gr.gi_id
+          join ff_game        gm on gm.gm_id = gi.gm_id
+         where gr.gr_id = '{$grid}'
+           and gr.gr_res_code = 'G'
+           and gm.gm_state != 'END'
+           and gm.gm_league = 'EPL'
+        ";
+        
+    $gr = sql_fetch($sql);
+    
+    if (empty($gr['gr_id'])){
+        return FALSE;
+    }
+    
+    // 전체 Goal 정보 갱신 + Monitor 전송
+    dplay_game_reload_goal_data($gr['gi_id'], TRUE);
+    
+    // PUSH 알림 전송
+    $gmid = $gr['gm_id'];
+    $secs = intval($gr['gr_seconds']) + 30;
+    
+    $sql = "
+        insert into `matchison.m`.tb_notification
+           set nt_mode  = 'normal'
+             , nt_type  = 'goal'
+             , nt_key   = '{$gmid}'
+             , nt_extra = '{$secs}'
+        ";
+    
+    sql_query($sql);
+    
+    $ntidx = sql_insert_id();
+        
+    // 서버 FCM 송신 요청
+    $out;
+    $ret;
+    exec(FCM_PROC_FULLPATH." {$ntidx} > /dev/null &", $out, $ret);
+}
+
+// -----------------------
+// 방송 이벤트 리스트 조회
+// -----------------------
+function broadcast_event_list($gmid, $filters) 
+{
+    if (!is_array($filters)) {
+        return false;
+    }
+    
+    global $g5;
+    
+    $imp = implode("','", $filters);
+
+    $sql = "
+        SELECT 
+               * 
+        FROM ff_game_bid gb 
+        WHERE gb.gm_id = '{$gmid}' 
+          AND gb.gb_req_cmd IN ('{$imp}') 
+        ORDER BY gb.gb_gidx;
+    ";
+
+    $res = sql_query($sql, G5_DISPLAY_SQL_ERROR, $g5['mio_connect']);
+
+    $lst = [];
+    while ($row = sql_fetch_array($res)){
+        $lst[] = $row;
+    }
+
+    return $lst;
+}
+
+// -----------------------
+// 방송 이벤트 초기화
+// -----------------------
+function broadcast_event_clear($gmid)
+{
+    $sql = "DELETE FROM ff_game_bid WHERE gm_id = '{$gmid}';";
+
+    return sql_query($sql, TRUE);
+}
+
+function broadcast_event_time_set($gmid, $halfCode, $time, $order)
+{
+    global $g5;
+
+    $o_sql = "
+    SELECT * 
+    FROM ff_game_bid gb
+    WHERE gb.gm_id = '{$gmid}' 
+      AND gb.gb_half = '{$halfCode}'
+    ";
+
+    $row = null;
+    $row_cnt = 0;
+    $rows = sql_query($o_sql, G5_DISPLAY_SQL_ERROR, $g5['mio_connect']);
+    while($r = sql_fetch_array($rows)) {
+        ++$row_cnt;
+        if ($order == $row_cnt) {
+            $row = $r;
+
+            break;
+        }
+    }
+
+    $t = strtotime($r['gb_regdt']);
+    $t -= $time;
+    $dt = date("Y-m-d H:i:s", $t);
+
+    if (!$row) {
+        return false;
+    }
+
+    $sql = "
+    UPDATE ff_game_bid gb
+    SET gb.gb_regdt = '{$dt}'
+    WHERE gb.gm_id = '{$gmid}'
+      AND gb.gb_gidx = {$row['gb_gidx']}
+    ";
+
+    return sql_query($sql,TRUE);
+}
+
+// -----------------------
+// 선수 교체 히스토리 저장
+// -----------------------
+function change_game_player_complete($gi_id, $t_code, $p_id_fr, $p_id_to, $position, $half, $seconds, $order)
+{
+    if (empty($gi_id) || empty($t_code) || empty($p_id_fr) || empty($p_id_to) || empty($position)|| empty($half)) {
+        return "Invalid Arguments";   
+    }
+    
+    // 숫자는 empty 로 비교하지 말기 (empty(0) 은 true, order 가 -1 일 경우 교체선수끼리 바꿈)
+    if ((isset($seconds) && $seconds < 0) || (!isset($order))) {
+        return "Invalid Arguments";
+    }
+    
+    $d = "";
+    if ($position == 'GK') {
+        $d = " pl_in_position = '{$position}', ";
+    }
+    
+    $sql = "
+    INSERT INTO 
+        ff_game_player_log 
+    SET 
+        gi_id           = '{$gi_id}', 
+        t_code          = '{$t_code}', 
+        pl_out_p_id     = '{$p_id_fr}', 
+        pl_in_p_id      = '{$p_id_to}', 
+        {$d}
+        pl_in_half      = '{$half}',
+        pl_in_seconds   = '{$seconds}',
+        pl_in_order     = '{$order}'
+    ";
+    
+    if (!sql_query($sql, FALSE)) {
+        return "Failed to save changed player log";
+    }
+    
+    $ret = [
+        'gi_id'          => $gi_id,
+        't_code'         => $t_code,
+        'pl_out_p_id'    => $p_id_fr,
+        'pl_in_p_id'     => $p_id_to,
+        'pl_in_position' => $position,
+        'pl_in_half'     => $half,
+        'pl_in_seconds'  => $seconds,
+        'pl_in_order'    => $order,
+        'in_player'      => dplay_game_player($gi_id, $p_id_to),
+        'out_player'     => dplay_game_player($gi_id, $p_id_fr),
+    ];
+    
+    // Monitor 전송
+    global $monitor;
+    $monitor->event("substitution", "save", $ret);
+    
+    return $ret;
+}
+
+function get_changed_game_player($gi_id, $t_code, $p_id)
+{
+    $sql = "select * from ff_game_player_log where gi_id = '{$gi_id}' and t_code = '{$t_code}' and (pl_in_p_id = '{$p_id}' or pl_out_p_id = '{$p_id}')";
+
+    return sql_fetch($sql, FALSE);
+}
+
+function get_changed_game_player_list($gi_id, $t_code)
+{
+    global $g5;
+    
+    $sql = "select * from ff_game_player_log where gi_id = '{$gi_id}' and t_code = '{$t_code}' order by pl_in_half, pl_in_seconds";
+    
+    $res = sql_query($sql, TRUE);
+    
+    $cnt = 0;
+    $lst = [];
+    while($row = sql_fetch_array($res)) {
+        $lst[] = $row;
+        $lst[$cnt]['in_player'] = dplay_game_player($row['gi_id'], $row['pl_in_p_id']);
+        $lst[$cnt]['out_player'] = dplay_game_player($row['gi_id'], $row['pl_out_p_id']);
+        ++$cnt;
+    }
+    
+    return $lst;
+}
+
+function update_changed_player($prev, $curr)
+{
+    $pr_arr = json_decode(stripslashes($prev), TRUE);
+    $cu_arr = json_decode(stripslashes($curr), TRUE);
+
+    $begin = "START TRANSACTION;";
+    sql_query($begin);
+
+    try {
+        // record 업데이트 먼저 실행
+        update_changed_player_row($pr_arr, $cu_arr);
+
+        reset_changed_player($cu_arr['gi_id']);
+
+        $commit = "COMMIT;";
+        sql_query($commit);
+    
+        // Monitor 전송
+        global $monitor;
+        $cu_arr['in_player' ] = dplay_game_player($cu_arr['gi_id'], $cu_arr['pl_in_p_id' ]);
+        $cu_arr['out_player'] = dplay_game_player($cu_arr['gi_id'], $cu_arr['pl_out_p_id']);
+        $monitor->event("substitution", "save", $cu_arr);
+        
+        return get_changed_game_player_list($cu_arr['gi_id'], $cu_arr['t_code']);
+        
+    } catch (Exception $exception) {
+        $rollback = "ROLLBACK;";
+        sql_query($rollback);
+    }
+
+    return [];
+}
+
+function init_game_player($player)
+{
+    $goalkeeper = "GK";
+    $main_player = "KY";
+    $sub_player = "ST";
+
+    $sql = "";
+    switch ($player['gp_type_str']) {
+        case $goalkeeper:
+        case $main_player:
+            $sql = "
+                UPDATE 
+                    ff_game_player 
+                SET gp_in_half = 'H1', 
+                    gp_in_half_seconds = 0, 
+                    gp_in_seconds = 0, 
+                    gp_out_half = '00', 
+                    gp_out_half_seconds = 0, 
+                    gp_out_seconds = 0, 
+                    gp_seconds = 0 
+                WHERE gi_id = '{$player['gi_id']}' 
+                  AND p_id = '{$player['p_id']}'
+                ";
+            break;
+        case $sub_player:
+            $sql = "
+                UPDATE ff_game_player 
+                SET gp_in_half = '00', 
+                    gp_in_half_seconds = 0, 
+                    gp_in_seconds = 0, 
+                    gp_out_half = '00', 
+                    gp_out_half_seconds = 0, 
+                    gp_out_seconds = 0, 
+                    gp_seconds = 0 
+                WHERE gi_id = '{$player['gi_id']}' 
+                  AND p_id = '{$player['p_id']}'
+            ";
+            break;
+    }
+
+    if (!$sql) {
+        if (!sql_query($sql)) {
+            throw new Exception("Check query: \n {$sql}");
+        }
+
+        throw new Exception("Invalid player type");
+    }
+
+    return true;
+}
+
+function delete_changed_player($aRow) {
+    $row = json_decode(stripslashes($aRow), TRUE);
+
+    $begin = "START TRANSACTION;";
+    sql_query($begin);
+
+    try {
+        $sql = "
+        DELETE FROM 
+            ff_game_player_log 
+        WHERE gi_id = '{$row['gi_id']}' 
+          AND t_code = '{$row['t_code']}' 
+          AND pl_out_p_id = '{$row['pl_out_p_id']}' 
+          AND pl_in_p_id = '{$row['pl_in_p_id']}'
+        ";
+
+        if (!sql_query($sql)) {
+            throw new Exception("Check query: \n {$sql}");
+        }
+
+        reset_changed_player($row['gi_id']);
+
+        $commit = "COMMIT";
+        sql_query($commit);
+        
+        // Monitor 전송
+        global $monitor;
+        $monitor->event("substitution", "remove", $row);
+        
+    } catch (Exception $exception) {
+        $rollback = "ROLLBACK";
+        sql_query($rollback);
+    }
+
+    return true;
+}
+
+function update_changed_player_row($prev, $curr) {
+    $sql = "
+        UPDATE ff_game_player_log 
+        SET gi_id   = '{$curr['gi_id']}', 
+            t_code  = '{$curr['t_code']}', 
+            pl_out_p_id = '{$curr['pl_out_p_id']}',
+            pl_in_p_id  = '{$curr['pl_in_p_id']}',
+            # pl_in_position = '{$curr['pl_in_position']}',
+            pl_in_order = '{$curr['pl_in_order']}',
+            pl_in_half = '{$curr['pl_in_half']}',
+            pl_in_seconds = '{$curr['pl_in_seconds']}'
+        WHERE gi_id = '{$prev['gi_id']}' AND t_code = '{$prev['t_code']}' AND pl_out_p_id = '{$prev['pl_out_p_id']}' AND pl_in_p_id = '{$prev['pl_in_p_id']}'
+    ";
+
+    if (!sql_query($sql)) {
+        throw new Exception("Check query: \n {$sql}");
+    }
+
+    return true;
+}
+
+function reset_changed_player($gi_id)
+{
+    // 변경되었던 record 에 따라 모든 상황 초기회
+    sterilize_changed_record($gi_id);
+
+    $sql = "select * from ff_game_player_log where gi_id = '{$gi_id}' order by pl_regdt";
+
+    $res = sql_query($sql);
+    while ($row = sql_fetch_array($res)) {
+        $total_seconds = 0;
+        switch ($row['pl_in_half']) {
+            case "H1";
+                $total_seconds = 45 * 60 * 0;
+                break;
+            case "H2";
+                $total_seconds = 45 * 60 * 1;
+                break;
+            case "H3";
+                $total_seconds = 45 * 60 * 2;
+                break;
+            case "H4";
+                $total_seconds = 45 * 60 * 3;
+                break;
+        }
+
+        $total_seconds += $row['pl_in_seconds'];
+
+        $r = dplay_game_player_change($row['gi_id'], $row['pl_out_p_id'], $row['pl_in_p_id'], $row['pl_in_half'], $row['pl_in_seconds'], $total_seconds);
+        if ($r != null) {
+            throw new Exception("Cannot updated player record.");
+        }
+    }
+}
+
+function sterilize_changed_record($gi_id) {
+    $sql = "
+    UPDATE ff_game_player 
+    SET gp_in_half = IF(gp_type='GK' or gp_type='KY', 'H1', '00'), 
+        gp_in_half_seconds = 0, 
+        gp_in_seconds = 0, 
+        gp_out_half = '00', 
+        gp_out_half_seconds = 0, 
+        gp_out_seconds = 0, 
+        gp_seconds = 0 
+    WHERE gi_id = '{$gi_id}'
+    ";
+
+    if (!sql_query($sql)) {
+        throw new Exception("Check query: \n {$sql}");
+    }
+
+    return true;
+}
+
+function broadcast_server_list() {
+    $sql = "SELECT * FROM ff_bid_server";
+   
+    $res = sql_query($sql);
+    
+    $lst=[];
+    while($row = sql_fetch_array($res)) {
+      $lst[] = $row;
+    }
+
+    return $lst;
+}
