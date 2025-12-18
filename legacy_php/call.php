@@ -213,6 +213,9 @@ elseif ($func == "dplay_game_info")
       $res['output']['gp_list'] = dplay_game_player_list($gi_id);
   }
 }
+
+
+
 //
 // FUNC : DID-Play 경기 전/후반전 종료 처리
 //

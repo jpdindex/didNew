@@ -1,0 +1,227 @@
+import torch
+import torch.nn as nn
+import pickle
+import os
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+# --- 1. Model & Encoders Loading ---
+
+# Define the model class exactly as in the training script
+class PathFinder(nn.Module):
+    """A 2-stage model for multi-label core emotion recognition."""
+    def __init__(self, input_size, num_cluster_classes, num_core_classes):
+        super(PathFinder, self).__init__()
+        self.base_layers = nn.Sequential(
+            nn.Linear(input_size, 256),
+            nn.ReLU(),
+            nn.Dropout(0.4)
+        )
+        self.cluster_head = nn.Linear(256, num_cluster_classes)
+        
+        core_input_size = 256 + num_cluster_classes
+        self.core_head = nn.Sequential(
+            nn.Linear(core_input_size, 128),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, num_core_classes)
+        )
+        
+    def forward(self, x):
+        base_features = self.base_layers(x)
+        cluster_output = self.cluster_head(base_features)
+        
+        combined_input = torch.cat((base_features, cluster_output), dim=1)
+        core_output = self.core_head(combined_input)
+        
+        return cluster_output, core_output
+
+import anthropic # Added this import
+
+# Determine the device dynamically
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Global variables to hold the loaded models and encoders
+embedding_model = None
+path_finder_model = None
+cluster_encoder = None
+core_mlb = None
+core_philosophy = None
+
+
+def load_models():
+    """Load all necessary model files into memory."""
+    global embedding_model, path_finder_model, cluster_encoder, core_mlb, core_philosophy
+    
+    print("--- Loading models and encoders... ---")
+    model_dir = os.path.join(os.path.dirname(__file__), 'emotion_model')
+
+    # Load Sentence Transformer
+    print("Loading SentenceTransformer 'all-MiniLM-L6-v2'...")
+    embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=device) # Specify device here
+
+    # Load encoders
+    print("Loading encoders...")
+    with open(os.path.join(model_dir, 'cluster_encoder.pkl'), 'rb') as f:
+        cluster_encoder = pickle.load(f)
+    with open(os.path.join(model_dir, 'core_mlb.pkl'), 'rb') as f:
+        core_mlb = pickle.load(f)
+
+    # Load the PathFinder model
+    print("Loading PathFinder model...")
+    input_size = 384 # From all-MiniLM-L6-v2
+    num_cluster_classes = len(cluster_encoder.classes_)
+    num_core_classes = len(core_mlb.classes_)
+    
+    path_finder_model = PathFinder(input_size, num_cluster_classes, num_core_classes)
+    model_path = os.path.join(model_dir, 'path_finder_model.pth')
+    path_finder_model.load_state_dict(torch.load(model_path, map_location=device))
+    path_finder_model.to(device) # Move model to the determined device
+    path_finder_model.eval() # Set the model to evaluation mode
+
+    # Load Core Philosophy
+    print("Loading Core Philosophy...")
+    philosophy_path = os.path.join(os.path.dirname(__file__), 'Philosophy', 'core_philosophy.md')
+    try:
+        with open(philosophy_path, 'r', encoding='utf-8') as f:
+            core_philosophy = f.read()
+        print("Core Philosophy loaded successfully.")
+    except FileNotFoundError:
+        print("Warning: core_philosophy.md not found. Proceeding without it.")
+        core_philosophy = "Default philosophy: Be empathetic and supportive." # Fallback
+    
+    print("--- All models loaded successfully! ---")
+
+
+# --- 2. Flask App Setup ---
+app = Flask(__name__)
+# Enable CORS to allow requests from the frontend
+CORS(app)
+
+@app.route('/rpc', methods=['POST'])
+def rpc_handler():
+    """Handles JSON-RPC requests."""
+    try:
+        data = request.get_json()
+        
+        # Basic JSON-RPC validation
+        if data.get('jsonrpc') != '2.0' or 'method' not in data or 'id' not in data:
+            return jsonify({
+                "jsonrpc": "2.0",
+                "error": {"code": -32600, "message": "Invalid Request"},
+                "id": data.get('id', None)
+            }), 400
+
+        if data['method'] == 'getEmotionContext':
+            # --- Prediction Logic ---
+            expression = data['params']['expression']
+            
+            # 1. Create embedding for the input text
+            input_embedding = embedding_model.encode([expression], convert_to_tensor=True, device=device) # Ensure embedding is on device
+            
+            # 2. Get model predictions
+            with torch.no_grad():
+                cluster_output, core_output = path_finder_model(input_embedding)
+
+            # 3. Decode Cluster prediction
+            cluster_probs = torch.softmax(cluster_output, dim=1)
+            top_cluster_prob, top_cluster_idx = torch.max(cluster_probs, dim=1)
+            predicted_cluster = cluster_encoder.inverse_transform(top_cluster_idx.cpu().numpy())[0]
+            cluster_confidence = top_cluster_prob.item()
+
+            # 4. Decode Core predictions
+            core_probs = torch.sigmoid(core_output).squeeze()
+            # Get core emotions with a probability > 30%
+            core_threshold = 0.3
+            predicted_core_indices = (core_probs > core_threshold).nonzero(as_tuple=True)[0]
+            
+            core_results = []
+            if len(predicted_core_indices) > 0:
+                for idx in predicted_core_indices:
+                    label = core_mlb.classes_[idx]
+                    score = core_probs[idx].item()
+                    core_results.append(f"{label} ({score:.2f})")
+            
+            # 5. Format the response by calling the generative LLM
+            try:
+                # Load API key for the generative call
+                api_key = os.environ.get("ANTHROPIC_API_KEY")
+                if not api_key:
+                    raise ValueError("ANTHROPIC_API_KEY environment variable not set for generative call.")
+                
+                anthropic_client = anthropic.Anthropic(api_key=api_key)
+
+                # Prepare context for the generative prompt
+                core_emotion_str = ", ".join(core_results) if core_results else "not clearly defined"
+                lang = data.get('params', {}).get('lang', 'en')
+                output_lang = "Korean" if lang == 'ko' else "English"
+
+
+                prompt = f"""You are Nea, a deeply empathetic AI assistant. Your core philosophy is as follows:
+---
+{core_philosophy}
+---
+
+Your goal is to provide warm, supportive, and insightful responses that are consistent with this philosophy. Be concise, but always complete your thought or sentence.
+
+A user has just shared something with you. Your internal emotion analysis module has provided the following context:
+- User's raw text: "{expression}"
+- Predicted primary emotion (Cluster): "{predicted_cluster}"
+- Influencing core emotions: "{core_emotion_str}"
+
+Based on this context AND your core philosophy, your task is to craft a thoughtful, natural, and non-repetitive response to the user. Speak directly to the user. Do not mention the internal analysis or your philosophy.
+
+Generate the response in {output_lang}.
+
+Your response:"""
+
+                message = anthropic_client.messages.create(
+                    model="claude-sonnet-4-5-20250929", # Updated to the working model ID
+                    max_tokens=1024, # Adjusted max_tokens for complete responses
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                responseText = message.content[0].text
+
+            except Exception as e:
+                print(f"LLM Generative call failed: {e}")
+                # Fallback to simple label display if LLM call fails
+                if not core_results:
+                    responseText = f"Predicted Emotion: {predicted_cluster} (Confidence: {cluster_confidence:.2f})\nNo specific core emotions detected."
+                else:
+                    responseText = f"Predicted Emotion: {predicted_cluster}\nCore Influences: {', '.join(core_results)}"
+
+            # 6. Construct JSON-RPC response
+            response = {
+                "jsonrpc": "2.0",
+                "result": {
+                    "responseText": responseText
+                },
+                "id": data['id']
+            }
+            return jsonify(response)
+
+        else:
+            return jsonify({
+                "jsonrpc": "2.0",
+                "error": {"code": -32601, "message": "Method not found"},
+                "id": data['id']
+            }), 404
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return jsonify({
+            "jsonrpc": "2.0",
+            "error": {"code": -32000, "message": f"Server error: {e}"},
+            "id": data.get('id' if 'data' in locals() else None)
+        }), 500
+
+
+if __name__ == '__main__':
+    load_models()
+    # Run the app on port 5000
+    app.run(port=5000, debug=True)
