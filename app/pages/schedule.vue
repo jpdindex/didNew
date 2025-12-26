@@ -1,6 +1,16 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 
+필요한 데이터 코드들 
+
+fm_formation (포메이션 문자열 ex.4-3-3)
+gi_part (경기장 진영 선택 L/R)
+gi_part_ex (연장 들어갈 경우 진영 재선택)
+gp_id (선수 아이디)
+gp_tap / gp_ttp / gp_sht / gp_gol / gp_asr / gp_ssr / gp_tmp / gp_ctp (왼쪽 양팀 스탯란에 필요한 리스트들)
+
+
+
 type MatchItem = {
   id: string
   time: string
