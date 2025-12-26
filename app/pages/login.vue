@@ -1,9 +1,31 @@
+<script setup lang="ts">
+import { ref } from 'vue'
+
+const uId = ref('')
+const uPw = ref('')
+const saveId = ref(true)
+const autoLogin = ref(false)
+const message = ref('')
+
+const goSchedule = async () => {
+  // 지금은 검증 없이 이동만
+  await navigateTo('/schedule')
+}
+
+// 지금은 남겨두기(나중에 진짜 로그인 붙일 때 사용)
+function onSubmit() {
+  if (!uId.value || !uPw.value) {
+    message.value = 'ID / PASSWORD 를 입력해줘.'
+    return
+  }
+  message.value = `입력됨: ${uId.value} (연동은 다음 단계)`
+}
+</script>
+
 <template>
   <div class="page">
-    <!-- 배경(스타디움 느낌) -->
     <div class="bg" />
 
-    <!-- 중앙 로그인 카드 -->
     <div class="card">
       <div class="brand">
         <div class="brandTop">AIMBROAD</div>
@@ -18,6 +40,7 @@
           placeholder="ID"
           autocomplete="username"
         />
+
         <div class="row">
           <input
             v-model="uPw"
@@ -25,9 +48,10 @@
             type="password"
             placeholder="PASSWORD"
             autocomplete="current-password"
-            @keyup.enter="onSubmit"
+            @keyup.enter="goSchedule"
           />
-          <button class="lockBtn" @click="onSubmit" aria-label="Login">
+
+          <button class="lockBtn" @click="goSchedule" aria-label="Login">
             🔒
           </button>
         </div>
@@ -37,6 +61,7 @@
             <input v-model="saveId" type="checkbox" />
             <span>아이디 저장</span>
           </label>
+
           <label class="check">
             <input v-model="autoLogin" type="checkbox" />
             <span>자동로그인</span>
@@ -49,27 +74,7 @@
   </div>
 </template>
 
-<script setup lang="ts">
-import { ref } from 'vue'
-
-const uId = ref('')
-const uPw = ref('')
-const saveId = ref(true)
-const autoLogin = ref(false)
-const message = ref('')
-
-// 지금은 “화면”만. 연동은 다음 단계에서.
-function onSubmit() {
-  if (!uId.value || !uPw.value) {
-    message.value = 'ID / PASSWORD 를 입력해줘.'
-    return
-  }
-  message.value = `입력됨: ${uId.value} (연동은 다음 단계)`
-}
-</script>
-
 <style scoped>
-/* iPad 기준: 가로 1024~1366을 상정 */
 .page {
   min-height: 100vh;
   display: grid;
@@ -79,7 +84,6 @@ function onSubmit() {
   background: #0b0f17;
 }
 
-/* 배경: 어두운 경기장 느낌(이미지 없이도 그럴듯하게) */
 .bg {
   position: absolute;
   inset: 0;
@@ -91,7 +95,6 @@ function onSubmit() {
   filter: saturate(1.1);
 }
 
-/* 로그인 카드 */
 .card {
   position: relative;
   width: min(920px, 92vw);
@@ -107,7 +110,6 @@ function onSubmit() {
   backdrop-filter: blur(8px);
 }
 
-/* 좌측 로고 영역 */
 .brand {
   display: grid;
   place-content: center;
@@ -121,13 +123,6 @@ function onSubmit() {
   font-weight: 700;
   font-size: 18px;
 }
-.brandMain {
-  color: #ffffff;
-  font-weight: 800;
-  font-size: 88px;
-  line-height: 1;
-  margin-top: 6px;
-}
 .brandSub {
   margin-top: 10px;
   color: rgba(255,255,255,0.65);
@@ -135,7 +130,6 @@ function onSubmit() {
   letter-spacing: 0.18em;
 }
 
-/* 우측 폼 영역 */
 .form {
   display: grid;
   align-content: center;
@@ -170,7 +164,7 @@ function onSubmit() {
   height: 46px;
   border-radius: 4px;
   border: none;
-  background: #f1b400; /* 레거시 느낌의 옐로우 */
+  background: #f1b400;
   color: #111;
   font-size: 18px;
   cursor: pointer;
@@ -200,7 +194,6 @@ function onSubmit() {
   font-size: 14px;
 }
 
-/* 작은 화면 대응 */
 @media (max-width: 860px) {
   .card {
     grid-template-columns: 1fr;
