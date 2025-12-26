@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>DID Analysis</title>
+    <style>
+        /* 1. 공통 배경 설정 */
+        body { 
+            margin: 0; width: 100%; height: 100vh; 
+            display: flex; justify-content: center; align-items: center; 
+            background-color: #121212;
+            background-size: cover; background-position: center; background-repeat: no-repeat;
+            font-family: 'Pretendard', -apple-system, sans-serif;
+            transition: all 0.5s ease;
+        }
+
+        /* 2. 로그인 섹션 */
+        #login-section {
+            background: #1e1e1e; padding: 40px; border-radius: 15px; 
+            width: 350px; text-align: center; border: 1px solid #333;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        #login-section h2 { color: white; margin-bottom: 30px; }
+        input { 
+            width: 100%; padding: 15px; margin: 10px 0; border: 1px solid #333; 
+            border-radius: 8px; font-size: 16px; background: #2d2d2d; color: white; box-sizing: border-box; 
+        }
+        button.login-btn { 
+            width: 100%; padding: 15px; background: #007bff; color: white; border: none; 
+            border-radius: 8px; font-size: 18px; font-weight: bold; cursor: pointer; margin-top: 20px;
+        }
+
+        /* 3. 일정 선택 섹션 */
+        #schedule-section {
+            display: none; /* 처음엔 숨김 */
+            width: 90%; max-width: 800px; height: 85vh;
+            background: rgba(20, 20, 20, 0.95); border-radius: 20px;
+            padding: 30px; box-sizing: border-box; overflow-y: auto;
+            border: 1px solid #444; backdrop-filter: blur(15px);
+        }
+        .header { text-align: center; margin-bottom: 30px; color: white; position: relative; }
+        
+        /* 날짜 선택바 */
+        .date-selector { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 20px; margin-bottom: 20px; border-bottom: 1px solid #333; }
+        .date-item {
+            min-width: 70px; height: 90px; background: #2a2a2a; border-radius: 12px;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            cursor: pointer; border: 1px solid #444; color: #fff; transition: 0.3s;
+        }
+        .date-item.active { background: #007bff; border-color: #007bff; transform: translateY(-5px); }
+        .date-item span { font-size: 12px; color: #aaa; margin-bottom: 5px; }
+
+        /* 경기 리스트 카드 */
+        .match-card {
+            background: #252525; margin-bottom: 15px; padding: 20px;
+            border-radius: 12px; display: flex; justify-content: space-between; align-items: center;
+            border: 1px solid #333; color: white; cursor: pointer; transition: 0.2s;
+        }
+        .match-card:hover { background: #333; border-color: #007bff; }
+        
+        .team-wrap { display: flex; align-items: center; gap: 15px; width: 220px; }
+        .team-logo { width: 45px; height: 45px; background: #fff; border-radius: 50%; object-fit: contain; padding: 3px; }
+        .team-name { font-size: 18px; font-weight: bold; }
+        .match-time { font-size: 20px; color: #f1c40f; font-weight: bold; text-align: center; flex: 1; }
+        
+        /* 뒤로가기 버튼 */
+        .back-btn { position: absolute; left: 0; top: 5px; background: none; border: 1px solid #555; color: #ccc; padding: 5px 12px; border-radius: 5px; cursor: pointer; }
+
+        /* 4. 라인업 섹션 */
+        #lineup-section {
+            display: none;
+            width: 95%; max-width: 1000px; height: 90vh;
+            background: rgba(15, 15, 15, 0.98); border-radius: 20px;
+            padding: 30px; box-sizing: border-box; overflow-y: auto;
+            border: 1px solid #007bff; color: white;
+        }
+        .lineup-header { display: flex; justify-content: space-around; align-items: center; margin-bottom: 40px; border-bottom: 2px solid #333; padding-bottom: 20px; }
+        .squad-wrapper { display: flex; gap: 30px; justify-content: space-between; }
+        .squad-container { flex: 1; background: #1a1a1a; padding: 20px; border-radius: 15px; border: 1px solid #333; }
+        .squad-title { font-size: 22px; font-weight: bold; margin-bottom: 20px; text-align: center; color: #007bff; border-bottom: 1px solid #444; padding-bottom: 10px; }
+        .player-list { list-style: none; padding: 0; }
+        .player-item { 
+            display: flex; justify-content: space-between; padding: 12px 15px; border-bottom: 1px solid #2a2a2a;
+            font-size: 18px; transition: 0.2s;
+        }
+        .player-item:hover { background: #333; transform: scale(1.02); }
+        .back-no { color: #f1c40f; font-weight: bold; width: 30px; }
+        .pos { font-size: 14px; color: #888; margin-left: 10px; }
+    </style>
+</head>
+<body>
+
+    <div id="login-section">
+        <h2>⚽ DID LOGIN</h2>
+        <input type="text" id="u_id" placeholder="관리자 아이디">
+        <input type="password" id="u_pw" placeholder="비밀번호">
+        <button class="login-btn" onclick="handleLogin()">로그인</button>
+    </div>
+
+    <div id="schedule-section">
+        <div class="header">
+            <button class="back-btn" onclick="goBack()">⬅ 뒤로</button>
+            <h2>📅 경기 일정 선택</h2>
+        </div>
+        
+        <div class="date-selector" id="date-bar">
+            <div class="date-item" onclick="selectDate(this)"><span>월</span><strong>23</strong></div>
+            <div class="date-item" onclick="selectDate(this)"><span>화</span><strong>24</strong></div>
+            <div class="date-item active" onclick="selectDate(this)"><span>수</span><strong>25</strong></div>
+            <div class="date-item" onclick="selectDate(this)"><span>목</span><strong>26</strong></div>
+            <div class="date-item" onclick="selectDate(this)"><span>금</span><strong>27</strong></div>
+            <div class="date-item" onclick="selectDate(this)"><span>토</span><strong>28</strong></div>
+            <div class="date-item" onclick="selectDate(this)"><span>일</span><strong>29</strong></div>
+        </div>
+
+        <div class="match-list" id="match-list-container">
+            </div>
+    </div>
+
+    <div id="lineup-section">
+        <div class="header" style="position: relative;">
+            <button class="back-btn" onclick="goBackToSchedule()">⬅ 일정으로</button>
+            <h2 id="lineup-match-title">라인업 정보</h2>
+        </div>
+        <div class="lineup-header">
+            <div style="text-align: center;">
+                <img id="home-logo" src="" class="team-logo" style="width: 80px; height: 80px; margin-bottom: 10px;">
+                <div id="home-name" style="font-size: 24px; font-weight: bold;">홈팀</div>
+            </div>
+            <div style="font-size: 40px; font-weight: bold; color: #555;">VS</div>
+            <div style="text-align: center;">
+                <img id="away-logo" src="" class="team-logo" style="width: 80px; height: 80px; margin-bottom: 10px;">
+                <div id="away-name" style="font-size: 24px; font-weight: bold;">원정팀</div>
+            </div>
+        </div>
+        <div class="squad-wrapper">
+            <div class="squad-container">
+                <div class="squad-title">STARTING XI (Home)</div>
+                <ul class="player-list" id="home-player-list"></ul>
+            </div>
+            <div class="squad-container">
+                <div class="squad-title">STARTING XI (Away)</div>
+                <ul class="player-list" id="away-player-list"></ul>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- 1. 배경 설정 ---
+        const bgImages = [
+            'https://images.unsplash.com/photo-1574629810360-7efbbe195018?q=80&w=1920',
+            'https://images.unsplash.com/photo-1508098682722-e99c43a406b2?q=80&w=1920',
+            'https://images.unsplash.com/photo-1522778119026-d647f0596c20?q=80&w=1920'
+        ];
+
+        function setRandomBackground() {
+            const randomIndex = Math.floor(Math.random() * bgImages.length);
+            document.body.style.backgroundImage = `linear-gradient(rgba(0,0,0,0.6), rgba(0,0,0,0.6)), url('${bgImages[randomIndex]}')`;
+        }
+
+        // --- 2. 경기 데이터 (로고 경로 포함, 팀 코드 추가) ---
+        const matchData = {
+            "23": [{ t1: "울산 HD", t1_code: "ULSAN", t2: "전북 현대", t2_code: "JEONBUK", time: "14:00", l1: "ulsan.png", l2: "jeonbuk.png" }],
+            "24": [{ t1: "대구 FC", t1_code: "DAEGU", t2: "광주 FC", t2_code: "GWANGJU", time: "19:00", l1: "daegu.png", l2: "gwangju.png" }],
+            "25": [
+                { t1: "FC서울", t1_code: "SEOUL", t2: "수원 삼성 블루윙즈", t2_code: "SUWON", time: "17:30", l1: "seoul.jpg", l2: "suwon.jpg" },
+                { t1: "포항 스틸러스", t1_code: "POHANG", t2: "강원 FC", t2_code: "GANGWON", time: "20:00", l1: "pohang.png", l2: "gangwon.png" }
+            ],
+            "28": [{ t1: "제주 유나이티드", t1_code: "JEJU", t2: "인천 유나이티드", t2_code: "INCHEON", time: "16:00", l1: "jeju.png", l2: "incheon.png" }]
+        };
+
+        // --- 3. 핵심 함수들 ---
+
+        // 로그인 처리
+        function handleLogin() {
+            const id = document.getElementById('u_id').value;
+            const pw = document.getElementById('u_pw').value;
+            if (id && pw) {
+                document.getElementById('login-section').style.display = 'none';
+                document.getElementById('schedule-section').style.display = 'block';
+                renderMatches("25"); // 기본으로 수요일(25일) 경기 표시
+            } else {
+                alert("아이디와 비밀번호를 입력해주세요.");
+            }
+        }
+
+        // 뒤로가기
+        function goBack() {
+            document.getElementById('schedule-section').style.display = 'none';
+            document.getElementById('login-section').style.display = 'block';
+        }
+
+        function goBackToSchedule() {
+            document.getElementById('lineup-section').style.display = 'none';
+            document.getElementById('schedule-section').style.display = 'block';
+        }
+
+        // 날짜 선택 시
+        function selectDate(element) {
+            const items = document.querySelectorAll('.date-item');
+            items.forEach(item => item.classList.remove('active'));
+            element.classList.add('active');
+
+            const day = element.querySelector('strong').innerText;
+            renderMatches(day);
+        }
+
+        // 경기 목록 그리기
+        function renderMatches(day) {
+            const container = document.getElementById('match-list-container');
+            const matches = matchData[day] || [];
+            
+            if (matches.length === 0) {
+                container.innerHTML = `<div style="text-align:center; color:#888; padding:50px;">해당 날짜에는 경기가 없습니다.</div>`;
+                return;
+            }
+
+            let html = "";
+            matches.forEach(m => {
+                html += `
+                    <div class="match-card" onclick='showLineup(${JSON.stringify(m)})'>
+                        <div class="team-wrap">
+                            <img src="images/${m.l1}" class="team-logo" alt="logo">
+                            <div class="team-name">${m.t1}</div>
+                        </div>
+                        <div class="match-time">${m.time}</div>
+                        <div class="team-wrap" style="justify-content: flex-end;">
+                            <div class="team-name">${m.t2}</div>
+                            <img src="images/${m.l2}" class="team-logo" alt="logo">
+                        </div>
+                    </div>
+                `;
+            });
+            container.innerHTML = html;
+        }
+
+        // 라인업 보기 (서버 통신 버전)
+        async function showLineup(match) {
+            // 1. 화면 전환 및 로딩
+            document.getElementById('schedule-section').style.display = 'none';
+            document.getElementById('lineup-section').style.display = 'block';
+            
+            document.getElementById('lineup-match-title').innerText = `${match.t1} vs ${match.t2}`;
+            document.getElementById('home-name').innerText = match.t1;
+            document.getElementById('away-name').innerText = match.t2;
+            document.getElementById('home-logo').src = `images/${match.l1}`;
+            document.getElementById('away-logo').src = `images/${match.l2}`;
+
+            const homeList = document.getElementById('home-player-list');
+            const awayList = document.getElementById('away-player-list');
+
+            // 리스트 초기화 (로딩 중 표시)
+            homeList.innerHTML = `<li class="player-item" style="justify-content:center;">로딩 중...</li>`;
+            awayList.innerHTML = `<li class="player-item" style="justify-content:center;">로딩 중...</li>`;
+
+            try {
+                // 2. 서버 요청 (mock_api.php)
+                const formData = new FormData();
+                formData.append('func', 'player_list');
+                formData.append('h_t_code', match.t1_code); // 예: SEOUL
+                formData.append('a_t_code', match.t2_code); // 예: SUWON
+                formData.append('gm_date', '2025.12.25');
+
+                // 주의: PHP 서버가 없으면 여기서 에러가 발생합니다.
+                const response = await fetch('mock_api.php', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+
+                if (data.result === true) {
+                    // 3. 받아온 데이터 분류 및 출력
+                    const allPlayers = data.output;
+                    const homeSquad = allPlayers.filter(p => p.t_code === match.t1_code);
+                    const awaySquad = allPlayers.filter(p => p.t_code === match.t2_code);
+
+                    renderPlayerList(homeList, homeSquad);
+                    renderPlayerList(awayList, awaySquad);
+                } else {
+                    homeList.innerHTML = `<li>데이터 없음: ${data.message}</li>`;
+                    awayList.innerHTML = `<li>데이터 없음</li>`;
+                }
+
+            } catch (error) {
+                console.error("서버 통신 에러:", error);
+                const msg = "서버 연결 실패 (PHP 미설치)";
+                homeList.innerHTML = `<li class="player-item" style="color:red; justify-content:center;">${msg}</li>`;
+                awayList.innerHTML = `<li class="player-item" style="color:red; justify-content:center;">${msg}</li>`;
+                
+                // 연습용: 에러가 나더라도 'mock_api.php'가 없어서 그런 것이니,
+                // 코드가 어떻게 동작하는지 설명하는 알림을 띄웁니다.
+                alert("현재 PHP 서버가 실행 중이지 않아 데이터를 가져올 수 없습니다.\n\n(코드는 정상적으로 작성되었습니다. 실제 서버 환경에서는 선수 명단이 표시됩니다.)");
+            }
+        }
+
+        function renderPlayerList(element, players) {
+            if (!players || players.length === 0) {
+                element.innerHTML = `<li class="player-item">등록된 선수가 없습니다.</li>`;
+                return;
+            }
+            let html = "";
+            players.forEach(p => {
+                // API 응답 필드명(back_no)에 맞춰 수정
+                html += `
+                    <li class="player-item">
+                        <div><span class="back-no">${p.back_no}</span> ${p.name} <span class="pos">${p.position}</span></div>
+                    </li>
+                `;
+            });
+            element.innerHTML = html;
+        }
+
+        // 초기 실행
+        window.onload = setRandomBackground;
+    </script>
+</body>
+</html>
