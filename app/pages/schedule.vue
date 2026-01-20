@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 
+
+
+// Db 에서 불러와야 할 목록
+// ff_user. ]anjanjanjanj
+
 type MatchItem = {
   id: string
   time: string
