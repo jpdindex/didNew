@@ -8,15 +8,15 @@ const date = computed(() => String(route.query.date ?? ''))
 const matchId = computed(() => String(route.query.matchId ?? ''))
 const league = computed(() => String(route.query.league ?? ''))
 
-// 더미(나중에 API로 교체)
+// schedule.vue에서 넘겨준 값 그대로 사용 (아직 목데이터라 없을 때만 기본값)
 const match = computed(() => ({
   date: date.value || '2024-12-15',
-  time: '12:00',
+  time: String(route.query.time ?? '12:00'),
   league: league.value || 'LALIGA',
-  round: '17R',
-  stadium: 'Fubol de Vallecas',
-  home: 'Vallecano',
-  away: 'Real Madrid',
+  round: String(route.query.round ?? '17R'),
+  stadium: String(route.query.stadium ?? 'Fubol de Vallecas'),
+  home: String(route.query.home ?? 'Vallecano'),
+  away: String(route.query.away ?? 'Real Madrid'),
   scoreHome: 0,
   scoreAway: 0,
   statusKo: '준비중',
@@ -28,9 +28,14 @@ const match = computed(() => ({
     <div class="bg" />
 
     <div class="frame">
+      <div class="topBar">
+        <button class="backBtn" @click="navigateTo('/schedule')">← 이전화면으로</button>
+        <div class="date">{{ match.date }}</div>
+      </div>
+
+      <div class="body">
       <!-- LEFT PANEL (① 영역) -->
       <aside class="left">
-        <div class="date">{{ match.date }}</div>
 
         <div class="matchBox">
           <div class="teams">
@@ -54,14 +59,12 @@ const match = computed(() => ({
         </div>
 
         <div class="kpiList">
-          <div class="kpiRow" v-for="k in ['TMP','TAP','CTP','Shoot','ASR','GSR','SSR','BAP']" :key="k">
+          <div class="kpiRow" v-for="k in ['TAP','DAP','DTP','Shoot','ASR','GSR','SSR','BAP']" :key="k">
             <div class="kpiVal">0</div>
             <div class="kpiKey">{{ k }}</div>
             <div class="kpiVal">0</div>
           </div>
         </div>
-
-        <button class="backBtn" @click="navigateTo('/schedule')">← 이전화면으로</button>
       </aside>
 
       <!-- MAIN -->
@@ -128,12 +131,20 @@ const match = computed(() => ({
           </section>
         </div>
       </main>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.page { min-height: 100vh; display: grid; place-items: center; position: relative; overflow: hidden; background: #0b0f17; }
+.page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  position: relative;
+  overflow: hidden;
+  background: #0b0f17;
+}
 .bg {
   position: absolute; inset: 0;
   background:
@@ -145,136 +156,181 @@ const match = computed(() => ({
 
 .frame {
   width: min(1260px, 96vw);
-  height: min(660px, 86vh);
+  height: min(700px, 82vh);
   border-radius: 10px;
   background: rgba(10, 14, 22, 0.78);
   border: 1px solid rgba(255,255,255,0.08);
   box-shadow: 0 18px 60px rgba(0,0,0,0.55);
   backdrop-filter: blur(8px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.topBar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 260px 1fr;
   overflow: hidden;
 }
 
 .left {
+  min-height: 0;
+  overflow: hidden;
   border-right: 1px solid rgba(255,255,255,0.06);
-  padding: 14px;
-  display: grid;
-  grid-template-rows: 32px auto auto 1fr;
-  gap: 10px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-.date { color: rgba(255,255,255,0.85); font-weight: 900; font-size: 18px; }
+.date { color: rgba(255,255,255,0.85); font-weight: 900; font-size: 16px; }
 
 .matchBox {
+  flex: 0 0 auto;
   border: 1px solid rgba(255,255,255,0.08);
   background: rgba(255,255,255,0.03);
   border-radius: 6px;
-  padding: 12px;
+  padding: 10px;
 }
-.teams { display: grid; grid-template-columns: 1fr 44px 1fr; gap: 6px; align-items: center; }
-.team { color: rgba(255,255,255,0.85); font-weight: 800; }
-.vs { color: rgba(255,255,255,0.55); text-align: center; font-weight: 900; }
-.score { margin-top: 10px; color: rgba(255,255,255,0.9); font-weight: 900; font-size: 26px; text-align: center; }
+.teams { display: grid; grid-template-columns: 1fr 40px 1fr; gap: 6px; align-items: center; }
+.team { color: rgba(255,255,255,0.85); font-weight: 800; font-size: 13px; }
+.vs { color: rgba(255,255,255,0.55); text-align: center; font-weight: 900; font-size: 12px; }
+.score { margin-top: 6px; color: rgba(255,255,255,0.9); font-weight: 900; font-size: 22px; text-align: center; }
 .colon { margin: 0 8px; color: rgba(255,255,255,0.55); }
-.status { margin-top: 6px; color: rgba(241,180,0,0.95); text-align: center; font-weight: 800; }
-.meta { margin-top: 10px; color: rgba(255,255,255,0.45); font-size: 12px; line-height: 1.35; text-align: center; }
+.status { margin-top: 4px; color: rgba(241,180,0,0.95); text-align: center; font-weight: 800; font-size: 13px; }
+.meta { margin-top: 6px; color: rgba(255,255,255,0.45); font-size: 11px; line-height: 1.3; text-align: center; }
 
 .kpiList {
+  flex: 1;
+  min-height: 0;
   border: 1px solid rgba(255,255,255,0.08);
   background: rgba(255,255,255,0.02);
   border-radius: 6px;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 .kpiRow {
+  flex: 1;
   display: grid;
-  grid-template-columns: 52px 1fr 52px;
+  grid-template-columns: 44px 1fr 44px;
   border-top: 1px solid rgba(255,255,255,0.06);
-  height: 34px;
   align-items: center;
+  min-height: 0;
 }
 .kpiRow:first-child { border-top: none; }
-.kpiVal { color: rgba(255,255,255,0.7); text-align: center; font-weight: 800; }
-.kpiKey { color: rgba(255,255,255,0.55); text-align: center; font-weight: 800; font-size: 12px; letter-spacing: 0.06em; }
+.kpiVal { color: rgba(255,255,255,0.7); text-align: center; font-weight: 800; font-size: 13px; }
+.kpiKey { color: rgba(255,255,255,0.55); text-align: center; font-weight: 800; font-size: 11px; letter-spacing: 0.06em; }
 
 .backBtn {
-  align-self: end;
-  height: 36px;
+  flex: 0 0 auto;
+  height: 30px;
+  padding: 0 12px;
   border-radius: 4px;
   border: 1px solid rgba(255,255,255,0.10);
   background: rgba(255,255,255,0.02);
   color: rgba(255,255,255,0.75);
+  font-size: 13px;
   cursor: pointer;
 }
 
-.main { padding: 14px; display: grid; grid-template-rows: 40px 1fr; gap: 10px; }
-.header { display: grid; place-items: center; color: rgba(255,255,255,0.85); font-weight: 900; font-size: 20px; }
+.main {
+  min-height: 0;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+}
+.header { flex: 0 0 auto; display: grid; place-items: center; color: rgba(255,255,255,0.85); font-weight: 900; font-size: 16px; }
 
 .grid {
+  flex: 1;
+  min-height: 0;
   display: grid;
   grid-template-columns: 1.1fr 1fr;
-  grid-template-rows: 1fr 170px;
-  gap: 12px;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 96px);
+  gap: 8px;
 }
 
 .formation, .players, .time, .start {
+  min-height: 0;
+  overflow: hidden;
   border: 1px solid rgba(255,255,255,0.08);
   background: rgba(255,255,255,0.03);
   border-radius: 6px;
-  padding: 12px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
 }
 
 .selectBar {
-  height: 34px;
+  flex: 0 0 auto;
+  height: 28px;
   border-radius: 4px;
   border: 1px solid rgba(255,255,255,0.10);
   background: rgba(255,255,255,0.04);
   display: grid;
-  grid-template-columns: 1fr 36px;
+  grid-template-columns: 1fr 30px;
   align-items: center;
   padding: 0 10px;
   color: rgba(255,255,255,0.7);
   font-weight: 700;
+  font-size: 13px;
 }
 .caret { text-align: center; color: rgba(255,255,255,0.55); }
 
 .pitch {
-  margin-top: 12px;
-  height: 260px;
+  flex: 1;
+  min-height: 0;
+  margin-top: 8px;
   border-radius: 6px;
   border: 1px solid rgba(255,255,255,0.08);
   background: rgba(0,0,0,0.12);
   position: relative;
   overflow: hidden;
 }
-.shirt { position: absolute; left: 50%; top: 46%; transform: translate(-50%,-50%); font-size: 32px; opacity: 0.9; }
-.dots { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); display: flex; gap: 10px; }
-.dot { width: 28px; height: 28px; border-radius: 50%; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.10); }
-.count { position: absolute; right: 12px; bottom: 12px; color: rgba(241,180,0,0.9); font-weight: 900; }
+.shirt { position: absolute; left: 50%; top: 46%; transform: translate(-50%,-50%); font-size: 28px; opacity: 0.9; }
+.dots { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); display: flex; gap: 8px; }
+.dot { width: 22px; height: 22px; border-radius: 50%; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.10); }
+.count { position: absolute; right: 10px; bottom: 8px; color: rgba(241,180,0,0.9); font-weight: 900; font-size: 13px; }
 
-.mini { margin-top: 12px; }
-.miniTitle { color: rgba(255,255,255,0.7); font-weight: 800; margin-bottom: 8px; }
-.miniBox { height: 72px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.08); background: rgba(0,0,0,0.10); }
+.mini { flex: 0 0 auto; margin-top: 8px; }
+.miniTitle { color: rgba(255,255,255,0.7); font-weight: 800; margin-bottom: 6px; font-size: 13px; }
+.miniBox { height: 44px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.08); background: rgba(0,0,0,0.10); }
 
-.tabs { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.tabs { flex: 0 0 auto; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
 .tab {
-  height: 30px; border-radius: 4px;
+  height: 26px; border-radius: 4px;
   border: 1px solid rgba(255,255,255,0.10);
   background: rgba(255,255,255,0.02);
   color: rgba(255,255,255,0.6);
   display: grid; place-items: center;
-  font-weight: 800; font-size: 12px;
+  font-weight: 800; font-size: 11px;
 }
 .tab.on { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.85); }
 
 .table {
-  margin-top: 10px;
+  flex: 1;
+  min-height: 0;
+  margin-top: 8px;
   display: grid;
   grid-template-columns: repeat(5, 1fr);
-  gap: 6px;
+  grid-auto-rows: minmax(0, 1fr);
+  gap: 4px;
 }
 .cell {
-  height: 46px;
   border-radius: 4px;
   border: 1px solid rgba(255,255,255,0.08);
   background: rgba(0,0,0,0.10);
@@ -282,45 +338,48 @@ const match = computed(() => ({
 }
 .num {
   position: absolute;
-  left: 10px; top: 10px;
+  left: 8px; top: 6px;
   color: rgba(255,255,255,0.75);
   font-weight: 900;
+  font-size: 12px;
 }
-.legend { margin-top: 10px; display: flex; justify-content: flex-end; gap: 8px; }
+.legend { flex: 0 0 auto; margin-top: 6px; display: flex; justify-content: flex-end; gap: 6px; }
 .legend .pill {
-  height: 22px; padding: 0 10px;
+  height: 20px; padding: 0 8px;
   border-radius: 4px;
   border: 1px solid rgba(255,255,255,0.10);
   background: rgba(255,255,255,0.04);
   color: rgba(255,255,255,0.7);
-  font-size: 12px;
+  font-size: 11px;
   display: inline-flex; align-items: center;
 }
 
-.timeTitle { color: rgba(255,255,255,0.8); font-weight: 900; margin-bottom: 10px; }
+.timeTitle { flex: 0 0 auto; color: rgba(255,255,255,0.8); font-weight: 900; margin-bottom: 6px; font-size: 13px; }
 .timeBox {
-  height: 110px;
+  flex: 1;
+  min-height: 0;
   border-radius: 6px;
   border: 1px solid rgba(255,255,255,0.08);
   background: rgba(0,0,0,0.10);
   display: grid;
   align-content: center;
   justify-items: center;
-  gap: 10px;
+  gap: 4px;
 }
-.timeBox .hint { color: rgba(255,255,255,0.45); font-size: 12px; }
-.clock { color: rgba(255,255,255,0.85); font-weight: 900; font-size: 42px; letter-spacing: 0.06em; }
+.timeBox .hint { color: rgba(255,255,255,0.45); font-size: 10px; text-align: center; padding: 0 6px; }
+.clock { color: rgba(255,255,255,0.85); font-weight: 900; font-size: 26px; letter-spacing: 0.06em; }
 
-.startHint { color: rgba(255,255,255,0.75); text-align: center; line-height: 1.5; }
+.startHint { flex: 0 0 auto; color: rgba(255,255,255,0.75); text-align: center; line-height: 1.4; font-size: 12px; }
 .startHint b { color: rgba(241,180,0,0.95); }
 .startBtn {
-  margin-top: 12px;
+  flex: 0 0 auto;
+  margin-top: 8px;
   width: 100%;
-  height: 44px;
+  height: 34px;
   border-radius: 4px;
   border: 1px solid rgba(255,255,255,0.10);
   background: rgba(255,255,255,0.04);
   color: rgba(255,255,255,0.35);
 }
-.small { margin-top: 10px; color: rgba(255,255,255,0.35); font-size: 12px; text-align: center; }
+.small { flex: 0 0 auto; margin-top: 6px; color: rgba(255,255,255,0.35); font-size: 11px; text-align: center; }
 </style>

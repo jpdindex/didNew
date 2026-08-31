@@ -1,5 +1,13 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { signOut } from 'firebase/auth'
+
+const { $auth } = useNuxtApp()
+
+async function logout() {
+  await signOut($auth)
+  await navigateTo('/login')
+}
 
 
 
@@ -130,6 +138,11 @@ async function goTeamSelection(match?: MatchItem) {
       date: selectedDate.value,
       matchId: m.id,
       league: m.league,
+      round: m.round,
+      stadium: m.stadium,
+      time: m.time,
+      home: m.home.name,
+      away: m.away.name,
     },
   })
 }
@@ -152,7 +165,11 @@ function onCancel() {
     <div class="frame">
       <div class="topBar">
         <div class="title">경기일자와 경기를 선택해주세요</div>
-        <div class="meta">did.matchison.com · v0.8.17</div>
+        <div class="topRight">
+          <div class="meta">did.matchison.com · v0.8.17</div>
+          <NuxtLink class="manageBtn" to="/manage">데이터 관리</NuxtLink>
+          <button class="logoutBtn" @click="logout">로그아웃</button>
+        </div>
       </div>
 
       <div class="body">
@@ -275,7 +292,34 @@ function onCancel() {
   border-bottom: 1px solid rgba(255,255,255,0.06);
 }
 .title { color: rgba(255,255,255,0.85); font-weight: 700; letter-spacing: 0.02em; }
-.meta { position: absolute; right: 16px; color: rgba(255,255,255,0.35); font-size: 12px; }
+.topRight { position: absolute; right: 16px; display: flex; align-items: center; gap: 12px; }
+.meta { color: rgba(255,255,255,0.35); font-size: 12px; }
+.logoutBtn {
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 4px;
+  border: 1px solid rgba(255,255,255,0.15);
+  background: transparent;
+  color: rgba(255,255,255,0.65);
+  font-size: 12px;
+  cursor: pointer;
+}
+.logoutBtn:hover { background: rgba(255,255,255,0.08); color: #fff; }
+
+.manageBtn {
+  height: 26px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 4px;
+  border: 1px solid rgba(0,217,255,0.35);
+  background: rgba(0,217,255,0.08);
+  color: rgba(200,245,255,0.9);
+  font-size: 12px;
+  text-decoration: none;
+  cursor: pointer;
+}
+.manageBtn:hover { background: rgba(0,217,255,0.16); }
 
 .body { display: grid; grid-template-columns: 420px 1fr; }
 

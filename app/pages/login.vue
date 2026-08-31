@@ -1,24 +1,61 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
+import {
+  browserLocalPersistence,
+  browserSessionPersistence,
+  setPersistence,
+  signInWithEmailAndPassword
+} from 'firebase/auth'
+
+const SAVED_ID_KEY = 'did_saved_id'
 
 const uId = ref('')
 const uPw = ref('')
 const saveId = ref(true)
 const autoLogin = ref(false)
 const message = ref('')
+const loading = ref(false)
 
-const goSchedule = async () => {
-  // 지금은 검증 없이 이동만
-  await navigateTo('/schedule')
-}
+const { $auth } = useNuxtApp()
 
-// 지금은 남겨두기(나중에 진짜 로그인 붙일 때 사용)
-function onSubmit() {
+onMounted(() => {
+  const saved = localStorage.getItem(SAVED_ID_KEY)
+  if (saved) {
+    uId.value = saved
+    saveId.value = true
+  }
+})
+
+// Firebase Auth는 이메일 형식만 받는다. "@"가 포함된 값은 실제 이메일로 그대로 쓰고,
+// 짧은 ID만 입력한 경우엔 내부용 가짜 이메일로 변환한다.
+const toInternalEmail = (id: string) => (id.includes('@') ? id : `${id}@jpd-did.internal`)
+
+async function login() {
   if (!uId.value || !uPw.value) {
     message.value = 'ID / PASSWORD 를 입력해줘.'
     return
   }
-  message.value = `입력됨: ${uId.value} (연동은 다음 단계)`
+
+  loading.value = true
+  message.value = ''
+
+  try {
+    // 자동로그인 체크: 브라우저를 닫아도 세션 유지. 해제 시: 탭 닫으면 로그아웃.
+    await setPersistence($auth, autoLogin.value ? browserLocalPersistence : browserSessionPersistence)
+    await signInWithEmailAndPassword($auth, toInternalEmail(uId.value), uPw.value)
+
+    if (saveId.value) {
+      localStorage.setItem(SAVED_ID_KEY, uId.value)
+    } else {
+      localStorage.removeItem(SAVED_ID_KEY)
+    }
+
+    await navigateTo('/schedule')
+  } catch {
+    message.value = '아이디 또는 비밀번호가 일치하지 않습니다.'
+  } finally {
+    loading.value = false
+  }
 }
 </script>
 
@@ -48,10 +85,10 @@ function onSubmit() {
             type="password"
             placeholder="PASSWORD"
             autocomplete="current-password"
-            @keyup.enter="goSchedule"
+            @keyup.enter="login"
           />
 
-          <button class="lockBtn" @click="goSchedule" aria-label="Login">
+          <button class="lockBtn" :disabled="loading" @click="login" aria-label="Login">
             🔒
           </button>
         </div>
