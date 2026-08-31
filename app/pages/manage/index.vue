@@ -36,7 +36,9 @@ const menus = [
 
 <style scoped>
 .page {
-  min-height: 100vh;
+  box-sizing: border-box;
+  width: 1280px;
+  height: 800px;
   display: grid;
   place-items: center;
   position: relative;
@@ -53,9 +55,11 @@ const menus = [
 }
 
 .frame {
+  box-sizing: border-box;
   position: relative;
-  width: min(920px, 92vw);
-  border-radius: 10px;
+  width: 1280px;
+  height: 800px;
+  border-radius: 0;
   background: rgba(10, 14, 22, 0.75);
   border: 1px solid rgba(255,255,255,0.08);
   box-shadow: 0 18px 60px rgba(0,0,0,0.55);
@@ -114,7 +118,4 @@ const menus = [
   padding: 2px 6px;
 }
 
-@media (max-width: 720px) {
-  .grid { grid-template-columns: 1fr; }
-}
 </style>

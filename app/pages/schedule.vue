@@ -262,7 +262,7 @@ function onCancel() {
 </template>
 
 <style scoped>
-.page { min-height: 100vh; display: grid; place-items: center; position: relative; overflow: hidden; background: #0b0f17; }
+.page { box-sizing: border-box; width: 1280px; height: 800px; display: grid; place-items: center; position: relative; overflow: hidden; background: #0b0f17; }
 .bg {
   position: absolute; inset: 0;
   background:
@@ -273,10 +273,11 @@ function onCancel() {
 }
 
 .frame {
+  box-sizing: border-box;
   position: relative;
-  width: min(1180px, 96vw);
-  height: min(560px, 80vh);
-  border-radius: 10px;
+  width: 1280px;
+  height: 800px;
+  border-radius: 0;
   background: rgba(10, 14, 22, 0.78);
   border: 1px solid rgba(255,255,255,0.08);
   box-shadow: 0 18px 60px rgba(0,0,0,0.55);

@@ -113,7 +113,9 @@ async function login() {
 
 <style scoped>
 .page {
-  min-height: 100vh;
+  box-sizing: border-box;
+  width: 1280px;
+  height: 800px;
   display: grid;
   place-items: center;
   position: relative;
@@ -133,9 +135,10 @@ async function login() {
 }
 
 .card {
+  box-sizing: border-box;
   position: relative;
-  width: min(920px, 92vw);
-  height: min(420px, 70vh);
+  width: 673.3281px;
+  height: 393.3281px;
   display: grid;
   grid-template-columns: 1fr 1.2fr;
   gap: 24px;
@@ -231,16 +234,4 @@ async function login() {
   font-size: 14px;
 }
 
-@media (max-width: 860px) {
-  .card {
-    grid-template-columns: 1fr;
-    height: auto;
-  }
-  .brand {
-    border-right: none;
-    border-bottom: 1px solid rgba(255,255,255,0.08);
-    padding-right: 0;
-    padding-bottom: 16px;
-  }
-}
 </style>
