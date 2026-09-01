@@ -262,7 +262,7 @@ function onCancel() {
 </template>
 
 <style scoped>
-.page { box-sizing: border-box; width: 1280px; height: 800px; display: grid; place-items: center; position: relative; overflow: hidden; background: #0b0f17; }
+.page { box-sizing: border-box; width: 1280px; height: 800px; margin: 0 auto; display: grid; place-items: center; position: relative; overflow: hidden; background: #0b0f17; }
 .bg {
   position: absolute; inset: 0;
   background:
@@ -283,11 +283,15 @@ function onCancel() {
   box-shadow: 0 18px 60px rgba(0,0,0,0.55);
   backdrop-filter: blur(8px);
   display: grid;
+  grid-template-columns: 1280px;
   grid-template-rows: 48px 1fr 60px;
+  grid-template-areas: "schedule-top" "schedule-body" "schedule-bottom";
   overflow: hidden;
 }
 
 .topBar {
+  grid-area: schedule-top;
+  width: 100%; min-width: 0;
   display: flex; align-items: center; justify-content: center;
   position: relative;
   border-bottom: 1px solid rgba(255,255,255,0.06);
@@ -322,7 +326,7 @@ function onCancel() {
 }
 .manageBtn:hover { background: rgba(0,217,255,0.16); }
 
-.body { display: grid; grid-template-columns: 420px 1fr; }
+.body { grid-area: schedule-body; width: 100%; min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-columns: 420px 860px; }
 
 .left {
   border-right: 1px solid rgba(255,255,255,0.06);
@@ -408,6 +412,8 @@ function onCancel() {
 .round { color: rgba(255,255,255,0.6); text-align: right; font-weight: 700; }
 
 .bottomBar {
+  grid-area: schedule-bottom;
+  width: 100%; min-width: 0;
   border-top: 1px solid rgba(255,255,255,0.06);
   display: flex; align-items: center; justify-content: center;
   gap: 14px;

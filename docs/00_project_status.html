@@ -1,0 +1,612 @@
+<title>DID 재구축 현황</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap">
+
+<style>
+  /* ── 라이트 팔레트가 기본. DID 화면의 앰버/슬레이트/피치그린을 그대로 쓴다. ── */
+  :root {
+    --ground:    #f6f5f2;
+    --surface:   #ffffff;
+    --surface-2: #edeae4;
+    --line:      rgba(20, 23, 26, 0.12);
+    --line-soft: rgba(20, 23, 26, 0.07);
+    --text:      #16191c;
+    --muted:     #5d656d;
+    --accent:    #8a6100;
+    --accent-bg: rgba(240, 180, 41, 0.16);
+    --pitch:     #2c6b39;
+    --pitch-bg:  rgba(44, 107, 57, 0.12);
+    --shadow:    0 1px 2px rgba(20,23,26,.06), 0 8px 24px rgba(20,23,26,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:    #14171a;
+      --surface:   #1c2025;
+      --surface-2: #242930;
+      --line:      rgba(255, 255, 255, 0.11);
+      --line-soft: rgba(255, 255, 255, 0.06);
+      --text:      #e8eaec;
+      --muted:     #98a0a8;
+      --accent:    #f0b429;
+      --accent-bg: rgba(240, 180, 41, 0.12);
+      --pitch:     #5ab06c;
+      --pitch-bg:  rgba(90, 176, 108, 0.14);
+      --shadow:    0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.3);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:    #14171a;
+    --surface:   #1c2025;
+    --surface-2: #242930;
+    --line:      rgba(255, 255, 255, 0.11);
+    --line-soft: rgba(255, 255, 255, 0.06);
+    --text:      #e8eaec;
+    --muted:     #98a0a8;
+    --accent:    #f0b429;
+    --accent-bg: rgba(240, 180, 41, 0.12);
+    --pitch:     #5ab06c;
+    --pitch-bg:  rgba(90, 176, 108, 0.14);
+    --shadow:    0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.3);
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--text);
+    font-family: "IBM Plex Sans KR", system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    font-size: 16px;
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 920px; margin: 0 auto; padding: 56px 24px 120px; }
+
+  /* ── 헤더 ── */
+  .masthead { margin-bottom: 40px; }
+  .kicker {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 14px;
+  }
+  h1 {
+    font-size: clamp(30px, 5vw, 42px); font-weight: 700; line-height: 1.2;
+    letter-spacing: -0.02em; text-wrap: balance; margin-bottom: 16px;
+  }
+  .standfirst { font-size: 17px; color: var(--muted); max-width: 62ch; text-wrap: pretty; }
+
+  /* ── 요약 카드 ── */
+  .summary {
+    margin: 36px 0 8px; background: var(--surface); border: 1px solid var(--line);
+    border-radius: 10px; box-shadow: var(--shadow); overflow: hidden;
+  }
+  .summary dl { display: grid; grid-template-columns: minmax(110px, 175px) 1fr; }
+  .summary dt, .summary dd { padding: 12px 20px; border-top: 1px solid var(--line-soft); }
+  .summary dt:first-of-type, .summary dt:first-of-type + dd { border-top: 0; }
+  .summary dt {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 12.5px; color: var(--muted); letter-spacing: 0.02em;
+  }
+  .summary dd { font-size: 15px; }
+
+  /* ── 섹션 ── */
+  section { margin-top: 54px; padding-top: 38px; border-top: 1px solid var(--line); }
+  .eyebrow {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11.5px; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 10px;
+  }
+  h2 { font-size: 25px; font-weight: 700; letter-spacing: -0.015em; text-wrap: balance; margin-bottom: 18px; }
+  h3 { font-size: 17px; font-weight: 600; margin: 30px 0 12px; letter-spacing: -0.005em; }
+  p { margin-bottom: 16px; max-width: 68ch; text-wrap: pretty; }
+  p:last-child { margin-bottom: 0; }
+  ul { margin: 0 0 16px; padding-left: 22px; }
+  li { margin-bottom: 7px; max-width: 66ch; }
+  strong { font-weight: 600; }
+
+  /* ── 표 ── */
+  .tscroll { overflow-x: auto; margin-bottom: 20px; -webkit-overflow-scrolling: touch; }
+  table {
+    width: 100%; min-width: 460px; border-collapse: collapse;
+    font-size: 14.5px; font-variant-numeric: tabular-nums;
+  }
+  th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  th {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td:first-child { white-space: nowrap; }
+  table.wide td:first-child { white-space: normal; }
+
+  code {
+    font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 0.88em;
+    background: var(--surface-2); border-radius: 4px; padding: 1.5px 5px; white-space: nowrap;
+  }
+
+  /* ── 화면 흐름 ── */
+  .flow {
+    display: flex; align-items: stretch; gap: 10px; flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .step {
+    flex: 1 1 150px; min-width: 0; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 8px; padding: 14px 15px;
+    box-shadow: var(--shadow);
+  }
+  .step .rt {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11.5px; color: var(--accent); margin-bottom: 5px;
+  }
+  .step .nm { font-size: 14.5px; font-weight: 600; line-height: 1.4; }
+  .step.aside { background: transparent; box-shadow: none; border-style: dashed; }
+  .step.aside .rt, .step.aside .nm { color: var(--muted); }
+  .arrow {
+    align-self: center; color: var(--muted);
+    font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 15px;
+  }
+
+  /* ── 타임라인 ── */
+  .tl { list-style: none; padding: 0; margin: 0 0 8px; }
+  .tl li {
+    display: grid; grid-template-columns: 110px 1fr; gap: 16px;
+    padding: 11px 0; border-bottom: 1px solid var(--line-soft); max-width: none;
+  }
+  .tl li:last-child { border-bottom: 0; }
+  .tl .when {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  .tl li.now .when { color: var(--accent); }
+  .tl li.now .what { font-weight: 600; }
+
+  /* ── 강조 블록 ── */
+  .note {
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: 10px; padding: 20px 22px; margin: 22px 0;
+  }
+  .note .label {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 9px;
+  }
+  .note p { margin-bottom: 0; }
+  .note p + p { margin-top: 12px; }
+
+  /* ── 상태 칩 ── */
+  .chip {
+    display: inline-block; font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px; letter-spacing: 0.06em; padding: 2.5px 9px;
+    border-radius: 999px; white-space: nowrap;
+  }
+  .chip.done { background: var(--pitch-bg);  color: var(--pitch); }
+  .chip.open { background: var(--accent-bg); color: var(--accent); }
+  .chip.none { background: var(--surface-2); color: var(--muted); }
+
+  .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 13.5px; }
+
+  footer {
+    margin-top: 62px; padding-top: 26px; border-top: 1px solid var(--line);
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 12px; color: var(--muted); letter-spacing: 0.03em;
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="kicker">Project Status · 2026-08-31</div>
+    <h1>DID 재구축 현황</h1>
+    <p class="standfirst">
+      레거시 DID(PHP/Gnuboard5 + Android APK)를 마이그레이션하지 않고,
+      <strong>Nuxt 4 기반으로 처음부터 다시 만드는</strong> 프로젝트의 현재 상태.
+    </p>
+  </header>
+
+  <div class="summary">
+    <dl>
+      <dt>프론트</dt>
+      <dd>Nuxt 4 (app 디렉터리) · Vue 3 <code>&lt;script setup&gt;</code> · TypeScript</dd>
+      <dt>인증 · 저장</dt>
+      <dd>Firebase Auth + Firestore — 신규 프로젝트 <code>JPD-DID</code></dd>
+      <dt>백엔드</dt>
+      <dd>Python API — 미착수</dd>
+      <dt>대상 기기</dt>
+      <dd>태블릿 웹앱 (네이티브 불필요). 기준 해상도 <strong>1280 × 800</strong></dd>
+      <dt>사용자</dt>
+      <dd>사내 직원 전용. 공개 가입 없음</dd>
+      <dt>완료된 화면</dt>
+      <dd>로그인 · 경기 선택 · 팀/라인업 선택 · DID-INPUT</dd>
+      <dt>오늘 작업</dt>
+      <dd>KPI 로직(공격루트 · DAP · BAP) 포팅 + DidInput 연결</dd>
+    </dl>
+  </div>
+
+  <div class="note">
+    <div class="label">프로젝트 분리</div>
+    <p>
+      <code>JPD-DID</code> 는 기존 <code>aifootballx</code> 와 <strong>분리된 별도 Firebase
+      프로젝트</strong>다. 나중에 Python API + Firebase Admin SDK 로 <code>aifootballx</code>
+      에 동기화할 예정이며, 이 작업은 가장 마지막으로 미뤄두었다.
+    </p>
+  </div>
+
+  <section>
+    <div class="eyebrow">이력</div>
+    <h2>진행 경과</h2>
+    <ul class="tl">
+      <li><span class="when">2025-12-18</span><span class="what">DID 초기 프로젝트 업로드, 레거시 분석 시작</span></li>
+      <li><span class="when">2025-12-26</span><span class="what">Nuxt 도입 → 베이스 리셋, 로그인·일정 화면 UI, 경기 선택창 프레임</span></li>
+      <li><span class="when">2026-01-20</span><span class="what">중간 푸쉬</span></li>
+      <li class="now"><span class="when">2026-08-31</span><span class="what">Firebase 연동 완료 · KPI 로직 포팅 + DidInput 연결</span></li>
+    </ul>
+  </section>
+
+  <section>
+    <div class="eyebrow">구조</div>
+    <h2>화면 흐름</h2>
+
+    <div class="flow">
+      <div class="step"><div class="rt">/login</div><div class="nm">로그인</div></div>
+      <div class="arrow">→</div>
+      <div class="step"><div class="rt">/schedule</div><div class="nm">경기 선택</div></div>
+      <div class="arrow">→</div>
+      <div class="step"><div class="rt">/TeamSelection</div><div class="nm">팀 · 라인업 선택</div></div>
+      <div class="arrow">→</div>
+      <div class="step"><div class="rt">/DidInput</div><div class="nm">DID-INPUT</div></div>
+      <div class="arrow">·</div>
+      <div class="step aside"><div class="rt">/manage</div><div class="nm">데이터 관리 (준비 중)</div></div>
+    </div>
+
+    <h3>/login</h3>
+    <p>
+      Firebase Auth 연동 완료. 짧은 ID 입력 시 <code>@jpd-did.internal</code> 로 변환해
+      이메일 형식을 맞춘다(<code>@</code> 가 포함되면 실제 이메일로 그대로 사용).
+      <strong>아이디 저장</strong>은 localStorage, <strong>자동로그인</strong>은 Firebase
+      persistence 모드(<code>browserLocal</code> ↔ <code>browserSession</code>)로 구현.
+    </p>
+
+    <h3>/schedule</h3>
+    <p>
+      날짜·경기 선택. 로그아웃, 데이터 관리 진입 버튼. 선택한 경기 정보(날짜·리그·라운드·
+      경기장·시간·홈/원정)를 쿼리로 다음 화면에 전달.
+    </p>
+
+    <h3>/TeamSelection</h3>
+    <ul>
+      <li>팀 선택 (홈/원정) → 선택에 따라 선수 명단 교체</li>
+      <li>포메이션 4종 — 4-4-2 / 4-3-3 / 3-5-2 / 4-2-3-1</li>
+      <li>선발 11 + 후보 7 = <strong>18슬롯</strong>. 클릭 배치와 <strong>드래그 앤 드롭</strong> 모두 지원</li>
+      <li>진영 선택 (좌/우) — 구역코드 계산의 기준이 된다</li>
+      <li><strong>입력 모드</strong> — <code>분석</code>(기본, 일시정지 가능) / <code>실시간</code>(정지 불가, 이동만 가능)</li>
+      <li>기록/수정 시작 시간 위젯 (클릭 편집)</li>
+      <li><code>TEST</code> 버튼 — 포메이션·18슬롯·진영을 랜덤으로 채워 QA 시간 단축</li>
+      <li>18슬롯 + 포메이션 + 진영이 모두 채워져야 <code>전반전 시작</code> 활성화</li>
+    </ul>
+
+    <h3>/manage</h3>
+    <p>팀 관리 / 선수 관리 / 경기 일정 관리 — <strong>3개 모두 준비 중 (미착수)</strong>.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">기반</div>
+    <h2>인증과 설정</h2>
+    <ul>
+      <li><code>app/plugins/firebase.client.ts</code> — Firebase app/auth/db 초기화. 미들웨어가 기다릴 수 있도록 <code>authReady</code> 프라미스를 제공한다.</li>
+      <li><code>app/middleware/auth.global.ts</code> — 라우트 가드. 비로그인 시 <code>/login</code> 으로, 로그인 상태로 <code>/login</code> 진입 시 <code>/schedule</code> 로 보낸다.</li>
+      <li>Firebase 설정값은 <code>.env</code> 의 <code>NUXT_PUBLIC_FIREBASE_*</code> → <code>nuxt.config.ts</code> 의 <code>runtimeConfig.public.firebase</code> 로 주입.</li>
+    </ul>
+
+    <div class="note">
+      <div class="label">주의</div>
+      <p>
+        아직 <strong>Firestore 쓰기가 하나도 없다.</strong> 입력한 기록은 전부 컴포넌트
+        로컬 상태이며, 새로고침하면 사라진다.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">좌표</div>
+    <h2>경기장 구역 체계</h2>
+    <p>
+      <code>03.areacode.sql</code> 이 유일한 근거다. APK 디컴파일로도 같은 개념을 확인했다.
+    </p>
+    <ul>
+      <li>원본 캔버스 <strong>971 × 634</strong>, 가로 6칸 × 세로 3칸 = <strong>18구역</strong></li>
+      <li>열 경계 <code>[0, 152, 318, 484, 651, 818, 971]</code></li>
+      <li>행 경계 <code>[0, 180, 451, 634]</code></li>
+      <li>진영 선택값 + 전/후반으로 방향(<code>L</code>/<code>R</code>)이 정해지고, 방향에 따라 번호가 반전된다 — <code>zone = dir === 'L' ? 19 - zoneR : zoneR</code></li>
+      <li><strong>구역 1~6 = 상대 진영 앞 1/3 (공격영역)</strong>, 10 이상 = 자기 진영</li>
+    </ul>
+    <p>경기장을 클릭하면 해당 구역이 잠깐 밝아졌다 사라진다(420ms).</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">용어</div>
+    <h2>레거시 명칭을 신규 명칭으로 전부 교체</h2>
+    <p>근거는 PPT <code>DID 프로세스 슬라이드_20251120</code> 슬라이드 7 과 레거시 코드 주석.</p>
+
+    <div class="tscroll">
+      <table class="wide">
+        <thead><tr><th>레거시</th><th>신규</th><th>DB 컬럼</th><th>근거</th></tr></thead>
+        <tbody>
+          <tr><td>TMP</td><td><strong>TAP</strong></td><td><code>gr_is_tmp</code></td><td>PPT 슬라이드 7</td></tr>
+          <tr><td>TAP</td><td><strong>DAP</strong></td><td><code>gr_is_tap</code></td><td>PPT 슬라이드 7 + <code>extra.lib.php:4021</code></td></tr>
+          <tr><td>CTP</td><td><strong>DTP</strong></td><td><code>gt_ctp</code></td><td>PPT 슬라이드 7</td></tr>
+          <tr><td>CSP</td><td><strong>DSP</strong></td><td><code>gt_csp</code></td><td><code>extra.lib.php:2414</code> (<code>csp = dsp</code>)</td></tr>
+          <tr><td>CTS / CTA<br>CTM / CTB</td><td><strong>DTS / DTA<br>DTM / DTB</strong></td><td><code>gr_is_ct*</code></td><td><code>CT*</code> → <code>DT*</code> 패턴</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      변경하지 않음 — <code>UPP</code> <code>UTP</code> <code>STP</code> <code>TTP</code>
+      <code>GTB</code> <code>GTM</code> <code>SHOT</code> <code>ASR</code> <code>GSR</code>
+      <code>SSR</code> <code>BAP</code>. 신규 명칭 근거를 찾지 못했고, 대부분 화면에
+      노출되지 않는 내부 분류값이다.
+    </p>
+
+    <div class="note">
+      <div class="label">혼동 주의</div>
+      <p>
+        <strong><code>TAP</code> 은 레거시와 신규에서 의미가 다르다.</strong>
+        레거시 TAP = 신규 DAP, 신규 TAP = 레거시 TMP.
+        옛 쿼리·문서를 볼 때 반드시 확인할 것.
+      </p>
+    </div>
+
+    <p>
+      화면 노출 8개 KPI — <code>TAP</code> <code>DAP</code> <code>DTP</code>
+      <code>SHOT</code> <code>ASR</code> <code>GSR</code> <code>SSR</code> <code>BAP</code>
+    </p>
+  </section>
+
+  <section>
+    <div class="eyebrow">로직</div>
+    <h2>공격루트 판정과 DAP 산출</h2>
+    <p>
+      <code>app/utils/didLogic.ts</code> 에 전부 들어 있다. 평점(rating) 계산은 범위에서 제외.
+    </p>
+
+    <h3>루트 분류</h3>
+    <div class="tscroll">
+      <table class="wide">
+        <thead><tr><th>분류</th><th>조건</th></tr></thead>
+        <tbody>
+          <tr><td><strong>UPP</strong></td><td>기본값. 슛도 없고 공격영역에도 못 들어간 단순 점유</td></tr>
+          <tr><td><strong>UTP</strong></td><td>공격영역(1~6) 진입. 레코드 2개 이상 필요<br>예외 — 1개여도 K/F 면 인정 (레거시 2021.12.13 추가)</td></tr>
+          <tr><td><strong>DTP</strong></td><td>루트 안에 슛(S/H/R)이 포함됨</td></tr>
+          <tr><td><strong>STP</strong></td><td>DTP 인데 레코드가 1개뿐인 단독슛</td></tr>
+          <tr><td><strong>DSP</strong></td><td>DTP 중 유효슈팅을 포함하는 건</td></tr>
+          <tr><td><strong>TTP</strong></td><td>UTP 또는 DTP (유효 공격 총합)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <div class="label">루트를 끊는 조건은 두 가지뿐</div>
+      <p>
+        ① 결과가 나옴 (<code>res != 'O'</code>) — X, B, 슛 결과<br>
+        ② 직전 레코드와 <strong>4초 초과</strong> 공백
+      </p>
+    </div>
+
+    <h3>DAP 판정</h3>
+    <ul>
+      <li><strong>DTP / STP</strong> — 루트 안의 모든 레코드가 DAP 로 인정된다.</li>
+      <li><strong>UTP</strong> — 공격영역 진입 시점 이후는 전부 인정, 진입 <strong>이전은 2개까지만</strong> 인정.</li>
+      <li>act 가 비어 있는 레코드는 항상 제외 (<code>isDap = !!act</code>).</li>
+    </ul>
+
+    <h3>선수 역할</h3>
+    <p>
+      DTP/STP 루트를 역순으로 훑으며 부여한다.
+      <code>DTS(슈터)</code> → <code>DTA(어시스터)</code> → <code>DTM(메이커)</code> →
+      그 이전 전원 <code>DTB(빌더)</code>. 골로 이어진 경우 <code>AST</code>
+      <code>GTM</code> <code>GTB</code> 가 함께 붙는다.
+    </p>
+
+    <h3>BAP</h3>
+    <p>
+      DAP 와 무관한 별도 카운터. <code>Ready</code> / <code>Keep</code> 상태머신으로
+      판정하며 4초 공백, 결과 발생, 공격영역 진입, 중앙선 돌파 등이 트리거다.
+    </p>
+  </section>
+
+  <section>
+    <div class="eyebrow">발견</div>
+    <h2>레거시에 계산이 두 벌 있고, 서로 다르게 동작한다</h2>
+    <p>포팅 도중 확인한 가장 중요한 사실.</p>
+
+    <div class="tscroll">
+      <table class="wide">
+        <thead>
+          <tr>
+            <th></th>
+            <th>단말 (APK)<br><code>calcMadenPath</code></th>
+            <th>서버 배치<br><code>extra.lib.php:2148</code></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>lookahead 보정</td><td><strong>없음</strong></td><td><strong>있음</strong></td></tr>
+          <tr><td>X/B 로 루트가 끊기나</td><td><strong>끊긴다</strong></td><td>안 끊긴다</td></tr>
+          <tr><td>BAP 중앙선 분기</td><td><code>empty(act)</code> 검사 없음</td><td><code>empty(act)</code> 검사 있음</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      서버 쪽 주석은 <em>"DID와 동일한 기준 및 순서로 판단하기 위한 처리"</em> 라고
+      되어 있지만, 실제로는 단말과 결과가 달라진다.
+    </p>
+
+    <div class="note">
+      <div class="label">채택한 기준</div>
+      <p>
+        우리가 다시 만드는 것은 <strong>입력 단말(DID) 자체</strong>이고, 실제 운영에서
+        관측된 동작도 "X/B/슛이 나오면 연결이 끊긴다" 이므로
+        <strong>단말 로직을 기준으로 삼았다.</strong>
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">데이터 모델</div>
+    <h2>플레이 하나 = 레코드 하나</h2>
+    <p>APK 디컴파일로 확인한 실제 동작이다.</p>
+
+    <div class="tscroll">
+      <table class="wide">
+        <thead><tr><th>단계</th><th>동작</th><th>결과</th></tr></thead>
+        <tbody>
+          <tr><td>액트 버튼<br>(C/P/K/F/S/H/R)</td><td><code>setActCode(act)</code> + <code>setResCode("O")</code></td><td><code>act='C', res='O'</code></td></tr>
+          <tr><td>결과 버튼<br>(X/B, 골대 존)</td><td>같은 레코드의 <code>res</code> 만 덮어씀</td><td><code>act='C', res='X'</code></td></tr>
+          <tr><td><strong>예외</strong><br>슛에 X/B</td><td>위 + <code>setActCode(null)</code></td><td><code>act='', res='X'</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <ul>
+      <li><code>'O'</code> 는 계산용 임시값이 아니라 <strong>앱이 실제로 저장하는 값</strong>이다 (<code>DPlayInputDefaultFragment.java:151</code>).</li>
+      <li>결과를 별도 레코드로 나눠 저장하지 않는다.</li>
+      <li>슛이 X/B 로 끝나면 서버가 <strong>직전 레코드의 <code>res</code> 도 같은 값으로 덮어쓴다</strong> (write-back, <code>extra.lib.php:1211</code>). <code>applyResult()</code> 가 이를 재현한다.</li>
+    </ul>
+
+    <h3>액트 / 결과 코드</h3>
+    <div class="tscroll">
+      <table class="wide">
+        <thead><tr><th>구분</th><th>코드</th></tr></thead>
+        <tbody>
+          <tr><td>액트</td><td class="mono">C 크로스 · P 패스 · K 코너킥 · F 프리킥 · S 슛 · H 헤딩 · R 직접 프리킥</td></tr>
+          <tr><td>결과</td><td class="mono">O 진행중 · X 실책 · B 블락 · GOAL · L/H/R 유효슛 · LX/HX/RX 빗나감</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">연결</div>
+    <h2>DidInput 화면에 붙인 것</h2>
+
+    <ul>
+      <li>위치 클릭 → 액트 → 결과가 레코드 하나로 쌓임</li>
+      <li><strong>X/B 는 새 레코드가 아니라 직전 레코드의 결과로 반영</strong></li>
+      <li><strong>연결이 끊기는 순간에만 <code>Select</code> 버튼 등장</strong> — 진행 중에는 뜨지 않는다</li>
+      <li><strong>선수선택 UI 가 액트 입력창 자리에서 전환</strong> (포메이션 유니폼 + Cancel / Submit)</li>
+      <li>BAP 실시간 카운트</li>
+      <li>전/후반 전환, <code>분석</code> 모드에서만 타이머 일시정지 가능</li>
+    </ul>
+
+    <h3>실시간 입력 전용 처리</h3>
+    <p>
+      레거시 배치는 마지막 미완료 루트를 강제로 마감하지만, 실시간 입력에서 그렇게 하면
+      <strong>아직 진행 중인 레코드에까지 DAP 가 붙어 선수 입력 버튼이 미리 떠버린다.</strong>
+      그래서 <code>computeAttackPaths(records, { closeTrailing: false })</code> 로 호출한다.
+    </p>
+
+    <h3>운영 기준으로 맞춘 것</h3>
+    <p>
+      <strong>X / B 로 끝난 레코드는 <code>Select</code> 를 띄우지 않는다.</strong>
+      레거시 코드의 표시 조건은 <code>is_tap == 1 &amp;&amp; act 있음</code> 뿐이라 X/B 를
+      직접 막지는 않는다(<code>DPlayInputFragment.java:1661</code>). 다만 서버 판정에서
+      X/B 가 루트를 끊지 않아 그런 공격은 대부분 UPP(무효)로 분류되어
+      <code>is_tap = 0</code> 이 되므로, 화면 결과는 같다.
+    </p>
+
+    <div class="note">
+      <div class="label">확인 필요</div>
+      <p>
+        현재 구현은 <code>res</code> 로 직접 막는 방식이라,
+        <strong>슛까지 이어진 공격 중간에 낀 X/B 레코드</strong>에서는 레거시와 결과가
+        갈릴 수 있다. 실데이터로 확인 필요.
+      </p>
+    </div>
+
+    <p>
+      <strong>모든 버튼은 항상 활성 상태.</strong> 블락·실책이 언제 나올지 알 수 없으므로
+      상황에 따라 흐려지지 않는다. 유효하지 않은 클릭은 각 핸들러에서 무시한다.
+    </p>
+  </section>
+
+  <section>
+    <div class="eyebrow">검증</div>
+    <h2>시나리오별 확인 결과</h2>
+    <p>타입체크 <code>strict</code> + <code>noUncheckedIndexedAccess</code> 통과.</p>
+
+    <div class="tscroll">
+      <table class="wide">
+        <thead><tr><th>시나리오</th><th>결과</th></tr></thead>
+        <tbody>
+          <tr><td>단독슛 골</td><td>STP, DSP, 슈터에 DTS</td></tr>
+          <tr><td>골 빌드업</td><td>DTP + 역할 DTB → DTM → DTA(+AST) → DTS</td></tr>
+          <tr><td>진입 전 빌드업 4개</td><td>앞 2개 제외, 가까운 2개만 DAP</td></tr>
+          <tr><td>4초 초과 공백</td><td>루트 2개로 분리</td></tr>
+          <tr><td>슛 → B</td><td>act 비워짐 + 직전 레코드 write-back</td></tr>
+          <tr><td>BAP 중앙선 돌파</td><td><code>CROSS ATTACK</code> 발생</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>브라우저에서 입력 → 연결 끊김 → Select → 선수선택 → Submit 전 과정 확인.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">다음</div>
+    <h2>미해결 항목</h2>
+
+    <div class="tscroll">
+      <table class="wide">
+        <thead><tr><th>항목</th><th>상태</th><th>내용</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>DSP</strong><br>(유효슛)</td>
+            <td><span class="chip open">부분</span></td>
+            <td>골대가 이산 존 버튼이라 탭 좌표를 수집하지 않음 → <strong><code>GOAL</code> 일 때만 인정.</strong> 골대 UI 를 좌표 방식으로 바꿔야 정확해진다 (<code>shootPosX/Y</code> 필드는 준비됨)</td>
+          </tr>
+          <tr>
+            <td><strong>라인업 연동</strong></td>
+            <td><span class="chip open">임시</span></td>
+            <td>스쿼드·포메이션(4-2-3-1) 하드코딩. TeamSelection 에서 넘겨받는 구조 없음</td>
+          </tr>
+          <tr><td><strong>Firestore 저장</strong></td><td><span class="chip none">미착수</span></td><td>전부 로컬 상태. 스키마도 미확정</td></tr>
+          <tr><td><strong>카드 / 교체</strong></td><td><span class="chip none">미착수</span></td><td>옐로/레드 카드, 선수 교체</td></tr>
+          <tr><td><strong>레코드 수정</strong></td><td><span class="chip none">미착수</span></td><td>길게 누르기 수정·삭제</td></tr>
+          <tr><td><strong>참조 데이터 관리</strong></td><td><span class="chip none">미착수</span></td><td>팀 / 선수(이적시장) / 경기 일정</td></tr>
+          <tr><td><strong>Python API</strong></td><td><span class="chip none">미착수</span></td><td>—</td></tr>
+          <tr><td><strong>aifootballx 동기화</strong></td><td><span class="chip none">미착수</span></td><td>가장 마지막</td></tr>
+          <tr><td><strong>평점(rating)</strong></td><td><span class="chip none">범위 밖</span></td><td>별도 진행</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">참고</div>
+    <h2>파일 맵</h2>
+
+    <div class="tscroll">
+      <table class="wide">
+        <thead><tr><th>경로</th><th>역할</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">app/pages/login.vue</td><td>로그인 (Firebase Auth)</td></tr>
+          <tr><td class="mono">app/pages/schedule.vue</td><td>날짜·경기 선택</td></tr>
+          <tr><td class="mono">app/pages/TeamSelection.vue</td><td>팀·포메이션·라인업·진영·모드 선택</td></tr>
+          <tr><td class="mono">app/pages/DidInput.vue</td><td>실시간 이벤트 입력</td></tr>
+          <tr><td class="mono">app/pages/manage/index.vue</td><td>데이터 관리 (준비 중)</td></tr>
+          <tr><td class="mono">app/utils/didLogic.ts</td><td>KPI 로직 전부 (공격루트 · DAP · BAP)</td></tr>
+          <tr><td class="mono">app/utils/squads.ts</td><td>임시 하드코딩 스쿼드</td></tr>
+          <tr><td class="mono">app/plugins/firebase.client.ts</td><td>Firebase 초기화</td></tr>
+          <tr><td class="mono">app/middleware/auth.global.ts</td><td>라우트 가드</td></tr>
+          <tr><td class="mono">docs/02_event_contract.md</td><td>레거시 <code>call.php</code> 이벤트 계약</td></tr>
+          <tr><td class="mono">docs/03_kpi_terminology.md</td><td>용어 변경표 + 데이터 모델 계약 (상세 근거)</td></tr>
+          <tr><td class="mono">03.areacode.sql</td><td>좌표·구역코드 스펙 (971×634, 18구역)</td></tr>
+          <tr><td class="mono">lib/extra.lib.php</td><td>레거시 서버 로직 원본</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>didNew · DID 데이터 입력 시스템 · 최종 갱신 2026-08-31</footer>
+
+</div>

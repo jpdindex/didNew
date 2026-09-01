@@ -10,7 +10,4 @@ export default defineNuxtRouteMiddleware(async (to) => {
     return navigateTo('/login')
   }
 
-  if (isLoggedIn && to.path === '/login') {
-    return navigateTo('/schedule')
-  }
 })

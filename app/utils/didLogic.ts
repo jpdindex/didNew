@@ -69,6 +69,10 @@ export interface DidRecord {
   res: ResCode
   /** 1~18 구역코드 (03.areacode.sql 스펙). 1~6 = 공격영역, 10 이상 = 자기 진영 */
   area: number
+  /** 경기장을 클릭한 실제 좌표(0~100%). area 는 이 좌표가 속한 구역일 뿐이라 정밀도가
+   *  떨어진다 — 기록 수정 화면에서 "정확한 위치"를 보여줄 때는 area 대신 이 값을 쓴다. */
+  posX?: number
+  posY?: number
   /** 레거시 p_id. 'OWN' = 자책골 */
   playerId?: string
   /** 같은 초에 여러 레코드가 있을 때의 순서 보정 (레거시 gr_regdt 대응) */
@@ -80,6 +84,10 @@ export interface DidRecord {
    */
   shootPosX?: number
   shootPosY?: number
+  /** 골포스트·크로스바 바깥 1m를 포함한 DSP 타깃 범위인지 여부. */
+  shootDspRange?: boolean
+  /** X/B 결과 처리 뒤에도 원래 슈팅 액트였음을 보존한다. DSP 판정에 사용한다. */
+  isShot?: boolean
 }
 
 function isShotAct(act: ActCode) {
@@ -114,17 +122,25 @@ export function createActRecord(
   act: Exclude<ActCode, ''>,
   seconds: number,
   area: number,
-  extra: Partial<Pick<DidRecord, 'playerId' | 'shootPosX' | 'shootPosY'>> = {}
+  extra: Partial<Pick<DidRecord, 'playerId' | 'shootPosX' | 'shootPosY' | 'posX' | 'posY'>> = {}
 ): DidRecord {
-  return { id: `rec_${++recSeq}`, seconds, act, res: 'O', area, seq: recSeq, ...extra }
+  return { id: `rec_${++recSeq}`, seconds, act, res: 'O', area, seq: recSeq, isShot: isShotAct(act), ...extra }
 }
 
 /**
- * 결과 버튼(X/B, 골대 존)을 누른 것을 기존 레코드에 반영한다. 레코드를 새로 만들지 않는다.
+ * 결과 버튼(X/B, 골대 존)을 누른 것을 반영한다.
  *
- * 레거시 재현 항목:
- *   · 슛(S/H/R)에 X/B 가 찍히면 act 를 비운다        (APK onClickResult)
- *   · 그 경우 직전 레코드의 res 도 같은 값으로 덮어쓴다 (extra.lib.php:1211 write-back)
+ * X/B 는 액트의 "결과"이므로 액트 레코드에 결과를 기록하되,
+ * **결과 자체를 나타내는 act 없는 레코드를 하나 더 남긴다.** 레거시와 동일한 형태다.
+ *
+ *   비-슛 (C/P/K/F) + X/B →  액트 레코드는 act 를 유지한 채 res 만 채우고,
+ *                            바로 뒤에 `act='' , res=X|B` 레코드를 추가한다.
+ *                            액트 레코드는 여전히 P/C 라는 행동이므로 DAP 대상이 되고,
+ *                            추가된 결과 레코드는 act 가 없어 DAP 에서 자동 제외된다.
+ *   슛 (S/H/R) + X/B      →  슛 레코드 자체의 act 가 비워져 그것이 결과 레코드가 되고
+ *                            (APK onClickResult), 직전 레코드에 write-back 한다
+ *                            (extra.lib.php:1211). 별도 레코드를 만들지 않는다.
+ *   골대 존 결과           →  해당 슛 레코드의 res 만 덮어쓴다.
  *
  * @param records 시간순 레코드 배열 (제자리에서 수정된다)
  * @param recordId 결과를 적용할 레코드 id
@@ -133,7 +149,14 @@ export function applyResult(
   records: DidRecord[],
   recordId: string,
   res: Exclude<ResCode, 'O' | ''>,
-  shootPos?: { x: number; y: number }
+  opts: {
+    shootPos?: { x: number; y: number }
+    shootDspRange?: boolean
+    seconds?: number
+    area?: number
+    /** X/B 를 누르기 전에 새로 클릭한 정확한 좌표(0~100%). 결과 레코드의 posX/posY 로 저장된다. */
+    pos?: { x: number; y: number }
+  } = {}
 ): void {
   const idx = records.findIndex(r => r.id === recordId)
   if (idx < 0) return
@@ -142,17 +165,35 @@ export function applyResult(
   const wasShot = isShotAct(rec.act)
 
   rec.res = res
-  if (shootPos) {
-    rec.shootPosX = shootPos.x
-    rec.shootPosY = shootPos.y
+  if (opts.shootPos) {
+    rec.shootPosX = opts.shootPos.x
+    rec.shootPosY = opts.shootPos.y
   }
+  if (opts.shootDspRange !== undefined) rec.shootDspRange = opts.shootDspRange
 
-  // 슛이 X/B 로 끝난 경우에만 act 를 비우고, 직전 레코드에 write-back 한다
-  if (wasShot && (res === 'X' || res === 'B')) {
+  if (res !== 'X' && res !== 'B') return
+
+  if (wasShot) {
+    // 슛 레코드가 곧 결과 레코드가 된다 + 직전 레코드에 write-back
     rec.act = ''
     const prev = records[idx - 1]
     if (prev) prev.res = res
+    return
   }
+
+  // 비-슛: 결과 레코드를 액트 레코드 "뒤"에 하나 더 남긴다.
+  // area/좌표는 X/B 를 누르기 전에 새로 클릭한 위치(실책·블락이 일어난 지점)를 쓴다.
+  // 넘어오지 않으면(레거시 재현 등) 직전 액트 레코드의 area 로 대체한다.
+  records.splice(idx + 1, 0, {
+    id: `rec_${++recSeq}`,
+    seconds: opts.seconds ?? rec.seconds,
+    act: '',
+    posX: opts.pos?.x,
+    posY: opts.pos?.y,
+    res,
+    area: opts.area ?? rec.area,
+    seq: recSeq,
+  })
 }
 
 // =============================================================================
@@ -289,14 +330,15 @@ function classifyChain(chain: DidRecord[]): { path: AttackPath; flags: Map<strin
 
     if (act) count++
 
-    if (act && isShotAct(act)) {
+    if (r.isShot || (act && isShotAct(act))) {
       // 슛이 있으면 전/후방 무관하게 DTP
       ptype = 'DTP'
       if (isGoal(r.res)) isGoalChain = true
 
       // DSP: 유효슈팅(득점 / 유효방향 L·H·R / 슛 좌표가 찍힌 블락)을 포함하는지
       const hasShootPos = (r.shootPosX ?? 0) > 0 || (r.shootPosY ?? 0) > 0
-      if (isGoal(r.res) || r.res === 'R' || r.res === 'L' || r.res === 'H' || (r.res === 'B' && hasShootPos)) {
+      if (isGoal(r.res) || r.res === 'R' || r.res === 'L' || r.res === 'H' ||
+        (r.res === 'B' && hasShootPos) || r.shootDspRange) {
         dsp = true
       }
     } else if (r.area < 7 && ptype === 'UPP') {
@@ -369,9 +411,10 @@ function classifyChain(chain: DidRecord[]): { path: AttackPath; flags: Map<strin
 
     f.isTap = !!act
     f.isTapS = !!act && (res === 'O' || isGoal(res))
-    f.isSht = isShotAct(act)
-    f.isShtS = isShotAct(act) &&
-      (isGoal(res) || res === 'R' || res === 'L' || res === 'H' || (res === 'B' && hasShootPos))
+    f.isSht = isShotAct(act) || !!r.isShot
+    f.isShtS = (isShotAct(act) || !!r.isShot) &&
+      (isGoal(res) || res === 'R' || res === 'L' || res === 'H' ||
+        (res === 'B' && hasShootPos) || !!r.shootDspRange)
     f.isGol = isGoal(res)
   }
 
