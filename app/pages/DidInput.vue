@@ -16,7 +16,7 @@ import {
   type GrassLines,
   type GrassPattern,
 } from '~/utils/grass'
-import { goalFramePoint, goalOuterPoint, isWithinGoalOneMeter } from '~/utils/goalCoordinates'
+import { GOAL_TARGET, goalFramePoint, goalOuterPoint, isWithinGoalOneMeter } from '~/utils/goalCoordinates'
 
 const route = useRoute()
 const home = computed(() => String(route.query.home ?? route.query.homeName ?? 'Vallecano').trim() || 'Vallecano')
@@ -189,7 +189,16 @@ const grassOpen = ref(false)
 const grassBg = computed(() => grassBackground(grassPattern.value, grassLines.value))
 
 const pendingPos = ref<{ x: number; y: number } | null>(null)
-const pendingShotId = ref<string | null>(null) // 골 존 결과를 기다리는 슛 레코드
+// 슛(S/H/R)은 결과(HX/LX/RX/H/L/R, GB/GOAL/GX)가 정해지기 전엔 레코드를 만들지 않는다 —
+// res:'O' 로 남는 슛은 존재하지 않는다. 골 존 결과가 나올 때까지는 여기 초안으로만 들고 있는다.
+interface PendingShot {
+  act: Exclude<ActCode, ''>
+  seconds: number
+  area: number
+  posX?: number
+  posY?: number
+}
+const pendingShot = ref<PendingShot | null>(null)
 const playerPickFor = ref<string | null>(null) // 선수 입력창을 띄운 레코드
 const pickedNo = ref<string | null>(null) // 선수선택 화면에서 고른 등번호 (Submit 전)
 
@@ -281,7 +290,9 @@ const displayRecord = computed(() => infoRecord.value ?? lastRecord.value)
 // 위 레코드의 act 를 채워서 보여준다. act 가 없는 레코드(결과 전용)면 아무 액트도
 // 채우지 않는다 — 예를 들어 P 가 B 로 막힌 직후엔 P 를 더 이상 채우지 않는다.
 // 수정 중일 때는 저장된 값이 아니라 아직 적용 전인 임시값(editAct)을 보여준다.
-const activeAct = computed(() => (editingId.value ? editAct.value : displayRecord.value?.act) || null)
+const activeAct = computed(() => (
+  editingId.value ? editAct.value : pendingShot.value ? pendingShot.value.act : displayRecord.value?.act
+) || null)
 
 // 위 레코드의 결과가 X/B 면 그 결과 버튼도 "선택됨"으로 보여준다.
 // 하나의 레코드에 act 와 res(X/B) 가 함께 있는 경우(예: 표에서 "P|B" 한 줄로 보이는
@@ -342,6 +353,8 @@ function clickPitch(e: MouseEvent) {
   // 경기장을 새로 찍으면 보고 있던(peek) 레코드의 위치/액트 하이라이트는 지운다 —
   // 이제부터는 새 입력을 하는 것이므로 옛 레코드 표시가 계속 남아있으면 안 된다.
   peekId.value = null
+  // 결과를 고르지 않은 채 새 위치를 찍으면 대기 중이던 슛 초안은 버려진다(레코드로 남지 않았으므로).
+  pendingShot.value = null
 
   const nextCell = cellFromPos({ x, y })
   pendingPos.value = { x, y }
@@ -376,6 +389,8 @@ function areaFromPos(pos: { x: number; y: number }) {
 }
 
 // 액트 버튼(C/P/K/F/S/H/R): 새 레코드를 만든다. res 는 'O'(진행중)로 시작.
+// 단, 슛(S/H/R)은 예외다 — 슛은 반드시 방향/골키퍼 결과가 있어야 하고 res:'O' 로
+// 남는 슛은 없으므로, 결과가 정해질 때까지 레코드를 만들지 않고 초안(pendingShot)으로만 둔다.
 function clickAct(actKey: string, isShot: boolean) {
   // 수정 중이면 새 레코드를 만들지 않고, 지금 수정 중인 레코드의 액트만 바꾼다.
   if (editingId.value) {
@@ -383,6 +398,19 @@ function clickAct(actKey: string, isShot: boolean) {
     return
   }
   if (!pendingPos.value) return
+  if (isShot) {
+    pendingShot.value = {
+      act: actKey as Exclude<ActCode, ''>,
+      seconds: seconds.value,
+      area: Number(areaFromPos(pendingPos.value)),
+      posX: pendingPos.value.x,
+      posY: pendingPos.value.y,
+    }
+    pendingPos.value = null
+    pendingCell.value = null
+    flashCell.value = null
+    return
+  }
   const rec = createActRecord(
     actKey as Exclude<ActCode, ''>,
     seconds.value,
@@ -393,7 +421,6 @@ function clickAct(actKey: string, isShot: boolean) {
   pendingPos.value = null
   pendingCell.value = null
   flashCell.value = null
-  if (isShot) pendingShotId.value = rec.id
 }
 
 // X/B: C/P 와 마찬가지로 위치를 먼저 찍어야 누를 수 있다 (실책·블락이 일어난 지점).
@@ -410,57 +437,74 @@ function clickResult(res: 'X' | 'B') {
   pendingPos.value = null
   pendingCell.value = null
   flashCell.value = null
-  pendingShotId.value = null
 }
 
-// 골대 존: 결과를 기다리던 슛 레코드에 반영한다.
+// 골대 존: 결과가 정해진 순간에야 비로소 슛 레코드를 만든다(act+res 를 함께 채워서 push) —
+// 그전까지는 records 배열에 아무것도 남기지 않는다.
 function recordGoalResult(zone: Exclude<ResCode, 'O' | ''>, point?: { x: number; y: number }) {
-  if (!pendingShotId.value) return
-  applyResult(records.value, pendingShotId.value, zone as Exclude<ResCode, 'O' | ''>, {
-    shootPos: point,
-    shootDspRange: point ? isWithinGoalOneMeter(point) : false,
-    seconds: seconds.value,
-  })
+  if (!pendingShot.value) return
+  const shot = pendingShot.value
+  const rec = createActRecord(shot.act, shot.seconds, shot.area, { posX: shot.posX, posY: shot.posY })
+  rec.res = zone
+  if (point) {
+    rec.shootPosX = point.x
+    rec.shootPosY = point.y
+    rec.shootDspRange = isWithinGoalOneMeter(point)
+  }
+  records.value.push(rec)
   if (zone === 'GOAL') homeScore.value++
-  pendingShotId.value = null
+  pendingShot.value = null
 }
 
-// 골문 내부 클릭은 footballX와 같은 628×300 원본 맵 좌표로 저장한다.
-// 이 좌표는 필요 시 7.32m × 2.44m 정규 골대의 실측 좌표로 환산할 수 있다.
+// 골대 UI(.goal 래퍼) 안에서 골문 프레임(.goalFrame)이 차지하는 비율.
+// CSS 의 .goalFrame{left:15%;right:15%;top:42%;bottom:0} 과 반드시 같이 맞춰야 한다.
+const FRAME_TOP = 0.42
+const FRAME_SIDE = 0.15
+// "포스트·크로스바 바깥 1m" 경계선 = 프레임 자체 크기(7.32m×2.44m) 기준으로 1m가
+// 래퍼 대비 몇 %인지 계산해서 프레임 경계에서 빼준다. 손으로 어림잡은 값이 아니라
+// GOAL_TARGET(실측 규격)에서 그대로 유도한 값이다 — CSS 의 .meterGuide/.hxDivider 도 같이 맞춰야 한다.
+const FRAME_WIDTH_FRAC = 1 - FRAME_SIDE * 2 // 0.70
+const FRAME_HEIGHT_FRAC = 1 - FRAME_TOP // 0.58
+const GUIDE_SIDE = FRAME_SIDE - (FRAME_WIDTH_FRAC / GOAL_TARGET.meters.width) // ≈ 0.0544
+const GUIDE_TOP = FRAME_TOP - (FRAME_HEIGHT_FRAC / GOAL_TARGET.meters.height) // ≈ 0.1823
+
+// 골문 프레임 안쪽 클릭: 바로 기록하지 않고 위치 마커만 세부 조정한다.
+// 확정은 아래 B/GOAL/X 버튼을 눌러야 이루어진다.
+const pendingFramePos = ref<{ x: number; y: number } | null>(null)
 function clickGoalFrame(e: MouseEvent) {
   const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
-  recordGoalResult('GOAL', goalFramePoint(
-    (e.clientX - rect.left) / rect.width,
-    (e.clientY - rect.top) / rect.height,
-  ))
+  pendingFramePos.value = {
+    x: (e.clientX - rect.left) / rect.width,
+    y: (e.clientY - rect.top) / rect.height,
+  }
+}
+// B/GOAL/X: 프레임 안쪽에서 마커로 찍어둔 위치를 결과로 확정한다. 마커가 없으면 무시한다.
+// 버튼 표시는 B/GOAL/X 그대로지만, 골키퍼 액션이므로 저장값은 GB/GX로 킥 패널의 B/X와 구분한다.
+function confirmGoalFrame(result: 'B' | 'GOAL' | 'X') {
+  if (!pendingFramePos.value) return
+  const zone = result === 'B' ? 'GB' : result === 'X' ? 'GX' : 'GOAL'
+  recordGoalResult(zone, goalFramePoint(pendingFramePos.value.x, pendingFramePos.value.y))
+  pendingFramePos.value = null
 }
 
-// 중앙 정렬된 골대 주변 영역도 footballX의 전체 628×300 좌표로 남긴다.
+// 중앙 정렬된 골대 주변 영역(프레임 바깥)은 지금처럼 클릭 즉시 기록한다 — 버튼 필요 없음.
+// footballX의 전체 628×300 좌표로 남긴다.
 function clickGoalTarget(e: MouseEvent) {
   const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
   const x = (e.clientX - rect.left) / rect.width
   const y = (e.clientY - rect.top) / rect.height
-  const frameTop = 0.42
-  const frameSide = 0.15
-  const guideTop = 0.21
-  const guideSide = 0.075
 
-  // 골문 ↔ 외곽 1m 선 사이는 L/H/R(DSP), 선 바깥은 LX/HX/RX다.
-  if (y < frameTop) {
-    const point = goalOuterPoint('HX', x, y / frameTop)
-    recordGoalResult(y < guideTop ? 'HX' : 'H', point)
-  } else if (x < frameSide) {
-    const point = goalOuterPoint('LX', x / frameSide, (y - frameTop) / (1 - frameTop))
-    recordGoalResult(x < guideSide ? 'LX' : 'L', point)
-  } else if (x > 1 - frameSide) {
-    const point = goalOuterPoint('RX', (x - (1 - frameSide)) / frameSide, (y - frameTop) / (1 - frameTop))
-    recordGoalResult(x > 1 - guideSide ? 'RX' : 'R', point)
+  // 골문 ↔ 외곽 1m 선 사이는 방향에 따라 L/H/R(DSP), 그 선 바깥은 LX/HX/RX다.
+  if (y < FRAME_TOP) {
+    const point = goalOuterPoint('HX', x, y / FRAME_TOP)
+    recordGoalResult(y < GUIDE_TOP ? 'HX' : 'H', point)
+  } else if (x < FRAME_SIDE) {
+    const point = goalOuterPoint('LX', x / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP))
+    recordGoalResult(x < GUIDE_SIDE ? 'LX' : 'L', point)
+  } else if (x > 1 - FRAME_SIDE) {
+    const point = goalOuterPoint('RX', (x - (1 - FRAME_SIDE)) / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP))
+    recordGoalResult(x > 1 - GUIDE_SIDE ? 'RX' : 'R', point)
   }
-}
-
-// B/X는 골대 아래의 별도 결과 버튼으로 둔다. 각 버튼은 골문 하단의 좌·우 좌표를 기록한다.
-function clickGoalBottom(result: 'B' | 'X') {
-  recordGoalResult(result, goalFramePoint(result === 'B' ? 0.25 : 0.75, 1))
 }
 
 // DAP 레코드의 선수 입력
@@ -644,7 +688,7 @@ function finishHalf() {
             <button v-for="a in shootActs" :key="a.k" class="actBtn" :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }" @click="clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
           </div>
 
-          <div class="goal" :class="{ active: pendingShotId !== null }" @click="clickGoalTarget">
+          <div class="goal" :class="{ active: pendingShot !== null }" @click="clickGoalTarget">
             <div class="goalZone hx">HX</div>
             <div class="goalZone lx">LX</div>
             <div class="goalZone rx">RX</div>
@@ -652,11 +696,17 @@ function finishHalf() {
             <div class="meterGuide" aria-hidden="true" />
             <div class="goalFrame" @click.stop="clickGoalFrame">
               <div class="goalZone goalCenter">GOAL</div>
+              <div
+                v-if="pendingFramePos"
+                class="frameMarker"
+                :style="{ left: pendingFramePos.x * 100 + '%', top: pendingFramePos.y * 100 + '%' }"
+              />
             </div>
           </div>
           <div class="goalResultButtons">
-            <button class="goalResultBtn" @click="clickGoalBottom('B')">B</button>
-            <button class="goalResultBtn" @click="clickGoalBottom('X')">X</button>
+            <button class="goalResultBtn resB" @click="confirmGoalFrame('B')">B</button>
+            <button class="goalResultBtn resGoal" @click="confirmGoalFrame('GOAL')">GOAL</button>
+            <button class="goalResultBtn resX" @click="confirmGoalFrame('X')">X</button>
           </div>
         </div>
 
@@ -835,16 +885,22 @@ section.right h1{margin:0;text-align:center;color:#fff;font-size:20px}
   box-shadow:inset 0 0 30px rgba(0,0,0,.5),0 2px 5px rgba(0,0,0,.45);
 }
 /* 포스트·크로스바 바깥 1m DSP 기준선: 골문과 이 U자 선 사이 띠가 클릭 가능한 DSP 범위다. */
-.hxDivider{position:absolute;left:0;right:0;top:21%;border-top:2px solid rgba(225,229,232,.7);box-shadow:0 1px 0 rgba(0,0,0,.3);pointer-events:none;z-index:3}
-.meterGuide{position:absolute;left:7.5%;right:7.5%;top:21%;bottom:0;border:2px solid rgba(225,229,232,.7);border-bottom:0;box-shadow:0 0 0 1px rgba(0,0,0,.3);pointer-events:none;z-index:3}
+/* 1m 경계선 위치(18.23%/5.44%)는 스크립트의 GUIDE_TOP/GUIDE_SIDE(실측 규격 기준 계산값)와
+   반드시 같이 맞춰야 한다 — 프레임 크기(70%×58%)를 7.32m×2.44m 기준으로 1m 환산한 값이다. */
+.hxDivider{position:absolute;left:0;right:0;top:18.23%;border-top:2px solid rgba(225,229,232,.7);box-shadow:0 1px 0 rgba(0,0,0,.3);pointer-events:none;z-index:3}
+.meterGuide{position:absolute;left:5.44%;right:5.44%;top:18.23%;bottom:0;border:2px solid rgba(225,229,232,.7);border-bottom:0;box-shadow:0 0 0 1px rgba(0,0,0,.3);pointer-events:none;z-index:3}
 .goalZone{cursor:pointer;color:#f0b429;font-weight:800;font-size:11px;display:grid;place-items:center}
-.hx{position:absolute;left:0;right:0;top:0;height:21%;text-align:center;color:rgba(255,255,255,.6);font-size:10px;letter-spacing:.08em}
-.lx{position:absolute;left:0;top:42%;bottom:0;width:7.5%;color:rgba(255,255,255,.68)}
-.rx{position:absolute;right:0;top:42%;bottom:0;width:7.5%;color:rgba(255,255,255,.68)}
+.hx{position:absolute;left:0;right:0;top:0;height:18.23%;text-align:center;color:rgba(255,255,255,.6);font-size:10px;letter-spacing:.08em}
+.lx{position:absolute;left:0;top:42%;bottom:0;width:5.44%;color:rgba(255,255,255,.68)}
+.rx{position:absolute;right:0;top:42%;bottom:0;width:5.44%;color:rgba(255,255,255,.68)}
 .goalCenter{position:absolute;inset:0;color:#fff;font-size:20px;letter-spacing:.05em;text-shadow:0 2px 6px rgba(0,0,0,.6);z-index:2;pointer-events:none}
 .goal:hover .hx,.goal:hover .lx,.goal:hover .rx{background:rgba(240,180,41,.08)}
-.goalResultButtons{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+.goalResultButtons{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px}
 .goalResultBtn{height:40px;border:1px solid rgba(255,255,255,.38);background:#292d31;color:#f1f1f1;font-weight:900;font-size:15px;cursor:pointer}
 .goalResultBtn:hover{background:#353a3f}
+.goalResultBtn.resGoal{border-color:#f0b429;background:rgba(240,180,41,.16);color:#f0b429}
+.goalResultBtn.resGoal:hover{background:rgba(240,180,41,.3)}
+/* 프레임 안쪽에 찍어둔 위치 마커. 결과가 확정되기 전까지(B/GOAL/X 누르기 전) 계속 보인다. */
+.frameMarker{position:absolute;width:16px;height:16px;margin:-8px;border-radius:50%;background:rgba(240,180,41,.85);border:2px solid #fff;box-shadow:0 0 0 5px rgba(240,180,41,.3);pointer-events:none;z-index:4}
 
 </style>

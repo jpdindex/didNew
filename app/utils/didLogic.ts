@@ -52,13 +52,16 @@ export type ActCode = 'C' | 'P' | 'K' | 'F' | 'S' | 'H' | 'R' | ''
 /**
  * 결과 코드.
  *   'O'                  진행중. 액트를 누른 직후의 값이며 실제로 저장된다.
- *   'X'                  실책으로 뺏김        / 'B' 상대 수비 블락
+ *   'X'                  실책으로 뺏김        / 'B' 상대 수비(필드 플레이어) 블락
+ *   'GB'                 골키퍼가 막음(선방)  / 'GX' 골키퍼 정면으로 가서 위협 안 됨
+ *                        — 골대 패널의 B/GOAL/X 버튼 전용. 킥 패널의 B/X(수비수·실책)와는
+ *                        다른 개념이라 코드를 분리했다. 라벨은 그대로 B/X 로 보여준다.
  *   'GOAL'               득점 (레거시 res_code 'G' 에 대응)
  *   'L' | 'H' | 'R'      유효 슈팅 — 골대 안쪽을 탭한 좌표에서 앱이 파생시키는 값
  *   'LX' | 'HX' | 'RX'   빗나간 슈팅
  *   ''                   결과 미입력 — 판정 대상에서 제외된다
  */
-export type ResCode = 'O' | 'X' | 'B' | 'GOAL' | 'L' | 'H' | 'R' | 'LX' | 'HX' | 'RX' | ''
+export type ResCode = 'O' | 'X' | 'B' | 'GB' | 'GX' | 'GOAL' | 'L' | 'H' | 'R' | 'LX' | 'HX' | 'RX' | ''
 
 /** 레코드 한 건. 레거시 ff_game_record 1행에 대응. */
 export interface DidRecord {
@@ -171,6 +174,9 @@ export function applyResult(
   }
   if (opts.shootDspRange !== undefined) rec.shootDspRange = opts.shootDspRange
 
+  // GOAL/L/H/R/LX/HX/RX 는 물론, GB/GX(골키퍼 선방·무위협)도 여기서 걸러진다 —
+  // 셋 다 "S | GB" 처럼 같은 레코드에 res 만 얹고 끝난다(액트 안 지움, 새 행 안 만듦).
+  // 아래 write-back/새 행 로직은 킥 패널의 순수 B/X(수비수 차단·실책) 전용이다.
   if (res !== 'X' && res !== 'B') return
 
   if (wasShot) {
@@ -335,9 +341,11 @@ function classifyChain(chain: DidRecord[]): { path: AttackPath; flags: Map<strin
       ptype = 'DTP'
       if (isGoal(r.res)) isGoalChain = true
 
-      // DSP: 유효슈팅(득점 / 유효방향 L·H·R / 슛 좌표가 찍힌 블락)을 포함하는지
+      // DSP: 유효슈팅(득점 / 유효방향 L·H·R / 좌표가 찍힌 블락 / 골키퍼 선방)을 포함하는지.
+      // GB(골키퍼 선방)는 좌표 유무와 무관하게 항상 유효슛이다 — 막았다는 것 자체가 온타깃이었다는 뜻.
+      // GX(골키퍼 정면, 무위협)는 포함하지 않는다.
       const hasShootPos = (r.shootPosX ?? 0) > 0 || (r.shootPosY ?? 0) > 0
-      if (isGoal(r.res) || r.res === 'R' || r.res === 'L' || r.res === 'H' ||
+      if (isGoal(r.res) || r.res === 'R' || r.res === 'L' || r.res === 'H' || r.res === 'GB' ||
         (r.res === 'B' && hasShootPos) || r.shootDspRange) {
         dsp = true
       }
@@ -413,7 +421,7 @@ function classifyChain(chain: DidRecord[]): { path: AttackPath; flags: Map<strin
     f.isTapS = !!act && (res === 'O' || isGoal(res))
     f.isSht = isShotAct(act) || !!r.isShot
     f.isShtS = (isShotAct(act) || !!r.isShot) &&
-      (isGoal(res) || res === 'R' || res === 'L' || res === 'H' ||
+      (isGoal(res) || res === 'R' || res === 'L' || res === 'H' || res === 'GB' ||
         (res === 'B' && hasShootPos) || !!r.shootDspRange)
     f.isGol = isGoal(res)
   }
