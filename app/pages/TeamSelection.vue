@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computeAttackPaths, computeBap } from '~/utils/didLogic'
+import type { HalfStatus } from '~/composables/useMatchState'
 import {
   GRASS_LINE_OPTIONS,
   GRASS_PATTERNS,
@@ -104,6 +105,11 @@ function pickFormation(key: string) {
   activeSlot.value = 'o0'
 }
 
+// 개발용 등급 토글. recorders/{uid}.level 연동 전까지 화면에서 직접 전환한다.
+function toggleRecorderLevel() {
+  game.value.recorderLevel = game.value.recorderLevel === 'basic' ? 'advanced' : 'basic'
+}
+
 // 테스트용: 포메이션/진영/전체 슬롯을 랜덤으로 한 번에 채움
 function fillTestData() {
   const keys = Object.keys(formations)
@@ -134,8 +140,26 @@ function pickTeam(team: 'home' | 'away') {
   activeSlot.value = game.value.formationKey ? 'o0' : null
 }
 
+// 탭-탭으로 자리 교환: 채워진 슬롯을 탭해 선택한 뒤 다른 슬롯을 탭하면 두 선수 자리가
+// 바뀐다(목표가 빈 자리면 그냥 그리로 옮긴다). 태블릿 터치 기준 — 드래그 앤 드롭 대신
+// 이 방식을 쓴다. 같은 슬롯을 다시 탭하면 선택 취소.
+// 선택된 슬롯이 비어 있으면(=일반적인 배정 흐름) 기존처럼 activeSlot 만 바뀐다.
 function clickSlot(id: string) {
   if (id !== 'gk' && !game.value.formationKey) return
+  const prev = activeSlot.value
+  if (prev === id) {
+    activeSlot.value = null
+    return
+  }
+  if (prev && game.value.assigned[prev] !== undefined) {
+    const fromIdx = game.value.assigned[prev]!
+    const toIdx = game.value.assigned[id]
+    if (toIdx === undefined) delete game.value.assigned[prev]
+    else game.value.assigned[prev] = toIdx
+    game.value.assigned[id] = fromIdx
+    activeSlot.value = null
+    return
+  }
   activeSlot.value = id
 }
 
@@ -166,6 +190,8 @@ function pickPlayer(index: number) {
 }
 
 // ---- 드래그 앤 드롭으로 선수 배정 ----
+// (Player List 패널에서 슬롯으로 끌어다 놓는 기존 기능. 마우스 기준이라 태블릿에서도
+// 되는지는 별개 — 여기서는 손대지 않는다.)
 const dragIndex = ref<number | null>(null)
 function onDragStart(index: number) {
   dragIndex.value = index
@@ -185,7 +211,10 @@ const canStart = computed(() => !!game.value.formationKey && !!game.value.side &
 // DidInput 으로 넘어갈 때 공통으로 실어보내는 쿼리.
 // date/league/round/stadium/time 은 TeamSelection 표시에만 쓰지만, DidInput 은 이 값을
 // 그대로 들고 있다가 전반/후반 종료 시 TeamSelection 으로 돌아올 때 되돌려준다.
-function didInputQuery(resumeHalf?: '전반' | '후반') {
+// editReturnStatus: 수정 화면에서 "대기방으로 나가기"를 눌렀을 때 되돌아갈 halfStatus.
+// 이미 끝난 half 를 고치러 온 거면 'H1_done'/'H2_done' 으로, 정지 중이던 half 를
+// 고치러 온 거면 'H1'/'H2' 로 넘긴다 — 그래야 나갈 때 원래 있던 화면으로 정확히 복귀한다.
+function didInputQuery(resumeHalf?: '전반' | '후반', edit?: boolean, editReturnStatus?: HalfStatus) {
   return {
     matchId: matchId.value,
     date: match.value.date,
@@ -201,6 +230,8 @@ function didInputQuery(resumeHalf?: '전반' | '후반') {
     grass: game.value.grassPattern,
     lines: game.value.grassLines,
     ...(resumeHalf ? { resumeHalf } : {}),
+    ...(edit ? { edit: '1' } : {}),
+    ...(editReturnStatus ? { editReturn: editReturnStatus } : {}),
   }
 }
 
@@ -208,25 +239,73 @@ function startFirstHalf() {
   if (!canStart.value) return
   if (!confirm('전반전을 시작하시겠습니까?\n시작 후에는 라인업을 수정할 수 없습니다.')) return
   game.value.halfStatus = 'H1'
+  game.value.seconds = 0 // 새 half 는 0초부터
   navigateTo({ path: '/DidInput', query: didInputQuery() })
+}
+
+// "대기방으로 나가기"로 빠져나온 상태(halfStatus 가 H1/H2 인데 이 화면에 있는 경우)에서
+// 나갔던 시간 그대로 다시 들어간다. game.seconds 를 건드리지 않는 것이 핵심이다.
+const isPaused = computed(() => game.value.halfStatus === 'H1' || game.value.halfStatus === 'H2')
+const pausedHalf = computed<'전반' | '후반'>(() => (game.value.halfStatus === 'H2' ? '후반' : '전반'))
+const pausedClock = computed(() => {
+  const s = game.value.seconds
+  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+})
+function reenterHalf() {
+  navigateTo({ path: '/DidInput', query: didInputQuery(pausedHalf.value) })
+}
+// 정지된 채로 나온 상태에서도 "수정"이 가능해야 한다. halfStatus 는 이미 H1/H2 로
+// 올바르게 남아있으므로 건드리지 않고, edit=1 만 붙여 시간이 멈춘 채로 들어간다.
+// editReturn 에도 지금 상태(H1/H2)를 그대로 넘겨서, 나갈 때 같은 "정지" 화면으로 돌아오게 한다.
+function editPausedHalf() {
+  navigateTo({ path: '/DidInput', query: didInputQuery(pausedHalf.value, true, game.value.halfStatus) })
 }
 
 // 전반 종료 후 대기 화면(이 화면)에서 고르는 두 가지 선택.
 // "수정" = 방금 끝난 전반 기록을 다시 보면서 고치러 DidInput 으로 돌아간다 (PPT 슬라이드 42).
 // "후반전 시작" = 스코어/기록을 이어서 후반을 시작한다.
+// editReturn 에 "끝난 상태"(H1_done/H2_done)를 넘겨서, 수정 후 "대기방으로 나가기"를
+// 누르면 다시 그 끝난 상태(= 후반전 시작 화면)로 돌아오게 한다. halfStatus 를 여기서
+// 미리 H1/H2 로 바꾸는 건 DidInput 진입 화면(정지 상태 표시)을 위한 것일 뿐이다.
 function editHalf() {
-  game.value.halfStatus = game.value.halfStatus === 'H2_done' ? 'H2' : 'H1'
-  navigateTo({ path: '/DidInput', query: didInputQuery(game.value.halfStatus === 'H2' ? '후반' : '전반') })
+  // 갱신으로 잠긴 half 는 관리자가 풀어주기 전까지 수정할 수 없다.
+  if (game.value.halfStatus === 'H1_done' && game.value.h1Locked) return
+  if (game.value.halfStatus === 'H2_done' && game.value.h2Locked) return
+  const prevStatus = game.value.halfStatus // 'H1_done' | 'H2_done'
+  game.value.halfStatus = prevStatus === 'H2_done' ? 'H2' : 'H1'
+  navigateTo({ path: '/DidInput', query: didInputQuery(game.value.halfStatus === 'H2' ? '후반' : '전반', true, prevStatus) })
 }
 function startSecondHalf() {
   game.value.halfStatus = 'H2'
+  game.value.seconds = 0 // 새 half 는 0초부터
   navigateTo({ path: '/DidInput', query: didInputQuery('후반') })
 }
 function finishMatch() {
   if (!confirm('경기를 종료하시겠습니까?')) return
+  // TODO: 여기서 파이썬 평점 서비스(jpd-rating) 호출 — 전체 확정 집계 + 평점 + JaionX 전송.
+  // 백엔드 연동 전까지는 상태 전환만 한다.
   game.value.halfStatus = 'final'
   navigateTo('/schedule')
 }
+
+// basic 등급 전용: 전반/후반 갱신. 누르면 확인 후 그 half 의 수정 버튼과 함께 잠긴다.
+// 관리자 잠금 해제 전까지는 다시 누를 수 없다 — 갱신된 데이터를 함부로 고치지 못하게 하려는 것.
+function refreshH1() {
+  if (game.value.h1Locked) return
+  if (!confirm('갱신하면 DB 데이터가 저장됩니다.\n정말 진행하시겠습니까?')) return
+  // TODO: 여기서 파이썬 KPI 서비스(jpd-did) 호출 — 판정 + KPI + 5분 구간 1~10.
+  // 백엔드 연동 전까지는 잠금 상태만 반영한다.
+  game.value.h1Locked = true
+}
+function refreshH2() {
+  if (game.value.h2Locked) return
+  if (!confirm('갱신하면 DB 데이터가 저장됩니다.\n정말 진행하시겠습니까?')) return
+  // TODO: 여기서 파이썬 KPI 서비스(jpd-did) 호출 — 판정 + KPI + 5분 구간 1~20.
+  game.value.h2Locked = true
+}
+// 잠금 해제는 이 화면(기록자용)에 두지 않는다. 여기 두면 basic 사용자 본인이
+// 스스로 풀 수 있게 되어 "관리자만 해제" 라는 전제가 무의미해진다.
+// 해제는 /manage(데이터 관리, 관리자 전용 화면)에서만 한다.
 
 // ---- 대기 화면 상태 표시 ----
 const statusLabel = computed(() => ({
@@ -372,6 +451,11 @@ function playerAt(id: string) {
           </div>
         </div>
         <button class="testBtn" @click="fillTestData">TEST</button>
+        <!-- 개발용 등급 토글. 실제로는 recorders/{uid}.level 을 읽어와야 하지만
+             그 연동 전까지 여기서 basic/advanced 화면을 바로 바꿔가며 확인한다. -->
+        <button class="levelToggle" :class="{ basic: game.recorderLevel === 'basic' }" @click="toggleRecorderLevel">
+          등급: {{ game.recorderLevel === 'basic' ? 'BASIC' : 'ADVANCED' }}
+        </button>
         <button class="backBtn" @click="navigateTo('/schedule')">◀ 이전화면으로</button>
       </aside>
       <main class="content"><h1>Player List</h1>
@@ -542,16 +626,35 @@ function playerAt(id: string) {
             </template>
             <template v-else-if="game.halfStatus === 'H1_done'">
               <p>전반 기록을 확인하세요<br><b>기록을 수정하거나 후반전을 시작할 수 있습니다.</b></p>
-              <div class="halfActions">
+              <p v-if="game.recorderLevel === 'basic' && game.h1Locked" class="lockNotice">🔒 갱신됨 — 관리자만 수정 잠금을 풀 수 있습니다. (데이터 관리에서 해제)</p>
+              <div v-if="game.recorderLevel === 'basic'" class="halfActions halfActions3">
+                <button class="editBtn" :disabled="game.h1Locked" @click="editHalf">수정</button>
+                <button class="refreshBtn" :disabled="game.h1Locked" @click="refreshH1">전반전 갱신</button>
+                <button class="startBtn" @click="startSecondHalf">후반전 시작</button>
+              </div>
+              <div v-else class="halfActions">
                 <button class="editBtn" @click="editHalf">수정</button>
                 <button class="startBtn" @click="startSecondHalf">후반전 시작</button>
               </div>
             </template>
             <template v-else-if="game.halfStatus === 'H2_done'">
               <p>후반 기록을 확인하세요<br><b>기록을 수정하거나 경기를 종료할 수 있습니다.</b></p>
-              <div class="halfActions">
+              <p v-if="game.recorderLevel === 'basic' && game.h2Locked" class="lockNotice">🔒 갱신됨 — 관리자만 수정 잠금을 풀 수 있습니다. (데이터 관리에서 해제)</p>
+              <div v-if="game.recorderLevel === 'basic'" class="halfActions halfActions3">
+                <button class="editBtn" :disabled="game.h2Locked" @click="editHalf">수정</button>
+                <button class="refreshBtn" :disabled="game.h2Locked" @click="refreshH2">후반전 갱신</button>
+                <button class="startBtn" @click="finishMatch">최종 데이터 갱신 &amp; 경기 종료</button>
+              </div>
+              <div v-else class="halfActions">
                 <button class="editBtn" @click="editHalf">수정</button>
-                <button class="startBtn" @click="finishMatch">경기 종료</button>
+                <button class="startBtn" @click="finishMatch">최종 데이터 갱신 &amp; 경기 종료</button>
+              </div>
+            </template>
+            <template v-else-if="isPaused">
+              <p>{{ pausedHalf }} 기록이 대기 중입니다<br><b>{{ pausedClock }} 시점부터 이어서 입력합니다.</b></p>
+              <div class="halfActions">
+                <button class="editBtn" @click="editPausedHalf">수정</button>
+                <button class="startBtn" @click="reenterHalf">{{ pausedHalf }}전 입장</button>
               </div>
             </template>
             <template v-else>
@@ -738,8 +841,16 @@ function playerAt(id: string) {
 .startBtn:not(:disabled){background:#f0b429;border-color:#f0b429;color:#161200;font-weight:800;cursor:pointer}
 .startPanel small{position:absolute;right:8px;bottom:3px;color:rgba(255,255,255,.25);font-size:8px}
 .halfActions{display:grid;grid-template-columns:1fr 1.4fr;gap:8px}
+.halfActions3{grid-template-columns:1fr 1fr 1.3fr}
 .editBtn{height:43px;border-radius:4px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.04);color:#ddd;font-weight:800;cursor:pointer}
 .editBtn:hover{background:rgba(255,255,255,.1)}
+.editBtn:disabled{opacity:.35;cursor:not-allowed}
 .halfActions .startBtn{background:#f0b429;border-color:#f0b429;color:#161200;cursor:pointer}
+.refreshBtn{height:43px;border-radius:4px;border:1px solid rgba(240,180,41,.4);background:rgba(240,180,41,.08);color:#f0b429;font-weight:800;cursor:pointer;font-size:12px}
+.refreshBtn:hover:not(:disabled){background:rgba(240,180,41,.18)}
+.refreshBtn:disabled{opacity:.35;cursor:not-allowed;color:rgba(255,255,255,.35);border-color:rgba(255,255,255,.16);background:transparent}
+.lockNotice{margin:0 0 8px;font-size:11px;color:#f0b429;text-align:center}
+.levelToggle{margin-top:6px;height:26px;border-radius:4px;border:1px dashed rgba(240,180,41,.5);background:rgba(240,180,41,.08);color:#f0b429;cursor:pointer;font-size:10px;font-weight:800;letter-spacing:.03em}
+.levelToggle.basic{background:rgba(99,192,162,.12);border-color:rgba(99,192,162,.5);color:#63c0a2}
 
 </style>

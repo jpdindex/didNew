@@ -2,7 +2,6 @@
 import {
   applyResult,
   computeAttackPaths,
-  computeBap,
   createActRecord,
   type ActCode,
   type DidRecord,
@@ -17,6 +16,7 @@ import {
   type GrassPattern,
 } from '~/utils/grass'
 import { GOAL_TARGET, goalFramePoint, goalOuterPoint, isWithinGoalOneMeter } from '~/utils/goalCoordinates'
+import type { HalfStatus } from '~/composables/useMatchState'
 
 const route = useRoute()
 const home = computed(() => String(route.query.home ?? route.query.homeName ?? 'Vallecano').trim() || 'Vallecano')
@@ -28,23 +28,59 @@ const inputMode = computed(() => (route.query.mode === '실시간' ? '실시간'
 // TeamSelection 으로 돌아가며, "수정"/"후반전 시작"으로 다시 들어올 때 이어서 불러온다.
 const game = useMatchState()
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
+// "수정"으로 들어온 경우(이미 끝난 half를 고치러 옴)와 실시간으로 기록 중인 경우를
+// 구분한다. 수정 화면은 시계가 멈춰 있고, 우상단 버튼도 "{half} 종료"가 아니라
+// 항상 "대기방으로 나가기"로 보여야 한다 — editHalf()/editPausedHalf() 가 이 쿼리를 붙여 보낸다.
+const isEditMode = route.query.edit === '1'
+// 수정 화면에서 "대기방으로 나가기"를 누르면 돌아갈 상태. 끝난 half 를 고치러 왔으면
+// 'H1_done'/'H2_done' 이 들어있어 후반전 시작 화면으로, 정지 중이던 half 를 고치러
+// 왔으면 'H1'/'H2' 가 들어있어 그 정지 화면으로 정확히 되돌아간다. 없으면(수정이 아닌
+// 일반 정지) half 기준으로 진행중 상태를 그대로 유지한다.
+const editReturnStatus = route.query.editReturn as HalfStatus | undefined
 
 const homeScore = ref(game.value.homeScore)
 const awayScore = ref(game.value.awayScore)
 const half = ref<'전반' | '후반'>(resumeHalf ?? '전반')
-const seconds = ref(0)
-const paused = ref(false)
+// 레코드에 태그로 남기는 half 코드. didLogic.ts/schema.ts 와 맞춘다.
+const halfCode = computed<'H1' | 'H2'>(() => (half.value === '전반' ? 'H1' : 'H2'))
+// 경과초는 공유 상태에서 이어받는다. "대기방으로 나가기"로 빠져나갔다가 다시 들어오면
+// 그 시간부터 이어서 흐른다. 새 half 를 시작할 때는 TeamSelection 이 0 으로 초기화한다.
+// 수정 화면(isEditMode)에서는 지금 보고 있는 half 자체의 확정 시간(h1Seconds/h2Seconds)에서
+// 시작한다 — game.seconds 하나로는 마지막에 종료한 half 값만 남기 때문이다.
+const seconds = ref(
+  isEditMode
+    ? (half.value === '전반' ? game.value.h1Seconds : game.value.h2Seconds)
+    : game.value.seconds
+)
+// 수정 화면에서는 시간이 멈춰 있어야 한다 — 끝난(또는 나가기 직전 멈춘) 시각 그대로 고정.
+const paused = ref(isEditMode)
 const clock = computed(() => {
   const m = String(Math.floor(seconds.value / 60)).padStart(2, '0')
   const s = String(seconds.value % 60).padStart(2, '0')
   return `${m}:${s}`
 })
+// 시계 양옆 화살표로 시간을 수동 보정한다. ◀ 는 1초 줄이고 ▶ 는 1초 늘린다(0초 아래로는 안 내려간다).
+function stepSeconds(delta: number) {
+  seconds.value = Math.max(0, seconds.value + delta)
+}
+
+// 수정 화면 전용: 시계의 "전반"/"후반" 라벨을 눌러 편집 대상 half 를 바꾼다.
+// 지금 보던 half 의 조정값을 먼저 저장해두고, 누른 half 의 저장된 시간을 불러온다.
+function selectHalf(target: '전반' | '후반') {
+  if (!isEditMode || target === half.value) return
+  if (half.value === '전반') game.value.h1Seconds = seconds.value
+  else game.value.h2Seconds = seconds.value
+  half.value = target
+  seconds.value = target === '전반' ? game.value.h1Seconds : game.value.h2Seconds
+}
 let timer: ReturnType<typeof setInterval> | undefined
 function startTicking() {
   if (timer) clearInterval(timer)
   timer = setInterval(() => { seconds.value++ }, 1000)
 }
-onMounted(() => { startTicking() })
+onMounted(() => {
+  if (!isEditMode) startTicking() // 수정 모드는 시간을 멈춘 채로 시작한다
+})
 onUnmounted(() => {
   if (timer) clearInterval(timer)
   if (flashTimer) clearTimeout(flashTimer)
@@ -60,6 +96,18 @@ function togglePause() {
   }
 }
 
+// 대기방으로 나가기.
+// 지금까지의 기록·스코어·경과초를 공유 상태에 저장한 뒤 TeamSelection 으로 나간다.
+// 돌아갈 상태는 editReturnStatus 가 있으면 그걸 그대로 쓰고(수정 화면 — 원래 있던
+// 화면으로 정확히 복귀), 없으면 진행중인 half 를 정지시키는 것뿐이므로 'H1'/'H2'.
+function exitToLobby() {
+  if (!confirm(`대기방으로 나가시겠습니까?\n${clock.value} 시점부터 다시 입장할 수 있습니다.`)) return
+
+  saveToStore()
+  game.value.halfStatus = editReturnStatus ?? (half.value === '전반' ? 'H1' : 'H2')
+  goTeamSelection()
+}
+
 // 레코드는 시간순(오래된 것 → 최신)으로 보관한다. 표시할 때만 뒤집는다.
 // 플레이 하나 = 레코드 하나이며, 결과(X/B/골존)는 새 레코드가 아니라
 // 직전 레코드의 res 를 덮어쓴다. 근거는 docs/03_kpi_terminology.md 참고.
@@ -70,11 +118,15 @@ const records = ref<DidRecord[]>(resumeHalf ? [...game.value.records] : [])
 const team = computed(() => (route.query.team === 'away' ? 'away' : 'home'))
 const squad = computed<SquadPlayer[]>(() => (team.value === 'away' ? AWAY_SQUAD : HOME_SQUAD))
 
+// 지금 보고 있는 half(전반/후반)의 레코드만 추린다. half 태그가 없는 과거 레코드는
+// 전반(H1)으로 취급한다 — 이 필드가 생기기 전에 만들어진 세션 데이터를 위한 대비다.
+// 전·후반 레코드가 한 배열에 섞이면 4초 룰이 반 경계를 넘어 잘못 이어진다(§6.1 버그).
+const visibleRecords = computed(() => records.value.filter(r => (r.half ?? 'H1') === halfCode.value))
+
 // 진행 중인 루트도 매번 판정한다. 그래야 DAP 존(구역 1~6)에 찍는 순간
 // 그 루트가 UTP 로 확정되어 진입 레코드 + 직전 2개에 선수 입력 버튼이 바로 뜬다.
 // (DAP 존에 못 들어갔고 슛도 없으면 여전히 UPP 라 뜨지 않는다)
-const analysis = computed(() => computeAttackPaths(records.value, { closeTrailing: true }))
-const bapCount = computed(() => computeBap(records.value).length)
+const analysis = computed(() => computeAttackPaths(visibleRecords.value, { closeTrailing: true }))
 
 function fmtTime(sec: number) {
   return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
@@ -83,7 +135,7 @@ function fmtTime(sec: number) {
 // 표시용 행. 시간순 그대로 — 가장 최근 기록이 맨 아래에 온다.
 const rows = computed(() => {
   const flags = analysis.value.flags
-  return records.value
+  return visibleRecords.value
     .map((r, i) => ({
       id: r.id,
       no: i + 1,
@@ -104,7 +156,9 @@ const rows = computed(() => {
 
 // 최신 기록이 맨 아래에 쌓이므로, 기록이 늘면 표를 아래로 붙여준다.
 const tableEl = ref<HTMLElement | null>(null)
-watch(() => records.value.length, async () => {
+// 수정 화면 전용: 기록표를 눌러서 넓히면(경기장이 위로 줄어들며) 더 많은 액트를 한 번에 본다.
+const tableExpanded = ref(false)
+watch(() => visibleRecords.value.length, async () => {
   await nextTick()
   if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
 })
@@ -161,6 +215,10 @@ function applyEdit() {
       rec.posY = editPos.value.y
       rec.area = Number(areaFromPos(editPos.value))
     }
+    // 시간을 바꿨으면 목록도 그 시간 순서에 맞게 다시 정렬한다 — 가장 늦은 시간으로
+    // 고치면 맨 아래로, 가장 이른 시간으로 고치면 맨 위로 옮겨간다. didLogic.ts의
+    // resolvedOnly() 와 같은 기준(seconds asc, seq asc)으로 정렬해 화면과 판정이 어긋나지 않게 한다.
+    records.value.sort((a, b) => (a.seconds - b.seconds) || ((a.seq ?? 0) - (b.seq ?? 0)))
   }
   editingId.value = null
 }
@@ -187,6 +245,19 @@ const grassLines = ref<GrassLines>(
 )
 const grassOpen = ref(false)
 const grassBg = computed(() => grassBackground(grassPattern.value, grassLines.value))
+
+// 좌우 반전: 경기장·기록표(left)와 액트 입력판(right)의 화면 위치를 통째로 바꾼다.
+// 팝업에서 고른 값은 "확인"을 눌러야 실제로 적용된다.
+const mirrorOpen = ref(false)
+const pendingMirrored = ref(game.value.mirrored)
+function openMirrorPopup() {
+  pendingMirrored.value = game.value.mirrored
+  mirrorOpen.value = true
+}
+function confirmMirror() {
+  game.value.mirrored = pendingMirrored.value
+  mirrorOpen.value = false
+}
 
 const pendingPos = ref<{ x: number; y: number } | null>(null)
 // 슛(S/H/R)은 결과(HX/LX/RX/H/L/R, GB/GOAL/GX)가 정해지기 전엔 레코드를 만들지 않는다 —
@@ -415,7 +486,7 @@ function clickAct(actKey: string, isShot: boolean) {
     actKey as Exclude<ActCode, ''>,
     seconds.value,
     Number(areaFromPos(pendingPos.value)),
-    { posX: pendingPos.value.x, posY: pendingPos.value.y }
+    { posX: pendingPos.value.x, posY: pendingPos.value.y, half: halfCode.value }
   )
   records.value.push(rec)
   pendingPos.value = null
@@ -444,7 +515,7 @@ function clickResult(res: 'X' | 'B') {
 function recordGoalResult(zone: Exclude<ResCode, 'O' | ''>, point?: { x: number; y: number }) {
   if (!pendingShot.value) return
   const shot = pendingShot.value
-  const rec = createActRecord(shot.act, shot.seconds, shot.area, { posX: shot.posX, posY: shot.posY })
+  const rec = createActRecord(shot.act, shot.seconds, shot.area, { posX: shot.posX, posY: shot.posY, half: halfCode.value })
   rec.res = zone
   if (point) {
     rec.shootPosX = point.x
@@ -526,14 +597,18 @@ function submitPlayer() {
 // 전반/후반 종료: 스코어·기록을 공유 상태에 저장하고 대기 화면(TeamSelection)으로
 // 돌아간다. "경기를 종료할지"는 이제 이 화면이 아니라 TeamSelection 이 판단한다
 // (전반/후반 모두 끝나면 그 화면에서 수정/다음 단계를 고르게 되어 있다).
-function finishHalf() {
-  if (!confirm(`${half.value}을 종료하시겠습니까?`)) return
-
+function saveToStore() {
   game.value.records = records.value
   game.value.homeScore = homeScore.value
   game.value.awayScore = awayScore.value
-  game.value.halfStatus = half.value === '전반' ? 'H1_done' : 'H2_done'
+  game.value.seconds = seconds.value
+  // 지금 보고 있는 half 의 확정 시간도 같이 남긴다 — "수정"에서 전반↔후반을 오갈 때
+  // 서로의 시간을 정확히 복원하기 위함이다.
+  if (half.value === '전반') game.value.h1Seconds = seconds.value
+  else game.value.h2Seconds = seconds.value
+}
 
+function goTeamSelection() {
   navigateTo({
     path: '/TeamSelection',
     query: {
@@ -548,21 +623,29 @@ function finishHalf() {
     },
   })
 }
+
+function finishHalf() {
+  if (!confirm(`${half.value}을 종료하시겠습니까?`)) return
+
+  if (timer) clearInterval(timer)
+  saveToStore()
+  game.value.halfStatus = half.value === '전반' ? 'H1_done' : 'H2_done'
+  goTeamSelection()
+}
 </script>
 
 <template>
   <div class="page">
     <div class="frameViewport">
-      <div class="frame">
+      <div class="frame" :class="{ mirrored: game.mirrored }">
       <section class="left">
         <div class="statBar">
           <div class="cardIcon">🟨🟥</div>
-          <button class="stat">-3</button>
-          <button class="stat">-1</button>
-          <div class="bap">BAP: {{ bapCount }}</div>
+          <button class="stat" @click="stepSeconds(-3)">-3</button>
+          <button class="stat" @click="stepSeconds(-1)">-1</button>
           <div class="spacer" />
-          <button class="stat">+1</button>
-          <button class="stat">+3</button>
+          <button class="stat" @click="stepSeconds(1)">+1</button>
+          <button class="stat" @click="stepSeconds(3)">+3</button>
           <div class="grassWrap">
             <button class="grassIcon" :class="{ on: grassOpen }" @click="grassOpen = !grassOpen">▦</button>
             <div v-if="grassOpen" class="grassPop">
@@ -592,22 +675,34 @@ function finishHalf() {
             </div>
           </div>
           <div class="swapIcon">⇄</div>
+          <button
+            v-if="inputMode === '분석'"
+            class="pauseBtn"
+            :class="{ paused }"
+            @click="togglePause"
+          >{{ paused ? '▶' : '❚❚' }}</button>
+          <div v-else class="modeTag">실시간</div>
         </div>
 
         <div class="scoreBar">
           <div class="team">{{ home }}</div>
           <div class="score">{{ homeScore }}</div>
           <div class="halfBox">
-            <div class="halfLabel" :class="{ on: half === '전반' }">전반</div>
-            <div class="clock" :class="{ paused }">{{ clock }}</div>
-            <div class="halfLabel" :class="{ on: half === '후반' }">후반</div>
-            <button
-              v-if="inputMode === '분석'"
-              class="pauseBtn"
-              :class="{ paused }"
-              @click="togglePause"
-            >{{ paused ? '▶' : '❚❚' }}</button>
-            <div v-else class="modeTag">실시간</div>
+            <div class="clockRow">
+              <button class="timeStep" @click="stepSeconds(-1)">◀</button>
+              <div
+                class="halfLabel"
+                :class="{ on: half === '전반', clickable: isEditMode }"
+                @click="selectHalf('전반')"
+              >전반</div>
+              <div class="clock" :class="{ paused }">{{ clock }}</div>
+              <div
+                class="halfLabel"
+                :class="{ on: half === '후반', clickable: isEditMode }"
+                @click="selectHalf('후반')"
+              >후반</div>
+              <button class="timeStep" @click="stepSeconds(1)">▶</button>
+            </div>
           </div>
           <div class="score">{{ awayScore }}</div>
           <div class="team right">{{ away }}</div>
@@ -625,7 +720,12 @@ function finishHalf() {
           <div v-if="pendingPos" class="marker" :style="{ left: pendingPos.x + '%', top: pendingPos.y + '%' }" />
         </div>
 
-        <div ref="tableEl" class="table">
+        <button
+          v-if="isEditMode"
+          class="tableToggle"
+          @click="tableExpanded = !tableExpanded"
+        >{{ tableExpanded ? '▼ 기록 접기' : '▲ 기록 더보기' }}</button>
+        <div ref="tableEl" class="table" :class="{ expanded: tableExpanded }">
           <div class="thead">
             <span>No.</span><span>Time</span><span>Act</span><span>Result</span><span>Area</span><span>Player</span>
           </div>
@@ -667,7 +767,24 @@ function finishHalf() {
           <button class="editDelete" @click="deleteEdit">삭제</button>
           <button class="editCancel" @click="cancelEdit">취소</button>
         </div>
+        <!-- 수정 화면(isEditMode)이거나 정지 중이면 "대기방으로 나가기". 실제로 기록 중일 때만 "{half} 종료". -->
+        <button v-else-if="isEditMode || paused" class="finishBtn" @click="exitToLobby">대기방으로 나가기</button>
         <button v-else class="finishBtn" @click="finishHalf">{{ half }} 종료</button>
+
+        <div class="mirrorWrap">
+          <button class="mirrorIcon" :class="{ on: mirrorOpen }" @click="openMirrorPopup">⇄</button>
+          <div v-if="mirrorOpen" class="mirrorPop">
+            <div class="popRow">
+              <span class="popLabel">좌우 반전</span>
+              <div class="popOpts">
+                <button class="popBtn" :class="{ on: !pendingMirrored }" @click="pendingMirrored = false">기본</button>
+                <button class="popBtn" :class="{ on: pendingMirrored }" @click="pendingMirrored = true">반전</button>
+              </div>
+            </div>
+            <button class="popOk" @click="confirmMirror">확인</button>
+          </div>
+        </div>
+
         <h1>{{ playerPickFor ? '선수선택' : 'DID-INPUT' }}</h1>
 
         <template v-if="!playerPickFor">
@@ -743,12 +860,15 @@ function finishHalf() {
 .page{width:1280px;height:800px;margin:0 auto;box-sizing:border-box;padding:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#0b0f17}
 .frameViewport{position:relative;flex:0 0 auto;width:1280px;height:800px;overflow:hidden;box-shadow:0 14px 44px rgba(0,0,0,.55)}
 .frame{position:absolute;left:0;top:0;width:1280px;height:800px;display:grid;grid-template-columns:712.6641px 567.3359px;overflow:hidden;border:1px solid rgba(255,255,255,.1)}
+/* 좌우 반전: 컨테이너만 뒤집고(rtl) 자식 각각은 다시 정방향(ltr)으로 되돌려 내부 내용은 그대로 둔 채
+   left/right 두 섹션의 위치만 맞바꾼다. DOM 순서·기존 코드는 전혀 안 건드린다. */
+.frame.mirrored{direction:rtl}
+.frame.mirrored>section{direction:ltr}
 
 .left{min-width:0;background:#1b1e22;display:flex;flex-direction:column}
-.statBar{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.08)}
+.statBar{position:relative;flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.08)}
 .cardIcon{font-size:14px}
 .stat{height:26px;padding:0 10px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#ddd;font-weight:800;cursor:pointer}
-.bap{color:#e8e8e8;font-size:12px;font-weight:700}
 .spacer{flex:1}
 .grassIcon,.swapIcon{width:26px;height:26px;display:grid;place-items:center;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#ddd;font-size:13px;padding:0;cursor:pointer}
 .grassIcon.on{border-color:#f0b429;color:#f0b429;background:rgba(240,180,41,.18)}
@@ -767,12 +887,17 @@ function finishHalf() {
 .team{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#eee;font-weight:800;font-size:13px}
 .team.right{text-align:right}
 .score{color:#fff;font-weight:900;font-size:20px;min-width:20px;text-align:center}
-.halfBox{display:flex;align-items:center;gap:8px;background:#111417;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:4px 10px}
+.halfBox{display:flex;flex-direction:column;align-items:center;gap:4px;background:#111417;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:6px 10px}
+.clockRow{display:flex;align-items:center;gap:8px}
+.timeStep{width:18px;height:18px;border-radius:3px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:rgba(255,255,255,.5);font-size:9px;cursor:pointer;display:grid;place-items:center;padding:0}
+.timeStep:hover{background:rgba(240,180,41,.15);border-color:#f0b429;color:#f0b429}
 .halfLabel{font-size:10px;color:rgba(255,255,255,.35);font-weight:800}
 .halfLabel.on{color:#f0b429}
+.halfLabel.clickable{cursor:pointer;padding:2px 4px;border-radius:3px}
+.halfLabel.clickable:hover{background:rgba(240,180,41,.15)}
 .clock{font-family:monospace;font-size:18px;color:#f0b429;font-weight:800}
 .clock.paused{color:rgba(255,255,255,.4)}
-.pauseBtn{width:22px;height:22px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#f0b429;font-size:10px;cursor:pointer;display:grid;place-items:center;padding:0}
+.pauseBtn{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:40px;height:26px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#f0b429;font-size:13px;cursor:pointer;display:grid;place-items:center;padding:0}
 .pauseBtn.paused{background:rgba(240,180,41,.2);border-color:#f0b429}
 .modeTag{font-size:9px;font-weight:800;color:rgba(255,255,255,.35);letter-spacing:.05em}
 
@@ -792,7 +917,10 @@ function finishHalf() {
 .editMarker{background:rgba(240,180,41,.85);border-color:#fff;box-shadow:0 0 0 5px rgba(240,180,41,.3);z-index:2}
 @keyframes zoneFlash{0%{opacity:1}55%{opacity:.55}100%{opacity:0}}
 
-.table{flex:0 0 auto;height:180px;overflow-y:auto;border-top:1px solid rgba(255,255,255,.08)}
+.tableToggle{flex:0 0 auto;height:20px;border:none;border-top:1px solid rgba(255,255,255,.08);background:#20242b;color:#f0b429;font-size:10px;font-weight:800;cursor:pointer}
+.tableToggle:hover{background:#262b33}
+.table{flex:0 0 auto;height:180px;overflow-y:auto;border-top:1px solid rgba(255,255,255,.08);transition:height .18s ease}
+.table.expanded{height:380px}
 .thead,.trow{display:grid;grid-template-columns:64px 96px 78px 86px 78px minmax(210px,1fr);gap:4px;padding:4px 10px}
 .thead span,.trow span{min-width:0;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .thead span:last-child,.trow span:last-child{text-align:left;padding-left:18px}
@@ -830,6 +958,11 @@ function finishHalf() {
 .pickCancel:hover{background:rgba(240,180,41,.15)}
 
 .finishBtn{position:absolute;top:8px;right:8px;height:26px;padding:0 12px;border-radius:4px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#ddd;font-weight:700;font-size:11px;cursor:pointer}
+.mirrorWrap{position:absolute;top:8px;left:8px}
+.mirrorIcon{width:26px;height:26px;display:grid;place-items:center;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#ddd;font-size:13px;padding:0;cursor:pointer}
+.mirrorIcon.on{border-color:#f0b429;color:#f0b429;background:rgba(240,180,41,.18)}
+.mirrorPop{position:absolute;z-index:30;top:32px;left:0;width:200px;padding:10px;border-radius:6px;border:1px solid rgba(255,255,255,.16);background:#1b1e22;box-shadow:0 14px 40px rgba(0,0,0,.6);display:flex;flex-direction:column;gap:9px}
+.mirrorPop .popOpts{grid-template-columns:repeat(2,1fr)}
 .finishBtn:hover{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.3)}
 
 /* 전반 종료 버튼과 같은 자리(절대위치)를 그대로 쓴다 — 레이아웃이 밀리면 안 된다 */

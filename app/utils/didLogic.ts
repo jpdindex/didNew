@@ -91,6 +91,9 @@ export interface DidRecord {
   shootDspRange?: boolean
   /** X/B 결과 처리 뒤에도 원래 슈팅 액트였음을 보존한다. DSP 판정에 사용한다. */
   isShot?: boolean
+  /** 어느 half 의 레코드인지. 전반/후반 기록이 한 배열에 섞이는 걸 막는 구분자.
+   *  없으면(과거 데이터) 전반으로 취급한다 — resolvedOnly() 참고. */
+  half?: 'H1' | 'H2'
 }
 
 function isShotAct(act: ActCode) {
@@ -125,7 +128,7 @@ export function createActRecord(
   act: Exclude<ActCode, ''>,
   seconds: number,
   area: number,
-  extra: Partial<Pick<DidRecord, 'playerId' | 'shootPosX' | 'shootPosY' | 'posX' | 'posY'>> = {}
+  extra: Partial<Pick<DidRecord, 'playerId' | 'shootPosX' | 'shootPosY' | 'posX' | 'posY' | 'half'>> = {}
 ): DidRecord {
   return { id: `rec_${++recSeq}`, seconds, act, res: 'O', area, seq: recSeq, isShot: isShotAct(act), ...extra }
 }
@@ -199,6 +202,7 @@ export function applyResult(
     res,
     area: opts.area ?? rec.area,
     seq: recSeq,
+    half: rec.half,
   })
 }
 

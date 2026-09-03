@@ -2,7 +2,8 @@
 const menus = [
   { label: '팀 관리', desc: '팀 추가/수정', to: '/manage/teams', ready: false },
   { label: '선수 관리', desc: '선수 정보 + 이적시장', to: '/manage/players', ready: false },
-  { label: '경기 일정 관리', desc: '경기 일정 등록/수정', to: '/manage/schedules', ready: false }
+  { label: '경기 일정 관리', desc: '경기 일정 등록/수정', to: '/manage/schedules', ready: false },
+  { label: '기록 잠금 관리', desc: '갱신으로 잠긴 반(半) 잠금 해제', to: '/manage/locks', ready: true }
 ]
 </script>
 
