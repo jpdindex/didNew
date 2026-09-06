@@ -299,6 +299,27 @@ footer{margin-top:64px;padding-top:24px;border-top:1px solid var(--line);font-si
 footer code{font-size:12px}
 .star{color:var(--accent);font-weight:600}
 h2 .star,h3 .star{font-size:.85em}
+@media print {
+  @page { size: A4; }
+  .toc { display:none !important; }
+  .layout { display:block; }
+  .wrap { max-width:none; padding:0; }
+  body { font-size:11px; background:#fff; }
+  section { margin-top:28px; }
+  h2,h3 { break-after:avoid; }
+  h2 { font-size:21px; }
+  h3 { font-size:16px; }
+  p,li { orphans:3; widows:3; }
+  table { font-size:10px; }
+  tr,.call,.bug-row,.oq { break-inside:avoid; }
+  .tbl-wrap { overflow:visible; }
+  pre,pre.code,.tree pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:10px; }
+  .call p,.ind,.sub,.oq .b,.bug-row .p,.bug-row .s { font-size:11px; }
+  code.inl { font-size:10px; }
+  .tree { break-inside:avoid; }
+  .bug-row { grid-template-columns:28px 1fr 1fr; }
+  .bug-row .s { padding:15px 12px; border-left:1px solid var(--line); }
+}
 </style>
 
 <div class="wrap">
@@ -308,42 +329,41 @@ h2 .star,h3 .star{font-size:.85em}
   <ol>
     <li class="grp">기본</li>
     <li><a href="#s0"><span class="n">00</span><span>목표와 규칙 0</span></a></li>
-    <li><a href="#s1"><span class="n">01</span><span>설계 원칙</span></a></li>
-    <li><a href="#s2"><span class="n">02</span><span>역할 분담</span></a></li>
-    <li class="grp">경기 기록</li>
-    <li><a href="#s3"><span class="n">03</span><span>matches ≠ recordings</span></a></li>
-    <li><a href="#s4"><span class="n">04</span><span>전체 트리</span></a></li>
-    <li><a href="#s5"><span class="n">05</span><span>matches</span></a></li>
-    <li><a href="#s6"><span class="n">06</span><span>recordings</span></a></li>
-    <li><a href="#s7"><span class="n">07</span><span>records</span></a></li>
-    <li><a href="#s8"><span class="n">08</span><span>파생 데이터 정책</span></a></li>
-    <li class="grp">출력 · 관리</li>
-    <li><a href="#s9"><span class="n">09</span><span>JaionX 출력 규격</span></a></li>
-    <li><a href="#s10"><span class="n">10</span><span>이적시장 · 팀 정보</span></a></li>
+    <li><a href="#s1"><span class="n">01</span><span>두 갈래 구조</span></a></li>
+    <li><a href="#s2"><span class="n">02</span><span>생산 순서</span></a></li>
+    <li class="grp">① 입력 데이터</li>
+    <li><a href="#s3"><span class="n">03</span><span>MatchDoc</span></a></li>
+    <li><a href="#s4"><span class="n">04</span><span>RecordingDoc</span></a></li>
+    <li><a href="#s5"><span class="n">05</span><span>RecordDoc</span></a></li>
+    <li><a href="#s6"><span class="n">06</span><span>확정 스냅샷</span></a></li>
+    <li class="grp">② 저장 관리 데이터</li>
+    <li><a href="#s7"><span class="n">07</span><span>팀 · 선수 · 계약</span></a></li>
+    <li><a href="#s8"><span class="n">08</span><span>리그 · 시즌 · 경기장 · 기록자</span></a></li>
+    <li class="grp">사라진 것</li>
+    <li><a href="#s9"><span class="n">09</span><span>표 자체를 없앤 것</span></a></li>
     <li class="grp">운영</li>
-    <li><a href="#s11"><span class="n">11</span><span>쓰기·조회 전략</span></a></li>
-    <li><a href="#s12"><span class="n">12</span><span>보안 · 색인</span></a></li>
+    <li><a href="#s10"><span class="n">10</span><span>역할 분담</span></a></li>
+    <li><a href="#s11"><span class="n">11</span><span>갱신 트리거</span></a></li>
+    <li><a href="#s12"><span class="n">12</span><span>조회 층</span></a></li>
     <li class="grp">근거</li>
     <li><a href="#s13"><span class="n">13</span><span>실데이터 검증</span></a></li>
-    <li><a href="#s14"><span class="n">14</span><span>레거시 대비</span></a></li>
-    <li><a href="#s15"><span class="n">15</span><span>미결정</span></a></li>
+    <li><a href="#s14"><span class="n">14</span><span>결정 필요</span></a></li>
   </ol>
 </nav>
 
 <main>
 
 <header class="doc">
-  <div class="eyebrow">DID · Schema Design · 전면 개정</div>
+  <div class="eyebrow">DID · Schema Design · 매핑 기반 재작성</div>
   <h1>Firestore 스키마 설계</h1>
   <p class="lede">
-    이 스키마의 목적은 좋은 스키마가 아니다.
-    <strong>사람이 엑셀로 하던 가공 단계를 없애는 것</strong>이다.
-    JaionX에 들어가는 데이터가 지금과 동일해지는 순간, 구 DID를 폐기한다.
+    레거시 19개 표 <strong>240개 컬럼 전부</strong>가 어디로 갔는지 한 줄씩 적는다.
+    무엇을 <strong>지우고 · 바꾸고 · 새로 넣었는지</strong>가 이 문서의 전부다.
   </p>
   <div class="meta">
-    <span><b>갱신</b> 2026-09-02</span>
-    <span><b>검증</b> TACTIC.xlsx 1,536행 · D-MST 20팀</span>
-    <span><b>로직</b> app/utils/didLogic.ts</span>
+    <span><b>갱신</b> 2026-09-06</span>
+    <span><b>원본</b> Aimbroad_database_schema-240812</span>
+    <span><b>대상</b> app/types/schema.ts</span>
   </div>
 </header>
 
@@ -361,67 +381,530 @@ h2 .star,h3 .star{font-size:.85em}
   <div class="call">
     <div class="h">규칙 0 — 다른 모든 원칙보다 위에 있다</div>
     <p><strong>JaionX가 받는 모든 컬럼은 Firestore 데이터만으로 복원 가능해야 한다.</strong> 복원 불가능한 값이 하나라도 있으면 그 값은 반드시 저장한다.</p>
-    <p>"계산으로 대체한다"는 결정은 <strong>복원 가능함이 증명될 때만</strong> 유효하다. 출력 규격의 실체는 §09에 있다.</p>
+    <p>"계산으로 대체한다"는 결정은 <strong>복원 가능함이 증명될 때만</strong> 유효하다.</p>
+  </div>
+
+  <h3>상태 표기 — 이 문서 전체에서 쓰는 6가지</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>표기</th><th>뜻</th></tr></thead>
+      <tbody>
+        <tr><td class="f">유지</td><td class="n">이름 그대로 옮김</td></tr>
+        <tr><td class="f">이름변경</td><td class="n">값은 같고 이름만 바뀜 (접두사 제거 / 신용어)</td></tr>
+        <tr><td class="f">삭제(계산)</td><td class="n">저장 안 함. 필요할 때 records 에서 계산 — 1,200건에 <b>0.16ms</b></td></tr>
+        <tr><td class="f">삭제(경로)</td><td class="n">Firestore 경로가 그 역할을 대신함</td></tr>
+        <tr><td class="f">삭제(불필요)</td><td class="n">새 구조에서 존재 이유가 없어짐</td></tr>
+        <tr><td class="f">신규</td><td class="n">레거시에 없던 것</td></tr>
+      </tbody>
+    </table>
   </div>
 </section>
 
 <!-- 1 -->
 <section id="s1">
-  <h2><span class="num">01</span> 설계 원칙</h2>
-  <p class="sub">레거시를 존중하되 그대로 베끼지 않는 기준. 이후 모든 결정이 여기서 나온다.</p>
-  <div class="principles">
-    <div class="pr">
-      <div class="k">00</div>
-      <div class="t">JaionX 출력을 전부 복원할 수 있어야 한다</div>
-      <div class="d">위 규칙 0. 나머지 원칙은 이것을 만족하는 선에서만 적용된다.</div>
-    </div>
-    <div class="pr">
-      <div class="k">01</div>
-      <div class="t">접두사를 버린다</div>
-      <div class="d">SQL은 네임스페이스가 평면이라 <code class="inl">gr_</code> <code class="inl">gi_</code>가 필요했다. Firestore는 컬렉션이 이미 네임스페이스다.</div>
-    </div>
-    <div class="pr">
-      <div class="k">02</div>
-      <div class="t">이름은 신용어를 쓴다</div>
-      <div class="d">TMP→TAP, TAP→DAP, CTP→DTP, CSP→DSP, CT*→DT*. 레거시 이름은 §09 매핑표에만 남긴다.</div>
-    </div>
-    <div class="pr">
-      <div class="k">03</div>
-      <div class="t">계산되는 값은 저장하지 않는다</div>
-      <div class="d">1,200건 전체 재계산이 <strong>0.16ms</strong>다(§13 실측). 저장은 어긋날 자리만 만든다.</div>
-    </div>
-    <div class="pr">
-      <div class="k">04</div>
-      <div class="t">단, 확정 시점 스냅샷은 남긴다</div>
-      <div class="d">리포트·JaionX 동기화는 "지금 값"이 아니라 "그때 값"을 요구한다.</div>
-    </div>
-    <div class="pr">
-      <div class="k">05</div>
-      <div class="t">같이 읽는 건 한 문서로</div>
-      <div class="d">라인업 18명은 map 필드. 계속 늘어나는 레코드 1,200건은 서브컬렉션.</div>
-    </div>
-    <div class="pr">
-      <div class="k">06</div>
-      <div class="t">이력은 원장 + 파생 뷰</div>
-      <div class="d">이적시장 = 추가 전용 계약 원장. 현재 스쿼드 = 그걸로 만든 조회용 뷰.</div>
-    </div>
-    <div class="pr">
-      <div class="k">07</div>
-      <div class="t">과거는 과거 모습대로</div>
-      <div class="d">이적·등번호 변경이 작년 기록을 바꾸면 안 된다. 라인업에 이름·번호 스냅샷을 남긴다.</div>
-    </div>
-    <div class="pr">
-      <div class="k">08</div>
-      <div class="t">모든 값은 출처를 남긴다</div>
-      <div class="d">사람 입력 / 비전 / 보정을 구분하지 않으면 나중에 신뢰도 판단이 불가능하다.</div>
-    </div>
+  <h2><span class="num">01</span> 두 갈래 — 입력 데이터 / 저장 관리 데이터</h2>
+  <p class="sub">둘 다 Firestore에 영구 저장된다. 구분 기준은 저장 여부가 아니라 누가 만들고 얼마나 자주 바뀌는가다.</p>
+
+  <div class="call">
+    <div class="h">입력 데이터 층이 곧 저장소다</div>
+    <p>“입력 데이터”는 임시 데이터가 아니라 <strong>입력을 통해 만들어지는 데이터</strong>다. 경기에서 입력한 사실은 그 문서 자체로 영구 저장되며, 별도 저장 관리 층으로 옮겨 담지 않는다. 기존 명칭은 유지한다.</p>
+    <p>예를 들어 아래 문서는 <strong>사카가 이 경기 전반 32분에 옐로카드를 받았다는 사실</strong>이다.</p>
+    <pre class="code">matches/{gm_id}/recordings/H/cards/abc123
+{ playerId: '1218', half: 'H1', halfSeconds: 1920, card: 'Y' }</pre>
+    <p><strong>경기별 카드 기록은 저장한다.</strong> “이번 시즌 누적 3장” 같은 누적값은 해당 시즌의 카드 기록을 조회·집계해 계산한다. 경기가 추가되거나 원본이 정정될 때 누적값을 따로 맞추는 구조를 만들지 않는다(원칙 3). 확정 시점의 스냅샷은 기존 원칙대로 별도 보존한다.</p>
+  </div>
+
+  <div class="tree">
+    <div class="tree-hd"><span>타입</span><span>경로</span></div>
+    <pre><span class="grp-l">① 입력 데이터 스키마 — 기록자가 실시간으로 만든다 ──────────</span>
+<span class="path">MatchDoc</span>              <span class="lg">matches/{gm_id}</span>
+<span class="path">RecordingDoc</span>          <span class="lg">matches/{gm_id}/recordings/{H|A}</span>          <span class="star">★</span>
+<span class="path">RecordDoc</span>             <span class="lg">matches/{gm_id}/recordings/{H|A}/records/{id}</span>
+<span class="path">PathSnapshotDoc</span>       <span class="lg">.../paths/{pathId}</span>              <span class="note">[확정 시점에만]</span>
+<span class="path">PlayerStatsDoc</span>        <span class="lg">.../playerStats/{playerId}</span>      <span class="note">[확정 시점에만]</span>
+
+<span class="grp-l">② 저장 관리 데이터 스키마 — 관리자가 화면에서 입력한다 ──────</span>
+<span class="path">LeagueDoc</span>             <span class="lg">leagues/{id}</span>
+<span class="path">SeasonDoc</span>             <span class="lg">seasons/{id}</span>
+<span class="path">StadiumDoc</span>            <span class="lg">stadiums/{id}</span>
+<span class="path">TeamDoc</span>               <span class="lg">teams/{teamId}</span>
+<span class="path">TeamSeasonEntry</span>       <span class="lg">teams/{teamId}/seasons/{seasonId}</span>   <span class="note">승강제 대응</span>
+<span class="path">SquadEntry</span>            <span class="lg">teams/{teamId}/squad/{playerId}</span>     <span class="note">[파생 뷰]</span>
+<span class="path">PlayerDoc</span>             <span class="lg">players/{playerId}</span>
+<span class="path">ContractDoc</span>           <span class="lg">players/{playerId}/contracts/{id}</span>   <span class="star">★ 이적시장 원장</span>
+<span class="path">RecorderProfileDoc</span>    <span class="lg">recorders/{uid}</span></pre>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th></th><th>① 입력 데이터</th><th>② 저장 관리 데이터</th></tr></thead>
+      <tbody>
+        <tr><td class="n">저장 여부</td><td class="n"><b>Firestore 영구 저장</b></td><td class="n"><b>Firestore 영구 저장</b></td></tr>
+        <tr><td class="n">누가 만드나</td><td class="n">기록자 (앱)</td><td class="n">관리자 (관리 화면)</td></tr>
+        <tr><td class="n">얼마나 늘어나나</td><td class="n">경기당 <b>400~1,200건</b>씩 계속</td><td class="n">거의 안 바뀜</td></tr>
+        <tr><td class="n">핵심 문제</td><td class="n">유실 방지 · 정합성</td><td class="n">이력 관리 · 감사</td></tr>
+        <tr><td class="n">읽기 방식</td><td class="n">실시간 구독</td><td class="n">파이썬 API + 스냅샷 (§12)</td></tr>
+      </tbody>
+    </table>
   </div>
 </section>
 
 <!-- 2 -->
 <section id="s2">
-  <h2><span class="num">02</span> 역할 분담 — 무엇을 어디서 계산하나</h2>
-  <p class="sub">판정 로직의 권위는 파이썬에 있다. 클라이언트 TS는 화면 보조일 뿐이다.</p>
+  <h2><span class="num">02</span> 무엇부터 생산되는가</h2>
+  <p class="sub">문서형이라도 참조 관계는 그대로 있다. ②가 없으면 ①이 채울 값이 없다.</p>
+
+  <pre class="code"><span class="k">② 저장 관리 데이터</span> — 뿌리부터
+
+LeagueDoc · SeasonDoc · StadiumDoc · TeamDoc · PlayerDoc   <span class="c">← 뿌리. 서로 독립</span>
+                    ↓
+              ContractDoc                                  <span class="c">← Team + Player 가 있어야 만들어짐</span>
+                    ↓
+              SquadEntry                                   <span class="c">← Contract 에서 파생(계산)</span>
+
+
+<span class="k">① 입력 데이터</span>
+
+              MatchDoc          <span class="c">← leagueId/seasonId/stadiumId/homeTeamId 를 ②에서 참조</span>
+                    ↓
+              RecordingDoc      <span class="c">← lineup 의 이름·번호를 Player/Contract 에서 스냅샷</span>
+                    ↓
+              RecordDoc         <span class="c">← 계속 쌓임</span>
+                    ↓
+      PathSnapshotDoc · PlayerStatsDoc                      <span class="c">← 확정 시점에만 계산돼서 생김</span></pre>
+
+  <h3>참조 · 스냅샷 · 자체생성 — 세 가지가 섞여 있다</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>구분</th><th>예</th><th>원본이 바뀌면</th></tr></thead>
+      <tbody>
+        <tr><td class="f">참조</td><td class="n"><code class="inl">MatchDoc.homeTeamId = 'ARSX'</code></td><td class="n">같이 바뀜 (ID만 들고 있음)</td></tr>
+        <tr><td class="f">스냅샷</td><td class="n"><code class="inl">lineup['1218'].name = 'B. Saka'</code></td><td class="n"><b>안 바뀜</b> — 그 시점 사실로 박제 (원칙 7)</td></tr>
+        <tr><td class="f">자체생성</td><td class="n"><code class="inl">RecordDoc.area / act / res</code></td><td class="n">원본이 없음 — 사람이 그 자리에서 만듦</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="ind">선수가 이적하거나 등번호를 바꿔도 <strong>작년 경기 기록의 이름·번호는 그대로여야 한다.</strong> 그래서 라인업만은 참조가 아니라 스냅샷이다.</p>
+</section>
+
+<!-- 3 -->
+<section id="s3">
+  <h2><span class="num">03</span> <span class="mono">MatchDoc</span> — <span class="mono">matches/{gm_id}</span></h2>
+  <p class="sub">ff_game (16개 컬럼) → 일정. 두 기록 세션이 공유하는 사실만 담는다.</p>
+
+  <h3>문서 ID는 gm_id 를 그대로 쓴다</h3>
+  <pre class="code">matches/<span class="k">20262027eplj2rgn13na28rd2b8q0001</span>
+
+<span class="k">20262027</span> <span class="k">epl</span> <span class="s">j2rgn13na28rd2b8q</span> <span class="k">0001</span>
+└──┬───┘ └┬┘ └───────┬───────┘ └─┬┘
+  <span class="c">시즌     리그    리그 고정 상수   일련번호</span></pre>
+  <p class="ind"><code class="inl">gm_id</code>는 <strong>JaionX의 모든 테이블을 잇는 조인 키</strong>다. 예시의 가운데 상수 구간은 2024-25·2025-26·2026-27 <strong>세 시즌 780건 전부 동일</strong> — 시즌별 난수가 아니다.</p>
+
+  <div class="call">
+    <div class="h">gm_id 는 우리가 만들지 않는다 — 사람이 입력한다</div>
+    <p>경기 일정 관리 화면(<code class="inl">/manage/schedules</code>)에서 <strong>담당자가 일정을 등록할 때 <code class="inl">gm_id</code> 를 직접 입력</strong>한다. 입력받은 문자열이 그대로 문서 ID가 된다.</p>
+    <p>따라서 <strong>우리는 채번 규칙을 알 필요도, 일련번호를 발급할 필요도 없다.</strong> 우리가 임의로 발급하면 같은 경기에 다른 번호가 붙어 JaionX 와 영영 맞지 않는다.</p>
+  </div>
+
+  <pre class="code">담당자 입력   <span class="k">20262027eplj2rgn13na28rd2b8q0001</span>
+        ↓
+matches/<span class="k">20262027eplj2rgn13na28rd2b8q0001</span></pre>
+
+  <div class="call bug">
+    <div class="h">그래서 입력 화면에 반드시 필요한 것</div>
+    <p><strong>오타 하나에 JaionX 매칭이 통째로 깨진다.</strong> 담당자가 직접 입력하는 값이므로 <em>형식 검증</em>(해당 리그의 실제 ID 규격 · 시즌 · 일련번호)과 경기 정보 일치 확인이 필요하다. 예시 ID는 30자이므로 일괄 32자 검증을 적용하지 않는다.</p>
+    <p>그리고 Firestore 는 같은 문서 ID 로 쓰면 <strong>말없이 덮어쓴다.</strong> 실수로 같은 <code class="inl">gm_id</code> 를 두 번 등록하면 앞 경기가 사라진다 — <em>중복 확인</em>이 반드시 있어야 한다.</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">gm_id</td><td class="f">(문서 ID)</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gm_date</td><td class="f">date</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gm_time</td><td class="f">kickoffTime</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gm_h_t_code / gm_a_t_code</td><td class="f">homeTeamId / awayTeamId</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gm_league</td><td class="f">leagueId</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gm_round</td><td class="f">round</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gm_s_code</td><td class="f">stadiumId</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gi_goal_home / gi_goal_away</td><td class="f">score.home / score.away</td><td class="n">이름변경 — 각 recording 이 자기 쪽만 merge</td></tr>
+        <tr><td class="lg">gm_state</td><td class="f">—</td><td class="n"><b>삭제(불필요)</b> — recordings.status 가 대신함</td></tr>
+        <tr><td class="lg">is_realtime</td><td class="f">recordings.inputMode</td><td class="n"><b>이동</b> — 경기 속성이 아니라 기록자별 설정</td></tr>
+        <tr><td class="lg">is_old / is_view / is_onair</td><td class="f">—</td><td class="n">삭제(불필요)</td></tr>
+        <tr><td class="lg">gm_sub_league</td><td class="f">—</td><td class="n">⚠️ <b>미결정</b> (§14)</td></tr>
+        <tr><td class="lg">—</td><td class="f">seasonId</td><td class="n"><span class="tag new">NEW</span> — 다만 <code class="inl">gm_id</code> 앞 8자리와 <b>중복</b>이다. 질의 편의용</td></tr>
+        <tr><td class="lg">—</td><td class="f">createdAt / updatedAt</td><td class="n"><span class="tag new">NEW</span> — 레거시 <code class="inl">ff_game</code> 에는 없다. 관례로 붙인 것</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="call">
+    <div class="h">sRound 는 DID 저장 스키마에서 제외한다</div>
+    <p><code class="inl">matches</code>와 <code class="inl">recordings</code> 모두에 저장하지 않는다. 경기 식별은 <code class="inl">gm_id</code>, 홈/원정 구분은 <code class="inl">recordings/{H|A}</code>가 맡는다. JaionX 출력의 S-Round 처리는 §04에 정리했다.</p>
+  </div>
+</section>
+
+<!-- 4 -->
+<section id="s4">
+  <h2><span class="num">04</span> <span class="mono">RecordingDoc</span> — <span class="mono">recordings/{H|A}</span> <span class="star">★</span></h2>
+  <p class="sub">ff_game_info (49개 컬럼) → 팀별 기록 세션. 이 구조는 레거시가 이미 하고 있던 것을 보존한 것이다.</p>
+
+  <pre class="code"><span class="c">// lib/extra.lib.php:3799 — 경기 하나에 gi 행이 정확히 2개</span>
+$gi[$row[<span class="k">'gi_write_code'</span>]] = $row;
+<span class="k">if</span> (count($gi) &lt; 2) <span class="k">return</span> FALSE;   <span class="c">// "양팀 입력 모두 종료되지 않은 경기는 진행 불가"</span></pre>
+  <p class="ind">KPI 집계가 전부 <code class="inl">ff_game_info</code>에 있는 것도 그래서다 — <em>KPI는 경기 단위가 아니라 팀-기록자 단위다.</em> 바뀐 것은 표현 방법뿐이다: JOIN → <strong>경로</strong>, <code class="inl">gi_write_code</code> 컬럼 → <strong>문서 ID</strong>.</p>
+
+  <h3>식별 · 상태</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">gi_id</td><td class="f">legacyGiId</td><td class="n"><b>삭제(경로)</b> + 동기화 매핑용으로만 보존</td></tr>
+        <tr><td class="lg">gm_id</td><td class="f">—</td><td class="n">삭제(경로) — 부모가 이미 가리킴</td></tr>
+        <tr><td class="lg">gi_write_code</td><td class="f">(문서 ID) + side</td><td class="n">이름변경 — 중복 세션이 <b>구조적으로 불가능</b>해짐</td></tr>
+        <tr><td class="lg">gi_user_id</td><td class="f">recorders / recorderIds</td><td class="n"><b>단수 → 복수</b> (2인 기록)</td></tr>
+        <tr><td class="lg">gi_h_t_code / gi_a_t_code</td><td class="f">teamId / opponentTeamId</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gi_state</td><td class="f">status</td><td class="n">이름변경 — <code class="inl">000/H1B/H1E</code> → <code class="inl">ready/H1/H1_done</code></td></tr>
+        <tr><td class="lg">gi_part</td><td class="f">fieldSide</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gi_formation</td><td class="f">formationKey</td><td class="n">이름변경 — 좌표는 상수, 문자열만 저장</td></tr>
+        <tr><td class="lg">gi_regdt / gi_moddt</td><td class="f">createdAt / updatedAt</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gi_part_ex</td><td class="f">—</td><td class="n">⚠️ <b>미결정</b> — 연장전 진영 (§14)</td></tr>
+        <tr><td class="lg">is_old</td><td class="f">—</td><td class="n">삭제(불필요)</td></tr>
+        <tr><td class="lg">—</td><td class="f">maxSeq</td><td class="n"><span class="tag new">NEW</span> 레코드 정렬키 발급</td></tr>
+        <tr><td class="lg">—</td><td class="f">kpiComputedAt / syncedAt</td><td class="n"><span class="tag new">NEW</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>S-Round — 표시·정렬용 출력값, DID 저장 필드에서는 제외</h3>
+  <p class="ind">앞선 JaionX 확인 결과, <code class="inl">admin/dMST.vue</code>·<code class="inl">admin/pMST.vue</code>에 표시 컬럼이 있고, <code class="inl">composables/pMST.ts</code>는 S-Round로 정렬한다. <code class="inl">build_MatchSchedule.py</code>는 dMST의 값을 읽어 일정 출력에 넣는다. 따라서 JaionX에서 전혀 쓰지 않는 값이라는 뜻은 아니다.</p>
+  <div class="call">
+    <div class="h">결정 — recordings.sRound 를 제외하고 DID 채번 로직을 만들지 않는다</div>
+    <p>파이프라인의 경기 식별·홈/원정 매칭 기준은 <strong><code class="inl">gm_id</code> + <code class="inl">team_type</code></strong>이다. 기존 S-Round 홀짝 매칭은 사용하지 않는다. DID에서는 문서 ID의 H/A를 출력 시 team_type으로 전달한다.</p>
+    <p>담당자는 <code class="inl">gm_id</code>를 입력하고, DID는 그 값을 경기 문서 ID로 보존한다. <strong>sRound 추가 입력이나 클라이언트 채번은 도입하지 않는다.</strong></p>
+    <p><strong>후속 구현:</strong> JaionX에 필요한 S-Round는 파이썬의 dMST 출력 단계에서 처리한다. 앞서 3시즌 780경기로 검증한 규칙을 기반으로 gm_id·round·H/A에서 기존 값과 동일하게 복원되는지 출력 대조 검증을 연결한다. 일정 빌더가 dMST에서 값을 읽는 것과, 그 값을 생성하는 단계는 구분한다. 이 문서 수정으로 파이프라인 구현까지 완료된 것은 아니다.</p>
+  </div>
+
+  <h3>시간 — 4개 컬럼이 맵 하나로</h3>
+  <pre class="code">halves: {
+  H1: { startedAt, seconds: <span class="s">2712</span> },
+  H2: { startedAt, seconds: <span class="s">2840</span> },
+}</pre>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">gi_h1_begin ~ gi_h4_begin</td><td class="f">halves.H1~H4.startedAt</td><td class="n">이름변경 + 구조화</td></tr>
+        <tr><td class="lg">gi_h1_seconds ~ gi_h4_seconds</td><td class="f">halves.H1~H4.seconds</td><td class="n">이름변경 + 구조화</td></tr>
+        <tr><td class="lg">gi_seconds</td><td class="f">—</td><td class="n"><b>삭제(계산)</b> — halves 합계</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="call">
+    <div class="h">45분을 넘겨도 half 는 안 바뀐다</div>
+    <p>전반 48:30 은 <strong>H1 이 계속 흐르는 것</strong>이지 H3 가 아니다. <code class="inl">half</code> 는 그대로 <code class="inl">'H1'</code> 이고 <code class="inl">halfSeconds</code> 만 2910 이 된다. H3/H4 는 <em>진짜 연장전</em>에만 쓴다.</p>
+    <p>JaionX 5분 구간 컬럼도 <code class="inl">JMX-H1-45-Plus</code> 처럼 <strong>45분 이후를 통 하나로</strong> 묶는다 — 몇 분을 넘겼든 그 버킷이다.</p>
+  </div>
+
+  <h3>KPI — 확정 시점에만 <span class="mono">kpi</span> 맵으로</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">gi_tmp</td><td class="f">kpi.TAP</td><td class="n">이름변경(신용어)</td></tr>
+        <tr><td class="lg">gi_tap</td><td class="f">kpi.DAP</td><td class="n">이름변경(신용어)</td></tr>
+        <tr><td class="lg">gi_ctp</td><td class="f">kpi.DTP</td><td class="n">이름변경(신용어)</td></tr>
+        <tr><td class="lg">gi_ttp / gi_bap / gi_asr / gi_ssr</td><td class="f">kpi.TTP / BAP / ASR / SSR</td><td class="n">유지 — 단 SSR 산식은 <code class="inl">(GOAL−OG)/SHOT</code></td></tr>
+        <tr><td class="lg">gi_sht / gi_gol</td><td class="f">kpi.SHOT / kpi.GOAL</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gi_ctb / ctm / cta / cts</td><td class="f">kpi.B / M / A / S</td><td class="n">이름변경(신용어 DTB/DTM/DTA/DTS)</td></tr>
+        <tr><td class="lg">—</td><td class="f">kpi.OG</td><td class="n"><span class="tag new">NEW</span> 자책골 수 (D-MST 요구)</td></tr>
+        <tr><td class="lg">gi_utp / gi_stp / gi_csp</td><td class="f">—</td><td class="n"><b>삭제(계산)</b> — paths 에서 셈</td></tr>
+        <tr><td class="lg">gi_gtb / gi_gtm / gi_gsr</td><td class="f">—</td><td class="n">삭제(계산)</td></tr>
+        <tr><td class="lg">gi_*_sc / _sr / _pr <span class="lg">(9개)</span></td><td class="f">—</td><td class="n"><b>삭제(계산)</b> — 성공수·성공률은 원자값 나눗셈 한 번</td></tr>
+        <tr><td class="lg">gi_score</td><td class="f">—</td><td class="n"><b>삭제(이동)</b> — 팀평점은 jpd-rating(대외비)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>lineup — ff_game_player 의 출전 정보가 여기로</h3>
+  <p class="ind">18명을 항상 통째로 읽고 쓴다. 서브컬렉션이면 로드마다 18 read, map 이면 <strong>1 read</strong>다.</p>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">gp_type</td><td class="f">type ('START'/'BENCH')</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gp_order</td><td class="f">order</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gp_in_half / gp_in_half_seconds</td><td class="f">inHalf / inSeconds</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gp_out_half / gp_out_half_seconds</td><td class="f">outHalf / outSeconds</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gp_in_seconds / gp_out_seconds / gp_seconds</td><td class="f">—</td><td class="n">삭제(계산) — 경기 기준 초·출전시간</td></tr>
+        <tr><td class="lg">gp_point_plus / gp_point_minus</td><td class="f">—</td><td class="n">⚠️ <b>미결정</b> — 상단 −3/−1/+1/+3 버튼 (§14)</td></tr>
+        <tr><td class="lg">—</td><td class="f">slot</td><td class="n"><span class="tag new">NEW</span> 포메이션 슬롯 ID</td></tr>
+        <tr><td class="lg">—</td><td class="f">no / name / pos</td><td class="n"><span class="tag snap">SNAPSHOT</span> 이적해도 과거 기록 불변</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>ff_game_player_log — 별도 컬렉션을 만들지 않는다</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">pl_out_p_id / pl_in_p_id</td><td class="f">lineup[선수].outHalf / inHalf</td><td class="n"><b>병합</b> — 맵 키가 곧 선수</td></tr>
+        <tr><td class="lg">pl_in_half / pl_in_seconds</td><td class="f">inHalf / inSeconds</td><td class="n">병합</td></tr>
+        <tr><td class="lg">pl_in_position</td><td class="f">pos</td><td class="n">병합</td></tr>
+        <tr><td class="lg">pl_in_order</td><td class="f">—</td><td class="n">⚠️ <b>미결정</b> — 교체 순번 (§14)</td></tr>
+        <tr><td class="lg">gi_id / t_code / pl_regdt / pl_moddt</td><td class="f">—</td><td class="n">삭제(경로) / 삭제(불필요)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="call">
+    <div class="h">교체는 기록된다 — 저장 형태만 다르다</div>
+    <p>교체 정보는 <code class="inl">lineup</code> 맵 안에서 완결되고, 어차피 <code class="inl">recordings</code> 문서를 통째로 읽으므로 <strong>추가 읽기가 0</strong>이다. 별도 <code class="inl">subs</code> 컬렉션을 두면 오히려 질의가 한 번 더 붙는다.</p>
+    <p>교체 목록 화면은 <code class="inl">lineup</code> 에서 in/out 이 채워진 항목만 골라 시간순 정렬하면 된다 — <em>저장은 한 벌, 화면은 필요한 만큼.</em></p>
+  </div>
+</section>
+
+<!-- 5 -->
+<section id="s5">
+  <h2><span class="num">05</span> <span class="mono">RecordDoc</span> — <span class="mono">records/{id}</span></h2>
+  <p class="sub">ff_game_record (37개 컬럼) → 플레이 1건. 37개 중 <b>17개가 사라진다</b> — 대부분 파생 플래그다.</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">gr_id</td><td class="f">(문서 ID)</td><td class="n">이름변경 — Firestore 자동 ID</td></tr>
+        <tr><td class="lg">gi_id</td><td class="f">—</td><td class="n"><b>삭제(경로)</b> — 1,200회 중복이 사라짐</td></tr>
+        <tr><td class="lg">t_code</td><td class="f">—</td><td class="n">삭제(경로) — recordings.teamId 에 있음</td></tr>
+        <tr><td class="lg">p_id</td><td class="f">playerId</td><td class="n">이름변경 — <code class="inl">'OWN'</code> = 자책골</td></tr>
+        <tr><td class="lg">gr_half / gr_half_seconds</td><td class="f">half / halfSeconds</td><td class="n">이름변경 — <b>반드시 저장</b></td></tr>
+        <tr><td class="lg">gr_seconds</td><td class="f">—</td><td class="n">삭제(계산) — halves + halfSeconds</td></tr>
+        <tr><td class="lg">gr_area_code</td><td class="f">area</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gr_act_code / gr_res_code</td><td class="f">act / res</td><td class="n">이름변경 — GB/GX/GOAL 신 코드</td></tr>
+        <tr><td class="lg">gr_pos_x / gr_pos_y</td><td class="f">posX / posY</td><td class="n">이름변경 + <b>단위 변환</b> — 레거시는 971×634 픽셀, 우리는 0~100% (아래 참고)</td></tr>
+        <tr><td class="lg">gr_shoot_pos_x/y</td><td class="f">shootPosX / shootPosY</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gr_part_pos_x/y</td><td class="f">—</td><td class="n">삭제(불필요) — posX/posY 로 통합</td></tr>
+        <tr><td class="lg">gt_id</td><td class="f">—</td><td class="n"><b>삭제(계산)</b> — export 시 computeAttackPaths() 가 채움</td></tr>
+        <tr><td class="lg">gr_is_* <span class="lg">(14개)</span></td><td class="f">—</td><td class="n"><b>삭제(계산)</b> — flags 로 항상 파생</td></tr>
+        <tr><td class="lg">gr_area_code_org</td><td class="f">—</td><td class="n">⚠️ <b>미결정</b> (§14)</td></tr>
+        <tr><td class="lg">gr_shoot_rate_x/y</td><td class="f">—</td><td class="n">⚠️ <b>미결정</b> (§14)</td></tr>
+        <tr><td class="lg">gr_regdt</td><td class="f">createdAt</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gr_moddt / is_old</td><td class="f">—</td><td class="n">삭제(불필요)</td></tr>
+        <tr><td class="lg">—</td><td class="f">seq</td><td class="n"><span class="tag new">NEW</span> 같은 초 안의 순서</td></tr>
+        <tr><td class="lg">—</td><td class="f">isShot</td><td class="n"><span class="tag new">NEW</span> write-back 후에도 슛이었음 보존</td></tr>
+        <tr><td class="lg">—</td><td class="f">shootDspRange</td><td class="n"><span class="tag new">NEW</span> 골포스트 1m 판정 캐시</td></tr>
+        <tr><td class="lg">—</td><td class="f">bapReason</td><td class="n"><span class="tag new">NEW</span> <b>ff_game_bap 병합</b></td></tr>
+        <tr><td class="lg">—</td><td class="f">createdBy / playerIdBy</td><td class="n"><span class="tag new">NEW</span> 2인 기록 시 누가 넣었나</td></tr>
+        <tr><td class="lg">—</td><td class="f">source / playerIdSource</td><td class="n"><span class="tag new">NEW</span> 사람 / 비전 구분</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>좌표 — 픽셀에서 백분율로</h3>
+  <pre class="code"><span class="c">// 03.areacode.sql 첫 줄</span>
+Ground = <span class="k">971 * 634</span>   <span class="c">// 경기장 전체 크기</span>
+
+posX = gr_pos_x / 971 * 100
+posY = gr_pos_y / 634 * 100</pre>
+  <p class="ind"><strong>실데이터로 검증됐다.</strong> TACTIC.xlsx 의 어느 레코드가 <code class="inl">gr_pos_x=327, gr_pos_y=598, area=7</code> 인데, <code class="inl">03.areacode.sql</code> 의 R07 범위가 <code class="inl">X=319~484 / Y=452~634</code> 로 정확히 그 안에 들어간다. 화면 해상도와 무관하게 <em>이 971×634 가 좌표 원점</em>이다.</p>
+
+  <h3>왜 gr_is_* 14개를 지우나</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시가 저장한 이유</th><th>지금은?</th></tr></thead>
+      <tbody>
+        <tr><td class="n">계산 로직이 서버(PHP)에만 있었다</td><td class="n"><b>사라짐</b> — didLogic.ts 를 모든 화면이 공유</td></tr>
+        <tr><td class="n">SQL 집계가 필요했다 (<code class="inl">SUM(gr_is_tap)</code>)</td><td class="n"><b>사라짐</b> — 확정 스냅샷을 따로 저장</td></tr>
+        <tr><td class="n">2013년 단말이 약했다</td><td class="n"><b>사라짐</b> — 실측 <b>0.16ms</b></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="ind">그리고 결정적으로, <strong>레코드 하나를 고치면 앞뒤 루트의 플래그가 연쇄로 바뀐다.</strong> 시간 1건을 고치면 <em>4건 × 14개 = 56개 값이 바뀐다.</em> 수정 기능이 이미 있으므로 저장하면 반드시 어긋난다.</p>
+
+  <h3>ff_game_bap — 표 자체를 없앤다</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">bap_id</td><td class="f">—</td><td class="n"><b>삭제(불필요)</b> — 레코드와 1:1이라 별도 ID가 필요 없다</td></tr>
+        <tr><td class="lg">gi_id / gr_id</td><td class="f">—</td><td class="n">삭제(경로) — 레코드 자신이 곧 그것</td></tr>
+        <tr><td class="lg">(BAP 여부·사유)</td><td class="f">RecordDoc.bapReason</td><td class="n"><b>병합</b></td></tr>
+        <tr><td class="lg">gr_half / gr_half_seconds / gr_seconds</td><td class="f">—</td><td class="n">삭제(중복) — 레코드에 이미 있음</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="ind"><code class="inl">computeBap()</code> 은 <strong>레코드 1개당 이벤트 0~1개</strong>를 산출한다. <code class="inl">gt_id</code>(여러 레코드를 하나로 묶음)와 달리 그룹핑이 아니므로, 별도 문서 대신 레코드 자신에게 표시하면 된다.</p>
+</section>
+
+<!-- 6 -->
+<section id="s6">
+  <h2><span class="num">06</span> 확정 스냅샷 — <span class="mono">paths</span> · <span class="mono">playerStats</span></h2>
+  <p class="sub">파생 스냅샷은 기록 중에는 저장하지 않는다. 입력 원본은 계속 저장한다. status:'final' 이 될 때 한 번에 배치로 쓴다.</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>시점</th><th>동작</th></tr></thead>
+      <tbody>
+        <tr><td class="f">기록 중</td><td class="n"><b>파생 스냅샷은 저장하지 않는다.</b> 원본 records 는 저장하며 화면 지표는 즉석 계산</td></tr>
+        <tr><td class="f">확정</td><td class="n">paths / playerStats / kpi 를 한 번에 배치 write</td></tr>
+        <tr><td class="f">확정 후 수정</td><td class="n">스냅샷 무효화 → 재계산 → 덮어쓰기</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="ind">변동기와 확정기의 요구가 반대이기 때문이다. 기록 중에는 매 탭마다 값이 바뀌므로 저장이 곧 부채고, 확정 후에는 리포트·동기화가 <strong>"그때 값"</strong>을 안정적으로 요구한다.</p>
+
+  <h3>ff_game_path (11) → PathSnapshotDoc</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">gt_id</td><td class="f">gtId</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gt_upp / gt_utp / gt_ctp / gt_stp</td><td class="f">ptype</td><td class="n"><b>구조 변경</b> — 불린 4개 → 단일 열거값</td></tr>
+        <tr><td class="lg">gt_csp</td><td class="f">dsp</td><td class="n">이름변경(신용어)</td></tr>
+        <tr><td class="lg">gt_ttp</td><td class="f">ttp</td><td class="n">유지</td></tr>
+        <tr><td class="lg">gt_res_code</td><td class="f">resCode</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gi_id / gt_regdt / gt_moddt</td><td class="f">—</td><td class="n">삭제(경로) / 삭제(불필요)</td></tr>
+        <tr><td class="lg">—</td><td class="f">recordIds</td><td class="n"><span class="tag new">NEW</span> 이 루트에 속한 레코드</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>ff_game_player 개인 KPI → PlayerStatsDoc</h3>
+  <p class="ind">46개 컬럼 중 <strong>16개만 저장</strong>한다. 저장하는 것도 전부 신용어로 바꾼다 — JaionX playerMST 는 아직 <code class="inl">gp_ctb</code> 같은 옛 이름을 쓰지만 <em>그건 내보낼 때의 이름이지 우리 저장소의 이름이 아니다.</em></p>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">gp_tmp / gp_tap / gp_ctp</td><td class="f">TAP / DAP / DTP</td><td class="n">이름변경(신용어)</td></tr>
+        <tr><td class="lg">gp_ctb / ctm / cta / cts</td><td class="f">DTB / DTM / DTA / DTS</td><td class="n">이름변경(신용어)</td></tr>
+        <tr><td class="lg">gp_utp / ttp / gtb / gtm / asr / ssr</td><td class="f">UTP / TTP / GTB / GTM / ASR / SSR</td><td class="n">유지</td></tr>
+        <tr><td class="lg">gp_sht / gp_ast / gp_gol</td><td class="f">SHOT / AST / GOAL</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">gp_*_sc / _sr / _tr / _pr <span class="lg">(11개)</span></td><td class="f">—</td><td class="n"><b>삭제(계산)</b> — 성공수·성공률·시도율</td></tr>
+        <tr><td class="lg">gp_score_rel / abs / gp_score</td><td class="f">—</td><td class="n"><b>삭제(이동)</b> — 평점은 jpd-rating(대외비)만 채움</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- 7 -->
+<section id="s7">
+  <h2><span class="num">07</span> ② 팀 · 선수 · 계약</h2>
+  <p class="sub">경기 기록이 아니라 관리 화면이 쓰는 참조 데이터. 입력·수정 대상이므로 이력과 감사 필드가 필요하다.</p>
+
+  <h3>ff_team (14) → TeamDoc</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">t_code</td><td class="f">(문서 ID)</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">t_name / t_name_kr / t_name_full / t_name_short</td><td class="f">name / nameKr / nameFull / nameShort</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">u_text_color_code</td><td class="f">textColor</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">s_code</td><td class="f">stadiumId</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">t_coach / t_coach_kr</td><td class="f">coach / coachKr</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">t_begin / t_end</td><td class="f">foundedAt / dissolvedAt</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">l_code</td><td class="f">currentLeagueId + teams/{id}/seasons/{id}</td><td class="n"><b>구조 변경</b> — 단일값이면 승강제를 표현 못 한다</td></tr>
+        <tr><td class="lg">t_name_ae / t_name_cn</td><td class="f">—</td><td class="n">⚠️ <b>미결정</b> (§14)</td></tr>
+        <tr><td class="lg">—</td><td class="f">crestUrl</td><td class="n"><span class="tag new">NEW</span></td></tr>
+        <tr><td class="lg">—</td><td class="f">createdAt/By · updatedAt/By</td><td class="n"><span class="tag new">NEW</span> 감사 필드</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>ff_player (9) → PlayerDoc — 정체성만</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">p_id</td><td class="f">(문서 ID)</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">p_name / p_name_en / p_name_full</td><td class="f">name / nameEn / nameFull</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">p_foot / p_birth / p_height / p_nation</td><td class="f">foot / birth / height / nation</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">p_id_old</td><td class="f">legacyPlayerId</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">—</td><td class="f">active</td><td class="n"><span class="tag new">NEW</span> 은퇴/삭제 대신 비활성 — 과거 기록을 고아로 만들지 않는다</td></tr>
+        <tr><td class="lg">—</td><td class="f">currentTeamId / currentNo / currentPos</td><td class="n"><span class="tag derived">파생 캐시</span> 계약에서 갱신</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="ind"><strong>어느 팀 소속인지는 시간에 따라 변하므로 여기 두지 않는다.</strong> 그건 계약 원장의 일이다.</p>
+
+  <h3>ff_player_team (8) → ContractDoc — 이적시장 원장 <span class="star">★</span></h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시</th><th>새 필드</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">p_id</td><td class="f">—</td><td class="n">삭제(경로)</td></tr>
+        <tr><td class="lg">t_code</td><td class="f">teamId</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">pt_begin / pt_end</td><td class="f">from / to</td><td class="n">이름변경 — <code class="inl">to = null</code> 이면 현재 소속</td></tr>
+        <tr><td class="lg">pt_num / pt_pos</td><td class="f">no / pos</td><td class="n">이름변경 — 계약에 종속(팀 옮기면 바뀐다)</td></tr>
+        <tr><td class="lg">l_code</td><td class="f">leagueId</td><td class="n">이름변경</td></tr>
+        <tr><td class="lg">p_id_old</td><td class="f">—</td><td class="n">삭제(불필요) — PlayerDoc 에 있음</td></tr>
+        <tr><td class="lg">—</td><td class="f">fromTeamId</td><td class="n"><span class="tag new">NEW</span> 직전 소속팀 — 한 문서로 "A→B" 완성</td></tr>
+        <tr><td class="lg">—</td><td class="f">transferType</td><td class="n"><span class="tag new">NEW</span> TRANSFER / LOAN / LOAN_RETURN / FREE / YOUTH / RETIRE</td></tr>
+        <tr><td class="lg">—</td><td class="f">fee / currency</td><td class="n"><span class="tag new">NEW</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="ind"><strong>이적 한 건 = 트랜잭션 하나</strong> — ① 이전 계약 <code class="inl">to</code> 닫기 ② 새 계약 생성 ③ <code class="inl">players.current*</code> 갱신 ④ 양 팀 <code class="inl">squad</code> 갱신. <em>계약 문서가 곧 이적 이벤트다</em> — 별도 transfers 컬렉션을 두지 않는 이유다.</p>
+
+  <h3>SquadEntry — 현재 스쿼드 <span class="tag derived">파생 뷰</span></h3>
+  <p class="ind">원장만 있으면 계약 30건 + 선수 30명 = <strong>61 read + 조인</strong>이 필요하다. 이 뷰가 있으면 <strong>1 query</strong>로 끝난다. 갱신은 이적 시에만(연 수십 회)이라 어긋날 위험이 낮다 — 원칙 3의 정당한 예외.</p>
+</section>
+
+<!-- 8 -->
+<section id="s8">
+  <h2><span class="num">08</span> ② 리그 · 시즌 · 경기장 · 기록자</h2>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시 표</th><th>새 타입</th><th>주요 변경</th></tr></thead>
+      <tbody>
+        <tr><td class="lg">ff_league (3)</td><td class="f">LeagueDoc</td><td class="n">league_code→(문서 ID), league_name→name, league_name_en→nameEn. <span class="tag new">NEW</span> country</td></tr>
+        <tr><td class="lg">ff_season (7)</td><td class="f">SeasonDoc</td><td class="n">l_code→leagueId, s_fr_date/s_to_date→from/to. <b>s_fr_dt/s_to_dt 삭제(중복)</b> — 날짜/일시 이중 보관</td></tr>
+        <tr><td class="lg">ff_stadium (8)</td><td class="f">StadiumDoc</td><td class="n">s_hometeam→homeTeamId, s_ground→surface, 나머지 접두사 제거</td></tr>
+        <tr><td class="lg">ff_user (5)</td><td class="f">RecorderProfileDoc</td><td class="n">u_id→(Auth UID), u_hand→handedness. <b>u_pw 삭제</b>. <span class="tag new">NEW</span> role, level</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="call">
+    <div class="h">ff_user 는 통째로 사라지지 않는다</div>
+    <p>로그인(<code class="inl">u_id</code>/<code class="inl">u_pw</code>) 기능만 Auth 로 넘어가고, <strong>이름·소속팀·역할 같은 프로필 정보는 그대로 남는다.</strong> 형태만 <code class="inl">recorders/{uid}</code> 로 바뀐 것이다.</p>
+  </div>
+
+  <pre class="code">recorders/{uid}: {
+  name, teamId, handedness,
+  <span class="k">role:  'recorder' | 'admin'</span>     <span class="c">// 데이터 관리 권한</span>
+  <span class="k">level: 'basic' | 'advanced'</span>    <span class="c">// 갱신 버튼 구성 (§11)</span>
+}</pre>
+</section>
+
+<!-- 9 -->
+<section id="s9">
+  <h2><span class="num">09</span> 표 자체를 없앤 것</h2>
+  <p class="sub">19개 표 중 5개는 새 구조에서 존재 이유가 사라졌다.</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>레거시 표</th><th>왜 없앴나</th></tr></thead>
+      <tbody>
+        <tr><td class="f">ff_game_bap</td><td class="n">레코드와 <b>1:1</b>이라 별도 ID·문서가 필요 없다 → <code class="inl">RecordDoc.bapReason</code> 으로 병합</td></tr>
+        <tr><td class="f">ff_game_player_log</td><td class="n">교체 정보가 <code class="inl">lineup</code> 맵 안에서 완결된다 → 추가 읽기 0</td></tr>
+        <tr><td class="f">ff_game_state</td><td class="n">관리자가 <code class="inl">recordings.status</code> 를 직접 고치는 것으로 대체</td></tr>
+        <tr><td class="f">ff_session<br>ff_member_session</td><td class="n">세션ID·기기ID·GCM등록ID — <b>Firebase Auth 토큰이 전부 대체</b>. 남길 값이 하나도 없다</td></tr>
+        <tr><td class="f">ff_formation</td><td class="n"><b>포메이션은 팀 소유물이 아니라 공용 도형</b>이다. 4-4-2 슬롯 좌표는 어느 팀이 쓰든 같다 → 코드 상수로 두고 <code class="inl">formationKey</code> 문자열만 저장</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="call bug">
+    <div class="h">아직 타입이 없는 것</div>
+    <p><strong>ff_game_card (7개 컬럼)</strong> — 트리에는 <code class="inl">cards/{cardId}</code> 로 적어놨으나 <code class="inl">schema.ts</code> 에 타입이 없다. 경기별 사실은 <code class="inl">recordings/{H|A}/cards/{cardId}</code>에 영구 저장한다. <strong>CardDoc 타입과 저장 연동은 후속 구현 대상</strong>이다 (§14).</p>
+  </div>
+</section>
+
+<!-- 10 -->
+<section id="s10">
+  <h2><span class="num">10</span> 역할 분담 — 무엇을 어디서 계산하나</h2>
+  <p class="sub">판정 로직의 권위는 파이썬에 있다. 클라이언트 TS 는 화면 보조일 뿐이다.</p>
 
   <div class="tbl-wrap">
     <table>
@@ -431,7 +914,7 @@ h2 .star,h3 .star{font-size:.85em}
           <td class="f">Nuxt 클라이언트<br><span class="lg">didLogic.ts</span></td>
           <td class="lg">jpd-did</td>
           <td class="n">루트가 끊겼는지 + 공격영역 진입 여부 → <b>선수 입력 버튼 띄우기 전용</b></td>
-          <td class="n">누구나<br><span class="lg">상관없음</span></td>
+          <td class="n">누구나</td>
         </tr>
         <tr>
           <td class="f">KPI 서비스<br><span class="lg">python</span></td>
@@ -449,684 +932,107 @@ h2 .star,h3 .star{font-size:.85em}
     </table>
   </div>
 
-  <p class="ind"><strong>클라이언트에 남는 판정은 하나뿐이다</strong> — "어느 레코드에 선수를 물어볼까". DTP/DAP라는 <em>이름을 붙이는 일은 전부 파이썬</em>이 한다. 클라는 ① 루트가 끊겼나(4초 공백·결과) ② 공격영역에 들어갔나(<code class="inl">area &lt; 7</code>) 두 가지만 보면 되고, 이는 분류 로직이 아니다.</p>
-  <p class="ind">클라 규칙이 다소 넉넉해도 문제없다. 버튼이 몇 개 더 떠서 선수가 더 붙을 뿐이고, 파이썬이 DAP가 아니라고 판정하면 집계에서 빠진다. <strong>반대로 덜 뜨면 데이터가 비므로, 넉넉한 쪽이 안전하다.</strong></p>
-
-  <h3><span class="num">2.1</span> 클라이언트 판정 결과는 저장하지 않는다</h3>
-  <p class="ind"><code class="inl">didLogic.ts</code>가 만든 플래그(<code class="inl">isDap</code>, <code class="inl">isDts</code> …)는 화면에 버튼을 띄우는 데만 쓰고 버린다. 저장되는 것은 사람이 찍은 사실뿐이고, 파이썬이 그것을 읽어 다시 판정한다. <em>두 구현이 어긋나도 JaionX에 틀린 값이 가지 않는다.</em></p>
-
-  <h3><span class="num">2.2</span> 그런데 왜 클라이언트에 판정이 남아 있나</h3>
-  <p class="ind">선수 입력 요청 횟수 때문이다. 실측(2026-08-21 ARS):</p>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>방식</th><th>경기당 선수 입력 요청</th><th></th></tr></thead>
-      <tbody>
-        <tr><td class="n">DAP 판정 사용 (현재)</td><td class="f">457회</td><td class="n"><code class="inl">DAP</code></td></tr>
-        <tr><td class="n">액트마다 전부 물어봄</td><td class="f">861회</td><td class="n"><code class="inl">gi_tmp</code> — 거의 <b>2배</b>. 실시간에서 못 따라감</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind"><strong>DAP 판정이 곧 "선수를 물어볼 최소 집합"이다.</strong> 이것이 클라에 로직을 두는 유일한 이유다. 향후 비전이 등번호를 채우면 이 버튼 자체가 사라지고, 클라이언트 판정도 제거해 <strong>파이썬 단일</strong> 구조가 된다.</p>
-</section>
-
-<!-- 3 -->
-<section id="s3">
-  <h2><span class="num">03</span> 가장 중요한 결정 — <span class="mono">matches</span> ≠ <span class="mono">recordings</span></h2>
-  <p class="sub">레거시가 이미 이렇게 하고 있었다. 새로 고안한 것이 아니라 보존하는 것이다.</p>
-
-  <pre class="code"><span class="c">// lib/extra.lib.php:3799</span>
-$gi[$row[<span class="k">'gi_write_code'</span>]] = $row;      <span class="c">// H/A 를 키로 담고</span>
-<span class="k">if</span> (count($gi) &lt; 2) <span class="k">return</span> FALSE;       <span class="c">// 2개가 아니면 실패</span>
-<span class="c">// 주석: "양팀 입력 모두 종료되지 않은 경기는 진행 불가"</span></pre>
-
-  <p class="ind"><code class="inl">ff_game_info</code>에는 <code class="inl">gi_write_code</code>(H/A)와 <code class="inl">gi_user_id</code>(기록자)가 있고, KPI 집계가 전부 이 테이블에 있다. 즉 <em>KPI는 경기 단위가 아니라 팀-기록자 단위다.</em> 팀 판별도 전부 <code class="inl">if(gi_write_code='H', gi_h_t_code, gi_a_t_code)</code> 패턴이다.</p>
-
-  <p class="ind">그리고 이건 지금 앱과 일치한다 — TeamSelection의 "입력할 팀 선택"(<code class="inl">game.team</code>)이 곧 <code class="inl">gi_write_code</code>다.</p>
-
-  <h3><span class="num">3.1</span> 바뀌는 것은 표현 방법뿐</h3>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th></th><th>레거시</th><th>새 스키마</th></tr></thead>
-      <tbody>
-        <tr><td class="n">관계</td><td class="lg">ff_game 1행 : ff_game_info 2행</td><td class="n">matches 1문서 : recordings 2문서 <b>(동일)</b></td></tr>
-        <tr><td class="n">소속 표현</td><td class="lg">gm_id 컬럼 + JOIN</td><td class="f">matches/{id}/recordings/{H|A}</td></tr>
-        <tr><td class="n">H/A 구분</td><td class="lg">gi_write_code 컬럼</td><td class="n"><b>문서 ID 자체</b></td></tr>
-        <tr><td class="n">세션 키</td><td class="lg">gi_id (숫자)</td><td class="n">불필요 — 경로가 키. <code class="inl">legacyGiId</code>만 매핑용으로 남긴다</td></tr>
-        <tr><td class="n">중복 세션</td><td class="n">가능 (막을 장치 없음)</td><td class="n"><b>구조적으로 불가능</b></td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind">Firestore에는 JOIN이 없다. 소속을 표현하는 방법은 ① 필드에 부모를 적고 질의 ② 경로에 넣기 두 가지인데, ②는 색인이 필요 없고 질의가 아닌 <strong>직접 읽기</strong>이며 결과가 "있거나 없거나" 둘 중 하나다. <code class="inl">matches/{matchId}/recordings/H</code> — 이 주소 한 번 읽기로 복구가 끝난다.</p>
-</section>
-
-<!-- 4 -->
-<section id="s4">
-  <h2><span class="num">04</span> 전체 트리</h2>
-  <div class="tree">
-    <div class="tree-hd"><span>컬렉션 경로</span><span>레거시 대응</span></div>
-    <pre><span class="grp-l">── 경기 기록 ──────────────────────────────────────────</span>
-<span class="path">matches/{matchId}</span>                        <span class="lg">← ff_game</span>            <span class="note">일정·확정 스코어</span>
-<span class="path">  recordings/<b>{H|A}</b></span>                     <span class="lg">← ff_game_info</span>       <span class="star">★ 팀별 기록 세션</span>
-<span class="path">    records/{recordId}</span>                 <span class="lg">← ff_game_record</span>     <span class="note">플레이 1건</span>
-<span class="path">    subs/{subId}</span>                       <span class="lg">← ff_game_player_log</span> <span class="note">교체</span>
-<span class="path">    cards/{cardId}</span>                     <span class="lg">← ff_game_card</span>       <span class="note">경고/퇴장</span>
-<span class="path">    paths/{pathId}</span>                     <span class="lg">← ff_game_path</span>       <span class="note">[확정 스냅샷]</span>
-<span class="path">    bapEvents/{bapId}</span>                  <span class="lg">← ff_game_bap</span>        <span class="note">[확정 스냅샷]</span>
-<span class="path">    playerStats/{playerId}</span>             <span class="lg">← ff_game_player</span>     <span class="note">[확정 스냅샷]</span>
-
-<span class="grp-l">── 참조 · 데이터 관리 ─────────────────────────────────</span>
-<span class="path">leagues/{leagueId}</span>                       <span class="lg">← ff_league</span>
-<span class="path">seasons/{seasonId}</span>                       <span class="lg">← ff_season</span>
-<span class="path">stadiums/{stadiumId}</span>                     <span class="lg">← ff_stadium</span>
-<span class="path">teams/{teamId}</span>                           <span class="lg">← ff_team</span>
-<span class="path">  seasons/{seasonId}</span>                     <span class="lg">← (신규)</span>             <span class="note">시즌별 리그 — 승강제</span>
-<span class="path">  squad/{playerId}</span>                       <span class="lg">← (파생)</span>             <span class="note">현재 스쿼드 뷰</span>
-<span class="path">players/{playerId}</span>                       <span class="lg">← ff_player</span>
-<span class="path">  contracts/{contractId}</span>                 <span class="lg">← ff_player_team</span>     <span class="star">★ 이적시장 원장</span>
-<span class="path">recorders/{uid}</span>                          <span class="lg">← ff_user</span></pre>
-  </div>
-
-  <h3>만들지 않는 것</h3>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>레거시</th><th>처리</th></tr></thead>
-      <tbody>
-        <tr><td class="lg">ff_game_state</td><td class="n"><code class="inl">recordings.status</code>를 관리자가 고치는 것으로 대체</td></tr>
-        <tr><td class="lg">ff_session · ff_member_session</td><td class="n">Firebase Auth 토큰이 대체</td></tr>
-        <tr><td class="lg">ff_formation</td><td class="n">슬롯 좌표는 상수. <code class="inl">TeamSelection.vue</code>에 두고 <code class="inl">formationKey</code>만 저장</td></tr>
-      </tbody>
-    </table>
-  </div>
-</section>
-
-<!-- 5 -->
-<section id="s5">
-  <h2><span class="num">05</span> <span class="mono">matches/{matchId}</span> — 일정</h2>
-  <p class="sub">두 기록 세션이 공유하는 사실만 담는다. 문서 ID는 <code class="inl">gm_id</code>를 그대로 쓴다.</p>
-
-  <h3>문서 ID는 gm_id를 그대로 쓴다</h3>
-  <pre class="code">matches/<span class="k">20262027eplj2rgn13na28rd2b8q0001</span></pre>
-  <p class="ind"><code class="inl">gm_id</code>는 레거시의 옛날 키가 아니라 <strong>JaionX의 모든 테이블을 잇는 조인 키</strong>다. <code class="inl">TACTIC</code>·<code class="inl">playerMST</code>의 첫 컬럼이 전부 <code class="inl">gm_id</code>이므로, <em>신규 경기도 이것 없이는 JaionX에 넣을 수 없다.</em></p>
-
-  <pre class="code"><span class="k">20262027</span> <span class="k">epl</span> <span class="s">j2rgn13na28rd2b8q</span> <span class="k">0001</span>
-└──┬───┘ └┬┘ └───────┬───────┘ └─┬┘
-  <span class="c">8자     3자        17자         4자</span>
-  <span class="c">시즌    리그    리그 고정 상수  일련번호</span></pre>
+  <p class="ind"><strong>클라이언트에 남는 판정은 하나뿐이다</strong> — "어느 레코드에 선수를 물어볼까". DTP/DAP라는 <em>이름을 붙이는 일은 전부 파이썬</em>이 한다. 클라는 ① 루트가 끊겼나 ② 공격영역에 들어갔나(<code class="inl">area &lt; 7</code>) 두 가지만 본다.</p>
 
   <div class="tbl-wrap">
     <table>
-      <thead><tr><th>구간</th><th>내용</th><th>검증</th></tr></thead>
+      <thead><tr><th>방식</th><th>경기당 선수 입력 요청</th></tr></thead>
       <tbody>
-        <tr><td class="f">[0:8]</td><td class="n">시즌 <code class="inl">20262027</code></td><td class="n"></td></tr>
-        <tr><td class="f">[8:11]</td><td class="n">리그 <code class="inl">epl</code></td><td class="n"></td></tr>
-        <tr><td class="f">[11:28]</td><td class="n"><b>리그 고정 상수</b></td><td class="n">2024-25 · 2025-26 · 2026-27 <b>세 시즌 780건 전부 동일.</b> 시즌별 난수가 아니다</td></tr>
-        <tr><td class="f">[28:32]</td><td class="n">일련번호</td><td class="n">시즌 통산 0001~0380, 빠짐없이 연속. 라운드1 = 1~10, 라운드2 = 11~20</td></tr>
+        <tr><td class="n">DAP 판정 사용 (현재)</td><td class="f">457회</td></tr>
+        <tr><td class="n">액트마다 전부 물어봄</td><td class="f">861회 — 거의 <b>2배</b></td></tr>
       </tbody>
     </table>
   </div>
-  <p class="ind">다른 리그를 추가할 때 상수가 달라지는지는 <strong>확인 불가</strong> — EPL 데이터밖에 없다. <code class="inl">gm_id</code>를 문서 ID로 쓰면 매핑 필드가 필요 없고, export 시 <strong>변환이 아예 없다.</strong></p>
-
-  <h3>일정은 만들지 않고 가져온다</h3>
-  <pre class="code">footballx/server/backend/data/matchschedule/{시즌}/match_schedule.json
-   <span class="c">─── 임포트 ───►</span>   matches/{gm_id}
-
-<span class="c">{ "gm_id": "20262027eplj2rgn13na28rd2b8q0020",</span>
-<span class="c">  "season": "2026-2027", "gm_date": "2026.08.31", "gm_round": 2,</span>
-<span class="c">  "home": { "code": "AVLX", "goal": 0, "jmx": 40.0, "points": 1, "sRound": 26270219 },</span>
-<span class="c">  "away": { "code": "ARSX", … }, "is_pending": true, "status": "FORECAST" }</span></pre>
-  <div class="call bug">
-    <div class="h">일련번호는 우리가 매기지 않는다</div>
-    <p>같은 시즌·같은 라운드에서 경기를 구분하는 것은 <strong>일련번호 4자리뿐</strong>이고, 그 번호는 일정이 만들어질 때 정해진다. 우리가 따로 발급하면 <strong>같은 경기에 다른 번호가 붙어 JaionX와 영영 맞지 않는다.</strong></p>
-  </div>
-
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>필드</th><th>타입</th><th>레거시</th><th>비고</th></tr></thead>
-      <tbody>
-        <tr><td class="f">(문서 ID)</td><td class="ty">string</td><td class="lg"><b>gm_id</b></td><td class="n">위 구조. 일정에서 그대로 가져온다</td></tr>
-        <tr><td class="f">date / kickoffTime</td><td class="ty">string</td><td class="lg">gm_date, gm_time</td><td class="n"></td></tr>
-        <tr><td class="f">leagueId / seasonId / round</td><td class="ty">string / number</td><td class="lg">gm_league, —, gm_round</td><td class="n"></td></tr>
-        <tr><td class="f">stadiumId</td><td class="ty">string</td><td class="lg">gm_s_code</td><td class="n"></td></tr>
-        <tr><td class="f">homeTeamId / awayTeamId</td><td class="ty">string</td><td class="lg">gm_h_t_code / gm_a_t_code</td><td class="n">일정의 home.code / away.code (IDX_CODE 체계)</td></tr>
-        <tr><td class="f">sRound</td><td class="ty">{home, away}</td><td class="lg">—</td><td class="n">일정에 이미 있는 D-MST <code class="inl">S-Round</code> 채번값</td></tr>
-        <tr><td class="f">score</td><td class="ty">{home, away}</td><td class="lg">gi_goal_home/away</td><td class="n">각 recording이 <b>자기 쪽 필드만</b> merge (§5.1)</td></tr>
-        <tr><td class="f">createdAt / updatedAt</td><td class="ty">Timestamp</td><td class="lg">—</td><td class="n"></td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind"><code class="inl">is_view</code>·<code class="inl">is_onair</code>·<code class="inl">is_old</code>는 옮기지 않는다. <code class="inl">is_realtime</code>은 경기 속성이 아니라 <strong>기록자의 입력 모드</strong>이므로 <code class="inl">recordings</code>로 내린다.</p>
-
-  <h3><span class="num">5.1</span> 스코어는 누가 쓰는가</h3>
-  <p class="ind">골은 각 기록자가 자기 팀 것만 찍는다. Firestore는 필드 단위 merge가 되므로 동시에 써도 충돌하지 않는다.</p>
-  <pre class="code">setDoc(matchRef, { score: { home: goals } }, { merge: <span class="k">true</span> })</pre>
-  <div class="call bug">
-    <div class="h">현재 코드 버그</div>
-    <p><code class="inl">DidInput.vue:455</code>의 <code class="inl">recordGoalResult</code>가 기록 중인 팀과 무관하게 항상 <code class="inl">homeScore.value++</code> 한다. 원정팀을 기록 중이어도 홈 스코어가 오른다. 연동 시 <code class="inl">recordings.side</code> 기준으로 고칠 것.</p>
-  </div>
-</section>
-
-<!-- 6 -->
-<section id="s6">
-  <h2><span class="num">06</span> <span class="mono">recordings/{H|A}</span> — 팀별 기록 세션 <span class="star">★</span></h2>
-
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>필드</th><th>타입</th><th>레거시</th><th>비고</th></tr></thead>
-      <tbody>
-        <tr><td class="f">side</td><td class="ty">'H' | 'A'</td><td class="lg">gi_write_code</td><td class="n">문서 ID와 중복이나 collectionGroup 질의용으로 유지</td></tr>
-        <tr><td class="f">teamId / opponentTeamId</td><td class="ty">string</td><td class="lg">gi_h_t_code / gi_a_t_code</td><td class="n"></td></tr>
-        <tr><td class="f">recorders<br>recorderIds</td><td class="ty">map / array</td><td class="lg">gi_user_id</td><td class="n"><b>한 팀을 두 명이 나눠 찍는 경우가 있다</b> — §6.3</td></tr>
-        <tr><td class="f">status</td><td class="ty">ready | H1 | H1_done | H2 | H2_done | final</td><td class="lg">gi_state</td><td class="n">이미 코드에 있는 값 그대로. 화면 상태와 1:1이라 매핑 코드 불필요</td></tr>
-        <tr><td class="f">inputMode</td><td class="ty">'분석' | '실시간'</td><td class="lg">is_realtime</td><td class="n"><b>집계·전송 트리거를 가른다</b> (§11)</td></tr>
-        <tr><td class="f">fieldSide</td><td class="ty">'left' | 'right'</td><td class="lg">gi_part</td><td class="n">전반 기준 진영. 구역코드 반전</td></tr>
-        <tr><td class="f">formationKey</td><td class="ty">string</td><td class="lg">gi_formation</td><td class="n"></td></tr>
-        <tr><td class="f">lineup</td><td class="ty">map</td><td class="lg">ff_game_player</td><td class="n">§6.2</td></tr>
-        <tr><td class="f">halves</td><td class="ty">map</td><td class="lg">gi_h1_begin, gi_h1_seconds …</td><td class="n">§6.1</td></tr>
-        <tr><td class="f">maxSeq</td><td class="ty">number</td><td class="lg">—</td><td class="n"><span class="tag new">NEW</span> 레코드 정렬키 발급 (§7.2)</td></tr>
-        <tr><td class="f">kpi</td><td class="ty">map | null</td><td class="lg">gi_tap, gi_bap …</td><td class="n"><span class="tag snap">SNAPSHOT</span> §08</td></tr>
-        <tr><td class="f">kpiComputedAt</td><td class="ty">Timestamp | null</td><td class="lg">—</td><td class="n">신선도 판단</td></tr>
-        <tr><td class="f">legacyGiId</td><td class="ty">number | null</td><td class="lg">gi_id</td><td class="n"><span class="tag new">NEW</span> <b>JaionX 동기화 매핑용.</b> 신규 경기는 null</td></tr>
-        <tr><td class="f">syncedAt</td><td class="ty">Timestamp | null</td><td class="lg">—</td><td class="n">동기화 멱등성</td></tr>
-        <tr><td class="f">createdAt / updatedAt</td><td class="ty">Timestamp</td><td class="lg">gi_regdt / gi_moddt</td><td class="n"></td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <h3><span class="num">6.1</span> <span class="mono">halves</span> — 시간의 기준을 여기서 잡는다</h3>
-  <pre class="code">halves: {
-  H1: { startedAt: Timestamp, seconds: <span class="s">2712</span> },   <span class="c">// 종료 시 확정</span>
-  H2: { startedAt: Timestamp, seconds: <span class="s">2840</span> },
-}</pre>
-  <p class="ind">레코드에는 <code class="inl">half</code> + <code class="inl">halfSeconds</code>만 저장하고, 경기 전체 기준 초(<code class="inl">gr_seconds</code>)는 export 시점에 계산한다. 저장 안 함 = 어긋날 일 없음.</p>
+  <p class="ind"><strong>DAP 판정이 곧 "선수를 물어볼 최소 집합"이다.</strong> 향후 비전이 등번호를 채우면 이 버튼 자체가 사라지고, 클라이언트 판정도 제거해 <strong>파이썬 단일</strong> 구조가 된다.</p>
 
   <div class="call bug">
-    <div class="h">현재 코드 버그를 이 설계가 고친다</div>
-    <p><code class="inl">DidInput.vue:35</code>는 <code class="inl">seconds = ref(0)</code>이고 후반에도 0부터 다시 센다. 그런데 <code class="inl">DidInput.vue:67</code>에서 후반 진입 시 전반 레코드를 그대로 이어받으므로, 배열 안에 <b>H1의 30초</b>와 <b>H2의 30초</b>가 같은 값으로 공존한다.</p>
-    <p><code class="inl">resolvedOnly()</code>가 <code class="inl">seconds</code>로 정렬하는 순간 <strong>전·후반 레코드가 뒤섞이고 4초 룰이 반 경계를 넘는다.</strong></p>
+    <div class="h">KPI 가 쌓이는 곳과 평점이 쌓이는 곳을 분리한다</div>
+    <p><strong>평점 서비스만 KPI 를 읽는다. 반대 방향은 없다.</strong> KPI 프로젝트를 전부 뒤져도 <code class="inl">DAP 65, BAP 7, SHOT 3</code> 같은 숫자만 있고 점수는 없다. 기준값(<code class="inl">ratingBaseline</code>)도 평점 저장소에만 둔다.</p>
+    <p>다만 JaionX 가 입력과 출력을 같은 표에 보여주므로 <strong>작정하고 회귀분석을 하면 공식은 복원된다.</strong> 그러므로 API 호출 제한 같은 역산 방지 장치는 만들지 않는다 — 실익 없이 복잡도만 는다. 분리로 얻는 것은 <em>복사 경로 차단 · 예외 처리의 정확도 · 영업비밀 지위</em>이며, 코드를 어디 두느냐의 문제라 비용이 0이므로 그대로 한다.</p>
   </div>
-
-  <div class="call">
-    <div class="h">그리고 이건 JaionX 요구사항이기도 하다</div>
-    <p><code class="inl">2627-5분단위 통합.xlsx</code>는 전·후반 × 5분 구간 20칸(<code class="inl">JMX-H1-0-5</code> … <code class="inl">DAP-H2-45-Plus</code>)으로 되어 있고, <strong>팀 JMX가 이 시계열에서 산출된다</strong>(§9.3). 반 구분과 반 기준 경과초가 없으면 이 시트를 만들 수 없다.</p>
-  </div>
-
-  <h3><span class="num">6.2</span> <span class="mono">lineup</span> — 서브컬렉션이 아니라 map</h3>
-  <p class="ind">18명을 항상 통째로 읽고 쓴다. 서브컬렉션이면 로드마다 18 read, map이면 1 read다.</p>
-  <pre class="code">lineup: {
-  [playerId]: {
-    slot: <span class="s">'o0' | 'gk' | 'b3'</span>,    <span class="c">// TeamSelection 의 assigned 키</span>
-    order, type: <span class="s">'START' | 'BENCH'</span>,
-    no: <span class="s">'7'</span>, name: <span class="s">'B. Saka'</span>, pos: <span class="s">'FW'</span>,   <span class="k">// ★ 스냅샷</span>
-    inHalf, inSeconds, outHalf, outSeconds,
-  }
-}</pre>
-  <p class="ind"><strong>이름·번호를 복사하는 이유(원칙 07):</strong> 선수가 이적하거나 번호를 바꾸면 <code class="inl">players</code> 문서가 갱신된다. 스냅샷이 없으면 <em>작년 경기를 열었을 때 그때 뛰지도 않은 팀의 번호로 표시된다.</em></p>
-  <p class="ind">선수별 지표(<code class="inl">gp_tap</code>, <code class="inl">gp_score</code> …)는 여기 두지 않는다 — 파생값이고 목록 화면을 무겁게 한다. 확정 시 <code class="inl">playerStats</code>로 뺀다.</p>
-
-  <h3><span class="num">6.3</span> recorders — 한 팀을 두 명이 찍는 경우 <span class="star">★</span></h3>
-  <p class="ind"><strong>기록자가 항상 한 명이 아니다.</strong> 한 팀을 둘이 나눠 찍는 방식이 실제로 쓰인다.</p>
-  <pre class="code"><span class="k">A</span>  액트 · 위치 담당      → 레코드를 만든다
-<span class="k">B</span>  선수 담당             → A가 만든 레코드에 등번호만 채운다</pre>
-  <p class="ind">레거시 <code class="inl">gi_user_id</code>가 단수라 이 구조를 표현하지 못했다. 새 스키마는 맵으로 둔다.</p>
-  <pre class="code">recorders: {
-  [uid]: { rank: <span class="s">'main' | 'sub'</span>, joinedAt }   <span class="c">// 주/부 — 조직상 구분일 뿐</span>
-},
-recorderIds: [uid, …]     <span class="c">// ← 질의용. Firestore는 map 의 키로 질의할 수 없다</span></pre>
-  <p class="ind"><code class="inl">recorderIds</code> 배열을 함께 두는 이유는 <strong>기록자 대시보드</strong>("내가 기록한 경기") 때문이다. map의 키는 조건으로 걸 수 없으므로 <code class="inl">array-contains</code>용 배열이 따로 필요하다. 보안 규칙은 map으로 검사한다.</p>
-
-  <div class="call bug">
-    <div class="h">rank 는 권한이 아니다</div>
-    <p><strong>주 분석관과 부 분석관의 기능은 완전히 동일하다.</strong> "한 명은 액트, 한 명은 선수"는 <strong>그날의 역할 분담이지 계정 속성이 아니다.</strong> 보안 규칙도 <code class="inl">recorders</code>에 포함되면 무엇이든 쓸 수 있게 둔다.</p>
-    <p>화면에서 "액트 입력 보기 / 선수 입력 보기"를 각자 고르되, 이는 <em>권한이 아니라 보기 설정</em>이라 언제든 바꿀 수 있다. 둘 다 액트를 찍어 같은 플레이가 중복되는 것은 화면에서 막는다 — 선수 입력 보기에서는 액트 버튼을 감춘다.</p>
-  </div>
-
-  <div class="call">
-    <div class="h">충돌하지 않는다</div>
-    <p>둘이 같은 레코드의 <strong>다른 필드</strong>를 건드리기 때문이다 — Firestore는 필드 단위로 병합한다. 홈/원정 기록자가 <code class="inl">score.home</code>/<code class="inl">score.away</code>를 각각 쓰는 것과 같은 원리다.</p>
-  </div>
-  <pre class="code">A → 레코드 생성    { act, res, area, posX, posY, half, halfSeconds }
-B → 같은 문서 갱신 { playerId }        <span class="c">← 필드 단위 merge</span></pre>
-  <p class="ind"><strong>누가 무엇을 했는지는 세션이 아니라 레코드에 남긴다</strong> — <code class="inl">records.createdBy</code>(액트를 만든 사람), <code class="inl">records.playerIdBy</code>(선수를 넣은 사람). 역할을 미리 정하지 않아도 실제 사실이 기록되고, 중간에 역할을 바꿔도 그대로 남는다. <strong>B의 화면은 A와 다르다</strong> — "선수 입력 버튼이 뜬 레코드 목록"만 보면 되고, A가 찍는 대로 목록이 차오른다. <code class="inl">records</code> 구독 하나로 성립하므로 별도 구조가 필요 없다.</p>
-  <p class="ind"><strong>두 모드 모두 가능하다.</strong> 레코드가 두 모드 다 즉시 서버로 가므로(§11.1) 실시간·분석 어느 쪽이든 서로의 입력이 보인다.</p>
-</section>
-
-<!-- 7 -->
-<section id="s7">
-  <h2><span class="num">07</span> <span class="mono">records/{recordId}</span> — 플레이 1건</h2>
-  <p class="sub"><code class="inl">didLogic.ts</code>의 <code class="inl">DidRecord</code>가 곧 문서 스키마다. 새 타입을 만들지 않는다.</p>
-
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>필드</th><th>레거시</th><th>비고</th></tr></thead>
-      <tbody>
-        <tr><td class="f">(문서 ID)</td><td class="lg">gr_id</td><td class="n">Firestore 자동 ID (§7.2)</td></tr>
-        <tr><td class="f">half</td><td class="lg">gr_half</td><td class="n"><b>'H1'|'H2'|'H3'|'H4'. 반드시 저장</b> (§6.1)</td></tr>
-        <tr><td class="f">halfSeconds</td><td class="lg">gr_half_seconds</td><td class="n">해당 반 기준 경과초. 4초 룰의 입력값</td></tr>
-        <tr><td class="f">seq</td><td class="lg">gr_regdt 대용</td><td class="n">같은 초 안의 순서 (§7.2)</td></tr>
-        <tr><td class="f">act / res</td><td class="lg">gr_act_code / gr_res_code</td><td class="n"><code class="inl">GB</code>/<code class="inl">GX</code>/<code class="inl">GOAL</code> 등 신 코드 체계</td></tr>
-        <tr><td class="f">area</td><td class="lg">gr_area_code</td><td class="n">1~18 구역</td></tr>
-        <tr><td class="f">posX / posY</td><td class="lg">gr_pos_x / gr_pos_y</td><td class="n">0~100%. <b>레거시는 픽셀값이다 — 변환 필요</b> (§15)</td></tr>
-        <tr><td class="f">shootPosX / shootPosY</td><td class="lg">gr_shoot_pos_x/y</td><td class="n">골대 타깃 좌표</td></tr>
-        <tr><td class="f">shootDspRange</td><td class="lg">—</td><td class="n"><span class="tag new">NEW</span> 골포스트 1m 판정 캐시</td></tr>
-        <tr><td class="f">isShot</td><td class="lg">—</td><td class="n"><span class="tag new">NEW</span> write-back으로 act가 비워져도 원래 슛이었음을 보존</td></tr>
-        <tr><td class="f">playerId</td><td class="lg">p_id</td><td class="n"><b>'OWN' = 자책골</b> (레거시 실데이터에서 확인, §13)</td></tr>
-        <tr><td class="f">createdBy</td><td class="lg">—</td><td class="n"><span class="tag new">NEW</span> 이 레코드(액트·위치)를 만든 사람의 uid</td></tr>
-        <tr><td class="f">playerIdBy</td><td class="lg">—</td><td class="n"><span class="tag new">NEW</span> 선수를 넣은 사람의 uid. 2인 기록에서 A≠B가 된다 (§6.3)</td></tr>
-        <tr><td class="f">source</td><td class="lg">—</td><td class="n"><span class="tag new">NEW</span> <b>'did' | 'vision'.</b> 지금은 전부 'did'</td></tr>
-        <tr><td class="f">playerIdSource</td><td class="lg">—</td><td class="n"><span class="tag new">NEW</span> <b>선수를 누가 넣었나</b></td></tr>
-        <tr><td class="f">createdAt</td><td class="lg">gr_regdt</td><td class="n"></td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <div class="call">
-    <div class="h">source 분기를 지금 넣어두는 이유</div>
-    <p>비전 데이터 구조는 <strong>지금 설계하지 않는다</strong>(§15). 다만 필드가 없으면, 나중에 비전이 들어왔을 때 <strong>과거 레코드에 대해 "이 값은 사람이 넣은 건가 기계가 넣은 건가"를 영원히 알 수 없다.</strong> 마이그레이션을 피하려고 자리만 잡아둔다.</p>
-    <p>원칙은 하나다 — <strong>비전은 DID 값을 덮어쓰지 않고 옆에 붙는다.</strong> 되돌릴 수 있어야 하고, 정확도를 재려면 사람 입력과 대조할 수 있어야 한다.</p>
-  </div>
-
-  <h3><span class="num">7.1</span> 저장하지 않는 것 — <span class="mono">gt_id</span>와 <span class="mono">gr_is_*</span> 14개</h3>
-  <p class="ind">레거시는 레코드마다 소속 루트와 판정 플래그 14개를 저장했다. 여기서는 전부 뺀다.</p>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>레거시가 저장한 이유</th><th>지금은?</th></tr></thead>
-      <tbody>
-        <tr><td class="n">계산 로직이 서버(PHP)에만 있었다. 여러 클라이언트가 각자 계산할 수 없었다</td><td class="n"><b>사라짐.</b> <code class="inl">didLogic.ts</code>를 모든 화면이 공유</td></tr>
-        <tr><td class="n">SQL 집계가 필요했다 — <code class="inl">SUM(gr_is_tap) GROUP BY</code>는 컬럼이어야 가능</td><td class="n"><b>사라짐.</b> 확정 스냅샷을 따로 저장(§08)</td></tr>
-        <tr><td class="n">2013년 단말에서 1,200건 재계산이 부담이었다</td><td class="n"><b>사라짐.</b> 실측 <b>0.16ms</b> (§13)</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind">그리고 결정적으로, <strong>레코드 하나를 수정하면 앞뒤 루트의 플래그가 연쇄로 바뀐다.</strong> 시간 1건을 고치면 4건 × 14개 = <em>56개 값이 바뀐다.</em> 수정 기능이 이미 있으므로(<code class="inl">DidInput.vue:157</code>) 저장하면 반드시 어긋난다.</p>
-
-  <div class="call">
-    <div class="h">단, gt_id는 JaionX가 요구한다</div>
-    <p><code class="inl">TACTIC.xlsx</code>에 <code class="inl">gt_id</code> 컬럼이 있다. 저장하지 않되 <strong>export 시점에 <code class="inl">computeAttackPaths()</code>의 <code class="inl">path.gtId</code>를 채워 내보낸다.</strong> 확정 스냅샷의 <code class="inl">paths</code>(§08)가 그 자리다.</p>
-  </div>
-
-  <h3><span class="num">7.2</span> 정렬키 — 지금 코드의 ID 충돌을 막는다</h3>
-  <div class="call bug">
-    <div class="h">현재 코드 버그</div>
-    <p><code class="inl">didLogic.ts:121</code>의 <code class="inl">let recSeq = 0</code>은 모듈 전역 카운터다. 새로고침하면 0으로 돌아가므로, 저장된 기록을 이어서 입력하면 <code class="inl">rec_1</code>이 두 번 생기고 <code class="inl">seq</code>도 중복된다.</p>
-  </div>
-  <p class="ind">문서 ID는 Firestore 자동 ID를 쓰고, <code class="inl">seq</code>는 세션 로드 시 <code class="inl">recordings.maxSeq</code>에서 이어받는다. 정렬은 <code class="inl">orderBy('half').orderBy('halfSeconds').orderBy('seq')</code> — <code class="inl">seq</code> 단독 정렬은 불가하다. 수정으로 시간을 바꾸면 입력 순서와 시간 순서가 어긋나기 때문이다.</p>
-
-  <h3><span class="num">7.3</span> 자책골 처리 — <span class="mono">playerId = 'OWN'</span></h3>
-  <p class="ind">레거시 실데이터에 <code class="inl">p_id = 'OWN'</code>이 그대로 들어 있다. 집계 규칙은 D-MST와 대조해 확정했다:</p>
-  <pre class="code">GOAL  = 자책골 <span class="k">포함</span>
-SHOT  = 자책골 <span class="k">제외</span>
-SSR   = (GOAL − OG) / SHOT
-OG    = 자책골 수 (별도 컬럼)</pre>
-</section>
-
-<!-- 8 -->
-<section id="s8">
-  <h2><span class="num">08</span> 파생 데이터는 언제 저장하나</h2>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>시점</th><th>동작</th></tr></thead>
-      <tbody>
-        <tr><td class="f">기록 중 (H1~H2_done)</td><td class="n"><b>저장하지 않는다.</b> 화면은 records로 즉석 계산</td></tr>
-        <tr><td class="f">확정 (status: 'final')</td><td class="n"><code class="inl">paths</code> / <code class="inl">bapEvents</code> / <code class="inl">playerStats</code> / <code class="inl">kpi</code>를 한 번에 배치 write</td></tr>
-        <tr><td class="f">확정 후 수정</td><td class="n">스냅샷 무효화 → 재계산 → 덮어쓰기 (<code class="inl">kpiComputedAt</code> 갱신)</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind">변동기와 확정기의 요구가 반대이기 때문이다. 기록 중에는 매 탭마다 값이 바뀌므로 저장이 곧 부채고, 확정 후에는 리포트·동기화가 "그때 값"을 안정적으로 요구한다. <code class="inl">AttackPath.recordIds</code>가 레코드를 참조하므로, 삭제 가능한 기록 중에 저장하면 끊어진 참조가 남는 것도 이유다.</p>
-  <div class="call">
-    <div class="h">이전 판의 오류를 정정한다</div>
-    <p>스냅샷 필드 목록의 기준은 <strong>화면이 아니라 JaionX다.</strong> 이전 판에서 "화면에 보이는 8개 중심"이라고 쓴 것은 잘못이었다. §09의 컬럼 전체를 담는다.</p>
-  </div>
-</section>
-
-<!-- 9 -->
-<section id="s9">
-  <h2><span class="num">09</span> 출력 규격 — JaionX가 받는 것</h2>
-  <p class="sub">이것이 규칙 0의 실체다. 규격의 원본은 footballx repo에 있다.</p>
-
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>대상</th><th>규격 위치</th><th>성격</th></tr></thead>
-      <tbody>
-        <tr><td class="f">dMST</td><td class="lg">admin/dMST.vue tableHeaders</td><td class="n">팀-경기 단위. "전 시스템의 중심 허브"</td></tr>
-        <tr><td class="f">playerMST</td><td class="lg">admin/playerMST.vue</td><td class="n">선수-경기 단위. 레거시 <code class="inl">gp_*</code> 거의 그대로</td></tr>
-        <tr><td class="f">multiSheet</td><td class="lg">admin/multiSheet/index.vue</td><td class="n">헤더 고정 아님. 업로드 행의 키에서 동적 생성</td></tr>
-        <tr><td class="f">TACTIC</td><td class="lg">레코드 원본</td><td class="n">gm_id, p_id, t_code, gr_half, gr_half_seconds, gr_area_code, gr_act_code, gr_res_code, gr_pos_x/y, gt_id …</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <h3><span class="num">9.1</span> 이미 Firestore다 — CSV는 껍데기다</h3>
-  <pre class="code"><span class="c">// footballx/app/composables/dMST.ts</span>
-<span class="k">import</span> { addDoc, collection, … } <span class="k">from</span> <span class="s">'firebase/firestore'</span>
-<span class="k">const</span> q = query(collection(db, <span class="k">'dMST'</span>), …)</pre>
-  <p class="ind"><strong>"CSV를 admin에 올린다"는 결국 Firestore에 문서를 쓰는 것이다. 우리는 CSV를 만들 필요가 없다.</strong> 단 프로젝트가 둘이다 — didNew는 <code class="inl">jpd-did</code>, JaionX는 <code class="inl">aifootballx</code>. 클라이언트끼리는 서로 쓸 수 없으므로 <em>반드시 서버(파이썬)를 거친다.</em> 이는 대외비 격리와도 맞아떨어진다.</p>
-
-  <h3><span class="num">9.2</span> dMST 컬럼 중 우리 몫</h3>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>구분</th><th>컬럼</th><th>담당</th></tr></thead>
-      <tbody>
-        <tr><td class="n"><b>DID 산출 KPI</b></td><td class="lg">gi_tmp(=TAP), DAP, TTP, DTP, BAP, B, M, A, S, SHOT, ASR, SSR, GOAL, OG</td><td class="n"><b>우리</b></td></tr>
-        <tr><td class="n"><b>경기 메타</b></td><td class="lg">gm_round, gm_date, t_code, t_Nm, H-A</td><td class="n"><b>우리</b></td></tr>
-        <tr><td class="n">채번/식별</td><td class="lg">Season, S-Round, M-Code, Match, T-Round, IDX_CODE, PlSeason</td><td class="n">규칙 파악됨 → 대외비 서버</td></tr>
-        <tr><td class="n">AI 예측</td><td class="lg">X-*, *(Ai*)</td><td class="n">파이썬 분석 쪽</td></tr>
-        <tr><td class="n">스코어링</td><td class="lg">JMX, APX, TPX, FPX, *Score, Power3X, G-*, W-TOT, Point, PDF</td><td class="n"><b>대외비 서버</b></td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind"><code class="inl">B/M/A/S</code>는 빌더·메이커·어시스터·슈터 수 = <code class="inl">gr_is_ctb/ctm/cta/cts</code> 집계다. <strong>저장하지 않아도 <code class="inl">computeAttackPaths()</code>로 산출된다는 것을 실데이터로 검증했다</strong>(§13). <code class="inl">H-A</code>는 <code class="inl">gi_write_code</code> 그대로 = <em>우리 recordings 문서 ID</em>.</p>
-
-  <h3><span class="num">9.3</span> 팀 JMX는 5분 구간 시계열에서 나온다</h3>
-  <p class="ind">경기 전체 집계가 아니라 <strong>전·후반 5분 구간 20칸의 누적값</strong>을 정규화한 뒤 평균내어 산출한다. 그래서 §6.1의 <code class="inl">half</code>/<code class="inl">halfSeconds</code>가 필수다.</p>
-
-  <h3><span class="num">9.4</span> 대외비 — KPI가 쌓이는 곳과 평점이 쌓이는 곳을 분리한다</h3>
-  <p class="ind">선수평점(<code class="inl">P-JMX</code>, <code class="inl">P-APX/TPX/FPX</code>, 등급)과 팀지수(<code class="inl">JMX</code>, <code class="inl">Power3X</code>)의 산출식·기준값·가중치·채번 규칙은 <strong>대외비다.</strong> 이 repo와 클라이언트 번들에 넣지 않는다.</p>
-
-  <pre class="code"><span class="k">① KPI 원장</span>                          <span class="k">② 평점 저장소</span>
-   프로젝트: jpd-did                   프로젝트: <span class="k">jpd-rating</span> (별도)
-   ─────────────────                  ─────────────────
-   records                            ratings/{matchId}/{H|A}/{playerId}
-   recordings.kpi                       → P-JMX, P-APX/TPX/FPX, G-*
-   playerStats/{playerId}             teamRatings/{matchId}/{H|A}
-     → DAP·BAP·DTP·SHOT·SSR·GOAL        → JMX, APX/TPX/FPX, Power3X
-     → B·M·A·S                        ratingBaseline/{version}
-                                         → <span class="k">기준값·가중치 (대외비)</span>
-   <span class="c">접근: 개발자 포함</span>                    <span class="c">접근: 1~2명</span>
-        │                                    │
-        └──── KPI 읽기 <span class="c">(한 방향)</span> ───────────►│
-                                             │ <span class="c">여기서만 합친다</span>
-                                             ▼
-                                <span class="s">aifootballx: dMST / playerMST</span></pre>
-
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>#</th><th>규칙</th></tr></thead>
-      <tbody>
-        <tr><td class="f">01</td><td class="n"><b>평점 서비스만 KPI를 읽는다. 반대 방향은 없다.</b> KPI 쪽에서는 평점이 존재하는지도 모른다</td></tr>
-        <tr><td class="f">02</td><td class="n"><b>aifootballx 쓰기 권한도 평점 서비스만 가진다.</b> dMST 한 행에 KPI 컬럼과 평점 컬럼이 섞여 있어 어차피 마지막에 합쳐야 하므로, 합치는 지점을 평점 쪽에 두면 <b>서비스 계정이 하나로 줄어든다</b></td></tr>
-        <tr><td class="f">03</td><td class="n"><b>기준값도 평점 저장소에만 둔다.</b> KPI 프로젝트를 전부 뒤져도 <code class="inl">DAP 65, BAP 7, SHOT 3</code> 같은 숫자만 있고 점수는 없다</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind">접근 통제는 두 층이다 — <strong>실행</strong> 접근(누가 호출하나)과 <strong>소스</strong> 접근(누가 코드를 읽나). 후자가 본질이며, 배포된 소스는 프로젝트 IAM 권한자가 내려받을 수 있으므로 <strong>프로젝트 분리</strong>가 가장 확실하다.</p>
-
-  <h3>무엇이 지켜지고 무엇이 안 지켜지나 — 솔직한 평가</h3>
-  <div class="call bug">
-    <div class="h">막을 수 없는 것</div>
-    <p>JaionX는 선수별 <strong>입력(P-DAP, P-BAP …)과 출력(P-JMX, 등급)을 같은 표에 함께</strong> 보여준다. 따라서 <strong>작정하고 회귀분석을 하면 공식은 복원된다.</strong> 6개 입력의 선형 조합 + 상한 클램프라 어렵지도 않다.</p>
-    <p>그러므로 <strong>API 호출 제한·역산 방지 장치는 만들지 않는다.</strong> 이미 화면에 있는 것을 API로 막는 셈이라 실익 없이 복잡도만 늘린다.</p>
-  </div>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>지켜지는 것</th><th>내용</th></tr></thead>
-      <tbody>
-        <tr><td class="n"><b>복사 경로 차단</b></td><td class="n">권한 없는 개발자에게 "소스를 그대로 가져가는" 길이 없다. 남는 건 회귀분석뿐이고 그건 별개의 일이다</td></tr>
-        <tr><td class="n"><b>정확도와 시간</b></td><td class="n">회귀는 근사치다. <code class="inl">0.99</code> 클램프, <code class="inl">99.9</code> 상한, X-GOAL의 계단식(0→50, 1→75, 2+→99.9), 등급 경계 같은 예외 처리는 잘 나오지 않는다</td></tr>
-        <tr><td class="n"><b>비공개 영역</b></td><td class="n">채번 규칙과 중간값(KPI-ALL, Conversion, 기본점수, 골 보너스)은 화면에 없다</td></tr>
-        <tr><td class="n"><b>영업비밀 지위</b></td><td class="n">비밀로 관리한 사실이 있어야 비밀이다</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <div class="call">
-    <div class="h">가장 강한 방어는 기술이 아니다</div>
-    <p><strong>기준값을 사람이 조정하는 것 자체가 가장 강한 방어다.</strong> 회귀로 과거 값은 맞출 수 있어도, 다음에 어떤 값으로 바꿀지는 규칙이 아니라 판단이라 예측할 수 없다.</p>
-    <p>반대로 <strong>"기준값 = 시즌 평균"으로 자동화하면 그것도 규칙이 되어 복원 가능해진다</strong> — 평균을 낼 재료가 JaionX에 이미 공개돼 있기 때문이다. 자동화는 보안이 아니라 <em>운영 편의</em>를 근거로 판단할 것(§15).</p>
-  </div>
-
-  <h3>ratingBaseline — 기준값은 반드시 버전으로 저장한다</h3>
-  <pre class="code">ratingBaseline/{version}   → { player: {DAP:30, BAP:8, DTP:6, SHOT:6, SSR:0.33, GOAL:2},
-                               team:   {DAP:400, BAP:60, DTP:12, SHOT:15, SSR:0.18, GOAL:3},
-                               weights: {…}, effectiveFrom, createdBy }
-
-ratings/{…}/{playerId}     → { pJmx: 11.65, …, <span class="k">baselineVersion: 'v3'</span> }</pre>
-  <p class="ind">기준값은 데이터를 보며 자주 바뀐다. <strong>어떤 기준값으로 계산된 평점인지 같이 남기지 않으면, 기준값을 바꾸는 순간 과거 평점이 전부 흔들리고 왜 달라졌는지 설명할 수 없다.</strong> 지금은 시즌별 엑셀 파일이 따로 있어 우연히 보존되고 있으나, 자동화하면 그 우연이 사라진다.</p>
-
-  <h3><span class="num">9.5</span> playerStats가 채우는 것</h3>
-  <p class="ind"><code class="inl">playerMST</code>의 <code class="inl">gp_*</code> 컬럼이 그대로 목록이다 — <code class="inl">gp_tmp, gp_tap, gp_utp, gp_ctp, gp_ttp, gp_sht, gp_ast, gp_goal, gp_ctb, gp_ctm, gp_cta, gp_cts, gp_gtb, gp_gtm, gp_asr, gp_ssr</code>. 단 <code class="inl">gp_score_rel / gp_score_abs / gp_score</code>(평점) 3개는 <strong>대외비 서버만 채운다.</strong></p>
-</section>
-
-<!-- 10 -->
-<section id="s10">
-  <h2><span class="num">10</span> 데이터 관리 — 이적시장 · 팀 정보</h2>
-  <p class="sub">경기 기록이 아니라 관리 화면이 쓰는 참조 데이터. 입력·수정 대상이므로 이력과 감사 필드가 필요하다.</p>
-
-  <h3><span class="num">10.1</span> <span class="mono">players</span> — 정체성만</h3>
-  <p class="ind"><code class="inl">name/nameEn/nameFull</code>, <code class="inl">birth/height/foot/nation</code>, <code class="inl">active</code>(은퇴 대신 비활성 — 과거 기록을 고아로 만들지 않는다), <code class="inl">currentTeamId/currentNo/currentPos</code>(<span class="tag derived">파생 캐시</span>), <code class="inl">legacyPlayerId</code>. <strong>어느 팀 소속인지는 시간에 따라 변하므로 여기 두지 않는다.</strong></p>
-
-  <h3><span class="num">10.2</span> <span class="mono">players/{id}/contracts</span> — 이적시장 원장 <span class="star">★</span></h3>
-  <p class="ind">레거시 <code class="inl">ff_player_team</code>이 이미 시간축 테이블이다. 이를 <strong>추가 전용 원장</strong>으로 만든다.</p>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>필드</th><th>레거시</th><th>비고</th></tr></thead>
-      <tbody>
-        <tr><td class="f">teamId / leagueId / seasonId</td><td class="lg">t_code / l_code</td><td class="n"></td></tr>
-        <tr><td class="f">from / to</td><td class="lg">pt_begin / pt_end</td><td class="n"><code class="inl">to = null</code>이면 현재 소속</td></tr>
-        <tr><td class="f">no / pos</td><td class="lg">pt_num / pt_pos</td><td class="n">계약에 종속 (팀 옮기면 바뀐다)</td></tr>
-        <tr><td class="f">fromTeamId</td><td class="lg">—</td><td class="n"><span class="tag new">NEW</span> 직전 소속팀 → 한 문서로 "A→B" 완성</td></tr>
-        <tr><td class="f">transferType</td><td class="lg">—</td><td class="n"><span class="tag new">NEW</span> TRANSFER / LOAN / LOAN_RETURN / FREE / YOUTH / RETIRE</td></tr>
-        <tr><td class="f">fee / currency</td><td class="lg">—</td><td class="n"><span class="tag new">NEW</span> 선택</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind"><strong>이적 한 건 = 트랜잭션 하나</strong> — ① 이전 계약 <code class="inl">to</code> 닫기 ② 새 계약 생성 ③ <code class="inl">players.current*</code> 갱신 ④ 양 팀 <code class="inl">squad</code> 갱신. 부분 실패하면 스쿼드가 어긋난다. 이적 목록은 <code class="inl">collectionGroup('contracts').orderBy('from','desc')</code> 한 방이다 — <em>계약 문서가 곧 이적 이벤트다.</em></p>
-
-  <h3><span class="num">10.3</span> <span class="mono">teams/{id}/squad</span> — 현재 스쿼드 <span class="tag derived">파생 뷰</span></h3>
-  <p class="ind">원장만 있으면 계약 30건 + 선수 30명 = <strong>61 read + 조인</strong>이 필요하다. 이 뷰가 있으면 <strong>1 query</strong>로 끝난다. 갱신은 이적 시에만(연 수십 회)이라 어긋날 위험이 낮다 — 원칙 03의 정당한 예외. 현재 <code class="inl">app/utils/squads.ts</code>의 하드코딩이 이 자리를 임시로 메우고 있다.</p>
-
-  <h3><span class="num">10.4</span> <span class="mono">teams</span> — 승강제 대응</h3>
-  <p class="ind"><strong><code class="inl">l_code</code>를 팀 문서에 단일값으로 두면 승강제를 표현할 수 없다.</strong> 강등되면 작년 리그가 덮어써진다.</p>
-  <pre class="code">teams/{teamId}/seasons/{seasonId}  →  { leagueId, division, finalRank? }</pre>
-  <p class="ind"><code class="inl">currentLeagueId</code>는 목록 필터용 캐시로만 유지한다.</p>
-
-  <h3><span class="num">10.5</span> 참조 컬렉션 · 감사 필드</h3>
-  <p class="ind"><code class="inl">leagues</code>, <code class="inl">seasons</code>, <code class="inl">stadiums</code>, <code class="inl">recorders</code>(<code class="inl">level: 'basic' | 'advanced'</code> 뱃지 포함 — §11.2.1). <code class="inl">u_pw</code>는 옮기지 않는다 — 비밀번호는 Auth가 관리한다. 관리 대상 문서 전부에 <code class="inl">createdAt / createdBy / updatedAt / updatedBy</code>를 붙인다. 경기 기록에는 붙이지 않는다 — 세션이 이미 <code class="inl">recorders</code>로 귀속되고, 선수 입력 주체는 <code class="inl">playerIdSource</code>에 남는다.</p>
 </section>
 
 <!-- 11 -->
 <section id="s11">
-  <h2><span class="num">11</span> 쓰기·조회 전략</h2>
+  <h2><span class="num">11</span> 갱신 트리거 — 계산은 오직 여기서만</h2>
 
-  <h3><span class="num">11.1</span> 레코드는 두 모드 모두 즉시 저장한다</h3>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>방식</th><th>판단</th></tr></thead>
-      <tbody>
-        <tr><td class="n">메모리에 모았다가 반 종료 시 flush</td><td class="n">❌ <b>지금 겪는 문제 그대로.</b> 새로고침 한 번에 반 전체가 날아간다</td></tr>
-        <tr><td class="n">탭할 때마다 즉시 write</td><td class="n">✅ 채택 (두 모드 공통)</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind">핵심은 Firestore의 <strong>오프라인 지속성</strong>이다. <code class="inl">persistentLocalCache</code>를 켜면 쓰기가 먼저 IndexedDB에 떨어지고 UI는 즉시 반영되며, 네트워크가 돌아올 때 자동 동기화된다. <em>경기장 와이파이가 끊겨도 입력이 멈추지 않는다.</em></p>
-
-  <h3><span class="num">11.2</span> 모드가 가르는 것은 집계·전송 트리거다</h3>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>무엇</th><th>경기당 비용</th></tr></thead>
-      <tbody>
-        <tr><td class="n">레코드 쓰기 (세션당 400~1,200건, 평균 730)</td><td class="n">약 <b>2원</b></td></tr>
-        <tr><td class="n">파이썬 집계 실행 + JaionX 갱신</td><td class="n">실행 횟수에 비례 — <b>여기가 실제 비용</b></td></tr>
-      </tbody>
-    </table>
-  </div>
-  <pre class="code"><span class="k">분석</span>    레코드 → Firestore 즉시 저장
-        └ 집계·JaionX 전송은 <span class="s">[전송/갱신]</span> 누를 때만
-
-<span class="k">실시간</span>  레코드 → Firestore 즉시 저장
-        └ 집계·JaionX 전송도 계속 (5~10초 묶음 권장)</pre>
-  <p class="ind"><code class="inl">useMatchState</code>는 버리지 않고 <strong>Firestore 구독의 로컬 캐시</strong>로 역할만 바꾼다.</p>
-
-  <div class="call bug">
-    <div class="h">오해하지 말 것</div>
-    <p><strong>오프라인은 평상시 동작 방식이 아니다.</strong> 기록은 보통 인터넷이 되는 곳에서 한다. 오프라인 지속성은 <strong>끊겼을 때 입력이 멈추지 않게 하는 안전장치</strong>이며, 품질을 위한 것이지 운영 전제가 아니다.</p>
-    <p>따라서 <strong>네트워크를 일부러 끊어두지 않는다</strong>(<code class="inl">disableNetwork</code>를 쓰지 않는다). 그래야 §6.3의 2인 기록이 두 모드 모두에서 성립한다.</p>
-  </div>
-
-  <h3><span class="num">11.2.1</span> 갱신 트리거 — 계산은 오직 여기서만 일어난다</h3>
   <div class="call bug">
     <div class="h">원칙</div>
     <p><strong>레코드가 쌓이는 것과 계산이 도는 것은 별개다.</strong> 레코드는 계속 서버에 쌓이지만, <strong>판정·KPI·평점은 갱신 트리거 없이는 절대 돌지 않는다.</strong></p>
   </div>
-  <p class="ind">이유는 셋이다 — ① 자동으로 계속 돌면 무겁고 파이썬 실행·JaionX 쓰기에 비용이 붙는다 ② 기록 중에는 값이 매 탭 바뀌므로 저장이 곧 부채다(§08) ③ <strong>언제 확정됐는지가 명확해야</strong> JaionX 동기화가 재현 가능하다.</p>
 
-  <h3>누가 계산하나</h3>
   <div class="tbl-wrap">
     <table>
-      <thead><tr><th>단계</th><th>어디서</th><th>트리거 없이 도나</th></tr></thead>
+      <thead><tr><th>버튼</th><th>KPI 서비스</th><th>평점 서비스</th><th>JaionX</th></tr></thead>
       <tbody>
-        <tr><td class="n">화면 KPI 표시</td><td class="f">클라이언트 didLogic.ts</td><td class="n">계속 (참고용, <b>저장 안 함</b>)</td></tr>
-        <tr><td class="n">판정 · KPI 집계 · 5분 구간 누적</td><td class="f">KPI 서비스<br><span class="lg">파이썬 · jpd-did</span></td><td class="n">❌ <b>갱신 때만</b></td></tr>
-        <tr><td class="n">팀 지수 · 선수 평점 · 등급</td><td class="f">평점 서비스<br><span class="lg">jpd-rating</span></td><td class="n">❌ <b>갱신 때만</b></td></tr>
-        <tr><td class="n">JaionX(dMST/playerMST) 전송</td><td class="f">평점 서비스</td><td class="n">❌ <b>최종 갱신 때만</b></td></tr>
+        <tr><td class="f">전반 데이터 갱신</td><td class="n">판정 + KPI + <b>5분 구간 1~10</b></td><td class="n">팀 JMX 구간 1~10</td><td class="n">❌</td></tr>
+        <tr><td class="f">후반 데이터 갱신</td><td class="n">판정 + KPI + <b>5분 구간 1~20</b></td><td class="n">팀 JMX 구간 1~20</td><td class="n">❌</td></tr>
+        <tr><td class="f">최종 데이터 갱신<br>&amp; 경기 종료</td><td class="n">전체 확정 집계</td><td class="n">팀 지수 + <b>선수 평점</b> + 등급</td><td class="n">✅ 전송</td></tr>
       </tbody>
     </table>
   </div>
-
-  <h3>버튼 세팅</h3>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>버튼</th><th>활성 조건</th><th>KPI 서비스</th><th>평점 서비스</th><th>JaionX</th></tr></thead>
-      <tbody>
-        <tr><td class="f">전반 데이터 갱신</td><td class="lg">status = H1_done</td><td class="n">판정 + KPI + <b>5분 구간 1~10</b></td><td class="n"><b>팀 JMX 구간 1~10</b></td><td class="n">❌</td></tr>
-        <tr><td class="f">후반 데이터 갱신</td><td class="lg">status = H2_done</td><td class="n">판정 + KPI + <b>5분 구간 1~20</b></td><td class="n"><b>팀 JMX 구간 1~20</b></td><td class="n">❌</td></tr>
-        <tr><td class="f">최종 데이터 갱신<br>&amp; 경기 종료</td><td class="lg">status = H2_done</td><td class="n">전체 확정 집계</td><td class="n">팀 지수 + <b>선수 평점</b> + 등급</td><td class="n">✅ 전송</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind">중간 갱신은 <strong>"여기까지 맞게 들어갔나" 확인용</strong>이다. 밖으로 나가는 것은 최종 하나뿐이며, 최종 갱신을 누르면 <code class="inl">status = 'final'</code>이 되고 스냅샷이 확정된다(§08).</p>
 
   <h3>계정 등급 뱃지</h3>
-  <pre class="code">recorders/{uid}: { …, <span class="k">level: 'basic' | 'advanced'</span> }</pre>
-  <p class="ind">로그인하면 뱃지가 표시되고, 그에 따라 버튼 구성이 달라진다.</p>
   <div class="tbl-wrap">
     <table>
       <thead><tr><th></th><th>basic</th><th>advanced</th></tr></thead>
       <tbody>
-        <tr><td class="n">전반 데이터 갱신</td><td class="n">있음</td><td class="n"><b>없음</b></td></tr>
-        <tr><td class="n">후반 데이터 갱신</td><td class="n">있음</td><td class="n"><b>없음</b></td></tr>
-        <tr><td class="n">최종 데이터 갱신 &amp; 경기 종료</td><td class="n">있음</td><td class="n">있음</td></tr>
+        <tr><td class="n">전반 · 후반 갱신</td><td class="n">있음</td><td class="n"><b>없음</b></td></tr>
+        <tr><td class="n">최종 갱신 &amp; 경기 종료</td><td class="n">있음</td><td class="n">있음</td></tr>
       </tbody>
     </table>
   </div>
-  <p class="ind">숙련자는 중간 확인 없이 끝까지 기록하고 마지막에 한 번만 누른다.</p>
+  <p class="ind">basic 이 갱신을 누르면 <strong>그 half 의 수정도 함께 잠긴다.</strong> 해제는 기록자 화면이 아니라 <code class="inl">/manage/locks</code>(관리자 전용)에서만 한다 — 기록자 화면에 두면 본인이 스스로 풀 수 있어 잠금이 무의미해진다.</p>
 
-  <h3>실시간 모드</h3>
-  <p class="ind">버튼 대신 <strong>5분 구간이 닫힐 때마다 자동으로 트리거</strong>된다 — KPI + 팀 JMX 구간값이 갱신되고 JaionX까지 반영된다. <strong>선수 평점과 최종 확정은 여전히 "최종 갱신 &amp; 경기 종료"에서만</strong> 일어난다.</p>
+  <h3>팀 JMX 는 5분 구간 시계열에서 나온다</h3>
+  <pre class="code"><span class="k">for</span> i <span class="k">in</span> 1..20:                      <span class="c"># H1 0-5 … H2 45+</span>
+    norm_k(i) = 누적_k(i) / (5분기준_k × i) × 100
+    avg(i)    = mean(DAP, DTP, SHOT, SSR, GOAL)
+    JMX(i)    = avg(i) × 0.6 + 40           <span class="c"># 구간별 JMX 시계열</span></pre>
+  <p class="ind"><strong>최종 JMX 는 20번째 구간값일 뿐이다.</strong> 그래서 <code class="inl">half</code>/<code class="inl">halfSeconds</code> 가 필수다 — 반 구분과 반 기준 경과초가 없으면 이 시트를 만들 수 없다. <em>선수 평점의 5분 단위는 아직 없다(추후).</em></p>
+
   <div class="call">
-    <div class="h">버튼과 백업은 다른 일이다</div>
-    <p>갱신 버튼은 "계산해서 확정하라"는 뜻이고, <strong>레코드 자체는 버튼과 무관하게 계속 서버에 쌓인다</strong>(§11.1). 중간 갱신을 건너뛰어도 기록이 위험해지지 않는다.</p>
+    <div class="h">오프라인은 평상시 동작 방식이 아니다</div>
+    <p>기록은 보통 인터넷이 되는 곳에서 한다. 오프라인 지속성은 <strong>끊겼을 때 입력이 멈추지 않게 하는 안전장치</strong>이며 품질을 위한 것이다. 따라서 네트워크를 일부러 끊어두지 않는다 — 그래야 2인 기록이 두 모드 모두에서 성립한다.</p>
   </div>
-
-  <h3><span class="num">11.3</span> 조회 층 — 화면은 Firestore를 직접 나열하지 않는다 <span class="star">★</span></h3>
-  <div class="call bug">
-    <div class="h">규칙</div>
-    <p><strong>목록·검색·집계를 <code class="inl">getDocs</code>로 컬렉션을 훑어서 해결하지 않는다.</strong> 이 규칙이 없으면 화면을 만들 때마다 전량 로드로 되돌아간다.</p>
-  </div>
-  <p class="ind">지금 footballX가 겪는 문제가 그것이다. <code class="inl">footballx/app/composables/dMST.ts</code>는 조건에 맞는 문서를 <strong>전부 받아서 배열에 쌓는다.</strong></p>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>컬렉션</th><th>시즌당 문서</th><th>한 번 열 때</th></tr></thead>
-      <tbody>
-        <tr><td class="f">dMST</td><td class="n">380경기 × 2팀 = 760</td><td class="n">760 read</td></tr>
-        <tr><td class="f">playerMST</td><td class="n">11,500</td><td class="n"><b>11,500 read</b> + 수 MB 전송</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind">Firestore의 구조적 한계 때문에 이렇게 될 수밖에 없다 — <strong>필드를 골라 받을 수 없고</strong>(웹 SDK에 <code class="inl">SELECT col1, col2</code>가 없다), <strong>검색이 없고</strong>(<code class="inl">LIKE '%손흥민%'</code> 불가, 앞글자 일치가 전부라 결국 <em>전부 받아서 브라우저에서 필터</em>하게 된다), <strong>조인·집계가 없다.</strong></p>
-
-  <pre class="code">┌─ 쓰기 ────────────┐  ┌─ 목록 · 검색 ────┐  ┌─ 분석 · 추출 ──────┐
-│  <span class="k">Firestore</span>        │  │  <span class="k">파이썬 API</span>      │  │  <span class="k">Parquet + DuckDB</span>  │
-│  원본 · 실시간     │  │  페이징 · 검색   │  │  SQL 그대로        │
-│  트랜잭션         │  │  화면이 호출     │  │  대량 조회 · 리포트 │
-└───────────────────┘  └──────────────────┘  └────────────────────┘
-        │                       ▲                      ▲
-        └──── 파이썬이 읽어서 ──┴──── 주기적으로 떨군다 ┘</pre>
-
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th></th><th>Firestore</th><th>파이썬 API</th><th>Parquet + DuckDB</th></tr></thead>
-      <tbody>
-        <tr><td class="n">실시간 쓰기 · 오프라인</td><td class="n">✅</td><td class="n"></td><td class="n"></td></tr>
-        <tr><td class="n">검색 · 정렬 · 페이징</td><td class="n">❌</td><td class="n">✅</td><td class="n">✅</td></tr>
-        <tr><td class="n">집계 · 조인 · SQL</td><td class="n">❌</td><td class="n"></td><td class="n">✅</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind"><strong>분석 층은 새로 만드는 것이 아니다.</strong> <code class="inl">footballx/server/backend/data/**/*.parquet</code>가 이미 그 구조다. DuckDB만 얹으면 SQL이 그대로 된다.</p>
-  <pre class="code"><span class="k">SELECT</span> t_code, AVG(DAP), SUM(GOAL)
-<span class="k">FROM</span> <span class="s">'dMST_*.parquet'</span>
-<span class="k">WHERE</span> gm_round <span class="k">BETWEEN</span> 1 <span class="k">AND</span> 10
-<span class="k">GROUP BY</span> t_code <span class="k">ORDER BY</span> 2 <span class="k">DESC</span>;</pre>
-  <p class="ind">11,500행이 밀리초 단위로 처리되고, <strong>Firestore read 비용이 0</strong>이다.</p>
-
-  <h3>화면이 Firestore를 직접 읽어도 되는 경우</h3>
-  <div class="open">
-    <div class="oq"><div class="d"></div><div class="b"><b>문서 하나를 주소로 읽을 때</b> — <code class="inl">matches/{gm_id}/recordings/H</code> 같은 직접 읽기</div></div>
-    <div class="oq"><div class="d"></div><div class="b"><b>실시간 구독이 필요한 기록 화면</b> — DID 입력 중의 <code class="inl">records</code></div></div>
-    <div class="oq"><div class="d"></div><div class="b"><b>방금 자기가 쓴 문서를 되읽을 때</b> — 스냅샷 갱신 전에 화면에 반영하기 위해</div></div>
-  </div>
-
-  <h3><span class="num">11.4</span> 관리 화면 — 일정 관리 · 이적시장</h3>
-  <p class="ind"><strong>둘 다 입력이 많고 데이터도 많은 화면이다.</strong> 읽기와 쓰기를 다르게 다룬다.</p>
-  <pre class="code">[화면]  검색 · 목록 · 이력 조회  ──► 파이썬 API ──► <span class="s">DuckDB 스냅샷</span>
-        등록 · 수정             ──► 파이썬 API ──► <span class="k">Firestore 트랜잭션 (원본)</span>
-                                                       │
-                                                       └─► 스냅샷 갱신</pre>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th></th><th>왜 이렇게</th></tr></thead>
-      <tbody>
-        <tr><td class="n"><b>쓰기는 Firestore가 원본</b></td><td class="n">이적 한 건 = 트랜잭션 4단계(§10.2). 부분 실패하면 스쿼드가 어긋난다</td></tr>
-        <tr><td class="n"><b>읽기는 스냅샷으로 충분</b></td><td class="n">이적 이력 조회가 몇 초 늦어도 아무 문제 없다</td></tr>
-        <tr><td class="n"><b>검색은 파이썬이 한다</b></td><td class="n">이름 부분 일치, 팀·기간·이적유형 복합 조건 — Firestore로는 불가능하고 파이썬에선 한 줄이다</td></tr>
-        <tr><td class="n"><b>쓰기 직후엔 그 문서만 직접 읽는다</b></td><td class="n">스냅샷이 갱신되기 전에도 사용자는 자기가 방금 넣은 것을 본다</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <h3><span class="num">11.5</span> 목록용 요약 문서</h3>
-  <pre class="code">matches/{gm_id}          <span class="c">← 상세 (무겁다)</span>
-matchIndex/{seasonId}    <span class="c">← 목록용. 한 문서에 시즌 전체를 압축</span>
-   { items: [{ gm_id, date, round, home, away, score, status }, …] }</pre>
-  <p class="ind">일정 목록이 <strong>380 read → 1 read</strong>가 된다. 갱신은 경기 상태가 바뀔 때뿐이라 어긋날 위험이 낮다 — 원칙 03의 정당한 예외다(§10.3의 <code class="inl">squad</code> 뷰와 같은 이유).</p>
 </section>
 
 <!-- 12 -->
 <section id="s12">
-  <h2><span class="num">12</span> 보안 규칙 · 색인</h2>
-  <pre class="code">matches/{m}/recordings/{side}
-  read : 로그인 사용자
-  write: <span class="k">request.auth.uid in resource.data.recorders</span>   <span class="c">(없으면 생성 가능 — 선점)</span>
-  .../records, subs, cards
-  write: 부모 recording 의 recorders 에 포함될 때만
-         <span class="c">※ 한 팀을 둘이 나눠 찍으므로 단수 recorderId 로 두면 안 된다 (§6.3)</span>
+  <h2><span class="num">12</span> 조회 층 — 화면은 Firestore 를 직접 나열하지 않는다</h2>
 
-teams, players, players/*/contracts, stadiums, leagues, seasons
-  write: recorders/{uid}.role == <span class="s">'admin'</span>
-
-<span class="c"># aifootballx 프로젝트</span>
-dMST, playerMST, multiSheet
-  write: <span class="k">클라이언트 전면 금지. Admin SDK(서버)만</span></pre>
-  <p class="ind">마지막 줄이 중요하다 — <strong>대외비 서버가 만든 산출물을 클라이언트가 덮어쓸 수 있으면 안 된다.</strong></p>
-
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>대상</th><th>색인</th></tr></thead>
-      <tbody>
-        <tr><td class="n">레코드 정렬</td><td class="lg">records: half ASC, halfSeconds ASC, seq ASC</td></tr>
-        <tr><td class="n">기록자 대시보드</td><td class="lg">CG recordings: recorderIds ARRAY_CONTAINS, createdAt DESC<br><span class="lg">맵은 색인이 안 되므로 uid 배열을 따로 둔다</span></td></tr>
-        <tr><td class="n">일정 목록</td><td class="lg">matches: date ASC, leagueId ASC</td></tr>
-        <tr><td class="n">이적 목록</td><td class="lg">CG contracts: from DESC</td></tr>
-        <tr><td class="n">팀별 계약</td><td class="lg">CG contracts: teamId ASC, to ASC</td></tr>
-      </tbody>
-    </table>
+  <div class="call bug">
+    <div class="h">규칙</div>
+    <p><strong>목록·검색·집계를 <code class="inl">getDocs</code> 로 컬렉션을 훑어서 해결하지 않는다.</strong> 이 규칙이 없으면 화면을 만들 때마다 전량 로드로 되돌아간다.</p>
   </div>
+
+  <p class="ind">지금 footballX 가 겪는 문제가 그것이다 — <code class="inl">dMST</code> 760 read, <code class="inl">playerMST</code> <strong>11,500 read</strong>. Firestore 는 <strong>필드를 골라 받을 수 없고</strong>(웹 SDK 에 <code class="inl">SELECT col1</code> 이 없다), <strong>검색이 없고</strong>(<code class="inl">LIKE '%손흥민%'</code> 불가), <strong>조인·집계가 없다.</strong></p>
+
+  <pre class="code">┌─ 쓰기 ────────────┐  ┌─ 목록 · 검색 ────┐  ┌─ 분석 · 추출 ──────┐
+│  <span class="k">Firestore</span>        │  │  <span class="k">파이썬 API</span>      │  │  <span class="k">Parquet + DuckDB</span>  │
+│  원본 · 실시간     │  │  페이징 · 검색   │  │  SQL 그대로        │
+└───────────────────┘  └──────────────────┘  └────────────────────┘
+        │                       ▲                      ▲
+        └──── 파이썬이 읽어서 ──┴──── 주기적으로 떨군다 ┘</pre>
+  <p class="ind"><strong>분석 층은 새로 만드는 것이 아니다.</strong> <code class="inl">footballx/server/backend/data/**/*.parquet</code> 가 이미 그 구조다. DuckDB 만 얹으면 SQL 이 그대로 된다.</p>
+
+  <h3>화면이 Firestore 를 직접 읽어도 되는 경우</h3>
+  <div class="open">
+    <div class="oq"><div class="d"></div><div class="b"><b>문서 하나를 주소로 읽을 때</b> — <code class="inl">matches/{gm_id}/recordings/H</code></div></div>
+    <div class="oq"><div class="d"></div><div class="b"><b>실시간 구독이 필요한 기록 화면</b> — DID 입력 중의 <code class="inl">records</code></div></div>
+    <div class="oq"><div class="d"></div><div class="b"><b>방금 자기가 쓴 문서를 되읽을 때</b> — 스냅샷 갱신 전에 화면에 반영하기 위해</div></div>
+  </div>
+
+  <h3>관리 화면 — 일정 · 이적시장</h3>
+  <p class="ind"><strong>읽기는 무겁고 쓰기는 가볍다.</strong> 이적은 연 수십~수백 건이라, 쓰기 시점에 스냅샷을 같이 갱신해도 부담이 없다 — "등록했는데 목록에 안 보인다" 문제 자체가 생기지 않는다.</p>
+  <pre class="code">[화면]  검색 · 목록 · 이력 조회  ──► 파이썬 API ──► <span class="s">DuckDB 스냅샷</span>
+        등록 · 수정             ──► 파이썬 API ──► <span class="k">Firestore 트랜잭션 (원본)</span></pre>
 </section>
 
 <!-- 13 -->
 <section id="s13">
   <h2><span class="num">13</span> 실데이터 검증 <span class="star">★</span></h2>
-  <p class="sub">2026-09-02. 레거시 <code class="inl">ff_game_record</code> 실제 1,536행(라운드 2, 20개 팀-경기)을 입력으로 <code class="inl">didLogic.ts</code>를 <strong>수정 없이</strong> 실행하고 D-MST 값과 대조했다.</p>
+  <p class="sub">레거시 ff_game_record 실제 1,536행(라운드 2, 20개 팀-경기)을 didLogic.ts 에 <b>수정 없이</b> 넣고 D-MST 값과 대조했다.</p>
 
   <div class="tbl-wrap">
     <table>
@@ -1140,12 +1046,11 @@ dMST, playerMST, multiSheet
       </tbody>
     </table>
   </div>
-  <p class="ind">우리 4초 룰은 레거시 273루트를 382개로 <strong>더 잘게 쪼갠다.</strong> 쪼개진 조각은 슛이 없어 UPP(무효)가 되므로 DTP 개수에는 영향이 없었다.</p>
 
-  <h3><span class="num">13.1</span> 성능 실측 — 원칙 03의 근거</h3>
+  <h3>성능 실측 — "저장하지 않는다"의 근거</h3>
   <div class="tbl-wrap">
     <table>
-      <thead><tr><th>레코드</th><th>computeAttackPaths + computeBap 전체 재계산 1회</th></tr></thead>
+      <thead><tr><th>레코드</th><th>전체 재계산 1회</th></tr></thead>
       <tbody>
         <tr><td class="f">300건</td><td class="n">0.11 ms</td></tr>
         <tr><td class="f">600건</td><td class="n">0.15 ms</td></tr>
@@ -1155,119 +1060,53 @@ dMST, playerMST, multiSheet
   </div>
   <p class="ind">한 프레임(16ms) 안에 100번 돌려도 남는다. <strong>계산이 저장보다 압도적으로 싸다.</strong></p>
 
-  <h3><span class="num">13.2</span> 발견한 버그 — 자책골이 SHOT에 포함된다</h3>
+  <h3>발견한 버그 — 자책골이 SHOT 에 포함된다</h3>
   <pre class="code"><span class="c">// didLogic.ts:415 — 공통 플래그 루프</span>
 <span class="k">for</span> (<span class="k">const</span> r <span class="k">of</span> chain) {
   <span class="k">const</span> { act, res } = r          <span class="c">// ← 원본 act. isOwnGoal 보정 없음</span>
-  f.isTap = !!act
   f.isSht = isShotAct(act) || !!r.isShot</pre>
-  <p class="ind">1차 패스(<code class="inl">:333</code>)와 2차 패스(<code class="inl">:380</code>)는 <code class="inl">const act = isOwnGoal ? '' : r.act</code>로 보정하는데 이 루프만 빠졌다. 파일 상단 주석은 "자살골은 TAP, DAP, DTP, Shoot 집계에서 제외"라고 명시하고 있다. 자책골을 제외하고 다시 돌리니 SHOT이 <strong>3팀 불일치 → 20/20 일치</strong>로 바뀌었다.</p>
+  <p class="ind">1차·2차 패스는 <code class="inl">isOwnGoal</code> 을 보정하는데 이 루프만 빠졌다. 자책골을 제외하니 SHOT 이 <strong>3팀 불일치 → 20/20 일치</strong>로 바뀌었다. 집계 규칙: <code class="inl">GOAL</code> 은 자책골 <b>포함</b>, <code class="inl">SHOT</code> 은 <b>제외</b>, <code class="inl">SSR = (GOAL − OG) / SHOT</code>.</p>
 
-  <h3><span class="num">13.3</span> 남은 불일치</h3>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>팀</th><th>차이</th><th>추정</th></tr></thead>
-      <tbody>
-        <tr><td class="f">BHAX</td><td class="n">S 15/14</td><td class="n"><code class="inl">H2 2926s H/O</code> — <b>결과가 안 찍힌 슛.</b> 우리는 closeTrailing으로 마감해 슈터를 부여, 레거시는 미부여</td></tr>
-        <tr><td class="f">LIVX</td><td class="n">A 11/10, S 13/12</td><td class="n">미확정</td></tr>
-        <tr><td class="f">TOTX</td><td class="n">B 19/17, M 6/5, A 11/10, S 16/15</td><td class="n">루트 하나(roles=BBMAS)가 통째로 빠진 것과 정확히 일치. 이유 미확정</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="ind">규명하려면 <code class="inl">gr_is_cts/cta/ctm/ctb</code>가 포함된 export가 필요하다. 현재 파일에는 없어 총합만 비교 가능하다.</p>
-
-  <h3><span class="num">13.4</span> 아직 검증되지 않은 것</h3>
   <div class="call bug">
-    <div class="h">주의</div>
-    <p><code class="inl">TACTIC.xlsx</code>에는 <strong>슛이 포함된 루트만</strong> 들어 있다(273루트 전부에 슛 존재, 슛 없는 루트 0개). 따라서 <code class="inl">gi_tmp</code>(TAP), <strong><code class="inl">DAP</code></strong>, <code class="inl">TTP</code>, <strong><code class="inl">BAP</code></strong>, <code class="inl">ASR</code>는 <strong>한 번도 실데이터로 검증된 적이 없다.</strong> 전체 레코드가 포함된 export가 필요하다.</p>
+    <div class="h">아직 검증되지 않은 것</div>
+    <p><code class="inl">TACTIC.xlsx</code> 에는 <strong>슛이 포함된 루트만</strong> 들어 있다. 따라서 <code class="inl">gi_tmp</code>(TAP), <strong><code class="inl">DAP</code></strong>, <code class="inl">TTP</code>, <strong><code class="inl">BAP</code></strong>, <code class="inl">ASR</code> 는 <strong>한 번도 실데이터로 검증된 적이 없다.</strong> 전체 레코드가 포함된 export 가 필요하다.</p>
   </div>
 </section>
 
 <!-- 14 -->
 <section id="s14">
-  <h2><span class="num">14</span> 레거시 대비 — 무엇이 사라지고 무엇이 나아지나</h2>
+  <h2><span class="num">14</span> 결정이 필요한 것</h2>
+  <p class="sub">240개 컬럼을 훑으면서 갈 곳이 정해지지 않은 것들. 여기가 비어 있으면 규칙 0을 만족한다고 말할 수 없다.</p>
 
-  <h3>사라지는 것</h3>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>레거시</th><th>왜</th></tr></thead>
-      <tbody>
-        <tr><td class="lg">gi_id (세션 키)</td><td class="n">경로가 키를 대신한다. 매핑용 <code class="inl">legacyGiId</code>만 남긴다</td></tr>
-        <tr><td class="lg">레코드마다의 gi_id (1,200회 중복)</td><td class="n">서브컬렉션 경로가 소속을 표현한다</td></tr>
-        <tr><td class="lg">gr_is_* 14개 + gt_id</td><td class="n">파생값. 0.16ms에 재계산된다</td></tr>
-        <tr><td class="lg">dplay_game_path_reset 배치</td><td class="n">저장을 안 하므로 재계산 대상이 없다</td></tr>
-        <tr><td class="lg">ff_game_state</td><td class="n"><code class="inl">recordings.status</code> 수정으로 대체</td></tr>
-        <tr><td class="lg">ff_session / ff_member_session / u_pw</td><td class="n">Firebase Auth</td></tr>
-        <tr><td class="lg">ff_formation</td><td class="n">상수</td></tr>
-        <tr><td class="lg">PHP + MySQL 서버 운영</td><td class="n">관리형 서비스</td></tr>
-        <tr><td class="lg"><b>엑셀 수작업 6단계</b></td><td class="n"><b>파이썬 자동 변환</b> (§00)</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <h3>없어지는 엑셀 편법</h3>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th>지금</th><th>무슨 문제</th><th>새 구조</th></tr></thead>
-      <tbody>
-        <tr><td class="lg">IF(MOD(Match,2)=1, 다음 행, 이전 행)</td><td class="n"><b>상대팀을 인접 행으로 찾는다.</b> 정렬이 깨지면 승점이 조용히 틀어짐</td><td class="n">matches의 반대편 recordings를 읽는다</td></tr>
-        <tr><td class="lg">IF(윗 행이 비었으면 "H" else "A")</td><td class="n">행 위치로 홈/원정 판정</td><td class="n"><b>문서 ID가 곧 H/A</b></td></tr>
-        <tr><td class="lg">Point = W-TOT2 − W-TOT</td><td class="n">베이스 숫자를 더했다 빼는 우회</td><td class="n">골 비교로 직접 산출</td></tr>
-        <tr><td class="lg">'C:\EPL2425\[…24R.xlsx]P-KEY'!J4</td><td class="n">라운드마다 사람이 셀 링크를 손으로 수정</td><td class="n">불필요</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <h3>개선되는 것</h3>
-  <div class="tbl-wrap">
-    <table>
-      <thead><tr><th></th><th>지금 (PHP/SQL)</th><th>새 구조</th></tr></thead>
-      <tbody>
-        <tr><td class="n">탭당 네트워크</td><td class="n">HTTP 왕복 1회 + <b>응답 대기</b></td><td class="n">0회 (로컬 우선, 백그라운드 동기화)</td></tr>
-        <tr><td class="n">탭당 SQL</td><td class="n">2~4개</td><td class="n">—</td></tr>
-        <tr><td class="n">오프라인</td><td class="n">불가 (입력 중단)</td><td class="n"><b>가능</b></td></tr>
-        <tr><td class="n">새로고침</td><td class="n">—</td><td class="n">살아남음</td></tr>
-        <tr><td class="n">파생값 정합성</td><td class="n">저장 + 배치로 맞춤</td><td class="n">저장 안 함 = 어긋날 자리 없음</td></tr>
-        <tr><td class="n">JaionX 반영</td><td class="n">사람이 6단계</td><td class="n"><b>자동</b></td></tr>
-        <tr><td class="n">대외비 로직</td><td class="n">엑셀 파일로 유통</td><td class="n">서버에 격리, 접근자 1~2명</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <h3>문제였던 것 — 이 스키마가 고치는 현재 코드의 결함</h3>
   <div class="bugs">
-    <div class="bug-row"><div class="i">01</div><div class="p">새로고침하면 기록 유실</div><div class="s">즉시 저장 + 오프라인 지속성 (§11)</div></div>
-    <div class="bug-row"><div class="i">02</div><div class="p">후반 seconds가 0부터 재시작 → 전·후반 레코드가 섞이고 4초 룰이 반 경계를 넘음</div><div class="s">half 명시 저장 (§6.1)</div></div>
-    <div class="bug-row"><div class="i">03</div><div class="p">recSeq 모듈 카운터 → 새로고침 후 ID·seq 중복</div><div class="s">자동 ID + maxSeq 시드 (§7.2)</div></div>
-    <div class="bug-row"><div class="i">04</div><div class="p">원정팀 기록 중에도 homeScore++</div><div class="s">side 기준 merge (§5.1)</div></div>
-    <div class="bug-row"><div class="i">05</div><div class="p">파생 플래그 저장 시 수정마다 어긋남</div><div class="s">미저장, 확정 시 스냅샷 (§7.1, §08)</div></div>
-    <div class="bug-row"><div class="i">06</div><div class="p">이적하면 과거 경기의 선수 이름·번호가 바뀜</div><div class="s">라인업 스냅샷 (§6.2)</div></div>
-    <div class="bug-row"><div class="i">07</div><div class="p">스쿼드가 squads.ts에 하드코딩</div><div class="s">계약 원장 + 스쿼드 뷰 (§10.2)</div></div>
-    <div class="bug-row"><div class="i">08</div><div class="p"><b>자책골이 SHOT에 포함됨</b> — 실데이터로 발견</div><div class="s">didLogic.ts:415 보정 (§13.2)</div></div>
+    <div class="bug-row"><div class="i">01</div><div class="p"><b>ff_game_card</b> — CardDoc 타입 자체가 없다</div><div class="s">cards 서브컬렉션에 사실 저장. CardDoc 타입·저장 연동 구현</div></div>
+    <div class="bug-row"><div class="i">02</div><div class="p"><b>gp_point_plus / gp_point_minus</b> — 상단 −3/−1/+1/+3 버튼. <b>지금 화면에는 버튼만 있고 저장 로직이 없다</b></div><div class="s">원래 무슨 점수였는지 확인 필요</div></div>
+    <div class="bug-row"><div class="i">03</div><div class="p">pl_in_order — 교체 순번</div><div class="s">LineupEntry.subOrder 추가 여부</div></div>
+    <div class="bug-row"><div class="i">04</div><div class="p">gr_area_code_org — 원본 구역코드</div><div class="s">진영 반전 전 값으로 추정. 확인 필요</div></div>
+    <div class="bug-row"><div class="i">05</div><div class="p">gr_shoot_rate_x/y — 골대 내 비율 좌표</div><div class="s">shootPosX/Y 와 중복인지 확인</div></div>
+    <div class="bug-row"><div class="i">06</div><div class="p">gi_part_ex — 연장전 진영</div><div class="s">H3/H4 UI 미구현 상태</div></div>
+    <div class="bug-row"><div class="i">07</div><div class="p">gm_sub_league — 서브리그</div><div class="s">개념 사용 여부</div></div>
+    <div class="bug-row"><div class="i">08</div><div class="p">t_name_ae / t_name_cn — 아랍어·중국어 팀명</div><div class="s">사용 여부</div></div>
+    <div class="bug-row"><div class="i">09</div><div class="p"><s>좌표 단위</s> — <b>해결됨.</b> 971×634 픽셀 ↔ 0~100%</div><div class="s">§05 에 변환식 기재. 실데이터로 검증 완료</div></div>
   </div>
-</section>
 
-<!-- 15 -->
-<section id="s15">
-  <h2><span class="num">15</span> 아직 결정하지 않은 것</h2>
+  <h3>그 밖의 미결정</h3>
   <div class="open">
-    <div class="oq"><div class="d"></div><div class="b"><b>기준값을 고정할 것인가, 시즌 평균으로 자동 갱신할 것인가</b> — 고정하면 과거 평점이 안 변해 <b>재현 가능</b>하다. 자동 갱신하면 리그 수준을 따라가지만 <b>어제 11.65였던 평점이 오늘 11.4가 된다.</b> 지금 엑셀은 사실상 고정. 어느 쪽이든 <code class="inl">ratingBaseline</code> 버전 스탬프가 있으면 과거 복원은 가능(§9.4)</div></div>
-    <div class="oq"><div class="d"></div><div class="b"><b>채번 규칙 구현 위치</b> — Season / S-Round / M-Code / Match / T-Round / IDX_CODE. 규칙은 파악됐으나 jpd-rating에 둘지 일반 파이썬에 둘지 미정</div></div>
-    <div class="oq"><div class="d"></div><div class="b"><b>좌표 변환</b> — 레거시 <code class="inl">gr_pos_x/y</code>는 픽셀(예: 327, 598), 우리는 0~100%. 기준 해상도 확인 필요</div></div>
-    <div class="oq"><div class="d"></div><div class="b"><b>D-MST 실제 업로드 열</b> — 계산 시트는 221열, admin 화면은 60여 열. 어디까지가 업로드 대상인지</div></div>
-    <div class="oq"><div class="d"></div><div class="b"><b>BAP가 팀 지수에 안 쓰이는 것이 의도인지</b> — <code class="inl">BAP(AiBuildup)</code> 열에 수식이 없고 JMX 평균에서도 빠져 있다. 기준값만 남아 있음</div></div>
-    <div class="oq"><div class="d"></div><div class="b"><b>비전 데이터 구조</b> — 별도 컬렉션 형태, 좌표 형식, 타임스탬프 정합. <b>지금은 source / playerIdSource 분기만 남기고 설계는 보류</b></div></div>
-    <div class="oq"><div class="d"></div><div class="b"><b>연장전(H3/H4)</b> — 스키마는 열어뒀으나 UI는 전·후반만</div></div>
+    <div class="oq"><div class="d"></div><div class="b"><b>기준값을 고정할 것인가, 시즌 평균으로 자동 갱신할 것인가</b> — 고정하면 과거 평점이 안 변해 재현 가능하다. 자동 갱신은 리그 수준을 따라가지만 <b>어제 11.65였던 평점이 오늘 11.4가 된다.</b> 어느 쪽이든 <code class="inl">ratingBaseline</code> 버전 스탬프가 있으면 과거 복원은 가능</div></div>
+    <div class="oq"><div class="d"></div><div class="b"><b>채번 규칙 구현 위치</b> — Season / M-Code / Match / T-Round의 서버 구현 위치. S-Round는 DID 저장·입력 대상에서 제외하며, 파이썬 출력 단계의 복원·대조 검증을 후속 구현한다(§04)</div></div>
+    <div class="oq"><div class="d"></div><div class="b"><b>비전 데이터 구조</b> — 지금은 <code class="inl">source</code> / <code class="inl">playerIdSource</code> 분기만 남기고 설계는 보류. 필드가 없으면 나중에 과거 레코드에 대해 "사람이 넣었나 기계가 넣었나"를 영영 알 수 없다</div></div>
+    <div class="oq"><div class="d"></div><div class="b"><b>연장전(H3/H4)</b> — 스키마는 열어뒀으나 UI 는 전·후반만</div></div>
     <div class="oq"><div class="d"></div><div class="b"><b>확정 후 수정 시 재계산 트리거</b> — 클라이언트 즉시 재계산 vs 파이썬 위임</div></div>
-    <div class="oq"><div class="d"></div><div class="b"><b>gp_score_rel / gp_score_abs</b> — 대외비 평점 외 나머지 두 지표의 산출 근거</div></div>
   </div>
 
   <hr class="sep">
   <footer>
-    레거시 전체 필드 · <code>Aimbroad_database_schema-240812</code>의 <code>전체주요목록</code> 시트<br>
-    판정 로직 규칙 · <code>docs/03_kpi_terminology.md</code> + <code>app/utils/didLogic.ts</code> 주석 — 이 문서는 저장 스키마만 다룬다<br>
-    출력 규격 · <code>footballx/app/pages/admin/{dMST,playerMST,multiSheet}</code> + <code>composables/*.ts</code><br>
-    대외비 산출식 · repo 밖 별도 관리 (§9.4)
+    레거시 전체 컬럼 · <code>Aimbroad_database_schema-240812.xlsx</code> 의 <code>전체주요목록</code> 시트 (19개 표 240개 컬럼)<br>
+    컬럼 단위 매핑 원본 · <code>docs/05_legacy_field_mapping.md</code><br>
+    판정 로직 규칙 · <code>docs/03_kpi_terminology.md</code> + <code>app/utils/didLogic.ts</code><br>
+    타입 정의 · <code>app/types/schema.ts</code><br>
+    출력 규격 · <code>footballx/app/pages/admin/{dMST,playerMST,multiSheet}</code><br>
+    대외비 산출식 · repo 밖 별도 관리
   </footer>
 </section>
 

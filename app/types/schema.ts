@@ -53,8 +53,6 @@ export interface MatchDoc {
   stadiumId: string
   homeTeamId: string
   awayTeamId: string
-  /** 일정에 이미 있는 D-MST S-Round 채번값. 우리는 계산하지 않고 그대로 옮긴다 */
-  sRound?: { home: number; away: number }
   /** 각 recording 이 자기 쪽 필드만 merge 로 쓴다 (§5.1) */
   score: { home: number; away: number }
   createdAt: Timestamp
@@ -136,6 +134,16 @@ export interface RecordingDoc {
   formationKey: string
   lineup: Record<string, LineupEntry>
   halves: Partial<Record<Half, HalfTiming>>
+  /**
+   * D-MST 한 행(= 이 기록 세션)을 가리키는 JaionX 쪽 키.
+   * `시즌(4) + 라운드(2) + 그 라운드 안 팀 순번(2)` — 예: 26270219.
+   * 날짜와 무관하며 라운드가 바뀌면 순번은 1부터 다시 시작한다.
+   *
+   * 계산하지 않고 match_schedule.json 에 있는 값을 그대로 옮긴다 — 채번 규칙이
+   * 대외비 쪽에 있고 아직 확정되지 않아, 다시 계산했다가 틀리면 JaionX 와
+   * 영영 맞지 않기 때문이다(규칙 0).
+   */
+  sRound?: number
   /** 레코드 정렬키 발급용. 세션 로드 시 여기서 이어받는다 (§7.2) */
   maxSeq: number
   /** 확정 전에는 null. 기록 중에는 저장하지 않는다 (§8) */
@@ -185,6 +193,13 @@ export interface RecordDoc {
   playerIdBy?: string
   source: DataSource
   playerIdSource?: DataSource
+  /**
+   * 이 레코드가 BAP 이벤트면 그 사유(didLogic.ts BapEvent.reason). BAP은 레거시
+   * ff_game_bap 처럼 별도 테이블·ID가 필요 없다 — computeBap() 이 항상 레코드 1개당
+   * 이벤트 0~1개를 산출하는 1:1 관계라, 별도 문서 대신 레코드 자신에게 표시하면 된다.
+   * 확정(status:'final') 시점에만 채운다 — 기록 중에는 다른 파생값처럼 계산만 한다.
+   */
+  bapReason?: string
   createdAt: Timestamp
 }
 
@@ -204,31 +219,48 @@ export interface PathSnapshotDoc {
   resCode: ResCode
 }
 
-/** .../bapEvents/{bapId}. didLogic.ts 의 BapEvent 를 그대로 스냅샷한다 */
-export interface BapEventSnapshotDoc {
-  recordId: string
-  reason: string
-}
-
-/** .../playerStats/{playerId}. playerMST 의 gp_* 컬럼 그대로 (§9.5).
- *  gp_score_rel/gp_score_abs/gp_score(평점)는 여기 없다 — jpd-rating(대외비)만 채운다. */
+/**
+ * .../playerStats/{playerId}. playerMST 의 gp_* 컬럼과 대응하지만, 저장은 신용어로
+ * 한다(원칙 2: CT*→DT*, 레거시 이름은 매핑에만 남긴다). JaionX playerMST 자체는 아직
+ * gp_ctb 같은 옛 이름을 그대로 쓰지만(팀 단위 dMST 는 이미 B/M/A/S 로 바뀐 것과 다르게
+ * 선수 단위는 안 바뀌었다), 그건 jpd-rating 이 내보낼 때의 이름이지 우리 저장소의
+ * 이름이 아니다 — RecordFlags(isDtb/isDtm/isDta/isDts), RecordingKpi(B/M/A/S) 와
+ * 같은 어휘를 쓴다.
+ * gp_score_rel/gp_score_abs/gp_score(평점)는 여기 없다 — jpd-rating(대외비)만 채운다.
+ */
 export interface PlayerStatsDoc {
-  gp_tmp: number
-  gp_tap: number
-  gp_utp: number
-  gp_ctp: number
-  gp_ttp: number
-  gp_sht: number
-  gp_ast: number
-  gp_goal: number
-  gp_ctb: number
-  gp_ctm: number
-  gp_cta: number
-  gp_cts: number
-  gp_gtb: number
-  gp_gtm: number
-  gp_asr: number
-  gp_ssr: number
+  /** gp_tmp */
+  TAP: number
+  /** gp_tap */
+  DAP: number
+  /** gp_utp (변경 없음) */
+  UTP: number
+  /** gp_ctp */
+  DTP: number
+  /** gp_ttp (변경 없음) */
+  TTP: number
+  /** gp_sht (변경 없음) */
+  SHOT: number
+  /** gp_ast (변경 없음) */
+  AST: number
+  /** gp_goal (변경 없음) */
+  GOAL: number
+  /** gp_ctb */
+  DTB: number
+  /** gp_ctm */
+  DTM: number
+  /** gp_cta */
+  DTA: number
+  /** gp_cts */
+  DTS: number
+  /** gp_gtb (변경 없음) */
+  GTB: number
+  /** gp_gtm (변경 없음) */
+  GTM: number
+  /** gp_asr (변경 없음) */
+  ASR: number
+  /** gp_ssr (변경 없음) */
+  SSR: number
 }
 
 // -----------------------------------------------------------------------------
