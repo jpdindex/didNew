@@ -108,6 +108,8 @@ function pickFormation(key: string) {
 // 개발용 등급 토글. recorders/{uid}.level 연동 전까지 화면에서 직접 전환한다.
 function toggleRecorderLevel() {
   game.value.recorderLevel = game.value.recorderLevel === 'basic' ? 'advanced' : 'basic'
+  // 실시간 모드는 advanced 전용. basic 으로 내려가면 분석으로 고정한다.
+  if (game.value.recorderLevel === 'basic') game.value.inputMode = '분석'
 }
 
 // 테스트용: 포메이션/진영/전체 슬롯을 랜덤으로 한 번에 채움
@@ -617,7 +619,7 @@ function playerAt(id: string) {
           </section>
           <section class="startPanel">
             <template v-if="game.halfStatus === 'ready'">
-              <div class="modeToggle">
+              <div v-if="game.recorderLevel === 'advanced'" class="modeToggle">
                 <button class="modeBtn" :class="{ on: game.inputMode === '분석' }" @click="game.inputMode = '분석'">분석<small>정지 가능</small></button>
                 <button class="modeBtn" :class="{ on: game.inputMode === '실시간' }" @click="game.inputMode = '실시간'">실시간<small>정지 불가</small></button>
               </div>

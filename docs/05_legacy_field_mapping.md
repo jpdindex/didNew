@@ -37,15 +37,20 @@
 | `gi_goal_home` | `score.home` | 이름변경 |
 | `gi_goal_away` | `score.away` | 이름변경 |
 | `gm_state` | — | **삭제(불필요)** — `recordings.status`가 대신함 |
-| `gm_sub_league` | — | ⚠️ **미결정** — 서브리그 개념을 쓸지 안 쓸지 |
+| `gm_sub_league` | `group` | **이름변경** — 서브리그가 아니라 토너먼트 조(그룹) 표기용이었다. 아래 참고 |
 | `is_realtime` | `recordings.inputMode` | **이름변경 + 이동** — 경기 속성이 아니라 기록자별 설정 |
 | `is_old` | — | 삭제(불필요) — 마이그레이션 플래그 |
 | `is_view` | — | 삭제(불필요) |
 | `is_onair` | — | 삭제(불필요) — BID 방송용 |
 | — | `seasonId` | **신규** — 단 `gm_id` 앞 8자리와 중복. 질의 편의용 |
+| — | `matchType` | **신규** — `'league' \| 'tournament'` |
+| — | `stage` | **신규** — 토너먼트 전용(`'R32'\|'R16'\|'QF'\|'SF'\|'F'`). `round` 를 재사용하지 않는다 |
+| — | `leg` | **신규** — 토너먼트 2차전(홈/원정 합산) 구분. 합산 스코어로 진출 여부를 가릴 때 필요 |
 | — | `createdAt` / `updatedAt` | 신규 — 레거시 `ff_game` 에는 없음. 관례 |
 
-> `sRound` 는 `matches` 가 아니라 **`recordings`** 로 간다 — "팀 하나 × 경기 하나" 단위이기 때문이다. 아래 참고.
+> **`gm_id` 는 우리가 채번하지 않는다.** 경기 일정 관리 화면(`/manage/schedules`)에서 담당자가 직접 입력한 값이 그대로 문서 ID가 된다. `match_schedule.json` 자동 임포트도 하지 않는다.
+>
+> `sRound` 는 `matches`/`recordings` 어디에도 저장하지 않는다 — 레거시 SQL에도 없던 엑셀 워크플로 전용 값이었고, JaionX 쪽 dMST 출력 단계(파이썬)에서 생성한다. 아래 ff_game_info 참고.
 
 ## ff_game_info (49) → `RecordingDoc` — `recordings/{H|A}`
 
@@ -61,7 +66,7 @@
 | `gi_a_t_code` | `opponentTeamId` | 이름변경 |
 | `gi_state` | `status` | **이름변경** — `000/H1B/H1E/…` → `ready/H1/H1_done/…` |
 | `gi_part` | `fieldSide` | 이름변경 |
-| `gi_part_ex` | — | ⚠️ **미결정** — 연장전 진영. H3/H4 UI 미구현 |
+| `gi_part_ex` | `fieldSideEx` | **이름변경 — 유지 결정**. 연장전(H3) 진영. 토너먼트 지원용. H3/H4 UI는 아직 미구현 |
 | `gi_formation` | `formationKey` | 이름변경 |
 | `gi_regdt` / `gi_moddt` | `createdAt` / `updatedAt` | 이름변경 |
 | `is_old` | — | 삭제(불필요) |
@@ -85,10 +90,10 @@
 | `gi_sht` | `kpi.SHOT` | 이름변경 |
 | `gi_gol` | `kpi.GOAL` | 이름변경 |
 | `gi_bap` | `kpi.BAP` | 유지 |
-| `gi_ctb` | `kpi.B` | 이름변경(신용어 DTB) |
-| `gi_ctm` | `kpi.M` | 이름변경(신용어 DTM) |
-| `gi_cta` | `kpi.A` | 이름변경(신용어 DTA) |
-| `gi_cts` | `kpi.S` | 이름변경(신용어 DTS) |
+| `gi_ctb` | `kpi.DTB` | 이름변경(신용어) — `PlayerStatsDoc`과 동일 명칭 |
+| `gi_ctm` | `kpi.DTM` | 이름변경(신용어) — `PlayerStatsDoc`과 동일 명칭 |
+| `gi_cta` | `kpi.DTA` | 이름변경(신용어) — `PlayerStatsDoc`과 동일 명칭 |
+| `gi_cts` | `kpi.DTS` | 이름변경(신용어) — `PlayerStatsDoc`과 동일 명칭 |
 | `gi_asr` | `kpi.ASR` | 유지 |
 | `gi_ssr` | `kpi.SSR` | 유지 — 단 산식은 `(GOAL − OG)/SHOT` |
 | — | `kpi.OG` | **신규** — 자책골 수 (D-MST 요구) |
@@ -100,11 +105,12 @@
 | `gi_tmp_sc` `gi_tmp_sr` | — | **삭제(계산)** — 성공수·성공률은 원자값 나눗셈 |
 | `gi_tap_sc` `gi_tap_sr` | — | 삭제(계산) |
 | `gi_ttp_sc` `gi_ttp_sr` `gi_ttp_pr` | — | 삭제(계산) |
-| `gi_score` | — | **삭제(이동)** — 팀평점은 `jpd-rating`(대외비)이 산출 |
+| `gi_score` | `teamRating` | **이동 + 형태 변경** — 계산은 `jpd-rating`(대외비)이 하고 결과값(5분구간 JMX 시계열)만 되돌려받는다. 공식은 여전히 밖으로 안 나간다 |
 | — | `kpiComputedAt` / `syncedAt` | 신규 — 스냅샷 신선도·동기화 멱등성 |
-| — | `sRound` | **신규** — D-MST 한 행을 가리키는 JaionX 키. `시즌(4)+라운드(2)+팀순번(2)`, 예 `26270219`. 일정에서 그대로 가져온다 |
 | — | `maxSeq` | 신규 — 레코드 정렬키 발급 |
 | — | `lineup` | **신규 위치** — `ff_game_player` 구성 부분이 여기로 |
+
+> **S-Round는 DID 저장 필드에서 제외한다.** JaionX 쪽(`admin/dMST.vue`, `composables/pMST.ts`)에서 여전히 쓰이는 건 확인했지만, 경기 식별·홈원정 매칭은 `gm_id` + `team_type`(문서 ID의 H/A)만으로 충분하다. S-Round가 필요하면 파이썬 dMST 출력 단계에서 생성한다 — 3시즌 780경기로 검증한 채번 규칙이 있으니 그때 그대로 쓰면 된다.
 
 ## ff_game_record (37) → `RecordDoc` — `records/{id}`
 
@@ -124,9 +130,9 @@
 | `gr_shoot_pos_x/y` | `shootPosX` / `shootPosY` | 이름변경 |
 | `gr_regdt` | `createdAt` | 이름변경 |
 | `gt_id` | — | **삭제(계산)** — export 시 `computeAttackPaths()`가 채움 |
-| `gr_area_code_org` | — | ⚠️ **미결정** — 원본 구역코드. 진영 반전 전 값으로 추정 |
+| `gr_area_code_org` | — | **삭제(불필요)** — `03.areacode.sql` 확인 결과 구역코드 재계산 마이그레이션 전 백업용. 실시간 기록엔 불필요 |
 | `gr_part_pos_x/y` | — | **삭제(불필요)** — `posX/posY`로 통합 |
-| `gr_shoot_rate_x/y` | — | ⚠️ **미결정** — 골대 내 비율 좌표 |
+| `gr_shoot_rate_x/y` | — | **삭제(불필요)** — 안 쓰는 값. 저장 안 함 |
 | `gr_is_tmp` | — | **삭제(계산)** — `flags.isTap` |
 | `gr_is_tap` | — | 삭제(계산) — `flags.isDap` |
 | `gr_is_ast` | — | 삭제(계산) — `flags.isAst` |
@@ -181,7 +187,7 @@
 | `gp_out_half_seconds` | `outSeconds` | 이름변경 |
 | `gp_in_seconds` / `gp_out_seconds` | — | 삭제(계산) — 경기 기준 초는 `halves`로 산출 |
 | `gp_seconds` | — | 삭제(계산) — 출전시간 = out − in |
-| `gp_point_plus` / `gp_point_minus` | — | ⚠️ **미결정** — 상단 `-3/-1/+1/+3` 버튼의 저장 위치. **지금 화면에는 버튼만 있고 저장이 없음** |
+| `gp_point_plus` / `gp_point_minus` | — | **삭제(불필요)** — 상단 `-3/-1/+1/+3` 버튼은 경기시간 조정용이라 무관. 저장 안 함 |
 | `is_old` | — | 삭제(불필요) |
 | — | `slot` | **신규** — 포메이션 슬롯 ID |
 | — | `no` / `name` / `pos` | **신규(스냅샷)** — 이적해도 과거 기록 불변 (원칙 7) |
@@ -211,7 +217,8 @@
 | `gp_ttp_sc/sr/tr/pr` | — | 삭제(계산) |
 | `gp_sht_sc/tr` | — | 삭제(계산) |
 | `gp_gol_tr` | — | 삭제(계산) |
-| `gp_score_rel` `gp_score_abs` `gp_score` | — | **삭제(이동)** — 평점은 `jpd-rating`(대외비)만 채움 |
+| `gp_score_rel` `gp_score_abs` `gp_score` | `scoreRel` `scoreAbs` `score` | **이동** — 계산은 `jpd-rating`(대외비)이 하고 결과값만 되돌려받아 채운다. 확정 전엔 `null` |
+| `p_id` | `playerId` | **신규 재도입** — 문서 ID와 중복이지만 `collectionGroup` 쿼리 전용. "선수 한 명의 전 경기"를 경로 없이 검색하려면 필드로도 있어야 한다(SQL의 `p_id` 컬럼과 같은 이유) |
 
 ## ff_game_player_log (10) → `LineupEntry`에 병합
 
@@ -223,14 +230,14 @@
 | `pl_in_half` | `inHalf` | 병합 |
 | `pl_in_seconds` | `inSeconds` | 병합 |
 | `pl_in_position` | `pos` | 병합 |
-| `pl_in_order` | — | ⚠️ **미결정** — 몇 번째 교체인지 순번. `LineupEntry.subOrder` 추가 필요 |
+| `pl_in_order` | — | **삭제(불필요)** — 저장 안 함 |
 | `pl_regdt` / `pl_moddt` | — | 삭제(불필요) |
 
 > **별도 `subs` 컬렉션을 만들지 않는다.** 교체 정보는 `lineup` 맵 안에서 완결되고, 어차피 `recordings` 문서를 통째로 읽으므로 추가 읽기가 0이다. 교체 목록 화면은 `lineup`에서 `inHalf`/`outHalf`가 채워진 항목만 골라 시간순 정렬하면 된다.
 
-## ff_game_card (7) → ⚠️ **타입 없음 — 만들어야 함**
+## ff_game_card (7) → `CardDoc` — `recordings/{H|A}/cards/{cardId}`
 
-| 레거시 | 새 필드(제안) | 상태 |
+| 레거시 | 새 필드 | 상태 |
 |---|---|---|
 | `c_id` | (문서 ID) | 이름변경 |
 | `gi_id` | — | 삭제(경로) |
@@ -240,7 +247,7 @@
 | `gr_seconds` | — | 삭제(계산) |
 | `gp_card_card` | `card` (`Y`/`R`) | 이름변경 |
 
-> **`schema.ts`에 `CardDoc`이 아직 없다.** 트리(§4)에는 `cards/{cardId}`로 적혀 있으나 타입 미작성. 카드도 교체처럼 `lineup`에 병합할지, 별도 컬렉션으로 둘지 **결정 필요**.
+> **해결됨.** 카드는 교체와 달리 "act"가 없고 공격 체인과 무관해 `RecordDoc`에 병합하면 KPI 계산 필터링만 오염된다 — 별도 컬렉션 + `CardDoc` 타입으로 `schema.ts`에 정의했다. 화면 UI·저장 로직 연동은 아직 후속 구현 대상.
 
 ## ff_game_state (7) → **표 자체 삭제**
 
@@ -263,12 +270,24 @@
 | `t_name_short` | `nameShort` | 이름변경 |
 | `u_text_color_code` | `textColor` | 이름변경 |
 | `s_code` | `stadiumId` | 이름변경 |
-| `t_coach` / `t_coach_kr` | `coach` / `coachKr` | 이름변경 |
+| `t_coach` / `t_coach_kr` | `currentCoachId` + `coaches/{id}` | **구조 변경** — 문자열 하나로 두면 감독 교체 시 과거 경기의 감독 이력이 사라진다. 아래 참고 |
 | `t_begin` / `t_end` | `foundedAt` / `dissolvedAt` | 이름변경 |
 | `l_code` | `currentLeagueId` + `teams/{id}/seasons/{seasonId}` | **구조 변경** — 단일값이면 승강제를 표현 못 함 |
-| `t_name_ae` / `t_name_cn` | — | ⚠️ **미결정** — 아랍어·중국어 팀명. 쓸지 안 쓸지 |
+| `t_name_ae` / `t_name_cn` | — | **삭제(불필요)** — 나중에 다국어 팀명 필요해지면 그때 필드 추가 |
 | — | `crestUrl` | 신규 — 엠블럼 |
 | — | `createdAt/By` `updatedAt/By` | 신규 — 감사 필드 |
+
+## (레거시에 없음) → `CoachDoc` + `CoachContractDoc` — `coaches/{coachId}`, `coaches/{coachId}/contracts/{id}`
+
+> 레거시엔 감독 전용 테이블이 없었다 — `ff_team.t_coach`/`t_coach_kr` 문자열 두 개가 전부였다. `PlayerDoc`/`ContractDoc`과 같은 이유(원칙 7 — 이적해도 과거 기록 불변)로 정체성과 이력을 분리해 새로 만든다.
+
+| 타입 | 필드 | 비고 |
+|---|---|---|
+| `CoachDoc` | `name` / `nameKr` / `nameEn` / `birth` / `nation` / `active` / `currentTeamId`(파생 캐시) / `legacyCoachId` | `PlayerDoc`과 동일 패턴 |
+| `CoachContractDoc` | `teamId` / `leagueId` / `seasonId` / `from` / `to`(null=현재) / `fromTeamId` | `ContractDoc`과 동일 패턴 |
+| `TeamDoc.currentCoachId` | (필드) | 파생 캐시. 이름이 아니라 ID |
+
+관리 화면(`/manage`)에 감독 등록·이적 처리 화면이 새로 필요하다 — 아직 미구현.
 
 ## ff_player (9) → `PlayerDoc` — `players/{playerId}`
 
@@ -365,15 +384,34 @@
 
 ---
 
-# ⚠️ 결정이 필요한 것 (구멍 목록)
+# ✅ 결정된 것 (구멍 목록 — 전부 해결됨)
 
-| # | 항목 | 내용 |
+| # | 항목 | 결정 |
 |---|---|---|
-| 1 | **`ff_game_card`** | `CardDoc` 타입 자체가 없음. 별도 컬렉션 vs `lineup` 병합 결정 필요 |
-| 2 | **`gp_point_plus` / `gp_point_minus`** | 상단 `-3/-1/+1/+3` 버튼. **지금 화면에는 버튼만 있고 저장 로직이 없음.** 원래 무슨 점수인지 확인 필요 |
-| 3 | `pl_in_order` | 교체 순번. `LineupEntry.subOrder` 추가 여부 |
-| 4 | `gr_area_code_org` | 원본 구역코드 (진영 반전 전 값으로 추정) |
-| 5 | `gr_shoot_rate_x/y` | 골대 내 비율 좌표. `shootPosX/Y`와 중복인지 확인 |
-| 6 | `gi_part_ex` | 연장전 진영. H3/H4 UI 미구현 상태 |
-| 7 | `gm_sub_league` | 서브리그 개념 사용 여부 |
-| 8 | `t_name_ae` / `t_name_cn` | 아랍어·중국어 팀명 사용 여부 |
+| 1 | `ff_game_card` | `CardDoc` 신설 — 별도 `cards` 컬렉션. 화면 연동은 후속 구현 |
+| 2 | `gp_point_plus` / `gp_point_minus` | 삭제 — 상단 `-3/-1/+1/+3` 버튼은 경기시간 조정용이라 무관. `DidInput.vue`의 `stepSeconds()`에 이미 구현·연결되어 있음(코드 확인 완료) |
+| 3 | `pl_in_order` | 삭제 |
+| 4 | `gr_area_code_org` | 삭제 — 구역코드 재계산 마이그레이션 전 백업용 |
+| 5 | `gr_shoot_rate_x/y` | 삭제 |
+| 6 | `gi_part_ex` | 유지 — `fieldSideEx`. 토너먼트 연장전 지원용 |
+| 7 | `gm_sub_league` | `group`으로 이름변경 — 토너먼트 조 표기용이었다 |
+| 8 | `t_name_ae` / `t_name_cn` | 삭제 — 필요해지면 나중에 추가 |
+| 9 | 좌표 단위 | 971×634 픽셀 ↔ 0~100%. 실데이터로 검증 완료 |
+| 10 | `kpi.B/M/A/S` vs `DTB/DTM/DTA/DTS` | `DTB/DTM/DTA/DTS`로 통일 — 팀·선수 KPI가 같은 값을 다른 이름으로 저장하던 것을 발견, TAP/DAP/DTP처럼 "같은 이름, 타입으로만 구분" 원칙에 맞춤 |
+| 11 | `leg` (토너먼트 2차전) | `MatchDoc.leg?: 1 \| 2` 신규 — 합산 스코어로 진출 여부를 가릴 때 이 경기가 1차전/2차전인지 필요 |
+
+---
+
+# 파이프라인 운영 안정성 (컬럼 매핑과 별개인 구조 결정)
+
+DID 입력 → jpd-did KPI → jpd-rating 평점 → jpd-did 조립 → JaionX 전송 흐름을 실제로 돌릴 때 필요한 것들. 레거시 컬럼과 무관한 신규 결정이라 여기 따로 적는다. 상세는 `04_firestore_schema.html` §12(운영 안정성) · §13(실시간 증분 계산) 참고.
+
+| 항목 | 결정 |
+|---|---|
+| 갱신 버튼의 동기 체인 | `exportJobs/{gm_id}_{H\|A}` 문서로 분리 — 파이썬 서비스가 `stage`를 보고 이어받는 워커가 됨. 중간 실패 복구 + 동시 경기 종료 폭주 흡수 |
+| jpd-rating 왕복 버전 관리 | `RecordingDoc.kpiVersion`(+1씩 증가) / `teamRating` / `ratingBasedOn`. 다르면 낡은 값으로 재요청 |
+| `PlayerStatsDoc` 평점 필드 | `scoreRel`/`scoreAbs`/`score`/`ratingBasedOn` 신설 — jpd-rating이 계산해서 되돌려준 값만 채움. 공식은 여전히 jpd-rating에만 |
+| `RecordingDoc` 쓰기 경합 | `maxSeq`는 half 종료·일시정지 때만 서버 반영, 그 사이엔 클라 메모리에서 증가 |
+| 잠금 상태 | `h1Locked`/`h2Locked`를 `RecordingDoc` 필드로 편입 — 실연동 시 실시간 구독으로 자동 동기화 |
+| 2인 기록 동시 편집 | 항상 `updateDoc`(부분 갱신). 레코드 생성 충돌 자체는 `createdBy`/`playerIdBy` 구조상 안 생김 |
+| JaionX 전송 멱등성 | `exportJobs` 문서 ID = `gm_id + team_type`(자연키) — 재시도해도 중복 행 없음 |
