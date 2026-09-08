@@ -1,0 +1,14 @@
+rules_version = '2';
+
+// 임시 규칙 — 로그인한 사람이면 전부 읽기/쓰기 허용.
+// 기록자별 쓰기 범위, half 잠금, 서버 전용 필드(kpi/teamRating 등) 보호 같은 세분화된
+// 규칙은 아직 미결정(docs/06_backend_integration.md §5 "지금 스코프가 아닌 것" 참고) —
+// 그게 정해지면 이 파일을 교체한다. 지금은 SQL 데이터 이관 도구(/manage/legacy-import)가
+// 막히지 않게 하는 것이 목적이다.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}

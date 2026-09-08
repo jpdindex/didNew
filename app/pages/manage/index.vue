@@ -3,7 +3,10 @@ const menus = [
   { label: '팀 관리', desc: '팀 추가/수정', to: '/manage/teams', ready: false },
   { label: '선수 관리', desc: '선수 정보 + 이적시장', to: '/manage/players', ready: false },
   { label: '경기 일정 관리', desc: '경기 일정 등록/수정', to: '/manage/schedules', ready: false },
-  { label: '기록 잠금 관리', desc: '갱신으로 잠긴 반(半) 잠금 해제', to: '/manage/locks', ready: true }
+  { label: '기록 잠금 관리', desc: '갱신으로 잠긴 반(半) 잠금 해제', to: '/manage/locks', ready: true },
+  { label: 'SQL 데이터 이관', desc: '레거시 SQL 경기 데이터를 Firestore로 이관 (1회성)', to: '/manage/legacy-import', ready: true },
+  { label: 'Firestore 데이터 뷰어', desc: '컬렉션 조회 + 값 수정 (삭제는 없음)', to: '/manage/data-viewer', ready: true },
+  { label: '입력 데이터 (경기 기록)', desc: '경기 → 팀 → 레코드/KPI/카드 순으로 클릭만으로 조회', to: '/manage/input-data', ready: true }
 ]
 </script>
 
@@ -18,18 +21,25 @@ const menus = [
       </div>
 
       <div class="grid">
-        <component
-          :is="menu.ready ? 'NuxtLink' : 'div'"
-          v-for="menu in menus"
+        <NuxtLink
+          v-for="menu in menus.filter(menu => menu.ready)"
           :key="menu.label"
-          :to="menu.ready ? menu.to : undefined"
+          :to="menu.to"
           class="card"
-          :class="{ disabled: !menu.ready }"
         >
           <div class="label">{{ menu.label }}</div>
           <div class="desc">{{ menu.desc }}</div>
-          <div v-if="!menu.ready" class="badge">준비 중</div>
-        </component>
+        </NuxtLink>
+
+        <div
+          v-for="menu in menus.filter(menu => !menu.ready)"
+          :key="menu.label"
+          class="card disabled"
+        >
+          <div class="label">{{ menu.label }}</div>
+          <div class="desc">{{ menu.desc }}</div>
+          <div class="badge">준비 중</div>
+        </div>
       </div>
     </div>
   </div>
