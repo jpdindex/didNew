@@ -581,6 +581,8 @@ $gi[$row[<span class="k">'gi_write_code'</span>]] = $row;
         <tr><td class="lg">is_old</td><td class="f">—</td><td class="n">삭제(불필요)</td></tr>
         <tr><td class="lg">—</td><td class="f">maxSeq</td><td class="n"><span class="tag new">NEW</span> 레코드 정렬키 발급</td></tr>
         <tr><td class="lg">—</td><td class="f">kpiComputedAt / syncedAt</td><td class="n"><span class="tag new">NEW</span></td></tr>
+        <tr><td class="lg">—</td><td class="f">kpiVersion / ratingBasedOn</td><td class="n"><span class="tag new">NEW</span> jpd-rating 왕복 버전 확인용 (§12)</td></tr>
+        <tr><td class="lg">—</td><td class="f">teamRating (jmx/apx/apxGrade/tpx/tpxGrade/fpx/fpxGrade)</td><td class="n"><span class="tag new">NEW</span> jpd-rating이 계산해 되돌려준 값. 확정 전엔 null</td></tr>
       </tbody>
     </table>
   </div>
@@ -790,6 +792,7 @@ posY = gr_pos_y / 634 * 100</pre>
         <tr><td class="lg">gp_sht / gp_ast / gp_gol</td><td class="f">SHOT / AST / GOAL</td><td class="n">이름변경</td></tr>
         <tr><td class="lg">gp_*_sc / _sr / _tr / _pr <span class="lg">(11개)</span></td><td class="f">—</td><td class="n"><b>삭제(계산)</b> — 성공수·성공률·시도율</td></tr>
         <tr><td class="lg">gp_score_rel / abs / gp_score</td><td class="f">scoreRel / scoreAbs / score</td><td class="n"><b>이동</b> — 계산은 jpd-rating(대외비)이 하고 결과값만 되돌려받아 채운다. 확정 전엔 null</td></tr>
+        <tr><td class="lg">(레거시에 없음)</td><td class="f">jmx / apx / apxGrade / tpx / tpxGrade / fpx / fpxGrade</td><td class="n"><span class="tag new">NEW</span> jpd-rating이 계산해 되돌려준 값. <code class="inl">jmx</code>는 선수당 경기 최종값 하나(5분구간 아님). 확정 전엔 null</td></tr>
         <tr><td class="lg">p_id</td><td class="f">playerId</td><td class="n"><span class="tag new">NEW</span> 문서 ID와 중복이지만 collectionGroup 쿼리 전용 — "선수 한 명의 전 경기"를 경로 없이 검색하려면 필드로도 있어야 한다(SQL의 p_id 컬럼과 같은 이유)</td></tr>
       </tbody>
     </table>
@@ -1093,10 +1096,11 @@ posY = gr_pos_y / 634 * 100</pre>
   </div>
   <p class="ind">basic 이 갱신을 누르면 <strong>그 half 의 수정도 함께 잠긴다.</strong> 해제는 기록자 화면이 아니라 <code class="inl">/manage/locks</code>(관리자 전용)에서만 한다 — 기록자 화면에 두면 본인이 스스로 풀 수 있어 잠금이 무의미해진다.</p>
 
-  <h3>팀 JMX 는 5분 구간 시계열에서 나온다</h3>
+  <h3>팀 JMX — 5분 구간 시계열까지 통째로 저장</h3>
   <div class="call">
-    <div class="h">산식은 평점 산출 서버(jpd-rating)에서 가져온다</div>
-    <p>실제 공식은 <strong>jpd-rating 안에서만</strong> 존재한다(§10). 이 문서가 요구하는 건 산식이 아니라 <strong>입력 조건</strong>뿐이다 — 팀 JMX가 "5분 구간별 시계열"이라는 형태로 나온다는 것, 그리고 그 계산을 하려면 <code class="inl">half</code>/<code class="inl">halfSeconds</code>가 레코드에 반드시 있어야 한다는 것(반 구분과 반 기준 경과초 없이는 구간을 못 나눈다). <code class="inl">RecordingDoc.teamRating.jmx: number[]</code>는 그 결과값을 담는 그릇일 뿐이다.</p>
+    <div class="h">산식은 평점 산출 서버(jpd-rating)에서 가져온다, jpd-did 는 원자값만 보낸다</div>
+    <p>실제 공식은 <strong>jpd-rating 안에서만</strong> 존재한다(§10). jpd-did 는 5분 구간 1~20 각각의 <strong>누적 KPI 원자값</strong>(DAP/DTP/SHOT/SSR/GOAL)만 jpd-rating 에 보내고, jpd-rating 이 구간별 JMX 를 계산해 시계열로 되돌려준다 — 공식이 담긴 계산 자체가 jpd-did 밖으로 안 나가게 하려는 것이다(원칙: 계산은 저쪽, 원자값과 결과값만 이쪽).</p>
+    <p><code class="inl">RecordingDoc.teamRating.jmx: number</code>는 경기 최종값(20번째 구간값과 항상 같다), <code class="inl">teamRating.jmxSeries: number[]</code>는 되돌려받은 구간 1~20 시계열 전체다. 둘 다 확정(<code class="inl">status:'final'</code>) 시점에 한 번 얼려서 그대로 저장한다 — <code class="inl">PathSnapshotDoc</code>/<code class="inl">PlayerStatsDoc</code>과 같은 "확정 스냅샷" 패턴(원칙 3의 정당한 예외). <code class="inl">multiSheet</code> 출력은 이 값을 그대로 꽂아 쓴다, 다시 계산하지 않는다.</p>
   </div>
 
   <div class="call">
@@ -1116,7 +1120,7 @@ posY = gr_pos_y / 634 * 100</pre>
       <tbody>
         <tr><td class="f">갱신 버튼</td><td class="n">KPI→평점→조립→전송이 동기 체인 — 중간 실패 시 복구 불가, 동시 경기 종료 시 폭주</td><td class="n"><code class="inl">exportJobs/{gm_id}_{H|A}</code> 문서 하나만 쓰고 반환. 파이썬 서비스가 <code class="inl">stage</code>를 보고 이어받는 워커가 됨</td></tr>
         <tr><td class="f">jpd-rating 왕복</td><td class="n">평점이 어느 KPI 기준인지, 도착했는지 알 방법이 없음</td><td class="n"><code class="inl">RecordingDoc.kpiVersion</code>을 KPI 쓸 때마다 +1. <code class="inl">teamRating</code>/<code class="inl">ratingBasedOn</code>이 그 버전을 스탬프. 조립 단계에서 <code class="inl">ratingBasedOn === kpiVersion</code> 아니면 낡은 값으로 보고 재요청</td></tr>
-        <tr><td class="f">RecordingDoc 쓰기</td><td class="n"><code class="inl">maxSeq</code>를 레코드마다 서버에 쓰면 문서당 쓰기 한도(1회/초)에 걸림</td><td class="n">세션 시작 시 1회만 읽고 클라 메모리에서 증가. 서버 반영은 half 종료·일시정지 때만. 2인 충돌은 <code class="inl">(seq, uid)</code> 정렬로 타이브레이크</td></tr>
+        <tr><td class="f">RecordingDoc 쓰기</td><td class="n"><code class="inl">maxSeq</code>를 레코드마다 서버에 쓰면 문서당 쓰기 한도(1회/초)에 걸림</td><td class="n">세션 시작 시 1회만 읽고 클라 메모리에서 증가. 서버 반영은 half 종료·일시정지 때만. 2인 충돌은 <code class="inl">(seq, createdBy)</code> 정렬로 타이브레이크(<code class="inl">uid</code> 필드는 없음 — <code class="inl">RecordDoc.createdBy</code>를 쓴다). <strong>아직 <code class="inl">didLogic.ts</code>에 미구현</strong> — 지금은 <code class="inl">seconds→seq</code>까지만 정렬한다</td></tr>
         <tr><td class="f">2인 기록 — 같은 레코드</td><td class="n">액트 만든 사람과 선수 넣는 사람이 같은 문서를 동시에 편집</td><td class="n">항상 <code class="inl">updateDoc</code>(부분 갱신)으로 쓴다. 서로 다른 필드만 건드리면 경합 없음 — 같은 필드를 동시에 고치는 건 드물고, 사람이 조율할 영역(§6.3)</td></tr>
         <tr><td class="f">잠금 상태</td><td class="n"><code class="inl">h1Locked</code>/<code class="inl">h2Locked</code>가 프로토타입 단계에선 클라 로컬 상태뿐이라 2인 기록 시 기기 간 어긋날 수 있음</td><td class="n"><code class="inl">RecordingDoc</code> 필드로 정식 편입 — 실제 연동되면 실시간 구독으로 양쪽 기기에 자동 동기화됨. 별도 장치 불필요</td></tr>
         <tr><td class="f">JaionX 전송</td><td class="n">재시도 시 중복 행 생성 위험</td><td class="n"><code class="inl">exportJobs</code> 문서 ID를 <code class="inl">gm_id + team_type</code>(자연키)로 고정 — JaionX 쪽 자연키와 동일해서 같은 작업이 두 번 돌아도 중복이 안 생긴다</td></tr>
@@ -1306,21 +1310,22 @@ posY = gr_pos_y / 634 * 100</pre>
       <thead><tr><th>작업</th><th>내용</th></tr></thead>
       <tbody>
         <tr><td class="f">판정 로직 이식</td><td class="n"><code class="inl">didLogic.ts</code>의 <code class="inl">computeAttackPaths</code>/<code class="inl">computeBap</code> 등을 파이썬으로 포팅(§10 — 판정 권위는 파이썬). 20/20 검증 이미 완료된 로직이라 이식 리스크는 낮음</td></tr>
-        <tr><td class="f">갱신 트리거 핸들러</td><td class="n"><code class="inl">exportJobs</code> 문서의 <code class="inl">stage: 'kpi'</code>를 구독해 KPI 계산 → <code class="inl">RecordingDoc.kpi</code>/<code class="inl">kpiVersion</code> 갱신 → <code class="inl">stage: 'rating'</code>으로 전이</td></tr>
+        <tr><td class="f">갱신 트리거 핸들러</td><td class="n"><code class="inl">exportJobs</code> 문서의 <code class="inl">stage: 'kpi'</code>를 구독해 KPI 계산 → <code class="inl">RecordingDoc.kpi</code>/<code class="inl">kpiVersion</code> 갱신 → 5분 구간 1~20 누적 원자값 계산 → <code class="inl">stage: 'rating'</code>으로 전이</td></tr>
+        <tr><td class="f">jpd-rating 호출</td><td class="n">Firestore 직접 접근이 아니라 <strong>HTTP API</strong>(<code class="inl">POST /v1/ratings/calculate</code>)로 호출한다. 팀 KPI + 5분 구간 20개 누적값 + 선수 KPI를 요청 본문에 담아 보내고, 응답으로 <code class="inl">teamRating</code>(jmx/jmxSeries 포함)·<code class="inl">playerRatings</code>를 그대로 받아 <code class="inl">RecordingDoc</code>/<code class="inl">PlayerStatsDoc</code>에 쓴다. Bearer 토큰으로 인증</td></tr>
         <tr><td class="f">실시간 증분 계산 워커</td><td class="n">§13에서 설계한 상주 워커(경기당 진행중 루트만 재계산). 실시간 모드가 켜지는 시점에 필요</td></tr>
       </tbody>
     </table>
   </div>
 
-  <h3>5. jpd-rating — 별도 Firebase 프로젝트 + 평점 서비스</h3>
+  <h3>5. jpd-rating — 별도 Firebase 프로젝트 + 평점 서비스 (HTTP API)</h3>
   <div class="tbl-wrap">
     <table>
       <thead><tr><th>작업</th><th>내용</th></tr></thead>
       <tbody>
-        <tr><td class="f">프로젝트 신규 생성</td><td class="n">jpd-did와 완전히 분리된 Firebase 프로젝트. 접근 인원 1~2명으로 제한(§10)</td></tr>
-        <tr><td class="f">jpd-did 읽기 전용 접근</td><td class="n">서비스 계정으로 jpd-did의 KPI(<code class="inl">RecordingDoc.kpi</code>, <code class="inl">kpiVersion</code>)만 읽음</td></tr>
-        <tr><td class="f">평점 공식 구현</td><td class="n">대외비 — 레거시 엑셀에서 역산 검증된 공식을 이 프로젝트 안에서만 구현</td></tr>
-        <tr><td class="f">jpd-did 쓰기 접근(왕복)</td><td class="n">계산 결과(<code class="inl">teamRating</code>, <code class="inl">PlayerStatsDoc.score*</code>, <code class="inl">ratingBasedOn</code>)만 jpd-did에 되돌려 씀 — 이 방향의 서비스 계정 권한은 좁게(해당 필드만) 설정</td></tr>
+        <tr><td class="f">프로젝트 신규 생성</td><td class="n">jpd-did와 완전히 분리된 Firebase 프로젝트 + Cloud Run. 접근 인원 1~2명으로 제한(§10)</td></tr>
+        <tr><td class="f">jpd-did Firestore 접근 없음</td><td class="n">서비스 계정으로 jpd-did 프로젝트를 읽거나 쓰지 않는다 — <strong>공식이 담긴 계산 자체가 jpd-did 밖으로 안 나가는 대신, 계산에 필요한 원자값과 결과값만 HTTP 요청/응답으로 오간다.</strong> jpd-rating이 접근하는 Firestore는 자기 프로젝트의 <code class="inl">ratingBaseline</code>뿐</td></tr>
+        <tr><td class="f">평점 공식 구현</td><td class="n">대외비 — 레거시 엑셀에서 역산 검증된 공식을 이 프로젝트 안에서만 구현(<code class="inl">src/formula.py</code>)</td></tr>
+        <tr><td class="f">HTTP API (FastAPI, Cloud Run)</td><td class="n"><code class="inl">POST /v1/ratings/calculate</code>(단건) · <code class="inl">/calculate-batch</code>(최대 1000건) · <code class="inl">/jobs</code>(비동기, in-memory 큐라 인스턴스 재시작·스케일아웃 시 유실 가능 — 실사용 전 보완 필요). 요청 필드가 스키마와 안 맞으면 422, 토큰 문제면 401, 토큰 미설정이면 503(fail-closed)</td></tr>
       </tbody>
     </table>
   </div>
@@ -1332,6 +1337,7 @@ posY = gr_pos_y / 634 * 100</pre>
       <tbody>
         <tr><td class="f"><code class="inl">exportJobs</code> 워커</td><td class="n"><code class="inl">stage: 'assemble'</code> → KPI + 되돌아온 평점 + 참조 데이터(팀/선수명 등)로 dMST/playerMST 행 조립. <code class="inl">ratingBasedOn === kpiVersion</code> 확인 후 진행</td></tr>
         <tr><td class="f">S-Round 생성</td><td class="n">이 조립 단계에서 생성(§04). 780경기로 검증된 규칙 재사용</td></tr>
+        <tr><td class="f">5분단위 평점 <span class="tag new">NEW</span></td><td class="n">여기서 계산하지 않는다 — <code class="inl">stage: 'rating'</code> 단계에서 jpd-rating이 이미 계산해 <code class="inl">teamRating.jmxSeries</code>로 저장해뒀다. <code class="inl">multiSheet</code> 출력은 이 값을 그대로 꽂아 쓴다</td></tr>
         <tr><td class="f">JaionX(footballX) 쓰기</td><td class="n"><code class="inl">gm_id + team_type</code> 자연키로 멱등 쓰기(§12). <code class="inl">stage: 'sent'</code>로 전이</td></tr>
       </tbody>
     </table>

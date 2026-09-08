@@ -1,8 +1,10 @@
 // =============================================================================
 // Firestore 스키마 타입 정의
 //
-// docs/04_firestore_schema.md 가 사람이 읽는 설계도라면, 이 파일은 그걸 코드가
-// 강제하게 만든 것이다. 컬렉션 구조가 바뀌면 문서를 먼저 고치고 여기를 맞춘다.
+// docs/04_firestore_schema.html(+ docs/05_legacy_field_mapping.md) 이 사람이 읽는
+// 설계도라면, 이 파일은 그걸 코드가 강제하게 만든 것이다. docs/04_firestore_schema.md는
+// 구 버전(2026-09-02 이전)이라 기준 문서가 아니다. 컬렉션 구조가 바뀌면 .html을 먼저
+// 고치고 여기를 맞춘다.
 // 아직 실제 Firestore 읽기/쓰기 코드(컴포저블)는 없다 — 그건 다음 단계(B/D)다.
 // 여기 정의된 각 인터페이스가 곧 해당 문서가 반드시 지켜야 할 필드 계약이다.
 // =============================================================================
@@ -130,10 +132,21 @@ export interface RecordingKpi {
 /**
  * jpd-rating 이 계산해서 되돌려주는 팀 지수 스냅샷. 공식은 모르고 결과값만 보관한다
  * (§10 — 평점 서비스만 KPI 를 읽고, 값만 jpd-did 로 되돌아온다).
+ *
+ * jmx 는 그 경기의 최종값(jmxSeries 의 20번째 구간값과 항상 같다).
+ * jmxSeries 는 5분 구간별 시계열(1~20구간) — 확정 시점에 한 번 얼려서 저장한다
+ * (PathSnapshotDoc/PlayerStatsDoc 과 같은 "확정 스냅샷" 패턴, 원칙 3의 정당한 예외).
+ * footballX 쪽 multiSheet 출력에 그대로 꽂아 쓴다.
  */
 export interface TeamRatingSnapshot {
-  /** 5분 구간별 JMX 시계열. 전반 갱신 1~10, 후반 갱신 1~20 까지 누적된다 */
-  jmx: number[]
+  jmx: number
+  jmxSeries: number[]
+  apx: number
+  apxGrade: string
+  tpx: number
+  tpxGrade: string
+  fpx: number
+  fpxGrade: string
 }
 
 export interface RecordingDoc {
@@ -163,8 +176,10 @@ export interface RecordingDoc {
   /**
    * 레코드 정렬키 발급용. 세션 로드 시 여기서 이어받는다(§7.2) — 그 이후로는 클라이언트
    * 메모리에서 증가시키고, 레코드마다 서버에 쓰지 않는다. 서버 반영은 half 종료·일시정지
-   * 때만 해서 RecordingDoc 쓰기 경합을 줄인다. 2인 기록 시 같은 seq 충돌은 (seq, uid)
-   * 정렬로 타이브레이크한다.
+   * 때만 해서 RecordingDoc 쓰기 경합을 줄인다. 2인 기록 시 같은 seq 충돌은 (seq, createdBy)
+   * 정렬로 타이브레이크한다 — createdBy 는 RecordDoc 필드, uid 라는 필드는 없다.
+   * 단, 이 타이브레이크는 아직 didLogic.ts 에 구현돼 있지 않다(현재는 seconds→seq 까지만
+   * 정렬한다) — Firestore 저장 코드를 만드는 단계(B/D)에서 실제로 넣어야 한다.
    */
   maxSeq: number
   /** 확정 전에는 null. 기록 중에는 저장하지 않는다 (§8) */
@@ -248,6 +263,8 @@ export interface CardDoc {
   half: Half
   halfSeconds: number
   card: 'Y' | 'R'
+  /** 이 카드를 넣은 사람의 uid. RecordDoc.createdBy 와 같은 이유 — 정정 책임 추적용 */
+  createdBy: string
   createdAt: Timestamp
 }
 
@@ -340,7 +357,15 @@ export interface PlayerStatsDoc {
   scoreRel: number | null
   scoreAbs: number | null
   score: number | null
-  /** score* 가 어느 kpiVersion(RecordingDoc) 기준으로 계산됐는지. 확정 전에는 null */
+  /** 선수 JMX. 팀과 달리 5분 구간으로 쪼개지 않는다 — 경기당 값 하나 */
+  jmx: number | null
+  apx: number | null
+  apxGrade: string | null
+  tpx: number | null
+  tpxGrade: string | null
+  fpx: number | null
+  fpxGrade: string | null
+  /** score/jmx/apx/tpx/fpx 가 어느 kpiVersion(RecordingDoc) 기준으로 계산됐는지. 확정 전에는 null */
   ratingBasedOn: number | null
 }
 

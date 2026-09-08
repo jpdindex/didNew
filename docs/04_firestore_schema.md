@@ -2,6 +2,11 @@
 
 최종 갱신: 2026-09-02 (전면 개정)
 
+> **⚠️ 이 문서는 더 이상 기준 문서가 아니다.** 이후 `docs/04_firestore_schema.html`로 이전해서
+> 계속 갱신해왔고, `subs`/`bapEvents` 서브컬렉션·`sRound` 필드 등 여기 남아있는 구조는
+> 최신 설계와 다르다. 현재 기준은 `docs/04_firestore_schema.html` + `app/types/schema.ts` +
+> `docs/05_legacy_field_mapping.md` 세 개다. 이 파일은 역사적 기록으로만 남겨둔다.
+
 ---
 
 ## 0. 이 문서의 전제 — 스키마는 목적이 아니라 수단이다

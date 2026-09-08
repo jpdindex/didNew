@@ -105,8 +105,12 @@
 | `gi_tmp_sc` `gi_tmp_sr` | — | **삭제(계산)** — 성공수·성공률은 원자값 나눗셈 |
 | `gi_tap_sc` `gi_tap_sr` | — | 삭제(계산) |
 | `gi_ttp_sc` `gi_ttp_sr` `gi_ttp_pr` | — | 삭제(계산) |
-| `gi_score` | `teamRating` | **이동 + 형태 변경** — 계산은 `jpd-rating`(대외비)이 하고 결과값(5분구간 JMX 시계열)만 되돌려받는다. 공식은 여전히 밖으로 안 나간다 |
+| `gi_score` | `teamRating.jmx` / `teamRating.jmxSeries` | **이동 + 형태 변경** — jpd-did는 5분 구간 1~20의 누적 KPI 원자값만 `jpd-rating`(대외비)에 보내고, 구간별 JMX 계산(공식)은 그쪽에서만 한다. 되돌려받는 건 계산 결과뿐 — `jmx`(경기 최종값 하나)와 `jmxSeries`(구간 1~20 시계열) 둘 다. 공식은 여전히 밖으로 안 나간다 |
+| — | `teamRating.apx/apxGrade/tpx/tpxGrade/fpx/fpxGrade` | **신규** — jpd-rating이 계산해 되돌려준 값. 확정 전엔 null |
+| — | `kpiVersion` / `ratingBasedOn` | 신규 — jpd-rating 왕복 버전 확인용 |
 | — | `kpiComputedAt` / `syncedAt` | 신규 — 스냅샷 신선도·동기화 멱등성 |
+
+> **5분 구간 JMX 시계열(`teamRating.jmxSeries`)도 저장한다.** 확정(`status:'final'`) 시점에 jpd-rating이 되돌려준 값을 한 번 얼려서 그대로 저장 — `PathSnapshotDoc`/`PlayerStatsDoc`과 같은 "확정 스냅샷" 패턴(원칙 3의 정당한 예외). `multiSheet` 출력은 이 값을 다시 계산하지 않고 그대로 꽂아 쓴다.
 | — | `maxSeq` | 신규 — 레코드 정렬키 발급 |
 | — | `lineup` | **신규 위치** — `ff_game_player` 구성 부분이 여기로 |
 
@@ -218,6 +222,7 @@
 | `gp_sht_sc/tr` | — | 삭제(계산) |
 | `gp_gol_tr` | — | 삭제(계산) |
 | `gp_score_rel` `gp_score_abs` `gp_score` | `scoreRel` `scoreAbs` `score` | **이동** — 계산은 `jpd-rating`(대외비)이 하고 결과값만 되돌려받아 채운다. 확정 전엔 `null` |
+| (레거시에 없음) | `jmx` `apx` `apxGrade` `tpx` `tpxGrade` `fpx` `fpxGrade` | **신규** — jpd-rating이 계산해 되돌려준 값. `jmx`는 선수당 경기 최종값 하나(팀과 달리 5분구간 아님). 확정 전엔 `null` |
 | `p_id` | `playerId` | **신규 재도입** — 문서 ID와 중복이지만 `collectionGroup` 쿼리 전용. "선수 한 명의 전 경기"를 경로 없이 검색하려면 필드로도 있어야 한다(SQL의 `p_id` 컬럼과 같은 이유) |
 
 ## ff_game_player_log (10) → `LineupEntry`에 병합
@@ -415,3 +420,4 @@ DID 입력 → jpd-did KPI → jpd-rating 평점 → jpd-did 조립 → JaionX �
 | 잠금 상태 | `h1Locked`/`h2Locked`를 `RecordingDoc` 필드로 편입 — 실연동 시 실시간 구독으로 자동 동기화 |
 | 2인 기록 동시 편집 | 항상 `updateDoc`(부분 갱신). 레코드 생성 충돌 자체는 `createdBy`/`playerIdBy` 구조상 안 생김 |
 | JaionX 전송 멱등성 | `exportJobs` 문서 ID = `gm_id + team_type`(자연키) — 재시도해도 중복 행 없음 |
+| 5분단위 평점(`jmxSeries`) | jpd-did가 구간 1~20 누적 KPI 원자값을 jpd-rating에 보내고, 구간별 JMX 계산(공식)은 그쪽에서 함 — 공식이 jpd-did 밖으로 안 나가게 하기 위함. 되돌려받은 시계열은 확정 시점에 `teamRating.jmxSeries`로 저장, `multiSheet`는 이 값을 그대로 씀 |
