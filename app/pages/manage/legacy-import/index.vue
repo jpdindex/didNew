@@ -414,7 +414,13 @@ async function runImport() {
       for (const r of rows) {
         const gmId = s(r.gm_id)
         const match = matchesById.get(gmId)
-        const side: 'H' | 'A' = match && match.homeTeamId === s(r.gi_h_t_code) ? 'H' : 'A'
+        // gi_write_code(DB 컬럼값 자체, 'H'|'A')를 그대로 쓴다 — 팀ID 비교로 추측하면
+        // match 조회가 실패하거나 팀ID가 어긋났을 때 둘 다 같은 side로 잘못 계산돼서
+        // 한쪽(A) 문서가 통째로 안 만들어지거나 다른 쪽에 덮어써질 수 있다.
+        const writeCode = s(r.gi_write_code).toUpperCase()
+        const side: 'H' | 'A' = writeCode === 'H' || writeCode === 'A'
+          ? writeCode
+          : (match && match.homeTeamId === s(r.gi_h_t_code) ? 'H' : 'A')
         recordingByGiId.set(s(r.gi_id), { gmId, side })
         items.push({
           path: `matches/${gmId}/recordings`, id: side,
