@@ -39,7 +39,7 @@
 //   - LineupEntry.no/pos는 그 경기 날짜에 유효했던 ff_player_team 계약에서 채운다. 겹치는
 //     계약이 없으면 가장 가까운 과거 계약으로 대체한다(완벽하진 않음, 로그에 표시).
 
-import { Timestamp, writeBatch, doc, collection, type Firestore } from 'firebase/firestore'
+import { Timestamp, writeBatch, doc, collection, collectionGroup, getDocs, type Firestore } from 'firebase/firestore'
 
 const { $db } = useNuxtApp()
 const db = $db as Firestore
@@ -212,16 +212,22 @@ function doParse() {
 // 4. Firestore 쓰기 — 500개씩 배치
 // ---------------------------------------------------------------------------
 
-async function commitInChunks(items: { path: string; id: string; data: Record<string, unknown> }[]) {
+async function commitInChunks(items: { path: string; id: string; data: Record<string, unknown> }[], resumeKey = '') {
+  const saved = resumeKey ? Number(localStorage.getItem(`legacy-import:${resumeKey}`) ?? 0) : 0
+  if (saved) addLog(`  ↻ ${resumeKey}: ${saved}번 배치까지 완료되어 이후부터 재개`)
   for (let i = 0; i < items.length; i += 450) {
+    const batchNo = Math.floor(i / 450) + 1
+    if (batchNo <= saved) continue
     const chunk = items.slice(i, i + 450)
     const batch = writeBatch(db)
     for (const item of chunk) {
       batch.set(doc(collection(db, item.path), item.id), item.data, { merge: true })
     }
     await batch.commit()
+    if (resumeKey) localStorage.setItem(`legacy-import:${resumeKey}`, String(batchNo))
     addLog(`  → ${Math.min(i + 450, items.length)}/${items.length} 저장`)
   }
+  if (resumeKey) localStorage.removeItem(`legacy-import:${resumeKey}`)
 }
 
 async function runImport() {
@@ -482,7 +488,17 @@ async function runImport() {
           }
         })
       }
-      await commitInChunks(items)
+      // 이전 실행에서 이미 저장된 레코드는 배치 진행 위치와 관계없이 건너뛴다.
+      // 기존 이관분과 새로 재개하는 이관분을 안전하게 섞을 수 있도록 문서 경로 전체를 비교한다.
+      addLog('  기존 records 확인 중...')
+      const existing = new Set<string>()
+      const existingSnap = await getDocs(collectionGroup(db, 'records'))
+      for (const d of existingSnap.docs) existing.add(`${d.ref.parent.parent?.path}/records/${d.id}`)
+      const pending = items.filter(item => !existing.has(`${item.path}/${item.id}`))
+      addLog(`  기존 ${items.length - pending.length}건 건너뜀, 신규 ${pending.length}건 저장`)
+      // 기존 문서 탐색 결과가 실제 기준이므로 과거 배치 오프셋은 무효화한다.
+      localStorage.removeItem('legacy-import:records')
+      await commitInChunks(pending, 'records')
       if (skipped) addLog(`  ⚠️ recordings를 못 찾아 건너뛴 레코드 ${skipped}건 (ff_game_info에 해당 gi_id 없음)`)
     }
 

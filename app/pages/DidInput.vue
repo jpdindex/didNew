@@ -16,7 +16,7 @@ import {
   type GrassPattern,
 } from '~/utils/grass'
 import { GOAL_TARGET, goalFramePoint, goalOuterPoint, isWithinGoalOneMeter } from '~/utils/goalCoordinates'
-import type { HalfStatus } from '~/composables/useMatchState'
+import type { HalfStatus, SubRecord, CardRecord } from '~/composables/useMatchState'
 
 const route = useRoute()
 const home = computed(() => String(route.query.home ?? route.query.homeName ?? 'Vallecano').trim() || 'Vallecano')
@@ -74,9 +74,18 @@ function selectHalf(target: '전반' | '후반') {
   seconds.value = target === '전반' ? game.value.h1Seconds : game.value.h2Seconds
 }
 let timer: ReturnType<typeof setInterval> | undefined
+let tickStartedAt = 0
+let tickBaseSeconds = 0
 function startTicking() {
   if (timer) clearInterval(timer)
-  timer = setInterval(() => { seconds.value++ }, 1000)
+  // setInterval 호출 횟수 대신 실제 시각을 기준으로 계산한다.
+  // 브라우저가 백그라운드 탭의 타이머를 지연시켜도 초가 10초 단위로 튀지 않는다.
+  tickStartedAt = Date.now()
+  tickBaseSeconds = seconds.value
+  timer = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - tickStartedAt) / 1000)
+    seconds.value = tickBaseSeconds + elapsed
+  }, 250)
 }
 onMounted(() => {
   if (!isEditMode) startTicking() // 수정 모드는 시간을 멈춘 채로 시작한다
@@ -295,6 +304,153 @@ const lineup = computed(() => {
   ]
   return ordered.map((p, i) => ({ ...p, slot: LINEUP_SLOTS[i] ?? { x: 50, y: 50 } }))
 })
+
+// ---------------------------------------------------------------------------
+// 선수 교체 — 상단 ⇄ 아이콘으로 연다.
+// TeamSelection 의 교체 화면과 같은 일을 하지만, 이쪽은 시계가 도는 중이라
+// "몇 분에 교체했는지"(half + seconds)를 함께 남긴다는 점이 다르다.
+// 명단의 출처는 game.assigned — TeamSelection 에서 배치한 그 값이다.
+// (위 LINEUP_SLOTS/lineup 은 경기장에 아이콘을 뿌리기 위한 임시 표시용이라 여기선 안 쓴다)
+// ---------------------------------------------------------------------------
+const subOpen = ref(false)
+const cardOpen = ref(false)
+const cardPlayer = ref<number | null>(null)
+const cardType = ref<'Y' | 'R'>('Y')
+const cardMinute = ref(0)
+const cardSecond = ref(0)
+const cardQueue = ref<CardRecord[]>([])
+const cardByPlayer = computed(() => {
+  const map = new Map<number, CardRecord[]>()
+  for (const c of [...game.value.cards, ...cardQueue.value]) map.set(c.player, [...(map.get(c.player) ?? []), c])
+  return map
+})
+function openCardPanel() { cardOpen.value = !cardOpen.value; if (cardOpen.value) subOpen.value = false; cardPlayer.value = null; cardMinute.value = Math.floor(seconds.value / 60); cardSecond.value = seconds.value % 60 }
+function addCard() { if (cardPlayer.value === null) return; game.value.cards.push({ half: halfCode.value, seconds: cardMinute.value * 60 + cardSecond.value, player: cardPlayer.value, card: cardType.value }); cardPlayer.value = null }
+function queueCard() { if (cardPlayer.value === null) return; cardQueue.value.push({ half: halfCode.value, seconds: cardMinute.value * 60 + cardSecond.value, player: cardPlayer.value, card: cardType.value }); cardPlayer.value = null }
+function submitCards() { queueCard(); game.value.cards.push(...cardQueue.value); cardQueue.value = []; cardOpen.value = false }
+function cancelCards() { cardOpen.value = false; cardPlayer.value = null; cardQueue.value = [] }
+function removeQueuedCard(index: number) { cardQueue.value.splice(index, 1) }
+function removeCard(index: number) { game.value.cards.splice(index, 1) }
+function bumpCardMinute(d: number) { cardMinute.value = Math.max(0, cardMinute.value + d) }
+function bumpCardSecond(d: number) { let s = cardSecond.value + d; if (s < 0) { s = 59; bumpCardMinute(-1) }; if (s > 59) { s = 0; bumpCardMinute(1) }; cardSecond.value = s }
+const subOutSlot = ref<string | null>(null)
+const subInSlot = ref<string | null>(null)
+// 교체 시각 — 패널을 열면 지금 시계 값으로 채워주지만, 실제로 몇 분에 있었던 교체인지
+// 다를 수 있어서(예: 뒤늦게 입력하는 경우) 고칠 수 있어야 한다. 태블릿에서 쓰는 화면이라
+// 키보드로 숫자 입력하는 대신, 상단 -3/-1/+1/+3 시계 조정과 같은 방식(버튼 탭)으로 만든다.
+const subMinute = ref(0)
+const subSecond = ref(0)
+const subTotalSeconds = computed(() => subMinute.value * 60 + subSecond.value)
+function bumpSubMinute(delta: number) {
+  subMinute.value = Math.max(0, subMinute.value + delta)
+}
+function bumpSubSecond(delta: number) {
+  let s = subSecond.value + delta
+  let m = subMinute.value
+  if (s < 0) { s += 60; m = Math.max(0, m - 1) }
+  else if (s > 59) { s -= 60; m += 1 }
+  subSecond.value = s
+  subMinute.value = m
+}
+
+/** 슬롯 id → 그 자리에 있는 선수. 배치가 없으면 null */
+function playerAtSlot(slotId: string): SquadPlayer | null {
+  const idx = game.value.assigned[slotId]
+  return idx === undefined ? null : (squad.value[idx] ?? null)
+}
+
+/** 'gk' + 'o0..oN' = 그라운드에 있는 선수, 'b0..bN' = 벤치 */
+const onFieldSlots = computed(() =>
+  Object.keys(game.value.assigned)
+    .filter(id => id === 'gk' || id.startsWith('o'))
+    .sort((a, b) => (a === 'gk' ? -1 : b === 'gk' ? 1 : Number(a.slice(1)) - Number(b.slice(1))))
+    .map(id => ({ id, p: playerAtSlot(id) }))
+    .filter(s => s.p && !(cardByPlayer.value.get(game.value.assigned[s.id]!) ?? []).some(c => c.card === 'R'))
+)
+const benchSlots = computed(() =>
+  Object.keys(game.value.assigned)
+    .filter(id => id.startsWith('b'))
+    .sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)))
+    .map(id => ({ id, p: playerAtSlot(id) }))
+    .filter(s => s.p)
+)
+
+/** 한 번 빠진 선수는 다시 못 들어온다(축구 규칙) — 벤치에 있어도 고를 수 없게 막는다 */
+const subbedOutPlayers = computed(() => new Set(game.value.subs.map(s => s.outPlayer)))
+function isSubbedOut(slotId: string) {
+  const idx = game.value.assigned[slotId]
+  return idx !== undefined && subbedOutPlayers.value.has(idx)
+}
+
+const canSubmitSub = computed(() => subOutSlot.value !== null && subInSlot.value !== null)
+
+function openSubPanel() {
+  cardOpen.value = false
+  subOutSlot.value = null
+  subInSlot.value = null
+  subMinute.value = Math.floor(seconds.value / 60)
+  subSecond.value = seconds.value % 60
+  subOpen.value = true
+}
+function closeSubPanel() {
+  subOpen.value = false
+}
+
+function pickSubOut(slotId: string) {
+  subOutSlot.value = subOutSlot.value === slotId ? null : slotId
+}
+function pickSubIn(slotId: string) {
+  if (isSubbedOut(slotId)) return // 이미 교체돼 나간 선수는 재투입 불가
+  subInSlot.value = subInSlot.value === slotId ? null : slotId
+}
+
+/** half 순서(H1<H2<H3<H4) → 초 순으로 정렬 위치를 찾아 끼워 넣는다.
+ *  시각을 나중에 고쳐서 앞선 시점으로 넣어도, 이력표엔 항상 시간순으로 보여야 한다. */
+const HALF_ORDER: Record<string, number> = { H1: 1, H2: 2, H3: 3, H4: 4 }
+function insertSubSorted(list: SubRecord[], sub: SubRecord): SubRecord[] {
+  const key = (s: SubRecord) => HALF_ORDER[s.half] * 100000 + s.seconds
+  const next = [...list]
+  let i = 0
+  while (i < next.length && key(next[i]) <= key(sub)) i++
+  next.splice(i, 0, sub)
+  return next
+}
+
+function submitSub() {
+  const outSlot = subOutSlot.value
+  const inSlot = subInSlot.value
+  if (!outSlot || !inSlot) return
+  const outPlayer = game.value.assigned[outSlot]
+  const inPlayer = game.value.assigned[inSlot]
+  if (outPlayer === undefined || inPlayer === undefined) return
+
+  // 자리를 맞바꾼다 — 들어온 선수가 나간 선수의 슬롯(포지션)을 그대로 이어받는다.
+  game.value.assigned = { ...game.value.assigned, [outSlot]: inPlayer, [inSlot]: outPlayer }
+  game.value.subs = insertSubSorted(game.value.subs, {
+    half: halfCode.value, seconds: subTotalSeconds.value, outPlayer, inPlayer,
+  })
+  subOutSlot.value = null
+  subInSlot.value = null
+}
+
+/** 잘못 넣은 교체 되돌리기 — 자리도 원래대로 돌려놓는다 */
+function undoSub(index: number) {
+  const s = game.value.subs[index]
+  if (!s) return
+  const entries = Object.entries(game.value.assigned)
+  const inSlot = entries.find(([, idx]) => idx === s.inPlayer)?.[0]
+  const outSlot = entries.find(([, idx]) => idx === s.outPlayer)?.[0]
+  if (inSlot && outSlot) {
+    game.value.assigned = { ...game.value.assigned, [inSlot]: s.outPlayer, [outSlot]: s.inPlayer }
+  }
+  game.value.subs = game.value.subs.filter((_, i) => i !== index)
+}
+
+const subHalfLabel: Record<string, string> = { H1: '전반', H2: '후반', H3: '연장전반', H4: '연장후반' }
+function playerLabel(idx: number) {
+  const p = squad.value[idx]
+  return p ? `${p.no} ${p.name}` : '-'
+}
 
 // 버튼은 항상 활성 상태로 둔다. 블락/실책이 언제 나올지 알 수 없기 때문에
 // 상황에 따라 흐려지면 안 된다. 유효하지 않은 클릭은 각 핸들러에서 무시한다.
@@ -640,7 +796,7 @@ function finishHalf() {
       <div class="frame" :class="{ mirrored: game.mirrored }">
       <section class="left">
         <div class="statBar">
-          <div class="cardIcon">🟨🟥</div>
+          <button class="cardIcon" :class="{ on: cardOpen }" title="카드 입력" @click="openCardPanel">🟨🟥</button>
           <button class="stat" @click="stepSeconds(-3)">-3</button>
           <button class="stat" @click="stepSeconds(-1)">-1</button>
           <div class="spacer" />
@@ -674,7 +830,7 @@ function finishHalf() {
               <button class="popOk" @click="grassOpen = false">확인</button>
             </div>
           </div>
-          <div class="swapIcon">⇄</div>
+          <button class="swapIcon" :class="{ on: subOpen }" title="선수 교체" @click="openSubPanel">⇄</button>
           <button
             v-if="inputMode === '분석'"
             class="pauseBtn"
@@ -785,9 +941,93 @@ function finishHalf() {
           </div>
         </div>
 
-        <h1>{{ playerPickFor ? '선수선택' : 'DID-INPUT' }}</h1>
+        <h1>{{ cardOpen ? '카드 입력' : subOpen ? '선수교체' : playerPickFor ? '선수선택' : 'DID-INPUT' }}</h1>
 
-        <template v-if="!playerPickFor">
+        <div v-if="cardOpen" class="cardPanel">
+          <div class="cardTypes"><button :class="{selected: cardType === 'Y'}" @click="cardType='Y'">🟨 경고</button><button :class="{selected: cardType === 'R'}" @click="cardType='R'">🟥 퇴장</button></div>
+          <div class="cardTime"><span>{{ half }} 시각</span><span class="timeStepper"><button @click="bumpCardMinute(-1)">−</button><strong>{{ String(cardMinute).padStart(2,'0') }}</strong><button @click="bumpCardMinute(1)">＋</button></span><b>:</b><span class="timeStepper"><button @click="bumpCardSecond(-1)">−</button><strong>{{ String(cardSecond).padStart(2,'0') }}</strong><button @click="bumpCardSecond(1)">＋</button></span></div>
+          <div class="cardPlayers"><button v-for="p in onFieldSlots" :key="p.id" :class="[p.p!.pos?.toLowerCase(), {selected: cardPlayer === game.assigned[p.id]}]" @click="cardPlayer = game.assigned[p.id]"><strong>{{ p.p!.no }}</strong><span>{{ p.p!.name }}</span></button></div>
+          <div class="cardSelected">{{ cardPlayer === null ? '선수를 선택하세요' : playerLabel(cardPlayer) }} · {{ cardType === 'Y' ? '🟨 경고' : '🟥 퇴장' }} <button v-if="cardPlayer !== null" class="queueBtn" @click="queueCard">목록에 추가</button></div>
+          <div class="cardHistory"><div class="cardHistHead"><span>Half</span><span>Time</span><span>Player</span><span>Card</span><span></span></div><div v-for="(c,i) in [...game.cards, ...cardQueue]" :key="i" class="cardHistRow"><span>{{ subHalfLabel[c.half] }}</span><span>{{ fmtTime(c.seconds) }}</span><span>{{ playerLabel(c.player) }}</span><span>{{ c.card === 'Y' ? '🟨 경고' : '🟥 퇴장' }}</span><button class="cardRowCancel" @click="i >= game.cards.length ? removeQueuedCard(i - game.cards.length) : removeCard(i)">취소</button></div></div>
+          <div class="cardActions"><button @click="cancelCards">Cancel</button><button :disabled="cardPlayer === null && !cardQueue.length" @click="submitCards">Submit</button></div>
+        </div>
+
+        <!-- 선수교체: 선수선택과 마찬가지로 액트 입력창 자리에서 UI 를 전환한다.
+             경기장·기록표(왼쪽)는 그대로 보여야 하므로 화면을 덮지 않는다. -->
+        <div v-if="subOpen" class="group subGroup">
+          <div class="subTimeRow">
+            <span class="subTimeLabel">{{ half }} 교체 시각</span>
+            <div class="subTimeStepper">
+              <button class="subTimeBtn" @click="bumpSubMinute(-1)">－</button>
+              <span class="subTimeNum">{{ String(subMinute).padStart(2, '0') }}</span>
+              <button class="subTimeBtn" @click="bumpSubMinute(1)">＋</button>
+            </div>
+            <span class="subTimeColon">:</span>
+            <div class="subTimeStepper">
+              <button class="subTimeBtn" @click="bumpSubSecond(-1)">－</button>
+              <span class="subTimeNum">{{ String(subSecond).padStart(2, '0') }}</span>
+              <button class="subTimeBtn" @click="bumpSubSecond(1)">＋</button>
+            </div>
+          </div>
+
+          <div class="subCols">
+            <div class="subSection">
+              <div class="subColHead"><span>선수목록</span><span class="subColHint">나갈 선수</span></div>
+              <div class="subGrid">
+                <button
+                  v-for="s in onFieldSlots" :key="s.id"
+                  class="subCard" :class="[`pos${s.p!.pos}`, { out: subOutSlot === s.id }]"
+                  @click="pickSubOut(s.id)"
+                >
+                  <span class="subNo">{{ s.p!.no }}</span>
+                  <span class="subName">{{ s.p!.name }}</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="subSection">
+              <div class="subColHead"><span>대기목록</span><span class="subColHint">들어올 선수</span></div>
+              <div class="subGrid">
+                <button
+                  v-for="s in benchSlots" :key="s.id"
+                  class="subCard"
+                  :class="[`pos${s.p!.pos}`, { in: subInSlot === s.id, done: isSubbedOut(s.id) }]"
+                  :disabled="isSubbedOut(s.id)"
+                  @click="pickSubIn(s.id)"
+                >
+                  <span class="subNo">{{ s.p!.no }}</span>
+                  <span class="subName">{{ s.p!.name }}</span>
+                  <span v-if="isSubbedOut(s.id)" class="subDoneTag">교체됨</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="subHistory">
+            <div class="subHistHead">
+              <span class="hHalf">Half</span>
+              <span class="hTime">Time</span>
+              <span class="hP">Out</span>
+              <span class="hP">In</span>
+              <span class="hAct"></span>
+            </div>
+            <div v-if="!game.subs.length" class="subHistEmpty">교체 기록이 없습니다.</div>
+            <div v-for="(s, i) in game.subs" v-else :key="i" class="subHistRow">
+              <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
+              <span class="hTime">{{ fmtTime(s.seconds) }}</span>
+              <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
+              <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
+              <span class="hAct"><button class="subUndo" @click="undoSub(i)">취소</button></span>
+            </div>
+          </div>
+
+          <div class="subActions">
+            <button class="subCancel" @click="closeSubPanel">Close</button>
+            <button class="subSubmit" :disabled="!canSubmitSub" @click="submitSub">Submit</button>
+          </div>
+        </div>
+
+        <template v-else-if="!cardOpen && !subOpen && !playerPickFor">
         <div class="group">
           <div class="groupTitle">Kick</div>
           <div class="kickGrid">
@@ -830,7 +1070,7 @@ function finishHalf() {
         </template>
 
         <!-- 선수선택: PPT 대로 액트 입력창 자리에서 UI 를 전환한다 -->
-        <div v-else class="group pickGroup">
+        <div v-if="!cardOpen && !subOpen && playerPickFor" class="group pickGroup">
           <div class="pickField">
             <button
               v-for="p in lineup"
@@ -850,6 +1090,7 @@ function finishHalf() {
           </div>
         </div>
       </section>
+
       </div>
     </div>
   </div>
@@ -868,6 +1109,11 @@ function finishHalf() {
 .left{min-width:0;background:#1b1e22;display:flex;flex-direction:column}
 .statBar{position:relative;flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.08)}
 .cardIcon{font-size:14px}
+.cardRowCancel{padding:2px 6px;border:1px solid rgba(255,255,255,.2);border-radius:3px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.7);font-size:10px}
+.cardHistHead,.cardHistRow{display:grid;grid-template-columns:44px 44px 1fr 78px 38px;align-items:center;gap:4px;padding:5px 7px;font-size:10px}.cardHistHead{background:#1b2130;color:rgba(255,255,255,.45);font-weight:600}.cardHistRow{border-top:1px solid rgba(255,255,255,.06)}
+.cardPlayers button{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px}.cardPlayers button strong{font-size:20px;line-height:1;font-weight:900}.cardPlayers button span{font-size:9px;color:rgba(255,255,255,.65);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}.cardPlayers button.gk strong{color:rgba(255,255,255,.65)}.cardPlayers button.fw strong{color:#5fb8c9}.cardPlayers button.mf strong{color:#d98671}.cardPlayers button.df strong{color:#93b56a}
+.cardIcon{border:1px solid rgba(255,255,255,.15);background:transparent;color:#fff;border-radius:4px;cursor:pointer;padding:5px 8px}.cardIcon.on{background:rgba(240,180,41,.2);border-color:#f0b429}
+.cardPanel{height:100%;box-sizing:border-box;padding:14px;display:flex;flex-direction:column;gap:10px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.18);border-radius:6px}.cardTypes{display:flex;gap:8px}.cardTypes button{flex:1;padding:10px;border:1px solid rgba(255,255,255,.2);border-radius:4px;background:rgba(255,255,255,.06);color:#fff}.cardTypes .selected{border-color:#f0b429;background:rgba(240,180,41,.2)}.cardTime{display:flex;align-items:center;justify-content:center;gap:6px;color:#f0b429}.cardTime button{width:24px;height:24px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.2);color:#fff;border-radius:4px}.cardTime strong{min-width:24px;text-align:center}.cardPlayers{flex:0 0 auto;display:grid;grid-template-columns:repeat(4,1fr);grid-auto-rows:42px;gap:6px;align-content:start}.cardPlayers button{padding:5px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.04);color:#ddd;border-radius:4px;font-size:11px}.cardPlayers button.selected{border-color:#f0b429;background:rgba(240,180,41,.15)}.cardSelected{text-align:center;color:rgba(255,255,255,.7);font-size:12px}.cardHistory{min-height:70px;max-height:120px;overflow:auto;padding:6px;border:1px solid rgba(255,255,255,.1);font-size:11px;color:rgba(255,255,255,.7);line-height:1.7}.cardActions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.cardActions button{padding:11px;border:1px solid #f0b429;border-radius:4px;background:transparent;color:#f0b429;font-weight:700}.cardActions button:last-child{background:#f0b429;color:#191919}.cardActions button:disabled{opacity:.4}
 .stat{height:26px;padding:0 10px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#ddd;font-weight:800;cursor:pointer}
 .spacer{flex:1}
 .grassIcon,.swapIcon{width:26px;height:26px;display:grid;place-items:center;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#ddd;font-size:13px;padding:0;cursor:pointer}
@@ -1035,5 +1281,57 @@ section.right h1{margin:0;text-align:center;color:#fff;font-size:20px}
 .goalResultBtn.resGoal:hover{background:rgba(240,180,41,.3)}
 /* 프레임 안쪽에 찍어둔 위치 마커. 결과가 확정되기 전까지(B/GOAL/X 누르기 전) 계속 보인다. */
 .frameMarker{position:absolute;width:16px;height:16px;margin:-8px;border-radius:50%;background:rgba(240,180,41,.85);border:2px solid #fff;box-shadow:0 0 0 5px rgba(240,180,41,.3);pointer-events:none;z-index:4}
+
+/* ---- 선수 교체 --------------------------------------------------------------
+   선수선택(pickGroup)과 같은 자리 — 액트 입력창 영역 안에서만 화면을 바꾼다.
+   왼쪽 경기장·기록표는 계속 보여야 하므로 절대 덮지 않는다. */
+.swapIcon.on{border-color:rgba(240,180,41,.7);background:rgba(240,180,41,.18);color:#f0b429}
+.subGroup{display:flex;flex-direction:column;gap:12px;min-height:0}
+.subTimeRow{display:flex;align-items:center;justify-content:center;gap:10px}
+.subTimeLabel{color:rgba(255,255,255,.6);font-size:13px;margin-right:4px}
+.subTimeColon{color:#f0b429;font-weight:700;font-size:16px}
+.subTimeStepper{display:flex;align-items:center;gap:4px}
+.subTimeBtn{width:26px;height:26px;border-radius:5px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#ddd;font-size:14px;line-height:1;cursor:pointer;padding:0}
+.subTimeBtn:hover{border-color:rgba(240,180,41,.6);color:#f0b429}
+.subTimeNum{display:inline-block;min-width:34px;text-align:center;color:#f0b429;font-family:ui-monospace,monospace;font-size:16px;font-weight:700}
+.subCols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.subSection{min-width:0}
+.subColHead{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
+.subColHead span:first-child{color:rgba(255,255,255,.85);font-weight:700;font-size:13px}
+.subColHint{color:rgba(255,255,255,.4);font-size:10px}
+.subGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.subCard{position:relative;display:flex;flex-direction:column;align-items:center;gap:4px;padding:18px 4px;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);cursor:pointer;overflow:hidden}
+.subCard:hover{border-color:rgba(255,255,255,.35)}
+.subNo{font-weight:700;font-size:28px;line-height:1}
+.subName{color:rgba(255,255,255,.65);font-size:11px;line-height:1.2;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+/* 포지션 색 — TeamSelection.vue 의 .player.gk/fw/mf/df strong 색을 그대로 옮긴 것(§831행대) */
+.subCard.posGK .subNo{color:rgba(255,255,255,.55)}
+.subCard.posFW .subNo{color:#5fb8c9}
+.subCard.posMF .subNo{color:#d98671}
+.subCard.posDF .subNo{color:#93b56a}
+.subCard.out{border-color:#ef4444;background:rgba(239,68,68,.16)}
+.subCard.in{border-color:#f0b429;background:rgba(240,180,41,.18)}
+.subCard.done{opacity:.4;cursor:not-allowed}
+.subCard.done:hover{border-color:rgba(255,255,255,.12)}
+.subDoneTag{position:absolute;top:1px;right:1px;font-size:7px;color:rgba(255,255,255,.5);border:1px solid rgba(255,255,255,.2);border-radius:3px;padding:0 2px}
+
+.subHistory{border:1px solid rgba(255,255,255,.08);border-radius:6px;display:flex;flex-direction:column}
+.subHistHead,.subHistRow{display:grid;grid-template-columns:60px 64px 1fr 1fr 60px;align-items:center;gap:8px;padding:8px 10px;font-size:13px}
+.subHistHead{background:#1b2130;color:rgba(255,255,255,.45);font-weight:600;border-radius:6px 6px 0 0}
+.subHistRow{border-top:1px solid rgba(255,255,255,.06);color:rgba(255,255,255,.8)}
+.subHistRow .hP{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.subHistRow .outP{color:#f87171}
+.subHistRow .inP{color:#f0b429}
+.subHistEmpty{padding:18px;text-align:center;color:rgba(255,255,255,.35);font-size:12px}
+.subUndo{border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:rgba(255,255,255,.6);font-size:11px;border-radius:4px;padding:3px 8px;cursor:pointer}
+.subUndo:hover{color:#fff;border-color:rgba(239,68,68,.5)}
+
+.subActions{display:flex;justify-content:center;gap:16px}
+.subCancel,.subSubmit{min-width:140px;padding:14px 20px;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer}
+.subCancel{border:1px solid rgba(255,255,255,.18);background:transparent;color:rgba(255,255,255,.7)}
+.subCancel:hover{color:#fff;border-color:rgba(255,255,255,.4)}
+.subSubmit{border:1px solid rgba(240,180,41,.6);background:rgba(240,180,41,.2);color:#f0b429;font-weight:700}
+.subSubmit:hover:not(:disabled){background:rgba(240,180,41,.32)}
+.subSubmit:disabled{opacity:.35;cursor:not-allowed}
 
 </style>

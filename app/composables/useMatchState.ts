@@ -1,6 +1,6 @@
 import type { DidRecord } from '~/utils/didLogic'
 import type { GrassLines, GrassPattern } from '~/utils/grass'
-import type { HalfStatus, RecorderLevel } from '~/types/schema'
+import type { Half, HalfStatus, RecorderLevel } from '~/types/schema'
 
 // TeamSelection ↔ DidInput 이 공유하는 임시 상태.
 // Firestore 연동 전까지 useState 로 메모리에만 들고 있는다 (새로고침하면 사라짐).
@@ -11,6 +11,23 @@ import type { HalfStatus, RecorderLevel } from '~/types/schema'
 // recorders.level 과 같은 타입을 써야 나중에 Firestore 연동 시 값이 어긋나지 않는다.
 // 기존 import 경로(~/composables/useMatchState)를 쓰는 다른 파일들이 계속 동작하도록 재수출한다.
 export type { HalfStatus, RecorderLevel }
+
+/**
+ * 선수 교체 1건. 레거시 ff_game_player_log 대응이지만, 새 스키마에는 별도 컬렉션이
+ * 없고 RecordingDoc.lineup[playerId] 의 inHalf/inSeconds/outHalf/outSeconds 로 병합된다
+ * (docs/05_legacy_field_mapping.md). 화면에서는 "교체 이력" 표를 그려야 해서 이벤트
+ * 단위로 들고 있다가, Firestore 저장 단계에서 lineup 쪽으로 접어 넣는다.
+ *
+ * outPlayer/inPlayer 는 players(HOME_SQUAD/AWAY_SQUAD) 배열의 인덱스다 —
+ * assigned 와 같은 키 체계를 써야 슬롯이 바뀌어도 사람이 안 바뀐다.
+ */
+export interface SubRecord {
+  half: Half
+  seconds: number
+  outPlayer: number
+  inPlayer: number
+}
+export interface CardRecord { half: Half; seconds: number; player: number; card: 'Y' | 'R' }
 
 export interface MatchState {
   // 어느 경기의 상태인지. schedule 에서 다른 경기를 새로 선택하면 초기화 판단 기준이 된다.
@@ -39,6 +56,10 @@ export interface MatchState {
   homeScore: number
   awayScore: number
   records: DidRecord[]
+  // 선수 교체 이력. 경기 시작 전(halfStatus:'ready')의 라인업 변경은 교체가 아니므로
+  // 여기 남기지 않는다 — 그건 그냥 명단을 고치는 것이다.
+  subs: SubRecord[]
+  cards: CardRecord[]
   // ---- 갱신(=KPI 확정) 흐름. §11.2.1 참고 ----
   recorderLevel: RecorderLevel
   // 전반전/후반전 갱신을 누르면 true. basic 등급에서만 의미가 있으며, true 인 동안은
@@ -65,6 +86,8 @@ function defaultMatchState(): MatchState {
     homeScore: 0,
     awayScore: 0,
     records: [],
+    subs: [],
+    cards: [],
     recorderLevel: 'advanced',
     h1Locked: false,
     h2Locked: false,

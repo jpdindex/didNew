@@ -839,6 +839,12 @@ posY = gr_pos_y / 634 * 100</pre>
   </div>
   <p class="ind"><strong>어느 팀 소속인지는 시간에 따라 변하므로 여기 두지 않는다.</strong> 그건 계약 원장의 일이다.</p>
 
+  <div class="call">
+    <div class="h">playerId 는 gm_id 와 같은 방식 — 사람이 직접 채번한다</div>
+    <p>레거시 <code class="inl">p_id</code>는 <strong>10자리 숫자를 0으로 채운 순번</strong>이다(예: <code class="inl">0000007813</code> → 다음 선수 <code class="inl">0000007814</code>). 팀 코드가 섞이거나 하는 규칙 없이, 데이터 입력 담당자가 마지막 번호를 보고 그냥 하나씩 손으로 올려서 입력해왔다.</p>
+    <p>새 "선수 관리" 화면을 만들 때도 이 관행을 그대로 잇는다 — <strong>현재 가장 큰 playerId 에 +1 해서 10자리로 0을 채운 값</strong>을 다음 선수 ID로 쓴다. Firestore 에는 SQL 의 auto_increment 가 없으므로, 마지막 번호를 기억해두는 카운터 문서(예: <code class="inl">counters/playerId</code>)를 두고 등록할 때마다 읽어서 +1 하는 방식으로 구현해야 한다 — 아직 미구현.</p>
+  </div>
+
   <h3>ff_player_team (8) → ContractDoc — 이적시장 원장 <span class="star">★</span></h3>
   <div class="tbl-wrap">
     <table>

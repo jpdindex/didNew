@@ -23,8 +23,17 @@ export type Half = 'H1' | 'H2' | 'H3' | 'H4'
 /** recordings 문서 ID와 동일. gi_write_code 대응 (§3, §6) */
 export type Side = 'H' | 'A'
 
-/** recordings.status. 화면 상태와 1:1이라 매핑 코드가 필요 없다 (§6) */
-export type HalfStatus = 'ready' | 'H1' | 'H1_done' | 'H2' | 'H2_done' | 'final'
+/** recordings.status. 화면 상태와 1:1이라 매핑 코드가 필요 없다 (§6).
+ *  H3/H4 는 연장 전·후반 — 토너먼트에서만 쓴다. 리그 경기는 H2_done 다음이 바로 final 이다.
+ *  Half 타입·halves 맵·fieldSideEx 가 이미 연장을 받게 되어 있었는데 status 에만 값이
+ *  없어서 "연장 진행 중"을 표현할 수 없었다 — 그 구멍을 메운 것이다. */
+export type HalfStatus =
+  | 'ready'
+  | 'H1' | 'H1_done'
+  | 'H2' | 'H2_done'
+  | 'H3' | 'H3_done'
+  | 'H4' | 'H4_done'
+  | 'final'
 
 /** 집계·전송 트리거를 가른다. 레코드 저장 자체는 두 모드 동일 (§11.2) */
 export type InputMode = '분석' | '실시간'
