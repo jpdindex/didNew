@@ -1,0 +1,12 @@
+{
+  "name": "didnew-firestore-migration",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dry-run": "node import-legacy.mjs --dry-run",
+    "import": "node import-legacy.mjs"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.0"
+  }
+}
