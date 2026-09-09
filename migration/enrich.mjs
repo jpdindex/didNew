@@ -33,7 +33,7 @@ export function enrich(plan, tables) {
     if(name) {
       const id=encodeURIComponent(name.replace(/\s+/g,'-'))
       d.currentCoachId=id
-      docs.set(`coaches/${id}`,{name,nameKr:str(x.t_coach_kr),nameEn:str(x.t_coach),active:true,createdAt:Timestamp.fromMillis(0),updatedAt:Timestamp.fromMillis(0),createdBy:'legacy-import',updatedBy:'legacy-import'})
+      docs.set(`coaches/${id}`,{name,nameKr:str(x.t_coach_kr),nameEn:str(x.t_coach),active:true,createdAt:Timestamp.now(),updatedAt:Timestamp.now(),createdBy:'legacy-import',updatedBy:'legacy-import'})
     }
   }
   for(const x of rows('ff_game_info')) {

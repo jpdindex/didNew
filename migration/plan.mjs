@@ -6,7 +6,7 @@ export function half(value, nullable = false) {
   return `H${h}`
 }
 export async function buildPlan(tables) {
-const now=Timestamp.fromMillis(0), s=x=>x==null?'':String(x), n=x=>Number(x)||0
+const now=Timestamp.now(), s=x=>x==null?'':String(x), n=x=>Number(x)||0
 const date=x=>s(x).replaceAll('.', '-').slice(0,10)
 const seasonId=x=>s(x).replace(/\D/g,'')
 const isOpen=x=>!x||s(x)==='9999.99.99'||s(x)==='9999-99-99'
