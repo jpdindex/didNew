@@ -522,13 +522,16 @@ async function runImport() {
           // 레거시엔 포메이션 슬롯 개념이 없어 playerId를 그대로 슬롯 값으로 쓴다(v1 타협)
           slot: playerId,
           order: n(r.gp_order),
-          type: r.gp_type === 'BENCH' ? 'BENCH' : 'START',
+          type: r.gp_type === 'ST' ? 'BENCH' : 'START',
           no, pos,
           name: playerNameById.get(playerId) ?? '',
-          inHalf: r.gp_in_half ? normalizeHalf(r.gp_in_half) : null,
-          inSeconds: r.gp_in_half_seconds != null ? n(r.gp_in_half_seconds) : null,
-          outHalf: r.gp_out_half ? normalizeHalf(r.gp_out_half) : null,
-          outSeconds: r.gp_out_half_seconds != null ? n(r.gp_out_half_seconds) : null
+          // gp_* time values are per-player duration values.  LineupEntry
+          // stores event-clock times: starters begin at H1 0 and substitute
+          // entry/exit is filled exclusively from ff_game_player_log below.
+          inHalf: r.gp_type === 'ST' ? null : 'H1',
+          inSeconds: r.gp_type === 'ST' ? null : 0,
+          outHalf: null,
+          outSeconds: null
         }
         lineupByRecording.set(key, map)
       }

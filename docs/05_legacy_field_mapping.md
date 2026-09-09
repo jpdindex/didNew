@@ -185,10 +185,8 @@
 | `gi_id` / `p_id` | — | 삭제(경로) — 경로 + 맵 키 |
 | `gp_type` | `type` (`START`/`BENCH`) | **이름변경** |
 | `gp_order` | `order` | 이름변경 |
-| `gp_in_half` | `inHalf` | 이름변경 |
-| `gp_in_half_seconds` | `inSeconds` | 이름변경 |
-| `gp_out_half` | `outHalf` | 이름변경 |
-| `gp_out_half_seconds` | `outSeconds` | 이름변경 |
+| `gp_in_half` / `gp_in_half_seconds` | — | 삭제(계산) — 선수별 출전시간 계산용 값. 실제 입장 시각은 교체 로그를 쓴다 |
+| `gp_out_half` / `gp_out_half_seconds` | — | 삭제(계산) — 선수별 출전시간 계산용 값. 실제 퇴장 시각은 교체 로그를 쓴다 |
 | `gp_in_seconds` / `gp_out_seconds` | — | 삭제(계산) — 경기 기준 초는 `halves`로 산출 |
 | `gp_seconds` | — | 삭제(계산) — 출전시간 = out − in |
 | `gp_point_plus` / `gp_point_minus` | — | **삭제(불필요)** — 상단 `-3/-1/+1/+3` 버튼은 경기시간 조정용이라 무관. 저장 안 함 |
