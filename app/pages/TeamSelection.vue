@@ -616,7 +616,7 @@ function undoSub(index: number) {
               <template v-if="game.formationKey">
                 <button
                   v-for="(s, i) in outfieldSlots" :key="`o${i}`"
-                  class="slot" :class="{ active: activeSlot === `o${i}`, filled: game.assigned[`o${i}`] !== undefined }"
+                  class="slot" :class="[{ active: activeSlot === `o${i}`, filled: game.assigned[`o${i}`] !== undefined }, playerAt(`o${i}`)?.[2]?.toLowerCase()]"
                   :style="{ left: s.x + '%', top: s.y + '%' }"
                   @click="clickSlot(`o${i}`)"
                   @dragover.prevent
@@ -636,7 +636,7 @@ function undoSub(index: number) {
             <div v-if="game.formationKey" class="bench">
               <button
                 v-for="id in benchIds" :key="id" class="slot benchSlot"
-                :class="{ active: activeSlot === id, filled: game.assigned[id] !== undefined }"
+                :class="[{ active: activeSlot === id, filled: game.assigned[id] !== undefined }, playerAt(id)?.[2]?.toLowerCase()]"
                 @click="clickSlot(id)"
                 @dragover.prevent
                 @drop="onDrop(id)"
@@ -911,6 +911,9 @@ function undoSub(index: number) {
 .slot.active{outline:2px solid #f0b429;outline-offset:2px}
 .slot.gk{background:rgba(255,255,255,.2)}
 .slot.gk.filled{background:rgba(180,190,200,.4);border-color:#c9d2db}
+.slot.fw.filled{background:rgba(95,184,201,.3);border-color:#5fb8c9}
+.slot.mf.filled{background:rgba(217,134,113,.3);border-color:#d98671}
+.slot.df.filled{background:rgba(147,181,106,.3);border-color:#93b56a}
 
 .fieldChoice h2{margin:0 0 8px;font-size:13px;text-align:center;color:rgba(255,255,255,.8);font-weight:800}
 

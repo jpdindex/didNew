@@ -150,7 +150,7 @@ function fmtTime(sec: number) {
 // 표시용 행. 시간순 그대로 — 가장 최근 기록이 맨 아래에 온다.
 const rows = computed(() => {
   const flags = analysis.value.flags
-  return visibleRecords.value
+  const list = visibleRecords.value
     .map((r, i) => ({
       id: r.id,
       no: i + 1,
@@ -166,14 +166,35 @@ const rows = computed(() => {
       // 뒤따라 생기는 act 없는 결과 레코드도 isDap = !!act 규칙으로 자동 제외된다.
       isDap: flags.get(r.id)?.isDap ?? false,
       playerName: squad.value.find(p => p.no === r.playerId)?.name ?? '',
+      draft: false,
     }))
+  // 위치만 찍고 아직 액트를 안 고른 상태 — 확정 레코드가 아니라 표시 전용 "가안" 행이다.
+  // records.value 에는 안 들어가므로 채점 로직(computeAttackPaths 등)에는 전혀 영향이 없다.
+  // 수정 중일 때는 안 보여준다(수정 중엔 pendingPos 가 그 레코드의 임시 위치라 다른 의미다).
+  if (!editingId.value) {
+    if (pendingShot.value) {
+      const shot = pendingShot.value
+      list.push({
+        id: '__draft__', no: list.length + 1, time: fmtTime(shot.seconds),
+        act: shot.act, result: '', area: String(shot.area),
+        isDap: false, playerName: '', draft: true,
+      })
+    } else if (pendingPos.value) {
+      list.push({
+        id: '__draft__', no: list.length + 1, time: fmtTime(seconds.value),
+        act: '', result: '', area: areaFromPos(pendingPos.value),
+        isDap: false, playerName: '', draft: true,
+      })
+    }
+  }
+  return list
 })
 
 // 최신 기록이 맨 아래에 쌓이므로, 기록이 늘면 표를 아래로 붙여준다.
 const tableEl = ref<HTMLElement | null>(null)
 // 수정 화면 전용: 기록표를 눌러서 넓히면(경기장이 위로 줄어들며) 더 많은 액트를 한 번에 본다.
 const tableExpanded = ref(false)
-watch(() => visibleRecords.value.length, async () => {
+watch(() => rows.value.length, async () => {
   await nextTick()
   if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
 })
@@ -213,25 +234,47 @@ watch(editPlayerEligible, eligible => {
 })
 let pressTimer: ReturnType<typeof setTimeout> | undefined
 let longPressed = false
+let touchMoved = false
+// 터치 이벤트를 처리한 직후엔 브라우저가 호환용으로 만들어내는 가짜 mousedown/mouseup을
+// 무시한다 — touchstart/touchend 에 preventDefault 를 걸면 이 가짜 이벤트는 막히지만
+// 스크롤(펜슬로 표 넘기기)까지 같이 막혀버려서, 대신 이 방식(짧은 시간 동안 무시)을 쓴다.
+let suppressMouseUntil = 0
 
-function startPress(id: string) {
+function startPress(id: string, isTouch = false) {
   cancelPress()
   longPressed = false
+  if (isTouch) touchMoved = false
+  else if (Date.now() < suppressMouseUntil) return
   pressTimer = setTimeout(() => { longPressed = true; openEdit(id) }, 500)
 }
 function cancelPress() {
   if (pressTimer) clearTimeout(pressTimer)
   pressTimer = undefined
 }
-/** mouseup/touchend 에서 호출. 길게 눌러서 이미 수정모드로 들어간 경우가 아니면 "짧은 클릭"으로 본다. */
-function endPress(id: string) {
+/** 터치가 스크롤로 이어지면(손가락이 움직이면) 롱프레스/클릭 판정을 취소한다 — 표 스크롤 중 오작동 방지. */
+function handleTouchMove() {
+  touchMoved = true
   cancelPress()
+}
+/** mouseup/touchend 에서 호출. 길게 눌러서 이미 수정모드로 들어간 경우가 아니면 "짧은 클릭"으로 본다. */
+function endPress(id: string, isTouch = false) {
+  cancelPress()
+  if (isTouch) {
+    suppressMouseUntil = Date.now() + 500
+    if (touchMoved) return
+  } else if (Date.now() < suppressMouseUntil) return
   if (!longPressed) clickRecord(id)
 }
 function clickRecord(id: string) {
+  // 다른 기록을 선택하면 현재 열려 있던 수정 모드를 닫는다.
+  // 수정 중인 행의 버튼/입력 상태가 다른 행으로 남지 않도록 한다.
+  if (editingId.value && editingId.value !== id) {
+    cancelEdit()
+  }
   peekId.value = peekId.value === id ? null : id
 }
 function openEdit(id: string) {
+  if (editingId.value && editingId.value !== id) cancelEdit()
   peekId.value = null
   const rec = records.value.find(r => r.id === id)
   if (!rec) return
@@ -756,23 +799,24 @@ function confirmGoalFrame(result: 'B' | 'GOAL' | 'X') {
   pendingFramePos.value = null
 }
 
-// 중앙 정렬된 골대 주변 영역(프레임 바깥)은 지금처럼 클릭 즉시 기록한다 — 버튼 필요 없음.
+// 중앙 정렬된 골대 주변 영역(프레임 바깥)은 클릭 즉시 기록한다 — 버튼 필요 없음.
 // footballX의 전체 628×300 좌표로 남긴다.
-function clickGoalTarget(e: MouseEvent) {
-  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+//
+// H/HX, L/LX, R/RX 는 예전엔 하나의 큰 영역 안에서 1m 경계선을 기준으로 좌표 계산으로
+// 구분했다 — 터치로는 그 얇은 경계선 정확히 어느 쪽인지 맞추기 어려워서, 지금은 여섯 칸을
+// 아예 서로 다른 요소(.goalZone)로 나눠서 어디를 눌렀는지 자체로 구분한다(경계선 좌표
+// 계산 자체는 그대로 재사용 — 저장되는 좌표값의 정확도는 그대로 유지된다).
+function clickOuterZone(e: MouseEvent, zone: 'H' | 'HX' | 'L' | 'LX' | 'R' | 'RX') {
+  const rect = (e.currentTarget as HTMLElement).closest('.goal')!.getBoundingClientRect()
   const x = (e.clientX - rect.left) / rect.width
   const y = (e.clientY - rect.top) / rect.height
 
-  // 골문 ↔ 외곽 1m 선 사이는 방향에 따라 L/H/R(DSP), 그 선 바깥은 LX/HX/RX다.
-  if (y < FRAME_TOP) {
-    const point = goalOuterPoint('HX', x, y / FRAME_TOP)
-    recordGoalResult(y < GUIDE_TOP ? 'HX' : 'H', point)
-  } else if (x < FRAME_SIDE) {
-    const point = goalOuterPoint('LX', x / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP))
-    recordGoalResult(x < GUIDE_SIDE ? 'LX' : 'L', point)
-  } else if (x > 1 - FRAME_SIDE) {
-    const point = goalOuterPoint('RX', (x - (1 - FRAME_SIDE)) / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP))
-    recordGoalResult(x > 1 - GUIDE_SIDE ? 'RX' : 'R', point)
+  if (zone === 'H' || zone === 'HX') {
+    recordGoalResult(zone, goalOuterPoint('HX', x, y / FRAME_TOP))
+  } else if (zone === 'L' || zone === 'LX') {
+    recordGoalResult(zone, goalOuterPoint('LX', x / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP)))
+  } else {
+    recordGoalResult(zone, goalOuterPoint('RX', (x - (1 - FRAME_SIDE)) / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP)))
   }
 }
 
@@ -906,7 +950,7 @@ function finishHalf() {
           <div class="team right">{{ away }}</div>
         </div>
 
-        <div class="pitch" :style="{ background: grassBg }" @click="clickPitch">
+        <div class="pitch" :style="{ background: grassBg }" @pointerdown="clickPitch">
           <div class="lineHalf" /><div class="lineCircle" />
           <div class="boxL" /><div class="arcL" /><div class="goalNetL" />
           <div class="boxR" /><div class="arcR" /><div class="goalNetR" />
@@ -930,12 +974,13 @@ function finishHalf() {
           <div class="tbody">
             <div
               v-for="r in rows" :key="r.id" class="trow"
-              :class="{ pending: r.result === 'O', editing: editingId === r.id, peeking: peekId === r.id, edited: records.find(x => x.id === r.id)?.edited }"
-              @mousedown="startPress(r.id)"
-              @mouseup="endPress(r.id)"
+              :class="{ pending: r.result === 'O', editing: editingId === r.id, peeking: peekId === r.id, edited: records.find(x => x.id === r.id)?.edited, draft: r.draft }"
+              @mousedown="!r.draft && startPress(r.id)"
+              @mouseup="!r.draft && endPress(r.id)"
               @mouseleave="cancelPress"
-              @touchstart="startPress(r.id)"
-              @touchend="endPress(r.id)"
+              @touchstart="!r.draft && startPress(r.id, true)"
+              @touchmove="handleTouchMove"
+              @touchend="!r.draft && endPress(r.id, true)"
               @contextmenu.prevent
             >
               <template v-if="editingId === r.id">
@@ -1087,13 +1132,16 @@ function finishHalf() {
             <button v-for="a in shootActs" :key="a.k" class="actBtn" :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }" @click="clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
           </div>
 
-          <div class="goal" :class="{ active: pendingShot !== null }" @click="clickGoalTarget">
-            <div class="goalZone hx">HX</div>
-            <div class="goalZone lx">LX</div>
-            <div class="goalZone rx">RX</div>
+          <div class="goal" :class="{ active: pendingShot !== null }">
+            <div class="goalZone hx" @click="clickOuterZone($event, 'HX')">HX</div>
+            <div class="goalZone h" @click="clickOuterZone($event, 'H')">H</div>
+            <div class="goalZone lx" @click="clickOuterZone($event, 'LX')">LX</div>
+            <div class="goalZone l" @click="clickOuterZone($event, 'L')">L</div>
+            <div class="goalZone rx" @click="clickOuterZone($event, 'RX')">RX</div>
+            <div class="goalZone r" @click="clickOuterZone($event, 'R')">R</div>
             <div class="hxDivider" aria-hidden="true" />
             <div class="meterGuide" aria-hidden="true" />
-            <div class="goalFrame" @click.stop="clickGoalFrame">
+            <div class="goalFrame" @click="clickGoalFrame">
               <div class="goalZone goalCenter" aria-hidden="true" />
               <div
                 v-if="pendingFramePos"
@@ -1148,7 +1196,7 @@ function finishHalf() {
 .frame.mirrored{direction:rtl}
 .frame.mirrored>section{direction:ltr}
 
-.left{min-width:0;background:#1b1e22;display:flex;flex-direction:column}
+.left{position:relative;min-width:0;background:#1b1e22;display:flex;flex-direction:column;padding-bottom:250px}
 .statBar{position:relative;flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.08)}
 .cardIcon{font-size:14px}
 .cardRowCancel{padding:2px 6px;border:1px solid rgba(255,255,255,.2);border-radius:3px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.7);font-size:10px}
@@ -1189,7 +1237,7 @@ function finishHalf() {
 .pauseBtn.paused{background:rgba(240,180,41,.2);border-color:#f0b429}
 .modeTag{font-size:9px;font-weight:800;color:rgba(255,255,255,.35);letter-spacing:.05em}
 
-.pitch{position:relative;flex:1;min-height:200px;overflow:hidden;cursor:crosshair}
+.pitch{position:relative;flex:1;min-height:200px;overflow:hidden;cursor:crosshair;touch-action:manipulation}
 .lineHalf{position:absolute;left:50%;top:0;bottom:0;width:0;border-left:2px solid rgba(255,255,255,.75)}
 .lineCircle{position:absolute;left:50%;top:50%;height:27%;aspect-ratio:1;transform:translate(-50%,-50%);border:2px solid rgba(255,255,255,.78);border-radius:50%}
 .boxL{position:absolute;left:0;top:19%;bottom:19%;width:15.5%;border:2px solid rgba(255,255,255,.78);border-left:none}
@@ -1207,13 +1255,14 @@ function finishHalf() {
 
 .tableToggle{flex:0 0 auto;height:20px;border:none;border-top:1px solid rgba(255,255,255,.08);background:#20242b;color:#f0b429;font-size:10px;font-weight:800;cursor:pointer}
 .tableToggle:hover{background:#262b33}
-.table{flex:0 0 auto;height:180px;overflow-y:auto;border-top:1px solid rgba(255,255,255,.08);transition:height .18s ease}
+.table{position:absolute;left:0;right:0;bottom:0;height:250px;box-sizing:border-box;padding-bottom:10px;overflow-y:auto;border-top:1px solid rgba(255,255,255,.08);transition:height .18s ease}
 .table.expanded{height:380px}
-.thead,.trow{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;padding:4px 10px}
+.thead,.trow{display:grid;grid-template-columns:.74fr .95fr .68fr .68fr .68fr 2.05fr;gap:4px;padding:8px 10px}
 .thead span,.trow span{min-width:0;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .thead span:last-child,.trow span:last-child{text-align:left;padding-left:18px}
-.thead{background:#f0b429;color:#1a1a1a;font-weight:800;font-size:11px;position:sticky;top:0}
-.trow{color:#ddd;font-size:11px;border-bottom:1px solid rgba(255,255,255,.06);cursor:pointer;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
+.thead{background:#f0b429;color:#1a1a1a;font-weight:800;font-size:13px;position:sticky;top:0}
+.trow{color:#ddd;font-size:14px;min-height:42px;align-items:center;border-bottom:1px solid rgba(255,255,255,.06);cursor:pointer;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
+.trow.draft{color:rgba(255,255,255,.4);font-style:italic;cursor:default;background:rgba(255,255,255,.03)}
 .trow.edited{color:#78c58a}
 .trow.edited button{color:#78c58a;border-color:#78c58a}
 .trow.pending{color:#f0b429}
@@ -1221,7 +1270,7 @@ function finishHalf() {
 .trow.edited .playerBtn.assigned{color:#191919}
 .trow.editing{background:rgba(240,180,41,.1)}
 .trow.peeking{background:rgba(240,180,41,.06)}
-.playerBtn{height:18px;padding:0 8px;border-radius:3px;border:1px dashed #f0b429;background:rgba(240,180,41,.1);color:#f0b429;font-size:10px;font-weight:700;cursor:pointer}
+.playerBtn{height:26px;min-width:96px;padding:0 16px;border-radius:4px;border:1px dashed #f0b429;background:rgba(240,180,41,.1);color:#f0b429;font-size:12px;font-weight:700;cursor:pointer}
 .playerBtn:hover{background:rgba(240,180,41,.25)}
 .playerBtn.assigned{border-style:solid;border-color:#c2a04a;background:#c2a04a;color:#080808;font-style:italic}
 
@@ -1305,11 +1354,13 @@ section.right h1{margin:0;text-align:center;color:#fff;font-size:20px}
 .goalFrame{
   position:absolute;left:15%;right:15%;top:42%;bottom:0;width:auto;height:auto;margin:0;
   border:10px solid #e8e8e8;border-bottom:none;border-radius:2px 2px 0 0;cursor:crosshair;
-  background:linear-gradient(180deg,#27302d,#151b1b 62%,#101414);
-  box-shadow:inset 0 0 30px rgba(0,0,0,.5),0 2px 5px rgba(0,0,0,.45);
+  background:
+    linear-gradient(180deg,rgba(86,110,105,.16),transparent 16%),
+    repeating-linear-gradient(0deg,rgba(122,160,151,.10) 0 1px,transparent 1px 18px),
+    repeating-linear-gradient(90deg,rgba(122,160,151,.07) 0 1px,transparent 1px 22px),
+    linear-gradient(180deg,#27302d,#151b1b 62%,#101414);
+  box-shadow:inset 0 18px 26px rgba(0,0,0,.35),inset 0 -22px 30px rgba(0,0,0,.5),0 4px 10px rgba(0,0,0,.5),0 0 0 2px rgba(190,205,201,.12);
 }
-.goalFrame::before,.goalFrame::after{content:"";position:absolute;top:0;bottom:0;width:7px;background:linear-gradient(90deg,#8d9391,#d2d5d3 45%,#737876);box-shadow:0 0 5px rgba(0,0,0,.5)}
-.goalFrame::before{left:12%}.goalFrame::after{right:12%}
 /* 포스트·크로스바 바깥 1m DSP 기준선: 골문과 이 U자 선 사이 띠가 클릭 가능한 DSP 범위다. */
 /* 1m 경계선 위치(18.23%/5.44%)는 스크립트의 GUIDE_TOP/GUIDE_SIDE(실측 규격 기준 계산값)와
    반드시 같이 맞춰야 한다 — 프레임 크기(70%×58%)를 7.32m×2.44m 기준으로 1m 환산한 값이다. */
@@ -1319,8 +1370,14 @@ section.right h1{margin:0;text-align:center;color:#fff;font-size:20px}
 .hx{position:absolute;left:0;right:0;top:0;height:18.23%;text-align:center;color:rgba(255,255,255,.6);font-size:10px;letter-spacing:.08em}
 .lx{position:absolute;left:0;top:42%;bottom:0;width:5.44%;color:rgba(255,255,255,.68)}
 .rx{position:absolute;right:0;top:42%;bottom:0;width:5.44%;color:rgba(255,255,255,.68)}
+/* H/L/R — HX/LX/RX 와 나란히 있는 "1m 이내(근접 미스)" 칸. 예전엔 이 경계선(hxDivider/
+   meterGuide) 안쪽인지 바깥쪽인지를 클릭 좌표 계산으로 구분했는데, 터치로는 경계선
+   정확히 어느 쪽을 짚었는지 맞추기 어려워서 아예 각각 별도로 누를 수 있는 칸으로 나눴다. */
+.h{position:absolute;left:0;right:0;top:18.23%;height:23.77%;text-align:center;color:rgba(255,255,255,.6);font-size:10px;letter-spacing:.08em}
+.l{position:absolute;left:5.44%;top:42%;bottom:0;width:9.56%;color:rgba(255,255,255,.68)}
+.r{position:absolute;right:5.44%;top:42%;bottom:0;width:9.56%;color:rgba(255,255,255,.68)}
 .goalCenter{position:absolute;inset:0;color:transparent;font-size:0;pointer-events:none}
-.goal:hover .hx,.goal:hover .lx,.goal:hover .rx{background:rgba(240,180,41,.08)}
+.goal:hover .hx,.goal:hover .h,.goal:hover .lx,.goal:hover .l,.goal:hover .rx,.goal:hover .r{background:rgba(240,180,41,.08)}
 .goalResultButtons{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px}
 .goalResultBtn{height:40px;border:1px solid rgba(255,255,255,.38);background:#292d31;color:#f1f1f1;font-weight:900;font-size:15px;cursor:pointer}
 .goalResultBtn:hover{background:#353a3f}

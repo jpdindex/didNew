@@ -417,6 +417,8 @@ function onCancel() {
   border-top: 1px solid rgba(255,255,255,0.06);
   display: flex; align-items: center; justify-content: center;
   gap: 14px;
+  /* Keep the actions clear of the tablet/browser bottom edge. */
+  transform: translateY(-22px);
 }
 .btn {
   height: 36px; min-width: 120px; padding: 0 16px;

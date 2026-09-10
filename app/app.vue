@@ -4,15 +4,22 @@
 const canvasScale = ref(1)
 
 function fitCanvas() {
-  canvasScale.value = Math.min(window.innerWidth / 1280, window.innerHeight / 800)
+  // PWA/browser chrome can make innerHeight larger than the actually visible
+  // area. Use visualViewport so the fixed canvas is always fully visible.
+  const viewport = window.visualViewport
+  const width = viewport?.width ?? window.innerWidth
+  const height = viewport?.height ?? window.innerHeight
+  canvasScale.value = Math.min(width / 1280, height / 800)
 }
 
 onMounted(() => {
   fitCanvas()
   window.addEventListener('resize', fitCanvas)
+  window.visualViewport?.addEventListener('resize', fitCanvas)
 })
 
 onUnmounted(() => window.removeEventListener('resize', fitCanvas))
+onUnmounted(() => window.visualViewport?.removeEventListener('resize', fitCanvas))
 </script>
 
 <template>
@@ -37,7 +44,7 @@ body {
 
 .canvasHost {
   width: 100vw;
-  height: 100vh;
+  height: 100dvh;
   display: grid;
   place-items: center;
   overflow: hidden;
