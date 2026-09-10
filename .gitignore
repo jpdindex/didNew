@@ -5,6 +5,7 @@
 .nitro
 .cache
 dist
+.pnpm-store/
 
 # Node dependencies
 node_modules
@@ -12,6 +13,14 @@ node_modules
 # Logs
 logs
 *.log
+
+__pycache__
+*.py[cod]
+.pytest_cache/
+*.db
+
+# Generated backend KPI artifacts
+backend/data/
 
 # Misc
 .DS_Store
@@ -27,3 +36,6 @@ logs
 service-account*.json
 jpd-did-service-account.json
 migration/service-account.json
+keys/migration/service-account.json
+keys
+
