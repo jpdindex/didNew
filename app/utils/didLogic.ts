@@ -461,7 +461,8 @@ export function computeAttackPaths(
   records: DidRecord[],
   opts: { closeTrailing?: boolean } = {}
 ): PathComputeResult {
-  const chains = splitIntoChains(resolvedOnly(records), opts.closeTrailing ?? true)
+  const ordered = resolvedOnly(records)
+  const chains = splitIntoChains(ordered, opts.closeTrailing ?? true)
 
   const paths: AttackPath[] = []
   const flags = new Map<string, RecordFlags>()
@@ -470,6 +471,28 @@ export function computeAttackPaths(
     const { path, flags: chainFlags } = classifyChain(chain)
     paths.push(path)
     for (const [id, f] of chainFlags) flags.set(id, f)
+  }
+
+  // DAP존(구역 1~6)에서 B(막힘)/X(끊김)로 끝난 경우, 그 레코드 자체는 액트가 없어도
+  // "공이 그 지역까지 들어갔다"는 사실은 유효하다 — 체인 경계와 무관하게 시간순으로
+  // 바로 앞에 있던 액트 있는 레코드 최대 2개까지는(그게 DAP존 바깥에서 있었던
+  // 액트여도) DAP로 인정한다. classifyChain 은 체인 단위로만 판정해서 이 경우를
+  // 못 잡는다 — 원인이 된 레코드가 이미 끝난 별개의 체인에 속해 있을 수 있어서다.
+  for (let i = 0; i < ordered.length; i++) {
+    const r = ordered[i]!
+    if (r.area >= 7) continue
+    if (r.res !== 'B' && r.res !== 'X') continue
+    let granted = 0
+    for (let j = i - 1; j >= 0 && granted < 2; j--) {
+      const prev = ordered[j]!
+      if (!prev.act) continue
+      const f = flags.get(prev.id)
+      if (f) {
+        f.isDap = true
+        f.isDapS = f.isDap && (prev.res === 'O' || isGoal(prev.res))
+      }
+      granted++
+    }
   }
 
   return { paths, flags }
