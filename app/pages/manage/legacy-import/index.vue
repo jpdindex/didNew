@@ -50,7 +50,13 @@ const db = $db as Firestore
 
 interface ParsedTable { columns: string[] | null; rows: unknown[][] }
 
-function parseLiteral(tok: string): unknown {
+// wasQuoted: 덤프에서 따옴표로 감싸져 있었는지. p_id 같은 "0000001072" 형식 컬럼은
+// 숫자처럼 생겼어도 따옴표 안에 있었으면 절대 Number()로 바꾸면 안 된다 — 앞자리 0이
+// 사라져서 실제 선수 ID가 깨진다(migration/sql.mjs의 stringValue 처리와 동일한 원칙).
+function parseLiteral(tok: string, wasQuoted: boolean): unknown {
+  if (wasQuoted) {
+    return tok.replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, '\\').replace(/''/g, "'")
+  }
   const t = tok.trim()
   if (t === '' || /^NULL$/i.test(t)) return null
   if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t)
@@ -62,6 +68,7 @@ function parseTuple(s: string): unknown[] {
   let cur = ''
   let inStr = false
   let strCh = ''
+  let wasQuoted = false
   for (let i = 0; i < s.length; i++) {
     const c = s[i]
     if (inStr) {
@@ -70,11 +77,11 @@ function parseTuple(s: string): unknown[] {
       cur += c
       continue
     }
-    if (c === "'" || c === '"') { inStr = true; strCh = c; continue }
-    if (c === ',') { vals.push(parseLiteral(cur)); cur = ''; continue }
+    if (c === "'" || c === '"') { inStr = true; strCh = c; wasQuoted = true; continue }
+    if (c === ',') { vals.push(parseLiteral(cur, wasQuoted)); cur = ''; wasQuoted = false; continue }
     cur += c
   }
-  vals.push(parseLiteral(cur))
+  vals.push(parseLiteral(cur, wasQuoted))
   return vals
 }
 
