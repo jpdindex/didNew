@@ -94,6 +94,7 @@ export interface DidRecord {
   /** 어느 half 의 레코드인지. 전반/후반 기록이 한 배열에 섞이는 걸 막는 구분자.
    *  없으면(과거 데이터) 전반으로 취급한다 — resolvedOnly() 참고. */
   half?: 'H1' | 'H2'
+  edited?: boolean
 }
 
 function isShotAct(act: ActCode) {

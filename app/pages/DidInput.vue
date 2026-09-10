@@ -62,6 +62,12 @@ const clock = computed(() => {
 // 시계 양옆 화살표로 시간을 수동 보정한다. ◀ 는 1초 줄이고 ▶ 는 1초 늘린다(0초 아래로는 안 내려간다).
 function stepSeconds(delta: number) {
   seconds.value = Math.max(0, seconds.value + delta)
+  // 실행 중인 타이머가 다음 tick에서 이전 기준값으로 되돌리지 않도록
+  // 수동 보정값을 새 기준 시각으로 즉시 반영한다.
+  if (timer && !paused.value) {
+    tickBaseSeconds = seconds.value
+    tickStartedAt = Date.now()
+  }
 }
 
 // 수정 화면 전용: 시계의 "전반"/"후반" 라벨을 눌러 편집 대상 half 를 바꾼다.
@@ -182,6 +188,29 @@ const editSeconds = ref(0)
 // 수정 모드에서는 경기장 클릭·액트 클릭이 새 레코드를 만들지 않고 이 값만 바꾼다.
 const editAct = ref<ActCode>('')
 const editPos = ref<{ x: number; y: number } | null>(null)
+const editPlayerEligible = computed(() => {
+  if (!editingId.value) return false
+  const preview = records.value.map(r => r.id === editingId.value && editPos.value
+    ? { ...r, posX: editPos.value.x, posY: editPos.value.y, area: Number(areaFromPos(editPos.value)) }
+    : r)
+  const result = computeAttackPaths(preview.filter(r => (r.half ?? 'H1') === halfCode.value), { closeTrailing: true })
+  const flags = result.flags.get(editingId.value)
+  const path = result.paths.find(p => p.recordIds.includes(editingId.value!))
+  return !!flags?.isDap || path?.ptype === 'DTP' || path?.ptype === 'STP'
+})
+watch(editPlayerEligible, eligible => {
+  if (eligible || !editingId.value) return
+  const preview = records.value.map(r => r.id === editingId.value && editPos.value
+    ? { ...r, posX: editPos.value.x, posY: editPos.value.y, area: Number(areaFromPos(editPos.value)) }
+    : r)
+  const result = computeAttackPaths(preview.filter(r => (r.half ?? 'H1') === halfCode.value), { closeTrailing: true })
+  const path = result.paths.find(p => p.recordIds.includes(editingId.value!))
+  const affected = new Set(path?.recordIds ?? [editingId.value])
+  for (const rec of records.value) {
+    if (affected.has(rec.id)) rec.playerId = undefined
+  }
+  if (playerPickFor.value === editingId.value) playerPickFor.value = null
+})
 let pressTimer: ReturnType<typeof setTimeout> | undefined
 let longPressed = false
 
@@ -214,15 +243,28 @@ function openEdit(id: string) {
 function stepEditSeconds(delta: number) {
   editSeconds.value = Math.max(0, editSeconds.value + delta)
 }
+const editMinute = computed(() => Math.floor(editSeconds.value / 60))
+const editSecond = computed(() => editSeconds.value % 60)
+function stepEditMinute(delta: number) {
+  editSeconds.value = Math.max(0, editSeconds.value + delta * 60)
+}
+function stepEditSecond(delta: number) {
+  editSeconds.value = Math.max(0, editSeconds.value + delta)
+}
 function applyEdit() {
   const rec = records.value.find(r => r.id === editingId.value)
   if (rec) {
     rec.seconds = editSeconds.value
     rec.act = editAct.value
+    rec.edited = true
     if (editPos.value) {
       rec.posX = editPos.value.x
       rec.posY = editPos.value.y
       rec.area = Number(areaFromPos(editPos.value))
+    }
+    if (!editPlayerEligible.value) {
+      rec.playerId = undefined
+      if (playerPickFor.value === rec.id) playerPickFor.value = null
     }
     // 시간을 바꿨으면 목록도 그 시간 순서에 맞게 다시 정렬한다 — 가장 늦은 시간으로
     // 고치면 맨 아래로, 가장 이른 시간으로 고치면 맨 위로 옮겨간다. didLogic.ts의
@@ -888,7 +930,7 @@ function finishHalf() {
           <div class="tbody">
             <div
               v-for="r in rows" :key="r.id" class="trow"
-              :class="{ pending: r.result === 'O', editing: editingId === r.id, peeking: peekId === r.id }"
+              :class="{ pending: r.result === 'O', editing: editingId === r.id, peeking: peekId === r.id, edited: records.find(x => x.id === r.id)?.edited }"
               @mousedown="startPress(r.id)"
               @mouseup="endPress(r.id)"
               @mouseleave="cancelPress"
@@ -898,18 +940,18 @@ function finishHalf() {
             >
               <template v-if="editingId === r.id">
                 <div class="editTimeRow" @mousedown.stop @touchstart.stop>
-                  <span class="editInfo"><b>{{ ACT_LABELS[editAct] ?? r.result }}</b><i>구역 {{ editPos ? areaFromPos(editPos) : r.area }}</i></span>
-                  <span class="editSpacer" />
-                  <button class="editStep" @click.stop="stepEditSeconds(-1)">−</button>
-                  <span class="editTimeVal">{{ fmtTime(editSeconds) }}</span>
-                  <button class="editStep" @click.stop="stepEditSeconds(1)">+</button>
+                  <div class="editClock">
+                    <span class="editUnit"><button class="editStep" @click.stop="stepEditMinute(-1)">−</button><b>{{ String(editMinute).padStart(2, '0') }}</b><button class="editStep" @click.stop="stepEditMinute(1)">+</button></span>
+                    <span class="editColon">:</span>
+                    <span class="editUnit"><button class="editStep" @click.stop="stepEditSecond(-1)">−</button><b>{{ String(editSecond).padStart(2, '0') }}</b><button class="editStep" @click.stop="stepEditSecond(1)">+</button></span>
+                  </div>
+                  <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn" @mousedown.stop @touchstart.stop @click.stop="openPlayerPick(r.id)">{{ r.playerName || '선수 선택' }}</button>
                 </div>
               </template>
               <template v-else>
                 <span>{{ r.no }}</span><span>{{ r.time }}</span><span>{{ r.act }}</span><span>{{ r.result }}</span><span>{{ r.area }}</span>
                 <span>
-                  <template v-if="r.playerName">{{ r.playerName }}</template>
-                  <button v-else-if="r.isDap" class="playerBtn" @mousedown.stop @touchstart.stop @click.stop="openPlayerPick(r.id)">Select</button>
+                  <button v-if="r.isDap || r.playerName" class="playerBtn" :class="{ assigned: !!r.playerName }" @mousedown.stop @touchstart.stop @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select' }}</button>
                 </span>
               </template>
             </div>
@@ -917,7 +959,7 @@ function finishHalf() {
         </div>
       </section>
 
-      <section class="right">
+      <section class="right" :class="{ editing: !!editingId }">
         <div v-if="editingId" class="editActions">
           <button class="editApply" @click="applyEdit">적용</button>
           <button class="editDelete" @click="deleteEdit">삭제</button>
@@ -927,7 +969,7 @@ function finishHalf() {
         <button v-else-if="isEditMode || paused" class="finishBtn" @click="exitToLobby">대기방으로 나가기</button>
         <button v-else class="finishBtn" @click="finishHalf">{{ half }} 종료</button>
 
-        <div class="mirrorWrap">
+        <div v-if="!editingId" class="mirrorWrap">
           <button class="mirrorIcon" :class="{ on: mirrorOpen }" @click="openMirrorPopup">⇄</button>
           <div v-if="mirrorOpen" class="mirrorPop">
             <div class="popRow">
@@ -941,7 +983,7 @@ function finishHalf() {
           </div>
         </div>
 
-        <h1>{{ cardOpen ? '카드 입력' : subOpen ? '선수교체' : playerPickFor ? '선수선택' : 'DID-INPUT' }}</h1>
+        <h1 :class="{ editTitle: !!editingId }">{{ cardOpen ? '카드 입력' : subOpen ? '선수교체' : playerPickFor ? '선수선택' : 'DID-INPUT' }}</h1>
 
         <div v-if="cardOpen" class="cardPanel">
           <div class="cardTypes"><button :class="{selected: cardType === 'Y'}" @click="cardType='Y'">🟨 경고</button><button :class="{selected: cardType === 'R'}" @click="cardType='R'">🟥 퇴장</button></div>
@@ -1017,7 +1059,7 @@ function finishHalf() {
               <span class="hTime">{{ fmtTime(s.seconds) }}</span>
               <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
               <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
-              <span class="hAct"><button class="subUndo" @click="undoSub(i)">취소</button></span>
+              <span class="hAct"><button class="subUndo" @click="openSubPanel">수정</button><button class="subUndo" @click="undoSub(i)">취소</button></span>
             </div>
           </div>
 
@@ -1052,7 +1094,7 @@ function finishHalf() {
             <div class="hxDivider" aria-hidden="true" />
             <div class="meterGuide" aria-hidden="true" />
             <div class="goalFrame" @click.stop="clickGoalFrame">
-              <div class="goalZone goalCenter">GOAL</div>
+              <div class="goalZone goalCenter" aria-hidden="true" />
               <div
                 v-if="pendingFramePos"
                 class="frameMarker"
@@ -1167,25 +1209,29 @@ function finishHalf() {
 .tableToggle:hover{background:#262b33}
 .table{flex:0 0 auto;height:180px;overflow-y:auto;border-top:1px solid rgba(255,255,255,.08);transition:height .18s ease}
 .table.expanded{height:380px}
-.thead,.trow{display:grid;grid-template-columns:64px 96px 78px 86px 78px minmax(210px,1fr);gap:4px;padding:4px 10px}
+.thead,.trow{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;padding:4px 10px}
 .thead span,.trow span{min-width:0;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .thead span:last-child,.trow span:last-child{text-align:left;padding-left:18px}
 .thead{background:#f0b429;color:#1a1a1a;font-weight:800;font-size:11px;position:sticky;top:0}
 .trow{color:#ddd;font-size:11px;border-bottom:1px solid rgba(255,255,255,.06);cursor:pointer;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
+.trow.edited{color:#78c58a}
+.trow.edited button{color:#78c58a;border-color:#78c58a}
 .trow.pending{color:#f0b429}
+.trow.pending.edited{color:#78c58a}
+.trow.edited .playerBtn.assigned{color:#191919}
 .trow.editing{background:rgba(240,180,41,.1)}
 .trow.peeking{background:rgba(240,180,41,.06)}
 .playerBtn{height:18px;padding:0 8px;border-radius:3px;border:1px dashed #f0b429;background:rgba(240,180,41,.1);color:#f0b429;font-size:10px;font-weight:700;cursor:pointer}
 .playerBtn:hover{background:rgba(240,180,41,.25)}
+.playerBtn.assigned{border-style:solid;border-color:#c2a04a;background:#c2a04a;color:#080808;font-style:italic}
 
-.editTimeRow{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:2px 2px}
-.editInfo{display:flex;align-items:baseline;gap:8px;color:#f0b429}
-.editInfo b{font-size:12px;font-weight:800}
-.editInfo i{font-style:normal;font-size:10px;color:rgba(255,255,255,.5)}
-.editSpacer{flex:1}
-.editStep{width:20px;height:20px;border-radius:4px;border:1px solid rgba(240,180,41,.5);background:rgba(240,180,41,.1);color:#f0b429;font-size:13px;font-weight:800;cursor:pointer;display:grid;place-items:center;padding:0;line-height:1}
+.editTimeRow{grid-column:1 / -1;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));align-items:center;gap:4px;padding:2px 0;min-width:0}
+.editClock{grid-column:1 / 4;display:flex;align-items:center;justify-content:center;gap:10px;min-width:0;overflow:visible}
+.editUnit{display:flex;align-items:center;gap:5px}.editUnit b{min-width:30px;text-align:center;color:#f0b429;font-family:monospace;font-size:16px;font-weight:900}.editColon{color:#f0b429;font-weight:900;font-size:18px}
+.editPlayerBtn{grid-column:6;justify-self:center;min-width:72px}
+.editStep{width:38px;height:24px;border-radius:4px;border:1px solid rgba(240,180,41,.7);background:rgba(240,180,41,.14);color:#f0b429;font-size:17px;font-weight:900;cursor:pointer;display:grid;place-items:center;padding:0;line-height:1}
 .editStep:hover{background:rgba(240,180,41,.25)}
-.editTimeVal{font-family:monospace;font-size:13px;font-weight:800;color:#f0b429;min-width:44px;text-align:center}
+.editTimeVal{font-family:monospace;font-size:13px;font-weight:800;color:#f0b429;min-width:58px;text-align:center}
 
 /* 선수선택 화면 (액트 입력창 자리에서 전환) */
 .pickGroup{display:flex;flex-direction:column;gap:12px}
@@ -1212,8 +1258,10 @@ function finishHalf() {
 .finishBtn:hover{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.3)}
 
 /* 전반 종료 버튼과 같은 자리(절대위치)를 그대로 쓴다 — 레이아웃이 밀리면 안 된다 */
-.editActions{position:absolute;top:8px;right:8px;display:flex;gap:6px}
-.editActions button{height:32px;padding:0 14px;border-radius:5px;font-weight:800;font-size:12.5px;letter-spacing:.02em;cursor:pointer;border:1px solid transparent}
+.editActions{position:absolute;top:8px;left:10px;right:10px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;z-index:4}
+.right.editing{padding-top:10px}
+.editTitle{visibility:hidden}
+.editActions button{height:28px;width:100%;padding:0 10px;border-radius:5px;font-weight:800;font-size:12.5px;letter-spacing:.02em;cursor:pointer;border:1px solid transparent}
 .editApply{background:#f0b429;border-color:#f0b429;color:#191919}
 .editApply:hover{background:#ffc84a}
 .editDelete{background:rgba(217,90,90,.15);border-color:rgba(217,90,90,.5);color:#e07a7a}
@@ -1229,7 +1277,7 @@ section.right h1{margin:0;text-align:center;color:#fff;font-size:20px}
 
 .kickGrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));grid-template-rows:96px 66px;gap:5px}
 .stacked{grid-column:5/7;grid-row:1;min-width:0;display:grid;grid-template-rows:1fr 1fr;gap:3px}
-.actBtn{min-width:0;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;height:76px;border-radius:0;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.05);color:rgba(255,255,255,.45);cursor:pointer;transition:opacity .15s,background .15s,transform .1s}
+.actBtn{min-width:0;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;height:76px;border-radius:0;border:1px solid rgba(255,255,255,.18);background:linear-gradient(135deg,rgba(255,255,255,.075),rgba(255,255,255,.035));color:rgba(255,255,255,.45);box-shadow:inset 0 1px 0 rgba(255,255,255,.06),inset 0 -2px 0 rgba(0,0,0,.18);cursor:pointer;transition:opacity .15s,background .15s,transform .1s,box-shadow .1s}
 .actBtn.small{height:auto;min-height:0;flex-direction:row;justify-content:flex-start;padding:0 14px;gap:12px}
 .kickPrimary{height:96px}.kick-c{grid-column:1/3;grid-row:1}.kick-p{grid-column:3/5;grid-row:1}.kickResult{height:66px;flex-direction:row;gap:16px}.kick-x{grid-column:1/4;grid-row:2}.kick-b{grid-column:4/7;grid-row:2}.kickResult .divider{color:rgba(255,255,255,.2);font-size:24px}
 .actBtn b{font-size:29px}
@@ -1239,12 +1287,12 @@ section.right h1{margin:0;text-align:center;color:#fff;font-size:20px}
 .kickPrimary b,.shootGrid .actBtn b{padding-right:12px;border-right:1px solid rgba(255,255,255,.22)}
 .actBtn:disabled{opacity:.35;border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.4);cursor:not-allowed}
 .actBtn:not(:disabled):hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.32)}
-.actBtn:not(:disabled):active{transform:scale(.98)}
+.actBtn:not(:disabled):active{transform:scale(.98);box-shadow:inset 0 2px 4px rgba(0,0,0,.3)}
 /* 3단계: 기본(회색) → 위치를 찍으면 available(테두리+텍스트만 노란색) → 실제 사용한 것만 on(안까지 채움).
    X/B(결과)는 이 셋 중 어느 클래스도 받지 않으므로 항상 기본 회색 그대로다. */
-.actBtn.available:not(:disabled){border-color:#f0b429;background:rgba(240,180,41,.08);color:#f0b429}
+.actBtn.available:not(:disabled){border-color:#f0b429;background:linear-gradient(135deg,rgba(240,180,41,.14),rgba(240,180,41,.06));color:#f0b429;box-shadow:inset 0 1px 0 rgba(240,180,41,.18),inset 0 -2px 0 rgba(0,0,0,.16)}
 .actBtn.available:not(:disabled):hover{background:rgba(240,180,41,.2)}
-.actBtn.on:not(:disabled){background:#f0b429;border-color:#f0b429;color:#191919}
+.actBtn.on:not(:disabled){background:linear-gradient(135deg,#f0b429,#d79e20);border-color:#f0b429;color:#191919;box-shadow:inset 0 1px 0 rgba(255,255,255,.25),inset 0 -2px 0 rgba(120,75,0,.28),0 2px 5px rgba(0,0,0,.2)}
 .actBtn.on:not(:disabled):hover{background:#ffc84a}
 /* X/B 는 절대 노란색이 되지 않는다 — 결과로 선택된 상태는 회색 계열로 채운다 (specificity 로 위 규칙을 덮는다) */
 .actBtn.kickResult.on:not(:disabled){background:rgba(255,255,255,.35);border-color:rgba(255,255,255,.55);color:#161616}
@@ -1257,12 +1305,11 @@ section.right h1{margin:0;text-align:center;color:#fff;font-size:20px}
 .goalFrame{
   position:absolute;left:15%;right:15%;top:42%;bottom:0;width:auto;height:auto;margin:0;
   border:10px solid #e8e8e8;border-bottom:none;border-radius:2px 2px 0 0;cursor:crosshair;
-  background:
-    repeating-linear-gradient(115deg, rgba(255,255,255,.14) 0 1px, transparent 1px 11px),
-    repeating-linear-gradient(65deg,  rgba(255,255,255,.14) 0 1px, transparent 1px 11px),
-    linear-gradient(180deg,#173c20,#102a17);
+  background:linear-gradient(180deg,#27302d,#151b1b 62%,#101414);
   box-shadow:inset 0 0 30px rgba(0,0,0,.5),0 2px 5px rgba(0,0,0,.45);
 }
+.goalFrame::before,.goalFrame::after{content:"";position:absolute;top:0;bottom:0;width:7px;background:linear-gradient(90deg,#8d9391,#d2d5d3 45%,#737876);box-shadow:0 0 5px rgba(0,0,0,.5)}
+.goalFrame::before{left:12%}.goalFrame::after{right:12%}
 /* 포스트·크로스바 바깥 1m DSP 기준선: 골문과 이 U자 선 사이 띠가 클릭 가능한 DSP 범위다. */
 /* 1m 경계선 위치(18.23%/5.44%)는 스크립트의 GUIDE_TOP/GUIDE_SIDE(실측 규격 기준 계산값)와
    반드시 같이 맞춰야 한다 — 프레임 크기(70%×58%)를 7.32m×2.44m 기준으로 1m 환산한 값이다. */
@@ -1272,7 +1319,7 @@ section.right h1{margin:0;text-align:center;color:#fff;font-size:20px}
 .hx{position:absolute;left:0;right:0;top:0;height:18.23%;text-align:center;color:rgba(255,255,255,.6);font-size:10px;letter-spacing:.08em}
 .lx{position:absolute;left:0;top:42%;bottom:0;width:5.44%;color:rgba(255,255,255,.68)}
 .rx{position:absolute;right:0;top:42%;bottom:0;width:5.44%;color:rgba(255,255,255,.68)}
-.goalCenter{position:absolute;inset:0;color:#fff;font-size:20px;letter-spacing:.05em;text-shadow:0 2px 6px rgba(0,0,0,.6);z-index:2;pointer-events:none}
+.goalCenter{position:absolute;inset:0;color:transparent;font-size:0;pointer-events:none}
 .goal:hover .hx,.goal:hover .lx,.goal:hover .rx{background:rgba(240,180,41,.08)}
 .goalResultButtons{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px}
 .goalResultBtn{height:40px;border:1px solid rgba(255,255,255,.38);background:#292d31;color:#f1f1f1;font-weight:900;font-size:15px;cursor:pointer}

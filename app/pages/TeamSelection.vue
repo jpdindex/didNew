@@ -127,9 +127,19 @@ function fillTestData() {
     ;[pool[i], pool[j]] = [pool[j], pool[i]]
   }
 
+  const gkPool = pool.filter(i => players.value[i]?.[2] === 'GK')
+  const outfieldPool = pool.filter(i => players.value[i]?.[2] !== 'GK')
+  const gk = gkPool[0]
+  if (gk !== undefined) game.value.assigned.gk = gk
   const outfieldIds = outfieldSlots.value.map((_, i) => `o${i}`)
-  const allIds = [...outfieldIds, 'gk', ...benchIds]
-  allIds.forEach((id, i) => { game.value.assigned[id] = pool[i] })
+  outfieldIds.forEach((id, i) => {
+    const player = outfieldPool[i]
+    if (player !== undefined) game.value.assigned[id] = player
+  })
+  benchIds.forEach((id, i) => {
+    const player = outfieldPool[outfieldIds.length + i]
+    if (player !== undefined) game.value.assigned[id] = player
+  })
 
   activeSlot.value = null
   game.value.side = Math.random() < 0.5 ? 'left' : 'right'
@@ -157,6 +167,14 @@ function clickSlot(id: string) {
   if (prev && game.value.assigned[prev] !== undefined) {
     const fromIdx = game.value.assigned[prev]!
     const toIdx = game.value.assigned[id]
+    // GK와 필드/벤치 슬롯을 서로 바꾸면 포지션 계약이 깨진다.
+    // 빈 슬롯으로 옮기는 경우도 assignToSlot과 동일한 제약을 적용한다.
+    const fromIsGk = players.value[fromIdx]?.[2] === 'GK'
+    const toIsGk = toIdx === undefined ? fromIsGk : players.value[toIdx]?.[2] === 'GK'
+    if ((id === 'gk') !== fromIsGk || (toIdx !== undefined && (prev === 'gk') !== toIsGk)) {
+      activeSlot.value = null
+      return
+    }
     if (toIdx === undefined) delete game.value.assigned[prev]
     else game.value.assigned[prev] = toIdx
     game.value.assigned[id] = fromIdx
@@ -182,6 +200,22 @@ function advanceAfter(slotId: string) {
 }
 
 function assignToSlot(slotId: string, index: number) {
+  const player = players.value[index]
+  if (!player) return
+
+  // 포지션이 맞지 않는 배정은 DID 입력 단계에서 되돌릴 수 없으므로
+  // 여기서 차단한다. GK 슬롯에는 GK만, 필드/벤치에는 GK 외 선수만 둔다.
+  const isGk = player[2] === 'GK'
+  if (slotId === 'gk' && !isGk) return
+  if (slotId !== 'gk' && isGk) return
+
+  // 이미 다른 슬롯에 배정된 선수는 중복 배정하지 않는다. 현재 슬롯에
+  // 같은 선수가 있는 경우에는 그대로 두어 탭 입력이 무해하게 동작한다.
+  const current = game.value.assigned[slotId]
+  if (current === index) {
+    advanceAfter(slotId)
+    return
+  }
   if (usedPlayerIndexes.value.has(index)) return
   game.value.assigned[slotId] = index
   advanceAfter(slotId)
@@ -362,6 +396,7 @@ const subOpen = ref(false)
 const cardForPlayer = (idx: number) => game.value.cards.filter(c => c.player === idx)
 const subOut = ref<string | null>(null) // 빠질 선수의 슬롯 id (선발)
 const subIn = ref<string | null>(null) //  들어올 선수의 슬롯 id (후보)
+const editingSubIndex = ref<number | null>(null)
 const subTimeMinute = ref(0)
 const subTimeSecond = ref(0)
 const subTimeTotal = computed(() => subTimeMinute.value * 60 + subTimeSecond.value)
@@ -395,10 +430,15 @@ const isBenchSlot = (id: string) => id.startsWith('b')
 
 function openSub() {
   if (subOpen.value) { closeSub(); return }
+  // 다른 팝업/슬롯 선택 상태를 닫고 교체 패널을 최상위 입력 상태로 연다.
+  grassOpen.value = false
+  menuOpen.value = false
+  activeSlot.value = null
   subSnapshot = { ...game.value.assigned }
   subOpen.value = true
   subOut.value = null
   subIn.value = null
+  editingSubIndex.value = null
   const moment = subMoment()
   subTimeMinute.value = moment ? Math.floor(moment.seconds / 60) : 0
   subTimeSecond.value = moment ? moment.seconds % 60 : 0
@@ -408,6 +448,7 @@ function closeSub() {
   subSnapshot = null
   subOut.value = null
   subIn.value = null
+  editingSubIndex.value = null
   subDragId.value = null
 }
 /** 선발 ↔ 후보 자리를 맞바꾼다. 즉시 반영되므로 포메이션에 바로 보인다. */
@@ -474,13 +515,25 @@ function saveSub() {
       if (!benchBefore.has(inPlayer)) continue // 벤치에서 올라온 게 아니면 교체가 아니다
       newSubs.push({ half: moment.half, seconds: subTimeTotal.value, outPlayer, inPlayer })
     }
-    if (newSubs.length) {
+    if (editingSubIndex.value !== null && newSubs[0]) {
+      game.value.subs = game.value.subs.map((s, i) => i === editingSubIndex.value ? newSubs[0]! : s)
+    } else if (newSubs.length) {
       game.value.subs = [...game.value.subs, ...newSubs].sort(
         (a, b) => HALF_ORDER[a.half] * 100000 + a.seconds - (HALF_ORDER[b.half] * 100000 + b.seconds)
       )
     }
   }
   closeSub()
+}
+function editSub(index: number) {
+  const s = game.value.subs[index]
+  if (!s) return
+  openSub()
+  editingSubIndex.value = index
+  const outSlot = Object.entries(game.value.assigned).find(([, idx]) => idx === s.inPlayer)?.[0]
+  const inSlot = Object.entries(game.value.assigned).find(([, idx]) => idx === s.outPlayer)?.[0]
+  subOut.value = outSlot ?? null
+  subIn.value = inSlot ?? null
 }
 /** 취소: 열었을 때 상태로 되돌린다. */
 function cancelSub() {
@@ -638,7 +691,7 @@ function undoSub(index: number) {
                       @dragend="subDragId = null"
                       @dragover.prevent
                       @drop="onSubDrop(s.id)"
-                    ><strong>{{ s.p?.[0] }} <i v-if="cardForPlayer(game.value.assigned[s.id]!).some(c => c.card === 'R')">🟥</i><i v-else-if="cardForPlayer(game.value.assigned[s.id]!).length">🟨</i></strong><span>{{ s.p?.[1] }}</span></button>
+                    ><strong>{{ s.p?.[0] }} <i v-if="cardForPlayer(game.assigned[s.id]!).some(c => c.card === 'R')">🟥</i><i v-else-if="cardForPlayer(game.assigned[s.id]!).length">🟨</i></strong><span>{{ s.p?.[1] }}</span></button>
                   </div>
                 </div>
                 <div class="subCol">
@@ -674,7 +727,7 @@ function undoSub(index: number) {
                     <span class="hTime">{{ fmtTime(s.seconds) }}</span>
                     <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
                     <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
-                    <span class="hAct"><button class="subUndo" @click="undoSub(i)">취소</button></span>
+                    <span class="hAct"><button class="subUndo" @click="editSub(i)">수정</button><button class="subUndo" @click="undoSub(i)">취소</button></span>
                   </div>
                 </div>
               </div>
@@ -701,7 +754,7 @@ function undoSub(index: number) {
                 <span class="toolIcon grassIcon" :style="{ background: grassBg }" />
                 <span class="toolLabel">잔디선택</span>
               </button>
-              <button class="toolBtn" :class="{ on: subOpen }" @click="openSub">
+              <button type="button" class="toolBtn" :class="{ on: subOpen }" @click.stop="openSub" @pointerup.stop>
                 <span class="toolIcon subIcon">⇄</span>
                 <span class="toolLabel">선수교체</span>
               </button>
@@ -950,6 +1003,7 @@ function undoSub(index: number) {
 .subHistRow .hP{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .subHistRow .outP{color:#f87171}
 .subHistRow .inP{color:#f0b429}
+.subHistRow .hAct{display:flex;gap:4px;justify-content:flex-end}
 .subHistEmpty{padding:8px;text-align:center;color:rgba(255,255,255,.35);font-size:10px}
 .subUndo{border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:rgba(255,255,255,.6);font-size:9px;border-radius:4px;padding:1px 4px;cursor:pointer}
 .subUndo:hover{color:#fff;border-color:rgba(239,68,68,.5)}
