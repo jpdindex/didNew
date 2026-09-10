@@ -132,6 +132,7 @@ const records = ref<DidRecord[]>(resumeHalf ? [...game.value.records] : [])
 // 입력 중인 팀. TeamSelection 에서 team 쿼리로 넘어온다.
 const team = computed(() => (route.query.team === 'away' ? 'away' : 'home'))
 const squad = computed<SquadPlayer[]>(() => (team.value === 'away' ? AWAY_SQUAD : HOME_SQUAD))
+const editingId = ref<string | null>(null)
 
 // 지금 보고 있는 half(전반/후반)의 레코드만 추린다. half 태그가 없는 과거 레코드는
 // 전반(H1)으로 취급한다 — 이 필드가 생기기 전에 만들어진 세션 데이터를 위한 대비다.
@@ -194,7 +195,7 @@ const rows = computed(() => {
 const tableEl = ref<HTMLElement | null>(null)
 // 수정 화면 전용: 기록표를 눌러서 넓히면(경기장이 위로 줄어들며) 더 많은 액트를 한 번에 본다.
 const tableExpanded = ref(false)
-watch(() => rows.value.length, async () => {
+watch(() => visibleRecords.value.length, async () => {
   await nextTick()
   if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
 })
@@ -203,7 +204,6 @@ watch(() => rows.value.length, async () => {
 // PPT 슬라이드 26-27: 수정할 데이터를 길게 클릭 → 시간 수정 → 적용/삭제/취소.
 // 짧게 클릭하면 그 레코드의 위치를 경기장에 잠깐 보여주기만 한다(수정 아님).
 const peekId = ref<string | null>(null)
-const editingId = ref<string | null>(null)
 const editSeconds = ref(0)
 // 수정 중인 레코드의 액트/위치 "임시값". 적용을 눌러야 실제 레코드에 반영된다.
 // 수정 모드에서는 경기장 클릭·액트 클릭이 새 레코드를 만들지 않고 이 값만 바꾼다.
@@ -1233,7 +1233,7 @@ function finishHalf() {
 .halfLabel.clickable:hover{background:rgba(240,180,41,.15)}
 .clock{font-family:monospace;font-size:18px;color:#f0b429;font-weight:800}
 .clock.paused{color:rgba(255,255,255,.4)}
-.pauseBtn{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:40px;height:26px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#f0b429;font-size:13px;cursor:pointer;display:grid;place-items:center;padding:0}
+.pauseBtn{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:180px;height:34px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#f0b429;font-size:16px;cursor:pointer;display:grid;place-items:center;padding:0}
 .pauseBtn.paused{background:rgba(240,180,41,.2);border-color:#f0b429}
 .modeTag{font-size:9px;font-weight:800;color:rgba(255,255,255,.35);letter-spacing:.05em}
 
@@ -1257,7 +1257,7 @@ function finishHalf() {
 .tableToggle:hover{background:#262b33}
 .table{position:absolute;left:0;right:0;bottom:0;height:250px;box-sizing:border-box;padding-bottom:10px;overflow-y:auto;border-top:1px solid rgba(255,255,255,.08);transition:height .18s ease}
 .table.expanded{height:380px}
-.thead,.trow{display:grid;grid-template-columns:.74fr .95fr .68fr .68fr .68fr 2.05fr;gap:4px;padding:8px 10px}
+.thead,.trow{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;padding:8px 10px}
 .thead span,.trow span{min-width:0;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .thead span:last-child,.trow span:last-child{text-align:left;padding-left:18px}
 .thead{background:#f0b429;color:#1a1a1a;font-weight:800;font-size:13px;position:sticky;top:0}
@@ -1270,12 +1270,12 @@ function finishHalf() {
 .trow.edited .playerBtn.assigned{color:#191919}
 .trow.editing{background:rgba(240,180,41,.1)}
 .trow.peeking{background:rgba(240,180,41,.06)}
-.playerBtn{height:26px;min-width:96px;padding:0 16px;border-radius:4px;border:1px dashed #f0b429;background:rgba(240,180,41,.1);color:#f0b429;font-size:12px;font-weight:700;cursor:pointer}
+.playerBtn{height:26px;min-width:72px;padding:0 10px;border-radius:4px;border:1px dashed #f0b429;background:rgba(240,180,41,.1);color:#f0b429;font-size:11px;font-weight:700;cursor:pointer}
 .playerBtn:hover{background:rgba(240,180,41,.25)}
 .playerBtn.assigned{border-style:solid;border-color:#c2a04a;background:#c2a04a;color:#080808;font-style:italic}
 
 .editTimeRow{grid-column:1 / -1;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));align-items:center;gap:4px;padding:2px 0;min-width:0}
-.editClock{grid-column:1 / 4;display:flex;align-items:center;justify-content:center;gap:10px;min-width:0;overflow:visible}
+.editClock{grid-column:1 / 5;display:flex;align-items:center;justify-content:flex-start;gap:10px;padding-left:8px;min-width:0;overflow:visible}
 .editUnit{display:flex;align-items:center;gap:5px}.editUnit b{min-width:30px;text-align:center;color:#f0b429;font-family:monospace;font-size:16px;font-weight:900}.editColon{color:#f0b429;font-weight:900;font-size:18px}
 .editPlayerBtn{grid-column:6;justify-self:center;min-width:72px}
 .editStep{width:38px;height:24px;border-radius:4px;border:1px solid rgba(240,180,41,.7);background:rgba(240,180,41,.14);color:#f0b429;font-size:17px;font-weight:900;cursor:pointer;display:grid;place-items:center;padding:0;line-height:1}
