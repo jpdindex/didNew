@@ -28,13 +28,20 @@ const awayPlayers = [
   ['8','Toni Kroos','MF'],['19','D. Ceballos','MF'],['6','Nacho','MF'],['22','Aurelien Tchouameni','MF'],['16','A. Modric','MF'],['4','David Alaba','DF'],['2','Dani Carvajal','DF'],
   ['3','Eder Militao','DF'],['23','Fran Garcia','DF'],['18','Alvaro Odriozola','DF'],['25','Antonio Rudiger','DF'],['27','Nacho Fernandez','DF'],['28','Jesus Vallejo','DF'],['32','Rafa Marin','DF'],['35','Chema Andres','DF'],
 ]
-const kpis = ['TAP','DAP','DTP','Shoot','ASR','GSR','SSR','BAP']
+const kpis = ['TAP','DAP','DTP','Shoot','Goal','SSR','BAP','ASR']
+const kpiHalf = ref<'all' | 'H1' | 'H2'>('all')
 
 // ---- 공유 상태 ----
 // TeamSelection ↔ DidInput 이 함께 쓰는 임시 스토어(useState). 전반/후반 종료 후
 // 이 화면(대기 화면)으로 돌아왔을 때 라인업·스코어·기록이 그대로 남아있어야 하므로,
 // selectedTeam/formationKey/assigned/side/inputMode/잔디 설정을 전부 여기로 옮겼다.
 const game = useMatchState()
+
+// 전반 시작~종료 구간에는 전반 데이터를, 후반 시작~종료 구간에는 후반 데이터를 자동으로 보여준다.
+watch(() => game.value.halfStatus, (st) => {
+  if (st === 'H1' || st === 'H1_done') kpiHalf.value = 'H1'
+  else if (st === 'H2' || st === 'H2_done') kpiHalf.value = 'H2'
+}, { immediate: true })
 
 // schedule 에서 다른 경기를 새로 선택해 들어온 경우(matchId 가 바뀐 경우)에는
 // 이전 경기의 라인업·기록이 남아있으면 안 되므로 초기화한다.
@@ -313,6 +320,7 @@ function editHalf() {
   navigateTo({ path: '/DidInput', query: didInputQuery(game.value.halfStatus === 'H2' ? '후반' : '전반', true, prevStatus) })
 }
 function startSecondHalf() {
+  if (!confirm('후반전을 시작하시겠습니까?')) return
   game.value.halfStatus = 'H2'
   game.value.seconds = 0 // 새 half 는 0초부터
   navigateTo({ path: '/DidInput', query: didInputQuery('후반') })
@@ -360,8 +368,12 @@ const statusLabel = computed(() => ({
 
 // KPI 는 저장하지 않고 기록(game.records)으로부터 항상 다시 계산한다.
 // 현재는 한 번에 한 팀(game.team)의 기록만 입력하므로, 그 팀 쪽 칸에만 값을 채운다.
+const kpiRecords = computed(() => {
+  if (kpiHalf.value === 'all') return game.value.records
+  return game.value.records.filter(r => (r.half ?? 'H1') === kpiHalf.value)
+})
 const kpiValues = computed(() => {
-  const { paths, flags } = computeAttackPaths(game.value.records, { closeTrailing: true })
+  const { paths, flags } = computeAttackPaths(kpiRecords.value, { closeTrailing: true })
   let tap = 0, dap = 0, dapSc = 0, sht = 0, gol = 0
   for (const f of flags.values()) {
     if (f.isTap) tap++
@@ -370,15 +382,64 @@ const kpiValues = computed(() => {
     if (f.isGol) gol++
   }
   const dtp = paths.filter(p => p.ptype === 'DTP' || p.ptype === 'STP').length
-  const bap = computeBap(game.value.records).length
+  const bap = computeBap(kpiRecords.value).length
   return {
-    TAP: tap, DAP: dap, DTP: dtp, Shoot: sht,
+    TAP: tap, DAP: dap, DTP: dtp, Shoot: sht, Goal: gol,
     ASR: dap ? Math.round((dapSc / dap) * 100) : 0,
-    GSR: dap ? Math.round((gol / dap) * 100) : 0,
     SSR: sht ? Math.round((gol / sht) * 100) : 0,
     BAP: bap,
   }
 })
+
+// ---- 입력 오류 감지 ----
+// E-Time: 같은 half 안에서 같은 초(seconds)에 두 번 이상 입력된 레코드.
+// E-Player: DAP 로 판정됐는데(=DidInput 표에서 선수 선택 버튼이 뜨는데) 선수를 아직 안 고른 레코드.
+function fmtErrTime(sec: number) {
+  return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
+}
+const kpiErrors = computed(() => {
+  const { flags } = computeAttackPaths(kpiRecords.value, { closeTrailing: true })
+
+  // DidInput 표의 No. 열과 같은 기준(그 half 레코드만 추린 순서)으로 번호를 매겨,
+  // 오류 목록에 찍힌 No.가 수정 화면에서 보이는 행 번호와 그대로 일치하게 한다.
+  const numberByHalf: Record<'H1' | 'H2', Map<string, number>> = { H1: new Map(), H2: new Map() }
+  for (const halfKey of ['H1', 'H2'] as const) {
+    game.value.records
+      .filter(r => (r.half ?? 'H1') === halfKey)
+      .forEach((r, i) => numberByHalf[halfKey].set(r.id, i + 1))
+  }
+
+  const timeGroups = new Map<string, { half: 'H1' | 'H2'; seconds: number; ids: string[] }>()
+  for (const r of kpiRecords.value) {
+    const halfKey = r.half ?? 'H1'
+    const key = `${halfKey}_${r.seconds}`
+    if (!timeGroups.has(key)) timeGroups.set(key, { half: halfKey, seconds: r.seconds, ids: [] })
+    timeGroups.get(key)!.ids.push(r.id)
+  }
+  const timeList = [...timeGroups.values()]
+    .filter(g => g.ids.length > 1)
+    .map(g => ({
+      half: g.half,
+      time: fmtErrTime(g.seconds),
+      nos: g.ids.map(id => numberByHalf[g.half].get(id) ?? 0).sort((a, b) => a - b),
+    }))
+    .sort((a, b) => (a.half === b.half ? 0 : a.half === 'H1' ? -1 : 1) || a.time.localeCompare(b.time))
+
+  const playerList = kpiRecords.value
+    .filter(r => flags.get(r.id)?.isDap && !r.playerId)
+    .map(r => {
+      const halfKey = r.half ?? 'H1'
+      return { half: halfKey, no: numberByHalf[halfKey].get(r.id) ?? 0, time: fmtErrTime(r.seconds) }
+    })
+    .sort((a, b) => (a.half === b.half ? 0 : a.half === 'H1' ? -1 : 1) || a.no - b.no)
+
+  return { eTime: timeList.length, ePlayer: playerList.length, timeList, playerList }
+})
+// 사이드바에서 E-Time/E-Player 행을 누르면 오류난 시간대/No.를 펼쳐 보여준다.
+const errorDetailOpen = ref<'time' | 'player' | null>(null)
+function toggleErrorDetail(kind: 'time' | 'player') {
+  errorDetailOpen.value = errorDetailOpen.value === kind ? null : kind
+}
 
 // ---- 잔디선택 ----
 // 레거시 APK 이미지 7종(p000/p1xx/p2xx)과 동일한 조합. 상세는 app/utils/grass.ts.
@@ -585,9 +646,36 @@ function undoSub(index: number) {
         </div>
         <div class="score">{{ game.homeScore }} : {{ game.awayScore }}</div><div class="status">{{ statusLabel }}</div>
         <div class="matchMeta">{{ match.time }} | {{ match.league }} | {{ match.round }}</div><div class="stadium">{{ match.stadium }}</div>
+        <div class="kpiHalfToggle">
+          <button :class="{ active: kpiHalf === 'all' }" @click="kpiHalf = 'all'">전체</button>
+          <button :class="{ active: kpiHalf === 'H1' }" @click="kpiHalf = 'H1'">전반</button>
+          <button :class="{ active: kpiHalf === 'H2' }" @click="kpiHalf = 'H2'">후반</button>
+        </div>
         <div class="kpis">
           <div v-for="key in kpis" :key="key" class="kpiRow">
             <span>{{ game.team === 'home' ? kpiValues[key] : 0 }}</span><b>{{ key }}</b><span>{{ game.team === 'away' ? kpiValues[key] : 0 }}</span>
+          </div>
+        </div>
+        <div class="kpiErrors">
+          <div
+            class="errRow" :class="{ has: kpiErrors.eTime > 0, open: errorDetailOpen === 'time' }"
+            @click="toggleErrorDetail('time')"
+          ><span>E-Time</span><b>{{ kpiErrors.eTime }}개</b></div>
+          <div v-if="errorDetailOpen === 'time'" class="errDetail">
+            <div v-if="kpiErrors.timeList.length" class="errDetailGrid">
+              <span v-for="(g, i) in kpiErrors.timeList" :key="i" class="errDetailItem">{{ g.half }} {{ g.time }}{{ i < kpiErrors.timeList.length - 1 ? ',' : '' }}</span>
+            </div>
+            <span v-else class="errDetailEmpty">중복된 시간 없음</span>
+          </div>
+          <div
+            class="errRow" :class="{ has: kpiErrors.ePlayer > 0, open: errorDetailOpen === 'player' }"
+            @click="toggleErrorDetail('player')"
+          ><span>E-Player</span><b>{{ kpiErrors.ePlayer }}개</b></div>
+          <div v-if="errorDetailOpen === 'player'" class="errDetail">
+            <div v-if="kpiErrors.playerList.length" class="errDetailGrid">
+              <span v-for="(p, i) in kpiErrors.playerList" :key="i" class="errDetailItem">{{ p.half }} {{ p.time }}{{ i < kpiErrors.playerList.length - 1 ? ',' : '' }}</span>
+            </div>
+            <span v-else class="errDetailEmpty">선수 미입력 없음</span>
           </div>
         </div>
         <button class="testBtn" @click="fillTestData">TEST</button>
@@ -862,9 +950,22 @@ function undoSub(index: number) {
 .status{color:rgba(241,180,0,.95);text-align:center;font-size:12px;font-weight:800}
 .matchMeta,.stadium{margin-top:8px;text-align:center;color:rgba(255,255,255,.45);font-size:11px}
 .stadium{margin-top:2px}
-.kpis{margin-top:12px;display:grid;gap:4px}
-.kpiRow{height:28px;display:grid;grid-template-columns:1fr 1.15fr 1fr;place-items:center;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.07);border-radius:4px;color:rgba(255,255,255,.7);font-size:10.5px}
-.kpiRow b{font-size:10px;letter-spacing:.04em;color:rgba(255,255,255,.55)}
+.kpiHalfToggle{margin-top:12px;display:grid;grid-template-columns:repeat(3,1fr);gap:4px}
+.kpiHalfToggle button{height:22px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:rgba(255,255,255,.55);cursor:pointer;font-size:10px;font-weight:700;letter-spacing:.03em}
+.kpiHalfToggle button.active{background:rgba(240,180,41,.12);border-color:rgba(240,180,41,.5);color:#f0b429}
+.kpis{margin-top:6px;display:grid;gap:4px}
+.kpiRow{height:32px;display:grid;grid-template-columns:1fr 1.15fr 1fr;place-items:center;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.07);border-radius:4px;color:rgba(255,255,255,.7);font-size:14px}
+.kpiRow b{font-size:13px;letter-spacing:.04em;color:rgba(255,255,255,.55)}
+.kpiErrors{margin-top:6px;display:grid;gap:4px}
+.errRow{height:26px;display:flex;align-items:center;justify-content:space-between;padding:0 10px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.07);border-radius:4px;color:rgba(255,255,255,.45);font-size:11px;font-weight:700;cursor:pointer}
+.errRow b{font-size:12px;color:rgba(255,255,255,.45)}
+.errRow.has{background:rgba(224,62,62,.12);border-color:rgba(224,62,62,.5);color:#e05c5c}
+.errRow.has b{color:#e05c5c}
+.errRow.open{border-color:rgba(240,180,41,.5)}
+.errDetail{margin:-2px 0 2px;padding:4px 8px;background:rgba(0,0,0,.2);border:1px solid rgba(255,255,255,.07);border-radius:4px}
+.errDetailGrid{display:grid;grid-template-columns:repeat(4,1fr);gap:2px 4px}
+.errDetailItem{font-size:10px;color:rgba(255,255,255,.6);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.errDetailEmpty{display:block;font-size:10px;color:rgba(255,255,255,.3);text-align:center;padding:2px 0}
 .testBtn{margin-top:auto;height:30px;border-radius:4px;border:1px dashed rgba(240,180,41,.5);background:rgba(240,180,41,.08);color:#f0b429;cursor:pointer;font-size:11px;font-weight:800;letter-spacing:.05em}
 .backBtn{margin-top:8px;height:34px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.02);color:rgba(255,255,255,.75);cursor:pointer;font-size:12px}
 

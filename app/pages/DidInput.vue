@@ -195,20 +195,37 @@ const rows = computed(() => {
 const tableEl = ref<HTMLElement | null>(null)
 // 수정 화면 전용: 기록표를 눌러서 넓히면(경기장이 위로 줄어들며) 더 많은 액트를 한 번에 본다.
 const tableExpanded = ref(false)
-watch(() => visibleRecords.value.length, async () => {
-  await nextTick()
-  if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
-})
+// 템플릿에 긴 문자열 리터럴을 직접 두면 에디터 자동 포맷터가 줄바꿈을 문자열 안에 넣어
+// 컴파일 에러를 내는 일이 반복돼서, 라벨을 computed로 빼 템플릿에는 짧은 표현식만 남긴다.
+const tableToggleLabel = computed(() => tableExpanded.value ? '▼ 기록 접기' : '▲ 기록 더보기')
 
 // ---- 기록 보기(짧은 클릭) / 수정(길게 눌러서 진입) ----
 // PPT 슬라이드 26-27: 수정할 데이터를 길게 클릭 → 시간 수정 → 적용/삭제/취소.
 // 짧게 클릭하면 그 레코드의 위치를 경기장에 잠깐 보여주기만 한다(수정 아님).
 const peekId = ref<string | null>(null)
 const editSeconds = ref(0)
-// 수정 중인 레코드의 액트/위치 "임시값". 적용을 눌러야 실제 레코드에 반영된다.
-// 수정 모드에서는 경기장 클릭·액트 클릭이 새 레코드를 만들지 않고 이 값만 바꾼다.
+// 수정 중인 레코드의 액트/위치/결과 "임시값". 적용을 눌러야 실제 레코드에 반영된다.
+// 수정 모드에서는 경기장 클릭·액트 클릭·결과 클릭이 새 레코드를 만들지 않고 이 값만 바꾼다.
 const editAct = ref<ActCode>('')
 const editPos = ref<{ x: number; y: number } | null>(null)
+// 원래 결과가 X/B 였던 레코드만 결과를 고칠 수 있다 — 그 외(진행중/슛 결과 등)는 null 로 두어
+// Kick 패널의 X/B 버튼을 눌러도 아무 효과가 없게 막는다.
+const editRes = ref<'X' | 'B' | null>(null)
+// applyResult() 는 X/B 를 누른 비-슛 액트에 대해 "액트 레코드(res 도 채움) + 그 결과만
+// 나타내는 act='' 레코드"를 항상 짝으로 만든다. 둘은 늘 같은 res 값을 가져야 하므로,
+// 한쪽을 수정하면 짝도 같이 바꿔준다. (예: 17번 P|B 와 18번 (빈 act)|B)
+const editPairedId = ref<string | null>(null)
+/** rec 와 짝을 이루는 결과 레코드의 id 를 찾는다. 없으면 null. */
+function findPairedResultRecordId(rec: DidRecord): string | null {
+  const idx = records.value.findIndex(r => r.id === rec.id)
+  if (idx < 0) return null
+  if (!rec.act) {
+    const prev = records.value[idx - 1]
+    return prev && prev.act && prev.res === rec.res ? prev.id : null
+  }
+  const next = records.value[idx + 1]
+  return next && !next.act && next.res === rec.res ? next.id : null
+}
 const editPlayerEligible = computed(() => {
   if (!editingId.value) return false
   const preview = records.value.map(r => r.id === editingId.value && editPos.value
@@ -265,16 +282,27 @@ function endPress(id: string, isTouch = false) {
   } else if (Date.now() < suppressMouseUntil) return
   if (!longPressed) clickRecord(id)
 }
+// 아직 확정 안 된 새 입력(경기장 클릭 후 액트/결과를 고르는 중인 가안)을 버린다.
+// 위쪽 기록을 눌러 옛 데이터를 보러 가는 순간, 하던 새 입력은 이어갈 수 없으므로 지운다.
+function clearPendingEntry() {
+  pendingPos.value = null
+  pendingCell.value = null
+  pendingShot.value = null
+  flashCell.value = null
+  if (flashTimer) clearTimeout(flashTimer)
+}
 function clickRecord(id: string) {
   // 다른 기록을 선택하면 현재 열려 있던 수정 모드를 닫는다.
   // 수정 중인 행의 버튼/입력 상태가 다른 행으로 남지 않도록 한다.
   if (editingId.value && editingId.value !== id) {
     cancelEdit()
   }
+  clearPendingEntry()
   peekId.value = peekId.value === id ? null : id
 }
 function openEdit(id: string) {
   if (editingId.value && editingId.value !== id) cancelEdit()
+  clearPendingEntry()
   peekId.value = null
   const rec = records.value.find(r => r.id === id)
   if (!rec) return
@@ -282,6 +310,8 @@ function openEdit(id: string) {
   editSeconds.value = rec.seconds
   editAct.value = rec.act
   editPos.value = rec.posX !== undefined && rec.posY !== undefined ? { x: rec.posX, y: rec.posY } : null
+  editRes.value = rec.res === 'X' || rec.res === 'B' ? rec.res : null
+  editPairedId.value = editRes.value ? findPairedResultRecordId(rec) : null
 }
 function stepEditSeconds(delta: number) {
   editSeconds.value = Math.max(0, editSeconds.value + delta)
@@ -304,6 +334,14 @@ function applyEdit() {
       rec.posX = editPos.value.x
       rec.posY = editPos.value.y
       rec.area = Number(areaFromPos(editPos.value))
+    }
+    if (editRes.value && (rec.res === 'X' || rec.res === 'B')) {
+      rec.res = editRes.value
+      const paired = records.value.find(r => r.id === editPairedId.value)
+      if (paired) {
+        paired.res = editRes.value
+        paired.edited = true
+      }
     }
     if (!editPlayerEligible.value) {
       rec.playerId = undefined
@@ -364,6 +402,15 @@ interface PendingShot {
   posY?: number
 }
 const pendingShot = ref<PendingShot | null>(null)
+
+// rows.length 를 봐야 한다 — 가안(draft) 행은 records 에 아직 안 들어가서
+// visibleRecords.length 만 보면 경기장을 찍은 직후(액트를 고르기 전)엔 스크롤이 안 따라간다.
+// (rows 가 pendingPos/pendingShot 을 참조하므로, 이 둘이 선언된 뒤에 watch 를 걸어야 한다.)
+watch(() => rows.value.length, async () => {
+  await nextTick()
+  if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
+})
+
 const playerPickFor = ref<string | null>(null) // 선수 입력창을 띄운 레코드
 const pickedNo = ref<string | null>(null) // 선수선택 화면에서 고른 등번호 (Submit 전)
 
@@ -401,23 +448,93 @@ const subOpen = ref(false)
 const cardOpen = ref(false)
 const cardPlayer = ref<number | null>(null)
 const cardType = ref<'Y' | 'R'>('Y')
-const cardMinute = ref(0)
-const cardSecond = ref(0)
 const cardQueue = ref<CardRecord[]>([])
 const cardByPlayer = computed(() => {
   const map = new Map<number, CardRecord[]>()
   for (const c of [...game.value.cards, ...cardQueue.value]) map.set(c.player, [...(map.get(c.player) ?? []), c])
   return map
 })
-function openCardPanel() { cardOpen.value = !cardOpen.value; if (cardOpen.value) subOpen.value = false; cardPlayer.value = null; cardMinute.value = Math.floor(seconds.value / 60); cardSecond.value = seconds.value % 60 }
-function addCard() { if (cardPlayer.value === null) return; game.value.cards.push({ half: halfCode.value, seconds: cardMinute.value * 60 + cardSecond.value, player: cardPlayer.value, card: cardType.value }); cardPlayer.value = null }
-function queueCard() { if (cardPlayer.value === null) return; cardQueue.value.push({ half: halfCode.value, seconds: cardMinute.value * 60 + cardSecond.value, player: cardPlayer.value, card: cardType.value }); cardPlayer.value = null }
-function submitCards() { queueCard(); game.value.cards.push(...cardQueue.value); cardQueue.value = []; cardOpen.value = false }
-function cancelCards() { cardOpen.value = false; cardPlayer.value = null; cardQueue.value = [] }
+function openCardPanel() { cardOpen.value = !cardOpen.value; if (cardOpen.value) { subOpen.value = false; cardType.value = 'Y' }; cardPlayer.value = null; cardPlayerEditTarget.value = null; cardEditSnapshot.value = null }
+// 카드 시각은 스테퍼로 미리 정해두는 게 아니라, 실제로 선수를 큐에 담는 이 순간의
+// 흘러가는 시계(seconds)값을 그대로 쓴다 — 패널을 열어둔 시간과 실제 입력 시각이 다를 수 있어서다.
+function queueCard() { if (cardPlayer.value === null) return; cardQueue.value.push({ half: halfCode.value, seconds: seconds.value, player: cardPlayer.value, card: cardType.value }); cardPlayer.value = null }
+function submitCards() { queueCard(); game.value.cards.push(...cardQueue.value); cardQueue.value = []; cardOpen.value = false; cardPlayerEditTarget.value = null; cardEditSnapshot.value = null }
+function cancelCards() { cardOpen.value = false; cardPlayer.value = null; cardQueue.value = []; cardPlayerEditTarget.value = null; cardEditSnapshot.value = null }
 function removeQueuedCard(index: number) { cardQueue.value.splice(index, 1) }
 function removeCard(index: number) { game.value.cards.splice(index, 1) }
-function bumpCardMinute(d: number) { cardMinute.value = Math.max(0, cardMinute.value + d) }
-function bumpCardSecond(d: number) { let s = cardSecond.value + d; if (s < 0) { s = 59; bumpCardMinute(-1) }; if (s > 59) { s = 0; bumpCardMinute(1) }; cardSecond.value = s }
+
+// 카드 히스토리 행의 "수정" 버튼을 누르면 새 창 없이, 이미 떠 있는 선수 목록/시각 스테퍼가
+// 그 카드의 값으로 채워지고 — 거기서 선수를 다시 고르거나 시각을 바꾸면 바로 반영된다.
+// 원래 값은 스냅샷으로 들고 있다가, "적용"이면 버리고 "취소"면 되돌린다.
+const cardPlayerEditTarget = ref<{ queue: boolean; index: number } | null>(null)
+const cardEditSnapshot = ref<{ player: number; seconds: number } | null>(null)
+const cardMinute = ref(0)
+const cardSecond = ref(0)
+function openCardPlayerEdit(queue: boolean, index: number) {
+  // 다른 행의 "수정"을 누르면, 지금 열려 있던 편집은 "취소"를 누른 것처럼 원래 값으로
+  // 되돌리고 곧바로 새 대상 편집으로 넘어간다 — 잘못 누른 행을 고치려고 취소를 따로 누를 필요가 없다.
+  if (cardPlayerEditTarget.value) cancelCardPlayerEdit()
+  cardPlayerEditTarget.value = { queue, index }
+  const rec = (queue ? cardQueue.value : game.value.cards)[index]
+  if (rec) {
+    cardMinute.value = Math.floor(rec.seconds / 60)
+    cardSecond.value = rec.seconds % 60
+    cardEditSnapshot.value = { player: rec.player, seconds: rec.seconds }
+  }
+}
+function applyCardPlayerEdit() { cardPlayerEditTarget.value = null; cardEditSnapshot.value = null }
+function cancelCardPlayerEdit() {
+  const target = cardPlayerEditTarget.value
+  const snap = cardEditSnapshot.value
+  if (target && snap) {
+    const rec = (target.queue ? cardQueue.value : game.value.cards)[target.index]
+    if (rec) { rec.player = snap.player; rec.seconds = snap.seconds }
+  }
+  cardPlayerEditTarget.value = null
+  cardEditSnapshot.value = null
+}
+function deleteCardPlayerEdit() {
+  const target = cardPlayerEditTarget.value
+  if (target) { if (target.queue) removeQueuedCard(target.index); else removeCard(target.index) }
+  cardPlayerEditTarget.value = null
+  cardEditSnapshot.value = null
+}
+const cardEditingRecord = computed(() => {
+  const target = cardPlayerEditTarget.value
+  if (!target) return null
+  const list = target.queue ? cardQueue.value : game.value.cards
+  return list[target.index] ?? null
+})
+// 수정 중일 때는 이 스테퍼가 새 카드 초안이 아니라 그 카드의 실제 시각을 가리키므로,
+// 바뀔 때마다 바로 레코드에 반영한다(선수 선택과 마찬가지로 즉시 적용 방식).
+function applyCardTimeIfEditing() {
+  const target = cardPlayerEditTarget.value
+  if (!target) return
+  const rec = (target.queue ? cardQueue.value : game.value.cards)[target.index]
+  if (rec) rec.seconds = cardMinute.value * 60 + cardSecond.value
+}
+function bumpCardMinute(d: number) { cardMinute.value = Math.max(0, cardMinute.value + d); applyCardTimeIfEditing() }
+function bumpCardSecond(d: number) { let s = cardSecond.value + d; if (s < 0) { s = 59; bumpCardMinute(-1) }; if (s > 59) { s = 0; bumpCardMinute(1) }; cardSecond.value = s; applyCardTimeIfEditing() }
+// 선수 목록에서 하이라이트할 대상 — 수정 중이면 그 카드의 현재 선수, 아니면 새 카드 입력 중인 선수.
+const cardHighlightPlayer = computed(() => cardPlayerEditTarget.value ? cardEditingRecord.value?.player ?? null : cardPlayer.value)
+// 상단 경고/퇴장 토글도 마찬가지 — 수정 중이면 그 카드의 실제 종류를 보여주고, 눌렀을 때도
+// 새 카드 초안이 아니라 그 카드 자체를 즉시 바꾼다.
+const cardTypeDisplay = computed(() => cardPlayerEditTarget.value ? cardEditingRecord.value?.card ?? cardType.value : cardType.value)
+function setCardType(t: 'Y' | 'R') {
+  const target = cardPlayerEditTarget.value
+  if (!target) { cardType.value = t; return }
+  const rec = (target.queue ? cardQueue.value : game.value.cards)[target.index]
+  if (rec) rec.card = t
+}
+function selectCardPlayer(idx: number) {
+  const target = cardPlayerEditTarget.value
+  if (!target) { cardPlayer.value = idx; return }
+  const list = target.queue ? cardQueue.value : game.value.cards
+  const rec = list[target.index]
+  if (rec) rec.player = idx
+  // 선수를 고르면 그걸로 끝 — 바로 적용하고 수정 모드를 닫는다.
+  applyCardPlayerEdit()
+}
 const subOutSlot = ref<string | null>(null)
 const subInSlot = ref<string | null>(null)
 // 교체 시각 — 패널을 열면 지금 시계 값으로 채워주지만, 실제로 몇 분에 있었던 교체인지
@@ -445,13 +562,21 @@ function playerAtSlot(slotId: string): SquadPlayer | null {
 }
 
 /** 'gk' + 'o0..oN' = 그라운드에 있는 선수, 'b0..bN' = 벤치 */
-const onFieldSlots = computed(() =>
+const fieldSlotsRaw = computed(() =>
   Object.keys(game.value.assigned)
     .filter(id => id === 'gk' || id.startsWith('o'))
     .sort((a, b) => (a === 'gk' ? -1 : b === 'gk' ? 1 : Number(a.slice(1)) - Number(b.slice(1))))
     .map(id => ({ id, p: playerAtSlot(id) }))
-    .filter(s => s.p && !(cardByPlayer.value.get(game.value.assigned[s.id]!) ?? []).some(c => c.card === 'R'))
+    .filter(s => s.p)
 )
+// 명시적 퇴장(R) 카드뿐 아니라, 경고(Y) 카드를 두 장 받아 경고 누적으로 퇴장된 경우도
+// 더는 뛸 수 없다. 다만 그 두 번째 경고 카드 자체는 기록/표시에서 여전히 "경고"로 남아야
+// 하므로, 여기서는 판정에만 쓰고 카드 종류(c.card)는 건드리지 않는다.
+function isSentOff(playerIdx: number) {
+  const cards = cardByPlayer.value.get(playerIdx) ?? []
+  return cards.some(c => c.card === 'R') || cards.filter(c => c.card === 'Y').length >= 2
+}
+const onFieldSlots = computed(() => fieldSlotsRaw.value.filter(s => !isSentOff(game.value.assigned[s.id]!)))
 const benchSlots = computed(() =>
   Object.keys(game.value.assigned)
     .filter(id => id.startsWith('b'))
@@ -459,6 +584,18 @@ const benchSlots = computed(() =>
     .map(id => ({ id, p: playerAtSlot(id) }))
     .filter(s => s.p)
 )
+// 카드는 필드 위 11명뿐 아니라 후보 선수에게도 매길 수 있어야 한다(경고 누적 관리 등).
+// 선발/후보로 나누고 각각 등번호 순으로 정렬해서 보여준다 — 슬롯 순서 그대로면 뒤섞여 보인다.
+const byNo = <T extends { p: SquadPlayer | null }>(list: T[]) =>
+  [...list].sort((a, b) => Number(a.p!.no) - Number(b.p!.no))
+// 이미 퇴장 처리된(명시적 R, 또는 경고 누적) 선수는 새로 카드를 줄 수 없어 목록에서 빠지지만,
+// 지금 그 선수의 카드를 "수정" 중이라면 목록에 남아 있어야 한다 — 그래야 경고 카드를 고치다가
+// 취소 없이 바로 다른 선수의 퇴장 카드도 이어서 고칠 수 있다.
+function canPickForCard(playerIdx: number) {
+  return !isSentOff(playerIdx) || playerIdx === cardHighlightPlayer.value
+}
+const cardStarterSlots = computed(() => byNo(fieldSlotsRaw.value.filter(s => canPickForCard(game.value.assigned[s.id]!))))
+const cardSubSlots = computed(() => byNo(benchSlots.value.filter(s => canPickForCard(game.value.assigned[s.id]!))))
 
 /** 한 번 빠진 선수는 다시 못 들어온다(축구 규칙) — 벤치에 있어도 고를 수 없게 막는다 */
 const subbedOutPlayers = computed(() => new Set(game.value.subs.map(s => s.outPlayer)))
@@ -555,10 +692,8 @@ const kickResultActs = [
   { k: 'B', label: 'Blocking' },
 ]
 
-// 아무것도 보고 있지 않을 때 기본으로 보여줄 레코드 = 시간순으로 진짜 마지막 레코드.
-// (act 없는 결과 전용 레코드를 건너뛰고 이전 액트로 되돌아가면 안 된다 —
-//  예: P 가 B 로 막히면 배열 끝은 {act:'', res:'B'} 이고, 그게 "가장 최근 상태"다.
-//  그러면 P 는 더 이상 채워지지 않고 B 만 채워져야 한다.)
+// 시간순으로 진짜 마지막 레코드. displayRecord 가 "아직 결과를 기다리는 중"인지
+// 판단하는 데 쓰인다 (아래 참고).
 const lastRecord = computed(() => records.value[records.value.length - 1] ?? null)
 const shootActs = [
   { k: 'S', label: 'Shooting' },
@@ -595,9 +730,19 @@ const peekRecord = computed(() => records.value.find(r => r.id === peekId.value)
 const editingRecord = computed(() => records.value.find(r => r.id === editingId.value) ?? null)
 const infoRecord = computed(() => editingRecord.value ?? peekRecord.value)
 
+// 수정 화면에서 기록표를 눌러 보고 있는(peek/edit) 레코드가 있으면, 위쪽 시계는 진행 시각
+// 대신 그 레코드의 시간을 보여준다. seconds.value(전/후반 종료 시각, 나가기 시 저장되는 값)는
+// 그대로 유지되므로 대기방으로 나가도 시간이 틀어지지 않는다 — 화면 표시만 바뀐다.
+const displayClock = computed(() => (infoRecord.value ? fmtTime(infoRecord.value.seconds) : clock.value))
+
 // Kick/Shooting 패널에 "채워서" 보여줄 레코드. 레코드를 클릭/롱프레스해서 보고 있는
-// 중이면 그 레코드를, 아무것도 안 보고 있으면 진짜 마지막 레코드를 기준으로 삼는다.
-const displayRecord = computed(() => infoRecord.value ?? lastRecord.value)
+// 중이면 그 레코드를 그대로 보여준다. 아무것도 안 보고 있을 때는 마지막 레코드가
+// 아직 결과를 기다리는 중(res==='O')인 경우에만 보여준다 — 결과(X/B 등)까지 이미
+// 확정된 레코드는 끝난 것이므로, 다음 입력을 새로 받을 수 있게 아무것도 표시하지 않는다.
+const displayRecord = computed(() => {
+  if (infoRecord.value) return infoRecord.value
+  return lastRecord.value?.res === 'O' ? lastRecord.value : null
+})
 
 // 위 레코드의 act 를 채워서 보여준다. act 가 없는 레코드(결과 전용)면 아무 액트도
 // 채우지 않는다 — 예를 들어 P 가 B 로 막힌 직후엔 P 를 더 이상 채우지 않는다.
@@ -609,7 +754,9 @@ const activeAct = computed(() => (
 // 위 레코드의 결과가 X/B 면 그 결과 버튼도 "선택됨"으로 보여준다.
 // 하나의 레코드에 act 와 res(X/B) 가 함께 있는 경우(예: 표에서 "P|B" 한 줄로 보이는
 // 레코드를 직접 클릭해서 보는 중) 는 activeAct 와 동시에 채워진다 — 의도된 동작이다.
+// 수정 중일 때는 저장된 값이 아니라 아직 적용 전인 임시값(editRes)을 보여준다.
 const activeResult = computed(() => {
+  if (editingId.value) return editRes.value
   const res = displayRecord.value?.res
   return res === 'X' || res === 'B' ? res : null
 })
@@ -650,7 +797,17 @@ function cellFromPos(pos: { x: number; y: number }) {
   return { col, row }
 }
 
+// 카드 입력·선수교체 중에 경기장·기록표를 터치하면 Cancel/Close 를 누른 것과 같이
+// 그 창을 닫는다 — 창을 따로 안 닫고 바로 기록을 이어서 찍을 수 있게 해준다.
+function closeOverlayPanelsOnOutsideTouch(e: Event): boolean {
+  if (cardOpen.value) { e.stopPropagation(); cancelCards(); return true }
+  if (subOpen.value) { e.stopPropagation(); closeSubPanel(); return true }
+  return false
+}
+
 function clickPitch(e: MouseEvent) {
+  if (closeOverlayPanelsOnOutsideTouch(e)) return
+
   const el = e.currentTarget as HTMLElement
   const rect = el.getBoundingClientRect()
   const x = ((e.clientX - rect.left) / rect.width) * 100
@@ -738,6 +895,13 @@ function clickAct(actKey: string, isShot: boolean) {
 // X/B: C/P 와 마찬가지로 위치를 먼저 찍어야 누를 수 있다 (실책·블락이 일어난 지점).
 // 직전 액트 레코드에 결과를 기록하고, 그 위치를 area 로 하는 결과 레코드를 하나 더 남긴다.
 function clickResult(res: 'X' | 'B') {
+  // 수정 중이면 새 레코드를 만들지 않고, 지금 수정 중인 레코드의 결과만 바꾼다.
+  // 원래 결과가 X/B 였던 레코드(editRes 가 null 이 아닌 경우)만 바꿀 수 있다 —
+  // 그 외는 짝 레코드가 없어 함께 갱신할 대상이 불분명하므로 막는다.
+  if (editingId.value) {
+    if (editRes.value !== null) editRes.value = res
+    return
+  }
   if (!pendingPos.value) return
   const last = records.value[records.value.length - 1]
   if (!last || last.res !== 'O') return
@@ -880,306 +1044,348 @@ function finishHalf() {
   <div class="page">
     <div class="frameViewport">
       <div class="frame" :class="{ mirrored: game.mirrored }">
-      <section class="left">
-        <div class="statBar">
-          <button class="cardIcon" :class="{ on: cardOpen }" title="카드 입력" @click="openCardPanel">🟨🟥</button>
-          <button class="stat" @click="stepSeconds(-3)">-3</button>
-          <button class="stat" @click="stepSeconds(-1)">-1</button>
-          <div class="spacer" />
-          <button class="stat" @click="stepSeconds(1)">+1</button>
-          <button class="stat" @click="stepSeconds(3)">+3</button>
-          <div class="grassWrap">
-            <button class="grassIcon" :class="{ on: grassOpen }" @click="grassOpen = !grassOpen">▦</button>
-            <div v-if="grassOpen" class="grassPop">
-              <div class="popRow">
-                <span class="popLabel">잔디 패턴</span>
-                <div class="popOpts">
-                  <button
-                    v-for="g in GRASS_PATTERNS" :key="g.value"
-                    class="popBtn" :class="{ on: grassPattern === g.value }"
-                    @click="grassPattern = g.value"
-                  >{{ g.label }}</button>
-                </div>
-              </div>
-              <div class="popRow">
-                <span class="popLabel">잔디 라인</span>
-                <div class="popOpts">
-                  <button
-                    v-for="n in GRASS_LINE_OPTIONS" :key="n"
-                    class="popBtn" :class="{ on: grassLines === n }"
-                    :disabled="grassPattern === 0"
-                    @click="grassLines = n"
-                  >{{ n }}줄</button>
-                </div>
-              </div>
-              <div class="popPreview" :style="{ background: grassBg }" />
-              <button class="popOk" @click="grassOpen = false">확인</button>
-            </div>
-          </div>
-          <button class="swapIcon" :class="{ on: subOpen }" title="선수 교체" @click="openSubPanel">⇄</button>
-          <button
-            v-if="inputMode === '분석'"
-            class="pauseBtn"
-            :class="{ paused }"
-            @click="togglePause"
-          >{{ paused ? '▶' : '❚❚' }}</button>
-          <div v-else class="modeTag">실시간</div>
-        </div>
-
-        <div class="scoreBar">
-          <div class="team">{{ home }}</div>
-          <div class="score">{{ homeScore }}</div>
-          <div class="halfBox">
-            <div class="clockRow">
-              <button class="timeStep" @click="stepSeconds(-1)">◀</button>
-              <div
-                class="halfLabel"
-                :class="{ on: half === '전반', clickable: isEditMode }"
-                @click="selectHalf('전반')"
-              >전반</div>
-              <div class="clock" :class="{ paused }">{{ clock }}</div>
-              <div
-                class="halfLabel"
-                :class="{ on: half === '후반', clickable: isEditMode }"
-                @click="selectHalf('후반')"
-              >후반</div>
-              <button class="timeStep" @click="stepSeconds(1)">▶</button>
-            </div>
-          </div>
-          <div class="score">{{ awayScore }}</div>
-          <div class="team right">{{ away }}</div>
-        </div>
-
-        <div class="pitch" :style="{ background: grassBg }" @pointerdown="clickPitch">
-          <div class="lineHalf" /><div class="lineCircle" />
-          <div class="boxL" /><div class="arcL" /><div class="goalNetL" />
-          <div class="boxR" /><div class="arcR" /><div class="goalNetR" />
-          <div class="corner cornerTL" /><div class="corner cornerBL" />
-          <div class="corner cornerTR" /><div class="corner cornerBR" />
-          <div v-if="cellRect" class="zoneHighlight" :style="cellRect" />
-          <div v-if="infoCellRect" class="zoneHighlight editZoneHighlight" :style="infoCellRect" />
-          <div v-if="infoMarkerPos" class="marker editMarker" :style="infoMarkerPos" />
-          <div v-if="pendingPos" class="marker" :style="{ left: pendingPos.x + '%', top: pendingPos.y + '%' }" />
-        </div>
-
-        <button
-          v-if="isEditMode"
-          class="tableToggle"
-          @click="tableExpanded = !tableExpanded"
-        >{{ tableExpanded ? '▼ 기록 접기' : '▲ 기록 더보기' }}</button>
-        <div ref="tableEl" class="table" :class="{ expanded: tableExpanded }">
-          <div class="thead">
-            <span>No.</span><span>Time</span><span>Act</span><span>Result</span><span>Area</span><span>Player</span>
-          </div>
-          <div class="tbody">
-            <div
-              v-for="r in rows" :key="r.id" class="trow"
-              :class="{ pending: r.result === 'O', editing: editingId === r.id, peeking: peekId === r.id, edited: records.find(x => x.id === r.id)?.edited, draft: r.draft }"
-              @mousedown="!r.draft && startPress(r.id)"
-              @mouseup="!r.draft && endPress(r.id)"
-              @mouseleave="cancelPress"
-              @touchstart="!r.draft && startPress(r.id, true)"
-              @touchmove="handleTouchMove"
-              @touchend="!r.draft && endPress(r.id, true)"
-              @contextmenu.prevent
-            >
-              <template v-if="editingId === r.id">
-                <div class="editTimeRow" @mousedown.stop @touchstart.stop>
-                  <div class="editClock">
-                    <span class="editUnit"><button class="editStep" @click.stop="stepEditMinute(-1)">−</button><b>{{ String(editMinute).padStart(2, '0') }}</b><button class="editStep" @click.stop="stepEditMinute(1)">+</button></span>
-                    <span class="editColon">:</span>
-                    <span class="editUnit"><button class="editStep" @click.stop="stepEditSecond(-1)">−</button><b>{{ String(editSecond).padStart(2, '0') }}</b><button class="editStep" @click.stop="stepEditSecond(1)">+</button></span>
+        <section class="left">
+          <div class="statBar">
+            <button class="cardIcon" :class="{ on: cardOpen }" title="카드 입력" @click="openCardPanel">🟨🟥</button>
+            <button class="stat" @click="stepSeconds(-3)">-3</button>
+            <button class="stat" @click="stepSeconds(-1)">-1</button>
+            <div class="spacer" />
+            <button class="stat" @click="stepSeconds(1)">+1</button>
+            <button class="stat" @click="stepSeconds(3)">+3</button>
+            <div class="grassWrap">
+              <button class="grassIcon" :class="{ on: grassOpen }" title="잔디 패턴" @click="grassOpen = !grassOpen"><span
+                  class="grassSwatch" /></button>
+              <div v-if="grassOpen" class="grassPop">
+                <div class="popRow">
+                  <span class="popLabel">잔디 패턴</span>
+                  <div class="popOpts">
+                    <button v-for="g in GRASS_PATTERNS" :key="g.value" class="popBtn"
+                      :class="{ on: grassPattern === g.value }" @click="grassPattern = g.value">{{ g.label }}</button>
                   </div>
-                  <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn" @mousedown.stop @touchstart.stop @click.stop="openPlayerPick(r.id)">{{ r.playerName || '선수 선택' }}</button>
+                </div>
+                <div class="popRow">
+                  <span class="popLabel">잔디 라인</span>
+                  <div class="popOpts">
+                    <button v-for="n in GRASS_LINE_OPTIONS" :key="n" class="popBtn" :class="{ on: grassLines === n }"
+                      :disabled="grassPattern === 0" @click="grassLines = n">{{ n }}줄</button>
+                  </div>
+                </div>
+                <div class="popPreview" :style="{ background: grassBg }" />
+                <button class="popOk" @click="grassOpen = false">확인</button>
+              </div>
+            </div>
+            <button class="swapIcon" :class="{ on: subOpen }" title="선수 교체" @click="openSubPanel">🔄</button>
+            <button v-if="inputMode === '분석'" class="pauseBtn" :class="{ paused }" @click="togglePause">{{ paused ? '▶'
+              : '❚❚' }}</button>
+            <div v-else class="modeTag">실시간</div>
+          </div>
+
+          <div class="scoreBar">
+            <div class="team">{{ home }}</div>
+            <div class="score">{{ homeScore }}</div>
+            <div class="halfBox">
+              <div class="clockRow">
+                <button class="timeStep" @click="stepSeconds(-1)">◀</button>
+                <div class="halfLabel" :class="{ on: half === '전반', clickable: isEditMode }" @click="selectHalf('전반')">
+                  전반</div>
+                <div class="clock" :class="{ paused }">{{ displayClock }}</div>
+                <div class="halfLabel" :class="{ on: half === '후반', clickable: isEditMode }" @click="selectHalf('후반')">
+                  후반</div>
+                <button class="timeStep" @click="stepSeconds(1)">▶</button>
+              </div>
+            </div>
+            <div class="score">{{ awayScore }}</div>
+            <div class="team right">{{ away }}</div>
+          </div>
+
+          <div class="pitch" :style="{ background: grassBg }" @pointerdown="clickPitch">
+            <div class="lineHalf" />
+            <div class="lineCircle" />
+            <div class="boxL" />
+            <div class="arcL" />
+            <div class="goalNetL" />
+            <div class="boxR" />
+            <div class="arcR" />
+            <div class="goalNetR" />
+            <div class="corner cornerTL" />
+            <div class="corner cornerBL" />
+            <div class="corner cornerTR" />
+            <div class="corner cornerBR" />
+            <div v-if="cellRect" class="zoneHighlight" :style="cellRect" />
+            <div v-if="infoCellRect" class="zoneHighlight editZoneHighlight" :style="infoCellRect" />
+            <div v-if="infoMarkerPos" class="marker editMarker" :style="infoMarkerPos" />
+            <div v-if="pendingPos" class="marker" :style="{ left: pendingPos.x + '%', top: pendingPos.y + '%' }" />
+          </div>
+
+          <button v-if="isEditMode" class="tableToggle" @click="tableExpanded = !tableExpanded">{{ tableToggleLabel }}</button>
+          <div ref="tableEl" class="table" :class="{ expanded: tableExpanded }"
+            @mousedown.capture="closeOverlayPanelsOnOutsideTouch"
+            @touchstart.capture="closeOverlayPanelsOnOutsideTouch">
+            <div class="thead">
+              <span>No.</span><span>Time</span><span>Act</span><span>Result</span><span>Area</span><span>Player</span>
+            </div>
+            <div class="tbody">
+              <div v-for="r in rows" :key="r.id" class="trow"
+                :class="{ pending: r.result === 'O', editing: editingId === r.id, peeking: peekId === r.id, edited: records.find(x => x.id === r.id)?.edited, draft: r.draft }"
+                @mousedown="!r.draft && startPress(r.id)" @mouseup="!r.draft && endPress(r.id)"
+                @mouseleave="cancelPress" @touchstart="!r.draft && startPress(r.id, true)" @touchmove="handleTouchMove"
+                @touchend="!r.draft && endPress(r.id, true)" @contextmenu.prevent>
+                <template v-if="editingId === r.id">
+                  <div class="editTimeRow" @mousedown.stop @touchstart.stop>
+                    <div class="editClock">
+                      <span class="editUnit"><button class="editStep" @click.stop="stepEditMinute(-1)">−</button><b>{{
+                        String(editMinute).padStart(2, '0') }}</b><button class="editStep"
+                          @click.stop="stepEditMinute(1)">+</button></span>
+                      <span class="editColon">:</span>
+                      <span class="editUnit"><button class="editStep" @click.stop="stepEditSecond(-1)">−</button><b>{{
+                        String(editSecond).padStart(2, '0') }}</b><button class="editStep"
+                          @click.stop="stepEditSecond(1)">+</button></span>
+                      <button class="editApply editApplyInline" @mousedown.stop @touchstart.stop
+                        @click.stop="applyEdit">적용</button>
+                    </div>
+                    <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn" @mousedown.stop @touchstart.stop
+                      @click.stop="openPlayerPick(r.id)">{{ r.playerName || '선수 선택' }}</button>
+                  </div>
+                </template>
+                <template v-else>
+                  <span>{{ r.no }}</span><span>{{ r.time }}</span><span>{{ r.act }}</span><span>{{ r.result
+                  }}</span><span>{{ r.area }}</span>
+                  <span>
+                    <button v-if="r.isDap || r.playerName" class="playerBtn" :class="{ assigned: !!r.playerName }"
+                      @mousedown.stop @touchstart.stop @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select'
+                      }}</button>
+                  </span>
+                </template>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="right" :class="{ editing: !!editingId }">
+          <div v-if="editingId" class="editActions">
+            <button class="editApply" @click="applyEdit">적용</button>
+            <button class="editDelete" @click="deleteEdit">삭제</button>
+            <button class="editCancel" @click="cancelEdit">취소</button>
+          </div>
+          <!-- 수정 화면(isEditMode)이거나 정지 중이면 "대기방으로 나가기". 실제로 기록 중일 때만 "{half} 종료". -->
+          <button v-else-if="isEditMode || paused" class="finishBtn" @click="exitToLobby">대기방으로 나가기</button>
+          <button v-else class="finishBtn" @click="finishHalf">{{ half }} 종료</button>
+
+          <div v-if="!editingId" class="mirrorWrap">
+            <button class="mirrorIcon" :class="{ on: mirrorOpen }" @click="openMirrorPopup">⇄</button>
+            <div v-if="mirrorOpen" class="mirrorPop">
+              <div class="popRow">
+                <span class="popLabel">좌우 반전</span>
+                <div class="popOpts">
+                  <button class="popBtn" :class="{ on: !pendingMirrored }" @click="pendingMirrored = false">기본</button>
+                  <button class="popBtn" :class="{ on: pendingMirrored }" @click="pendingMirrored = true">반전</button>
+                </div>
+              </div>
+              <button class="popOk" @click="confirmMirror">확인</button>
+            </div>
+          </div>
+
+          <h1 :class="{ editTitle: !!editingId }">{{ cardOpen ? '카드 입력' : subOpen ? '선수교체' : playerPickFor ? '선수선택' :
+            'DID-INPUT' }}</h1>
+
+          <div v-if="cardOpen" class="cardPanel">
+            <div class="cardTypes"><button :class="{ selected: cardTypeDisplay === 'Y' }" @click="setCardType('Y')">🟨
+                경고</button><button :class="{ selected: cardTypeDisplay === 'R' }" @click="setCardType('R')">🟥 퇴장</button>
+            </div>
+            <div v-if="cardPlayerEditTarget" class="cardEditBar">
+              <div class="cardEditTime">
+                <button class="timeBtn" @click="bumpCardMinute(-1)">−</button>
+                <strong>{{ String(cardMinute).padStart(2, '0') }}</strong>
+                <button class="timeBtn" @click="bumpCardMinute(1)">＋</button>
+                <b class="timeColon">:</b>
+                <button class="timeBtn" @click="bumpCardSecond(-1)">−</button>
+                <strong>{{ String(cardSecond).padStart(2, '0') }}</strong>
+                <button class="timeBtn" @click="bumpCardSecond(1)">＋</button>
+              </div>
+              <div class="cardEditBtns">
+                <button class="cardEditBtn cardEditBtnApply" @click="applyCardPlayerEdit">적용</button>
+                <button class="cardEditBtn cardEditBtnDelete" @click="deleteCardPlayerEdit">삭제</button>
+                <button class="cardEditBtn cardEditBtnCancel" @click="cancelCardPlayerEdit">취소</button>
+              </div>
+            </div>
+            <div class="cardPlayerGroups">
+              <div class="cardPlayers">
+                <button v-for="p in cardStarterSlots" :key="p.id"
+                  :class="[p.p!.pos?.toLowerCase(), { selected: cardHighlightPlayer === game.assigned[p.id] }]"
+                  @click="selectCardPlayer(game.assigned[p.id]!)"><strong>{{ p.p!.no }}</strong><span>{{ p.p!.name
+                  }}</span></button>
+              </div>
+              <template v-if="cardSubSlots.length">
+                <div class="cardGroupLabel">후보</div>
+                <div class="cardPlayers">
+                  <button v-for="p in cardSubSlots" :key="p.id"
+                    :class="[p.p!.pos?.toLowerCase(), { selected: cardHighlightPlayer === game.assigned[p.id] }]"
+                    @click="selectCardPlayer(game.assigned[p.id]!)"><strong>{{ p.p!.no }}</strong><span>{{ p.p!.name
+                    }}</span></button>
                 </div>
               </template>
-              <template v-else>
-                <span>{{ r.no }}</span><span>{{ r.time }}</span><span>{{ r.act }}</span><span>{{ r.result }}</span><span>{{ r.area }}</span>
-                <span>
-                  <button v-if="r.isDap || r.playerName" class="playerBtn" :class="{ assigned: !!r.playerName }" @mousedown.stop @touchstart.stop @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select' }}</button>
+            </div>
+            <div v-if="!cardPlayerEditTarget" class="cardSelected">{{ cardPlayer === null ? '선수를 선택하세요' :
+              playerLabel(cardPlayer) }} · {{
+                cardType ===
+                  'Y' ? '🟨 경고' : '🟥 퇴장' }} <button v-if="cardPlayer !== null" class="queueBtn" @click="queueCard">목록에
+                추가</button>
+            </div>
+            <div class="cardHistory">
+              <div class="cardHistHead">
+                <span>Half</span><span>Time</span><span>Player</span><span>Card</span><span></span>
+              </div>
+              <div v-for="(c, i) in [...game.cards, ...cardQueue]" :key="i" class="cardHistRow">
+                <span>{{ subHalfLabel[c.half] }}</span><span>{{ fmtTime(c.seconds) }}</span><span>{{
+                  playerLabel(c.player)
+                }}</span><span>{{ c.card === 'Y' ? '🟨 경고' : '🟥 퇴장' }}</span>
+                <span class="cardRowActions">
+                  <button class="cardRowEdit"
+                    @click="openCardPlayerEdit(i >= game.cards.length, i >= game.cards.length ? i - game.cards.length : i)">수정</button>
+                  <button class="cardRowCancel"
+                    @click="i >= game.cards.length ? removeQueuedCard(i - game.cards.length) : removeCard(i)">삭제</button>
                 </span>
-              </template>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section class="right" :class="{ editing: !!editingId }">
-        <div v-if="editingId" class="editActions">
-          <button class="editApply" @click="applyEdit">적용</button>
-          <button class="editDelete" @click="deleteEdit">삭제</button>
-          <button class="editCancel" @click="cancelEdit">취소</button>
-        </div>
-        <!-- 수정 화면(isEditMode)이거나 정지 중이면 "대기방으로 나가기". 실제로 기록 중일 때만 "{half} 종료". -->
-        <button v-else-if="isEditMode || paused" class="finishBtn" @click="exitToLobby">대기방으로 나가기</button>
-        <button v-else class="finishBtn" @click="finishHalf">{{ half }} 종료</button>
-
-        <div v-if="!editingId" class="mirrorWrap">
-          <button class="mirrorIcon" :class="{ on: mirrorOpen }" @click="openMirrorPopup">⇄</button>
-          <div v-if="mirrorOpen" class="mirrorPop">
-            <div class="popRow">
-              <span class="popLabel">좌우 반전</span>
-              <div class="popOpts">
-                <button class="popBtn" :class="{ on: !pendingMirrored }" @click="pendingMirrored = false">기본</button>
-                <button class="popBtn" :class="{ on: pendingMirrored }" @click="pendingMirrored = true">반전</button>
               </div>
             </div>
-            <button class="popOk" @click="confirmMirror">확인</button>
+            <div class="cardActions"><button @click="cancelCards">Cancel</button><button
+                :disabled="cardPlayer === null && !cardQueue.length" @click="submitCards">Submit</button></div>
           </div>
-        </div>
 
-        <h1 :class="{ editTitle: !!editingId }">{{ cardOpen ? '카드 입력' : subOpen ? '선수교체' : playerPickFor ? '선수선택' : 'DID-INPUT' }}</h1>
-
-        <div v-if="cardOpen" class="cardPanel">
-          <div class="cardTypes"><button :class="{selected: cardType === 'Y'}" @click="cardType='Y'">🟨 경고</button><button :class="{selected: cardType === 'R'}" @click="cardType='R'">🟥 퇴장</button></div>
-          <div class="cardTime"><span>{{ half }} 시각</span><span class="timeStepper"><button @click="bumpCardMinute(-1)">−</button><strong>{{ String(cardMinute).padStart(2,'0') }}</strong><button @click="bumpCardMinute(1)">＋</button></span><b>:</b><span class="timeStepper"><button @click="bumpCardSecond(-1)">−</button><strong>{{ String(cardSecond).padStart(2,'0') }}</strong><button @click="bumpCardSecond(1)">＋</button></span></div>
-          <div class="cardPlayers"><button v-for="p in onFieldSlots" :key="p.id" :class="[p.p!.pos?.toLowerCase(), {selected: cardPlayer === game.assigned[p.id]}]" @click="cardPlayer = game.assigned[p.id]"><strong>{{ p.p!.no }}</strong><span>{{ p.p!.name }}</span></button></div>
-          <div class="cardSelected">{{ cardPlayer === null ? '선수를 선택하세요' : playerLabel(cardPlayer) }} · {{ cardType === 'Y' ? '🟨 경고' : '🟥 퇴장' }} <button v-if="cardPlayer !== null" class="queueBtn" @click="queueCard">목록에 추가</button></div>
-          <div class="cardHistory"><div class="cardHistHead"><span>Half</span><span>Time</span><span>Player</span><span>Card</span><span></span></div><div v-for="(c,i) in [...game.cards, ...cardQueue]" :key="i" class="cardHistRow"><span>{{ subHalfLabel[c.half] }}</span><span>{{ fmtTime(c.seconds) }}</span><span>{{ playerLabel(c.player) }}</span><span>{{ c.card === 'Y' ? '🟨 경고' : '🟥 퇴장' }}</span><button class="cardRowCancel" @click="i >= game.cards.length ? removeQueuedCard(i - game.cards.length) : removeCard(i)">취소</button></div></div>
-          <div class="cardActions"><button @click="cancelCards">Cancel</button><button :disabled="cardPlayer === null && !cardQueue.length" @click="submitCards">Submit</button></div>
-        </div>
-
-        <!-- 선수교체: 선수선택과 마찬가지로 액트 입력창 자리에서 UI 를 전환한다.
+          <!-- 선수교체: 선수선택과 마찬가지로 액트 입력창 자리에서 UI 를 전환한다.
              경기장·기록표(왼쪽)는 그대로 보여야 하므로 화면을 덮지 않는다. -->
-        <div v-if="subOpen" class="group subGroup">
-          <div class="subTimeRow">
-            <span class="subTimeLabel">{{ half }} 교체 시각</span>
-            <div class="subTimeStepper">
-              <button class="subTimeBtn" @click="bumpSubMinute(-1)">－</button>
-              <span class="subTimeNum">{{ String(subMinute).padStart(2, '0') }}</span>
-              <button class="subTimeBtn" @click="bumpSubMinute(1)">＋</button>
-            </div>
-            <span class="subTimeColon">:</span>
-            <div class="subTimeStepper">
-              <button class="subTimeBtn" @click="bumpSubSecond(-1)">－</button>
-              <span class="subTimeNum">{{ String(subSecond).padStart(2, '0') }}</span>
-              <button class="subTimeBtn" @click="bumpSubSecond(1)">＋</button>
-            </div>
-          </div>
-
-          <div class="subCols">
-            <div class="subSection">
-              <div class="subColHead"><span>선수목록</span><span class="subColHint">나갈 선수</span></div>
-              <div class="subGrid">
-                <button
-                  v-for="s in onFieldSlots" :key="s.id"
-                  class="subCard" :class="[`pos${s.p!.pos}`, { out: subOutSlot === s.id }]"
-                  @click="pickSubOut(s.id)"
-                >
-                  <span class="subNo">{{ s.p!.no }}</span>
-                  <span class="subName">{{ s.p!.name }}</span>
-                </button>
+          <div v-if="subOpen" class="group subGroup">
+            <div class="subTimeRow">
+              <span class="subTimeLabel">{{ half }} 교체 시각</span>
+              <div class="subTimeStepper">
+                <button class="subTimeBtn" @click="bumpSubMinute(-1)">－</button>
+                <span class="subTimeNum">{{ String(subMinute).padStart(2, '0') }}</span>
+                <button class="subTimeBtn" @click="bumpSubMinute(1)">＋</button>
+              </div>
+              <span class="subTimeColon">:</span>
+              <div class="subTimeStepper">
+                <button class="subTimeBtn" @click="bumpSubSecond(-1)">－</button>
+                <span class="subTimeNum">{{ String(subSecond).padStart(2, '0') }}</span>
+                <button class="subTimeBtn" @click="bumpSubSecond(1)">＋</button>
               </div>
             </div>
 
-            <div class="subSection">
-              <div class="subColHead"><span>대기목록</span><span class="subColHint">들어올 선수</span></div>
-              <div class="subGrid">
-                <button
-                  v-for="s in benchSlots" :key="s.id"
-                  class="subCard"
-                  :class="[`pos${s.p!.pos}`, { in: subInSlot === s.id, done: isSubbedOut(s.id) }]"
-                  :disabled="isSubbedOut(s.id)"
-                  @click="pickSubIn(s.id)"
-                >
-                  <span class="subNo">{{ s.p!.no }}</span>
-                  <span class="subName">{{ s.p!.name }}</span>
-                  <span v-if="isSubbedOut(s.id)" class="subDoneTag">교체됨</span>
-                </button>
+            <div class="subCols">
+              <div class="subSection">
+                <div class="subColHead"><span>선수목록</span><span class="subColHint">나갈 선수</span></div>
+                <div class="subGrid">
+                  <button v-for="s in onFieldSlots" :key="s.id" class="subCard"
+                    :class="[`pos${s.p!.pos}`, { out: subOutSlot === s.id }]" @click="pickSubOut(s.id)">
+                    <span class="subNo">{{ s.p!.no }}</span>
+                    <span class="subName">{{ s.p!.name }}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="subSection">
+                <div class="subColHead"><span>대기목록</span><span class="subColHint">들어올 선수</span></div>
+                <div class="subGrid">
+                  <button v-for="s in benchSlots" :key="s.id" class="subCard"
+                    :class="[`pos${s.p!.pos}`, { in: subInSlot === s.id, done: isSubbedOut(s.id) }]"
+                    :disabled="isSubbedOut(s.id)" @click="pickSubIn(s.id)">
+                    <span class="subNo">{{ s.p!.no }}</span>
+                    <span class="subName">{{ s.p!.name }}</span>
+                    <span v-if="isSubbedOut(s.id)" class="subDoneTag">교체됨</span>
+                  </button>
+                </div>
               </div>
             </div>
-          </div>
 
-          <div class="subHistory">
-            <div class="subHistHead">
-              <span class="hHalf">Half</span>
-              <span class="hTime">Time</span>
-              <span class="hP">Out</span>
-              <span class="hP">In</span>
-              <span class="hAct"></span>
+            <div class="subHistory">
+              <div class="subHistHead">
+                <span class="hHalf">Half</span>
+                <span class="hTime">Time</span>
+                <span class="hP">Out</span>
+                <span class="hP">In</span>
+                <span class="hAct"></span>
+              </div>
+              <div v-if="!game.subs.length" class="subHistEmpty">교체 기록이 없습니다.</div>
+              <div v-for="(s, i) in game.subs" v-else :key="i" class="subHistRow">
+                <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
+                <span class="hTime">{{ fmtTime(s.seconds) }}</span>
+                <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
+                <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
+                <span class="hAct"><button class="subUndo" @click="openSubPanel">수정</button><button class="subUndo"
+                    @click="undoSub(i)">취소</button></span>
+              </div>
             </div>
-            <div v-if="!game.subs.length" class="subHistEmpty">교체 기록이 없습니다.</div>
-            <div v-for="(s, i) in game.subs" v-else :key="i" class="subHistRow">
-              <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
-              <span class="hTime">{{ fmtTime(s.seconds) }}</span>
-              <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
-              <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
-              <span class="hAct"><button class="subUndo" @click="openSubPanel">수정</button><button class="subUndo" @click="undoSub(i)">취소</button></span>
-            </div>
-          </div>
 
-          <div class="subActions">
-            <button class="subCancel" @click="closeSubPanel">Close</button>
-            <button class="subSubmit" :disabled="!canSubmitSub" @click="submitSub">Submit</button>
-          </div>
-        </div>
-
-        <template v-else-if="!cardOpen && !subOpen && !playerPickFor">
-        <div class="group">
-          <div class="groupTitle">Kick</div>
-          <div class="kickGrid">
-            <button v-for="a in kickActs" :key="a.k" class="actBtn kickPrimary" :class="[`kick-${a.k.toLowerCase()}`, { on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }]" @click="clickAct(a.k, false)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
-            <div class="stacked">
-              <button v-for="a in kickActs2" :key="a.k" class="actBtn small" :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }" @click="clickAct(a.k, false)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
-            </div>
-            <button v-for="a in kickResultActs" :key="a.k" class="actBtn kickResult" :class="[`kick-${a.k.toLowerCase()}`, { on: activeResult === a.k }]" @click="clickResult(a.k as 'X' | 'B')"><b>{{ a.k }}</b><span class="divider">|</span><span>{{ a.label }}</span></button>
-          </div>
-        </div>
-
-        <div class="group">
-          <div class="groupTitle">Shooting</div>
-          <div class="shootGrid">
-            <button v-for="a in shootActs" :key="a.k" class="actBtn" :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }" @click="clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
-          </div>
-
-          <div class="goal" :class="{ active: pendingShot !== null }">
-            <div class="goalZone hx" @click="clickOuterZone($event, 'HX')">HX</div>
-            <div class="goalZone h" @click="clickOuterZone($event, 'H')">H</div>
-            <div class="goalZone lx" @click="clickOuterZone($event, 'LX')">LX</div>
-            <div class="goalZone l" @click="clickOuterZone($event, 'L')">L</div>
-            <div class="goalZone rx" @click="clickOuterZone($event, 'RX')">RX</div>
-            <div class="goalZone r" @click="clickOuterZone($event, 'R')">R</div>
-            <div class="hxDivider" aria-hidden="true" />
-            <div class="meterGuide" aria-hidden="true" />
-            <div class="goalFrame" @click="clickGoalFrame">
-              <div class="goalZone goalCenter" aria-hidden="true" />
-              <div
-                v-if="pendingFramePos"
-                class="frameMarker"
-                :style="{ left: pendingFramePos.x * 100 + '%', top: pendingFramePos.y * 100 + '%' }"
-              />
+            <div class="subActions">
+              <button class="subCancel" @click="closeSubPanel">Close</button>
+              <button class="subSubmit" :disabled="!canSubmitSub" @click="submitSub">Submit</button>
             </div>
           </div>
-          <div class="goalResultButtons">
-            <button class="goalResultBtn resB" @click="confirmGoalFrame('B')">B</button>
-            <button class="goalResultBtn resGoal" @click="confirmGoalFrame('GOAL')">GOAL</button>
-            <button class="goalResultBtn resX" @click="confirmGoalFrame('X')">X</button>
-          </div>
-        </div>
 
-        </template>
+          <template v-else-if="!cardOpen && !subOpen && !playerPickFor">
+            <div class="group">
+              <div class="groupTitle">Kick</div>
+              <div class="kickGrid">
+                <button v-for="a in kickActs" :key="a.k" class="actBtn kickPrimary"
+                  :class="[`kick-${a.k.toLowerCase()}`, { on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }]"
+                  @click="clickAct(a.k, false)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
+                <div class="stacked">
+                  <button v-for="a in kickActs2" :key="a.k" class="actBtn small"
+                    :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }"
+                    @click="clickAct(a.k, false)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
+                </div>
+                <button v-for="a in kickResultActs" :key="a.k" class="actBtn kickResult"
+                  :class="[`kick-${a.k.toLowerCase()}`, { on: activeResult === a.k }]"
+                  @click="clickResult(a.k as 'X' | 'B')"><b>{{ a.k }}</b><span class="divider">|</span><span>{{ a.label
+                  }}</span></button>
+              </div>
+            </div>
 
-        <!-- 선수선택: PPT 대로 액트 입력창 자리에서 UI 를 전환한다 -->
-        <div v-if="!cardOpen && !subOpen && playerPickFor" class="group pickGroup">
-          <div class="pickField">
-            <button
-              v-for="p in lineup"
-              :key="p.no"
-              class="jersey"
-              :class="{ on: pickedNo === p.no }"
-              :style="{ left: p.slot.x + '%', top: p.slot.y + '%' }"
-              @click="pickedNo = p.no"
-            >
-              <span class="shirt">{{ p.no }}</span>
-              <span class="jname">{{ p.name }}</span>
-            </button>
+            <div class="group">
+              <div class="groupTitle">Shooting</div>
+              <div class="shootGrid">
+                <button v-for="a in shootActs" :key="a.k" class="actBtn"
+                  :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }"
+                  @click="clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
+              </div>
+
+              <div class="goal" :class="{ active: pendingShot !== null }">
+                <div class="goalZone hx" @click="clickOuterZone($event, 'HX')">HX</div>
+                <div class="goalZone h" @click="clickOuterZone($event, 'H')">H</div>
+                <div class="goalZone lx" @click="clickOuterZone($event, 'LX')">LX</div>
+                <div class="goalZone l" @click="clickOuterZone($event, 'L')">L</div>
+                <div class="goalZone rx" @click="clickOuterZone($event, 'RX')">RX</div>
+                <div class="goalZone r" @click="clickOuterZone($event, 'R')">R</div>
+                <div class="hxDivider" aria-hidden="true" />
+                <div class="meterGuide" aria-hidden="true" />
+                <div class="goalFrame" @click="clickGoalFrame">
+                  <div class="goalZone goalCenter" aria-hidden="true" />
+                  <div v-if="pendingFramePos" class="frameMarker"
+                    :style="{ left: pendingFramePos.x * 100 + '%', top: pendingFramePos.y * 100 + '%' }" />
+                </div>
+              </div>
+              <div class="goalResultButtons">
+                <button class="goalResultBtn resB" @click="confirmGoalFrame('B')">B</button>
+                <button class="goalResultBtn resGoal" @click="confirmGoalFrame('GOAL')">GOAL</button>
+                <button class="goalResultBtn resX" @click="confirmGoalFrame('X')">X</button>
+              </div>
+            </div>
+
+          </template>
+
+          <!-- 선수선택: PPT 대로 액트 입력창 자리에서 UI 를 전환한다 -->
+          <div v-if="!cardOpen && !subOpen && playerPickFor" class="group pickGroup">
+            <div class="pickField">
+              <button v-for="p in lineup" :key="p.no" class="jersey" :class="{ on: pickedNo === p.no }"
+                :style="{ left: p.slot.x + '%', top: p.slot.y + '%' }" @click="pickedNo = p.no">
+                <span class="shirt">{{ p.no }}</span>
+                <span class="jname">{{ p.name }}</span>
+              </button>
+            </div>
+            <div class="pickActions">
+              <button class="pickCancel" @click="cancelPlayerPick">Cancel</button>
+              <button class="pickSubmit" :disabled="!pickedNo" @click="submitPlayer">Submit</button>
+            </div>
           </div>
-          <div class="pickActions">
-            <button class="pickCancel" @click="cancelPlayerPick">Cancel</button>
-            <button class="pickSubmit" :disabled="!pickedNo" @click="submitPlayer">Submit</button>
-          </div>
-        </div>
-      </section>
+        </section>
 
       </div>
     </div>
@@ -1187,255 +1393,1936 @@ function finishHalf() {
 </template>
 
 <style scoped>
-*{box-sizing:border-box}button{font:inherit}
-.page{width:1280px;height:800px;margin:0 auto;box-sizing:border-box;padding:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#0b0f17}
-.frameViewport{position:relative;flex:0 0 auto;width:1280px;height:800px;overflow:hidden;box-shadow:0 14px 44px rgba(0,0,0,.55)}
-.frame{position:absolute;left:0;top:0;width:1280px;height:800px;display:grid;grid-template-columns:712.6641px 567.3359px;overflow:hidden;border:1px solid rgba(255,255,255,.1)}
+* {
+  box-sizing: border-box
+}
+
+button {
+  font: inherit
+}
+
+.page {
+  width: 1280px;
+  height: 800px;
+  margin: 0 auto;
+  box-sizing: border-box;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #0b0f17
+}
+
+.frameViewport {
+  position: relative;
+  flex: 0 0 auto;
+  width: 1280px;
+  height: 800px;
+  overflow: hidden;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, .55)
+}
+
+.frame {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1280px;
+  height: 800px;
+  display: grid;
+  grid-template-columns: 712.6641px 567.3359px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .1)
+}
+
 /* 좌우 반전: 컨테이너만 뒤집고(rtl) 자식 각각은 다시 정방향(ltr)으로 되돌려 내부 내용은 그대로 둔 채
    left/right 두 섹션의 위치만 맞바꾼다. DOM 순서·기존 코드는 전혀 안 건드린다. */
-.frame.mirrored{direction:rtl}
-.frame.mirrored>section{direction:ltr}
+.frame.mirrored {
+  direction: rtl
+}
 
-.left{position:relative;min-width:0;background:#1b1e22;display:flex;flex-direction:column;padding-bottom:250px}
-.statBar{position:relative;flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.08)}
-.cardIcon{font-size:14px}
-.cardRowCancel{padding:2px 6px;border:1px solid rgba(255,255,255,.2);border-radius:3px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.7);font-size:10px}
-.cardHistHead,.cardHistRow{display:grid;grid-template-columns:44px 44px 1fr 78px 38px;align-items:center;gap:4px;padding:5px 7px;font-size:10px}.cardHistHead{background:#1b2130;color:rgba(255,255,255,.45);font-weight:600}.cardHistRow{border-top:1px solid rgba(255,255,255,.06)}
-.cardPlayers button{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px}.cardPlayers button strong{font-size:20px;line-height:1;font-weight:900}.cardPlayers button span{font-size:9px;color:rgba(255,255,255,.65);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}.cardPlayers button.gk strong{color:rgba(255,255,255,.65)}.cardPlayers button.fw strong{color:#5fb8c9}.cardPlayers button.mf strong{color:#d98671}.cardPlayers button.df strong{color:#93b56a}
-.cardIcon{border:1px solid rgba(255,255,255,.15);background:transparent;color:#fff;border-radius:4px;cursor:pointer;padding:5px 8px}.cardIcon.on{background:rgba(240,180,41,.2);border-color:#f0b429}
-.cardPanel{height:100%;box-sizing:border-box;padding:14px;display:flex;flex-direction:column;gap:10px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.18);border-radius:6px}.cardTypes{display:flex;gap:8px}.cardTypes button{flex:1;padding:10px;border:1px solid rgba(255,255,255,.2);border-radius:4px;background:rgba(255,255,255,.06);color:#fff}.cardTypes .selected{border-color:#f0b429;background:rgba(240,180,41,.2)}.cardTime{display:flex;align-items:center;justify-content:center;gap:6px;color:#f0b429}.cardTime button{width:24px;height:24px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.2);color:#fff;border-radius:4px}.cardTime strong{min-width:24px;text-align:center}.cardPlayers{flex:0 0 auto;display:grid;grid-template-columns:repeat(4,1fr);grid-auto-rows:42px;gap:6px;align-content:start}.cardPlayers button{padding:5px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.04);color:#ddd;border-radius:4px;font-size:11px}.cardPlayers button.selected{border-color:#f0b429;background:rgba(240,180,41,.15)}.cardSelected{text-align:center;color:rgba(255,255,255,.7);font-size:12px}.cardHistory{min-height:70px;max-height:120px;overflow:auto;padding:6px;border:1px solid rgba(255,255,255,.1);font-size:11px;color:rgba(255,255,255,.7);line-height:1.7}.cardActions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.cardActions button{padding:11px;border:1px solid #f0b429;border-radius:4px;background:transparent;color:#f0b429;font-weight:700}.cardActions button:last-child{background:#f0b429;color:#191919}.cardActions button:disabled{opacity:.4}
-.stat{height:26px;padding:0 10px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#ddd;font-weight:800;cursor:pointer}
-.spacer{flex:1}
-.grassIcon,.swapIcon{width:26px;height:26px;display:grid;place-items:center;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#ddd;font-size:13px;padding:0;cursor:pointer}
-.grassIcon.on{border-color:#f0b429;color:#f0b429;background:rgba(240,180,41,.18)}
-.grassWrap{position:relative}
-.grassPop{position:absolute;z-index:30;top:32px;right:0;width:250px;padding:10px;border-radius:6px;border:1px solid rgba(255,255,255,.16);background:#1b1e22;box-shadow:0 14px 40px rgba(0,0,0,.6);display:flex;flex-direction:column;gap:9px}
-.popRow{display:flex;flex-direction:column;gap:5px}
-.popLabel{font-size:10px;font-weight:800;color:rgba(255,255,255,.5)}
-.popOpts{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}
-.popBtn{height:24px;border-radius:4px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.05);color:#ddd;font-size:10px;font-weight:700;cursor:pointer;padding:0}
-.popBtn.on{border-color:#f0b429;background:rgba(240,180,41,.2);color:#f0b429}
-.popBtn:disabled{opacity:.35;cursor:not-allowed}
-.popPreview{height:34px;border-radius:4px;border:1px solid rgba(255,255,255,.18)}
-.popOk{height:26px;border-radius:4px;border:none;background:#f0b429;color:#191919;font-weight:800;font-size:11px;cursor:pointer}
+.frame.mirrored>section {
+  direction: ltr
+}
 
-.scoreBar{flex:0 0 auto;min-width:0;display:grid;grid-template-columns:minmax(120px,1fr) 24px auto 24px minmax(150px,1fr);align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid rgba(255,255,255,.08)}
-.team{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#eee;font-weight:800;font-size:13px}
-.team.right{text-align:right}
-.score{color:#fff;font-weight:900;font-size:20px;min-width:20px;text-align:center}
-.halfBox{display:flex;flex-direction:column;align-items:center;gap:4px;background:#111417;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:6px 10px}
-.clockRow{display:flex;align-items:center;gap:8px}
-.timeStep{width:18px;height:18px;border-radius:3px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:rgba(255,255,255,.5);font-size:9px;cursor:pointer;display:grid;place-items:center;padding:0}
-.timeStep:hover{background:rgba(240,180,41,.15);border-color:#f0b429;color:#f0b429}
-.halfLabel{font-size:10px;color:rgba(255,255,255,.35);font-weight:800}
-.halfLabel.on{color:#f0b429}
-.halfLabel.clickable{cursor:pointer;padding:2px 4px;border-radius:3px}
-.halfLabel.clickable:hover{background:rgba(240,180,41,.15)}
-.clock{font-family:monospace;font-size:18px;color:#f0b429;font-weight:800}
-.clock.paused{color:rgba(255,255,255,.4)}
-.pauseBtn{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:180px;height:34px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#f0b429;font-size:16px;cursor:pointer;display:grid;place-items:center;padding:0}
-.pauseBtn.paused{background:rgba(240,180,41,.2);border-color:#f0b429}
-.modeTag{font-size:9px;font-weight:800;color:rgba(255,255,255,.35);letter-spacing:.05em}
+.left {
+  position: relative;
+  min-width: 0;
+  background: #1b1e22;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 250px
+}
 
-.pitch{position:relative;flex:1;min-height:200px;overflow:hidden;cursor:crosshair;touch-action:manipulation}
-.lineHalf{position:absolute;left:50%;top:0;bottom:0;width:0;border-left:2px solid rgba(255,255,255,.75)}
-.lineCircle{position:absolute;left:50%;top:50%;height:27%;aspect-ratio:1;transform:translate(-50%,-50%);border:2px solid rgba(255,255,255,.78);border-radius:50%}
-.boxL{position:absolute;left:0;top:19%;bottom:19%;width:15.5%;border:2px solid rgba(255,255,255,.78);border-left:none}
-.arcL{position:absolute;left:8.5%;top:50%;width:14%;aspect-ratio:1;transform:translateY(-50%);border:2px solid rgba(255,255,255,.78);border-radius:50%;clip-path:inset(0 0 0 50%)}
-.boxR{position:absolute;right:0;top:19%;bottom:19%;width:15.5%;border:2px solid rgba(255,255,255,.78);border-right:none}
-.arcR{position:absolute;right:8.5%;top:50%;width:14%;aspect-ratio:1;transform:translateY(-50%);border:2px solid rgba(255,255,255,.78);border-radius:50%;clip-path:inset(0 50% 0 0)}
-.goalNetL,.goalNetR{position:absolute;top:35%;bottom:35%;width:5%;background:transparent;border:2px solid rgba(255,255,255,.78)}
-.goalNetL{left:0;border-left:none}.goalNetR{right:0;border-right:none}
-.corner{position:absolute;width:22px;height:22px;border:2px solid rgba(255,255,255,.35);border-radius:50%}.cornerTL{left:-12px;top:-12px}.cornerBL{left:-12px;bottom:-12px}.cornerTR{right:-12px;top:-12px}.cornerBR{right:-12px;bottom:-12px}
-.marker{position:absolute;width:14px;height:14px;margin:-7px;border-radius:50%;background:rgba(235,235,235,.72);border:2px solid rgba(255,255,255,.9);box-shadow:0 0 0 4px rgba(210,210,210,.22);pointer-events:none}
-.zoneHighlight{position:absolute;background:rgba(255,255,255,.14);border:0;pointer-events:none;box-sizing:border-box;animation:zoneFlash .42s ease-out forwards}
-.editZoneHighlight{background:rgba(240,180,41,.28);border:2px solid #f0b429;animation:none}
-.editMarker{background:rgba(240,180,41,.85);border-color:#fff;box-shadow:0 0 0 5px rgba(240,180,41,.3);z-index:2}
-@keyframes zoneFlash{0%{opacity:1}55%{opacity:.55}100%{opacity:0}}
+.statBar {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, .08)
+}
 
-.tableToggle{flex:0 0 auto;height:20px;border:none;border-top:1px solid rgba(255,255,255,.08);background:#20242b;color:#f0b429;font-size:10px;font-weight:800;cursor:pointer}
-.tableToggle:hover{background:#262b33}
-.table{position:absolute;left:0;right:0;bottom:0;height:250px;box-sizing:border-box;padding-bottom:10px;overflow-y:auto;border-top:1px solid rgba(255,255,255,.08);transition:height .18s ease}
-.table.expanded{height:380px}
-.thead,.trow{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;padding:8px 10px}
-.thead span,.trow span{min-width:0;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.thead span:last-child,.trow span:last-child{text-align:left;padding-left:18px}
-.thead{background:#f0b429;color:#1a1a1a;font-weight:800;font-size:13px;position:sticky;top:0}
-.trow{color:#ddd;font-size:14px;min-height:42px;align-items:center;border-bottom:1px solid rgba(255,255,255,.06);cursor:pointer;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
-.trow.draft{color:rgba(255,255,255,.4);font-style:italic;cursor:default;background:rgba(255,255,255,.03)}
-.trow.edited{color:#78c58a}
-.trow.edited button{color:#78c58a;border-color:#78c58a}
-.trow.pending{color:#f0b429}
-.trow.pending.edited{color:#78c58a}
-.trow.edited .playerBtn.assigned{color:#191919}
-.trow.editing{background:rgba(240,180,41,.1)}
-.trow.peeking{background:rgba(240,180,41,.06)}
-.playerBtn{height:26px;min-width:72px;padding:0 10px;border-radius:4px;border:1px dashed #f0b429;background:rgba(240,180,41,.1);color:#f0b429;font-size:11px;font-weight:700;cursor:pointer}
-.playerBtn:hover{background:rgba(240,180,41,.25)}
-.playerBtn.assigned{border-style:solid;border-color:#c2a04a;background:#c2a04a;color:#080808;font-style:italic}
+.cardIcon {
+  font-size: 14px
+}
 
-.editTimeRow{grid-column:1 / -1;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));align-items:center;gap:4px;padding:2px 0;min-width:0}
-.editClock{grid-column:1 / 5;display:flex;align-items:center;justify-content:flex-start;gap:10px;padding-left:8px;min-width:0;overflow:visible}
-.editUnit{display:flex;align-items:center;gap:5px}.editUnit b{min-width:30px;text-align:center;color:#f0b429;font-family:monospace;font-size:16px;font-weight:900}.editColon{color:#f0b429;font-weight:900;font-size:18px}
-.editPlayerBtn{grid-column:6;justify-self:center;min-width:72px}
-.editStep{width:38px;height:24px;border-radius:4px;border:1px solid rgba(240,180,41,.7);background:rgba(240,180,41,.14);color:#f0b429;font-size:17px;font-weight:900;cursor:pointer;display:grid;place-items:center;padding:0;line-height:1}
-.editStep:hover{background:rgba(240,180,41,.25)}
-.editTimeVal{font-family:monospace;font-size:13px;font-weight:800;color:#f0b429;min-width:58px;text-align:center}
+.cardRowActions {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end
+}
+
+.cardRowCancel {
+  padding: 3px 6px;
+  border: 1px solid rgba(255, 255, 255, .2);
+  border-radius: 3px;
+  background: rgba(255, 255, 255, .06);
+  color: rgba(255, 255, 255, .7);
+  font-size: 11px
+}
+
+.cardRowEdit {
+  padding: 3px 6px;
+  border: 1px solid rgba(240, 180, 41, .5);
+  border-radius: 3px;
+  background: rgba(240, 180, 41, .1);
+  color: #f0b429;
+  font-size: 11px
+}
+
+.cardHistHead,
+.cardHistRow {
+  display: grid;
+  grid-template-columns: 44px 44px 1fr 78px 80px;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 7px;
+  font-size: 13px
+}
+
+.cardHistHead {
+  background: #1b2130;
+  color: rgba(255, 255, 255, .45);
+  font-weight: 600
+}
+
+.cardHistRow {
+  border-top: 1px solid rgba(255, 255, 255, .06)
+}
+
+.cardGroupLabel {
+  font-size: 10px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, .4);
+  line-height: 1;
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, .08)
+}
+
+.cardIcon {
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: transparent;
+  color: #fff;
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 5px 8px
+}
+
+.cardIcon.on {
+  background: rgba(240, 180, 41, .2);
+  border-color: #f0b429
+}
+
+.cardPlayers button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 0;
+  overflow: hidden
+}
+
+.cardPlayers button strong {
+  font-size: 16px;
+  line-height: 1;
+  font-weight: 900
+}
+
+.cardPlayers button span {
+  font-size: 10px;
+  color: rgba(255, 255, 255, .65);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%
+}
+
+.cardPlayers button.gk strong {
+  color: rgba(255, 255, 255, .65)
+}
+
+.cardPlayers button.fw strong {
+  color: #5fb8c9
+}
+
+.cardPlayers button.mf strong {
+  color: #d98671
+}
+
+.cardPlayers button.df strong {
+  color: #93b56a
+}
+
+.cardPanel {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  box-sizing: border-box;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  background: rgba(0, 0, 0, .18);
+  border-radius: 6px
+}
+
+.cardTypes {
+  display: flex;
+  gap: 8px
+}
+
+.cardTypes button {
+  flex: 1;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, .2);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .06);
+  color: #fff
+}
+
+.cardTypes .selected {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .2)
+}
+
+.cardEditBar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px
+}
+
+.cardEditTime {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  gap: 2px;
+  padding: 5px 10px;
+  background: rgba(255, 255, 255, .04);
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 8px
+}
+
+.timeBtn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: rgba(255, 255, 255, .45);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer
+}
+
+.timeBtn:active {
+  background: rgba(240, 180, 41, .2);
+  color: #f0b429
+}
+
+.cardEditTime strong {
+  min-width: 22px;
+  text-align: center;
+  font-family: ui-monospace, monospace;
+  font-size: 15px;
+  font-weight: 700;
+  color: #f0b429
+}
+
+.timeColon {
+  margin: 0 2px;
+  color: rgba(255, 255, 255, .3);
+  font-weight: 400
+}
+
+.cardEditBtns {
+  display: flex;
+  gap: 8px
+}
+
+.cardEditBtn {
+  flex: 1;
+  padding: 6px 0;
+  font-size: 14px;
+  font-weight: 800;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: #23262b;
+  color: #fff
+}
+
+.cardEditBtnApply {
+  border-color: #f0b429;
+  background: #f0b429;
+  color: #191919
+}
+
+.cardEditBtnDelete {
+  border-color: rgba(217, 76, 76, .45);
+  background: #3a2126;
+  color: #e08a8a
+}
+
+.cardPlayerGroups {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px
+}
+
+.cardPlayers {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  grid-auto-rows: 46px;
+  gap: 5px
+}
+
+.cardPlayers button {
+  padding: 4px 3px;
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: rgba(255, 255, 255, .04);
+  color: #ddd;
+  border-radius: 4px;
+  font-size: 11px
+}
+
+.cardPlayers button.selected {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .15)
+}
+
+.cardSelected {
+  text-align: center;
+  color: rgba(255, 255, 255, .7);
+  font-size: 12px
+}
+
+.queueBtn {
+  margin-left: 6px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 800;
+  border-radius: 6px;
+  border: 1px solid #f0b429;
+  background: rgba(240, 180, 41, .15);
+  color: #f0b429;
+  cursor: pointer
+}
+
+.queueBtn:active {
+  background: #f0b429;
+  color: #191919
+}
+
+.cardHistory {
+  flex: 1;
+  min-height: 150px;
+  max-height: 280px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, .1);
+  font-size: 11px;
+  color: rgba(255, 255, 255, .7);
+  line-height: 1.7
+}
+
+.cardActions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px
+}
+
+.cardActions button {
+  padding: 11px;
+  border: 1px solid #f0b429;
+  border-radius: 4px;
+  background: transparent;
+  color: #f0b429;
+  font-weight: 700
+}
+
+.cardActions button:last-child {
+  background: #f0b429;
+  color: #191919
+}
+
+.cardActions button:disabled {
+  opacity: .4
+}
+
+.stat {
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: rgba(255, 255, 255, .06);
+  color: #ddd;
+  font-weight: 800;
+  cursor: pointer
+}
+
+.spacer {
+  flex: 1
+}
+
+.grassIcon,
+.swapIcon {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: rgba(255, 255, 255, .06);
+  color: #ddd;
+  font-size: 13px;
+  padding: 0;
+  cursor: pointer
+}
+
+.grassIcon.on {
+  border-color: #f0b429;
+  color: #f0b429;
+  background: rgba(240, 180, 41, .18)
+}
+
+.grassSwatch {
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  background: repeating-linear-gradient(90deg, #9ccc65 0 4px, #4caf50 4px 8px)
+}
+
+.grassWrap {
+  position: relative
+}
+
+.grassPop {
+  position: absolute;
+  z-index: 30;
+  top: 32px;
+  right: 0;
+  width: 250px;
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, .16);
+  background: #1b1e22;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
+  display: flex;
+  flex-direction: column;
+  gap: 9px
+}
+
+.popRow {
+  display: flex;
+  flex-direction: column;
+  gap: 5px
+}
+
+.popLabel {
+  font-size: 10px;
+  font-weight: 800;
+  color: rgba(255, 255, 255, .5)
+}
+
+.popOpts {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 5px
+}
+
+.popBtn {
+  height: 24px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .14);
+  background: rgba(255, 255, 255, .05);
+  color: #ddd;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0
+}
+
+.popBtn.on {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .2);
+  color: #f0b429
+}
+
+.popBtn:disabled {
+  opacity: .35;
+  cursor: not-allowed
+}
+
+.popPreview {
+  height: 34px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .18)
+}
+
+.popOk {
+  height: 26px;
+  border-radius: 4px;
+  border: none;
+  background: #f0b429;
+  color: #191919;
+  font-weight: 800;
+  font-size: 11px;
+  cursor: pointer
+}
+
+.scoreBar {
+  flex: 0 0 auto;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) 24px auto 24px minmax(150px, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, .08)
+}
+
+.team {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #eee;
+  font-weight: 800;
+  font-size: 13px
+}
+
+.team.right {
+  text-align: right
+}
+
+.score {
+  color: #fff;
+  font-weight: 900;
+  font-size: 20px;
+  min-width: 20px;
+  text-align: center
+}
+
+.halfBox {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  background: #111417;
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: 6px;
+  padding: 6px 10px
+}
+
+.clockRow {
+  display: flex;
+  align-items: center;
+  gap: 8px
+}
+
+.timeStep {
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: rgba(255, 255, 255, .05);
+  color: rgba(255, 255, 255, .5);
+  font-size: 9px;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0
+}
+
+.timeStep:hover {
+  background: rgba(240, 180, 41, .15);
+  border-color: #f0b429;
+  color: #f0b429
+}
+
+.halfLabel {
+  font-size: 10px;
+  color: rgba(255, 255, 255, .35);
+  font-weight: 800
+}
+
+.halfLabel.on {
+  color: #f0b429
+}
+
+.halfLabel.clickable {
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 3px
+}
+
+.halfLabel.clickable:hover {
+  background: rgba(240, 180, 41, .15)
+}
+
+.clock {
+  font-family: monospace;
+  font-size: 18px;
+  color: #f0b429;
+  font-weight: 800
+}
+
+.clock.paused {
+  color: rgba(255, 255, 255, .4)
+}
+
+.pauseBtn {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 180px;
+  height: 34px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: rgba(255, 255, 255, .06);
+  color: #f0b429;
+  font-size: 16px;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0
+}
+
+.pauseBtn.paused {
+  background: rgba(240, 180, 41, .2);
+  border-color: #f0b429
+}
+
+.modeTag {
+  font-size: 9px;
+  font-weight: 800;
+  color: rgba(255, 255, 255, .35);
+  letter-spacing: .05em
+}
+
+.pitch {
+  position: relative;
+  flex: 1;
+  min-height: 200px;
+  overflow: hidden;
+  cursor: crosshair;
+  touch-action: manipulation
+}
+
+.lineHalf {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 2px solid rgba(255, 255, 255, .75)
+}
+
+.lineCircle {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  height: 27%;
+  aspect-ratio: 1;
+  transform: translate(-50%, -50%);
+  border: 2px solid rgba(255, 255, 255, .78);
+  border-radius: 50%
+}
+
+.boxL {
+  position: absolute;
+  left: 0;
+  top: 19%;
+  bottom: 19%;
+  width: 15.5%;
+  border: 2px solid rgba(255, 255, 255, .78);
+  border-left: none
+}
+
+.arcL {
+  position: absolute;
+  left: 8.5%;
+  top: 50%;
+  width: 14%;
+  aspect-ratio: 1;
+  transform: translateY(-50%);
+  border: 2px solid rgba(255, 255, 255, .78);
+  border-radius: 50%;
+  clip-path: inset(0 0 0 50%)
+}
+
+.boxR {
+  position: absolute;
+  right: 0;
+  top: 19%;
+  bottom: 19%;
+  width: 15.5%;
+  border: 2px solid rgba(255, 255, 255, .78);
+  border-right: none
+}
+
+.arcR {
+  position: absolute;
+  right: 8.5%;
+  top: 50%;
+  width: 14%;
+  aspect-ratio: 1;
+  transform: translateY(-50%);
+  border: 2px solid rgba(255, 255, 255, .78);
+  border-radius: 50%;
+  clip-path: inset(0 50% 0 0)
+}
+
+.goalNetL,
+.goalNetR {
+  position: absolute;
+  top: 35%;
+  bottom: 35%;
+  width: 5%;
+  background: transparent;
+  border: 2px solid rgba(255, 255, 255, .78)
+}
+
+.goalNetL {
+  left: 0;
+  border-left: none
+}
+
+.goalNetR {
+  right: 0;
+  border-right: none
+}
+
+.corner {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  border: 2px solid rgba(255, 255, 255, .35);
+  border-radius: 50%
+}
+
+.cornerTL {
+  left: -12px;
+  top: -12px
+}
+
+.cornerBL {
+  left: -12px;
+  bottom: -12px
+}
+
+.cornerTR {
+  right: -12px;
+  top: -12px
+}
+
+.cornerBR {
+  right: -12px;
+  bottom: -12px
+}
+
+.marker {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  margin: -7px;
+  border-radius: 50%;
+  background: rgba(235, 235, 235, .72);
+  border: 2px solid rgba(255, 255, 255, .9);
+  box-shadow: 0 0 0 4px rgba(210, 210, 210, .22);
+  pointer-events: none
+}
+
+.zoneHighlight {
+  position: absolute;
+  background: rgba(255, 255, 255, .14);
+  border: 0;
+  pointer-events: none;
+  box-sizing: border-box;
+  animation: zoneFlash .42s ease-out forwards
+}
+
+.editZoneHighlight {
+  background: rgba(240, 180, 41, .28);
+  border: 2px solid #f0b429;
+  animation: none
+}
+
+.editMarker {
+  background: rgba(240, 180, 41, .85);
+  border-color: #fff;
+  box-shadow: 0 0 0 5px rgba(240, 180, 41, .3);
+  z-index: 2
+}
+
+@keyframes zoneFlash {
+  0% {
+    opacity: 1
+  }
+
+  55% {
+    opacity: .55
+  }
+
+  100% {
+    opacity: 0
+  }
+}
+
+.tableToggle {
+  flex: 0 0 auto;
+  height: 20px;
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, .08);
+  background: #20242b;
+  color: #f0b429;
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer
+}
+
+.tableToggle:hover {
+  background: #262b33
+}
+
+.table {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 250px;
+  box-sizing: border-box;
+  padding-bottom: 10px;
+  overflow-y: auto;
+  border-top: 1px solid rgba(255, 255, 255, .08);
+  transition: height .18s ease
+}
+
+.table.expanded {
+  height: 380px
+}
+
+.thead,
+.trow {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 4px;
+  padding: 8px 10px
+}
+
+.thead span,
+.trow span {
+  min-width: 0;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap
+}
+
+.thead span:last-child,
+.trow span:last-child {
+  text-align: left;
+  padding-left: 18px
+}
+
+.thead {
+  background: #f0b429;
+  color: #1a1a1a;
+  font-weight: 800;
+  font-size: 13px;
+  position: sticky;
+  top: 0
+}
+
+.trow {
+  color: #ddd;
+  font-size: 14px;
+  min-height: 42px;
+  align-items: center;
+  border-bottom: 1px solid rgba(255, 255, 255, .06);
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: manipulation
+}
+
+.trow.draft {
+  color: rgba(255, 255, 255, .4);
+  font-style: italic;
+  cursor: default;
+  background: rgba(255, 255, 255, .03)
+}
+
+.trow.editing {
+  background: rgba(240, 180, 41, .1)
+}
+
+.trow.peeking {
+  background: rgba(240, 180, 41, .06)
+}
+
+.playerBtn {
+  height: 26px;
+  min-width: 72px;
+  padding: 0 10px;
+  border-radius: 4px;
+  border: 1px dashed #f0b429;
+  background: rgba(240, 180, 41, .1);
+  color: #f0b429;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer
+}
+
+.playerBtn:hover {
+  background: rgba(240, 180, 41, .25)
+}
+
+.playerBtn.assigned {
+  border-style: solid;
+  border-color: #c2a04a;
+  background: #c2a04a;
+  color: #080808;
+  font-style: italic
+}
+
+.editTimeRow {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+  min-width: 0
+}
+
+.editClock {
+  grid-column: 1 / 5;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  padding-left: 8px;
+  min-width: 0;
+  overflow: visible
+}
+
+.editUnit {
+  display: flex;
+  align-items: center;
+  gap: 5px
+}
+
+.editUnit b {
+  min-width: 30px;
+  text-align: center;
+  color: #f0b429;
+  font-family: monospace;
+  font-size: 16px;
+  font-weight: 900
+}
+
+.editColon {
+  color: #f0b429;
+  font-weight: 900;
+  font-size: 18px
+}
+
+.editPlayerBtn {
+  grid-column: 6;
+  justify-self: center;
+  min-width: 72px
+}
+
+.editStep {
+  width: 38px;
+  height: 24px;
+  border-radius: 4px;
+  border: 1px solid rgba(240, 180, 41, .7);
+  background: rgba(240, 180, 41, .14);
+  color: #f0b429;
+  font-size: 17px;
+  font-weight: 900;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  line-height: 1
+}
+
+.editStep:hover {
+  background: rgba(240, 180, 41, .25)
+}
+
+.editApplyInline {
+  height: 24px;
+  padding: 0 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  flex-shrink: 0
+}
+
+.editTimeVal {
+  font-family: monospace;
+  font-size: 13px;
+  font-weight: 800;
+  color: #f0b429;
+  min-width: 58px;
+  text-align: center
+}
 
 /* 선수선택 화면 (액트 입력창 자리에서 전환) */
-.pickGroup{display:flex;flex-direction:column;gap:12px}
-.pickField{position:relative;flex:1;min-height:0;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.02)}
-.jersey{position:absolute;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;gap:3px;padding:4px 6px;border:1px solid transparent;border-radius:4px;background:transparent;cursor:pointer}
-.jersey:hover{border-color:rgba(240,180,41,.5);background:rgba(240,180,41,.08)}
-.jersey.on{border-color:#f0b429;background:rgba(240,180,41,.2)}
-.shirt{width:34px;height:30px;display:grid;place-items:center;color:#1a1a1a;font-weight:900;font-size:13px;background:#c9ccd1;clip-path:polygon(0 22%,22% 0,35% 8%,65% 8%,78% 0,100% 22%,84% 38%,84% 100%,16% 100%,16% 38%)}
-.jersey.on .shirt{background:#f0b429}
-.jname{color:#ddd;font-size:10px;white-space:nowrap}
-.pickActions{flex:0 0 auto;display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:0 6px 4px}
-.pickCancel,.pickSubmit{height:34px;border-radius:4px;font-weight:800;font-size:13px;cursor:pointer;border:1px solid #f0b429;background:transparent;color:#f0b429}
-.pickSubmit{border-color:rgba(255,255,255,.2);color:rgba(255,255,255,.5)}
-.pickSubmit:not(:disabled){border-color:#f0b429;background:#f0b429;color:#191919}
-.pickSubmit:disabled{cursor:not-allowed}
-.pickCancel:hover{background:rgba(240,180,41,.15)}
+.pickGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 12px
+}
 
-.finishBtn{position:absolute;top:8px;right:8px;height:26px;padding:0 12px;border-radius:4px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#ddd;font-weight:700;font-size:11px;cursor:pointer}
-.mirrorWrap{position:absolute;top:8px;left:8px}
-.mirrorIcon{width:26px;height:26px;display:grid;place-items:center;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#ddd;font-size:13px;padding:0;cursor:pointer}
-.mirrorIcon.on{border-color:#f0b429;color:#f0b429;background:rgba(240,180,41,.18)}
-.mirrorPop{position:absolute;z-index:30;top:32px;left:0;width:200px;padding:10px;border-radius:6px;border:1px solid rgba(255,255,255,.16);background:#1b1e22;box-shadow:0 14px 40px rgba(0,0,0,.6);display:flex;flex-direction:column;gap:9px}
-.mirrorPop .popOpts{grid-template-columns:repeat(2,1fr)}
-.finishBtn:hover{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.3)}
+.pickField {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  border: 1px solid rgba(255, 255, 255, .1);
+  background: rgba(255, 255, 255, .02)
+}
+
+.jersey {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer
+}
+
+.jersey:hover {
+  border-color: rgba(240, 180, 41, .5);
+  background: rgba(240, 180, 41, .08)
+}
+
+.jersey.on {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .2)
+}
+
+.shirt {
+  width: 34px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  color: #1a1a1a;
+  font-weight: 900;
+  font-size: 13px;
+  background: #c9ccd1;
+  clip-path: polygon(0 22%, 22% 0, 35% 8%, 65% 8%, 78% 0, 100% 22%, 84% 38%, 84% 100%, 16% 100%, 16% 38%)
+}
+
+.jersey.on .shirt {
+  background: #f0b429
+}
+
+.jname {
+  color: #ddd;
+  font-size: 10px;
+  white-space: nowrap
+}
+
+.pickActions {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  padding: 0 6px 4px
+}
+
+.pickCancel,
+.pickSubmit {
+  height: 34px;
+  border-radius: 4px;
+  font-weight: 800;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid #f0b429;
+  background: transparent;
+  color: #f0b429
+}
+
+.pickSubmit {
+  border-color: rgba(255, 255, 255, .2);
+  color: rgba(255, 255, 255, .5)
+}
+
+.pickSubmit:not(:disabled) {
+  border-color: #f0b429;
+  background: #f0b429;
+  color: #191919
+}
+
+.pickSubmit:disabled {
+  cursor: not-allowed
+}
+
+.pickCancel:hover {
+  background: rgba(240, 180, 41, .15)
+}
+
+.finishBtn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  height: 26px;
+  padding: 0 12px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .16);
+  background: rgba(255, 255, 255, .06);
+  color: #ddd;
+  font-weight: 700;
+  font-size: 11px;
+  cursor: pointer
+}
+
+.mirrorWrap {
+  position: absolute;
+  top: 8px;
+  left: 8px
+}
+
+.mirrorIcon {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: rgba(255, 255, 255, .06);
+  color: #ddd;
+  font-size: 13px;
+  padding: 0;
+  cursor: pointer
+}
+
+.mirrorIcon.on {
+  border-color: #f0b429;
+  color: #f0b429;
+  background: rgba(240, 180, 41, .18)
+}
+
+.mirrorPop {
+  position: absolute;
+  z-index: 30;
+  top: 32px;
+  left: 0;
+  width: 200px;
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, .16);
+  background: #1b1e22;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
+  display: flex;
+  flex-direction: column;
+  gap: 9px
+}
+
+.mirrorPop .popOpts {
+  grid-template-columns: repeat(2, 1fr)
+}
+
+.finishBtn:hover {
+  background: rgba(255, 255, 255, .14);
+  border-color: rgba(255, 255, 255, .3)
+}
 
 /* 전반 종료 버튼과 같은 자리(절대위치)를 그대로 쓴다 — 레이아웃이 밀리면 안 된다 */
-.editActions{position:absolute;top:8px;left:10px;right:10px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;z-index:4}
-.right.editing{padding-top:10px}
-.editTitle{visibility:hidden}
-.editActions button{height:28px;width:100%;padding:0 10px;border-radius:5px;font-weight:800;font-size:12.5px;letter-spacing:.02em;cursor:pointer;border:1px solid transparent}
-.editApply{background:#f0b429;border-color:#f0b429;color:#191919}
-.editApply:hover{background:#ffc84a}
-.editDelete{background:rgba(217,90,90,.15);border-color:rgba(217,90,90,.5);color:#e07a7a}
-.editDelete:hover{background:rgba(217,90,90,.28)}
-.editCancel{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.16);color:#ddd}
-.editCancel:hover{background:rgba(255,255,255,.14)}
+.editActions {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  right: 10px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  z-index: 4
+}
 
-section.right{position:relative;width:567.3359px;min-width:567.3359px;min-height:0;background:#1e2126;display:flex;flex-direction:column;padding:10px;gap:10px;overflow:hidden}
-section.right h1{margin:0;text-align:center;color:#fff;font-size:20px}
-.group{border:1px solid rgba(255,255,255,.1);padding:7px;background:rgba(255,255,255,.02)}
-.group:last-of-type{flex:1;min-height:0;display:flex;flex-direction:column}
-.groupTitle{color:#eee;font-weight:800;margin-bottom:8px;font-size:18px}
+.right.editing {
+  padding-top: 10px
+}
 
-.kickGrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));grid-template-rows:96px 66px;gap:5px}
-.stacked{grid-column:5/7;grid-row:1;min-width:0;display:grid;grid-template-rows:1fr 1fr;gap:3px}
-.actBtn{min-width:0;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;height:76px;border-radius:0;border:1px solid rgba(255,255,255,.18);background:linear-gradient(135deg,rgba(255,255,255,.075),rgba(255,255,255,.035));color:rgba(255,255,255,.45);box-shadow:inset 0 1px 0 rgba(255,255,255,.06),inset 0 -2px 0 rgba(0,0,0,.18);cursor:pointer;transition:opacity .15s,background .15s,transform .1s,box-shadow .1s}
-.actBtn.small{height:auto;min-height:0;flex-direction:row;justify-content:flex-start;padding:0 14px;gap:12px}
-.kickPrimary{height:96px}.kick-c{grid-column:1/3;grid-row:1}.kick-p{grid-column:3/5;grid-row:1}.kickResult{height:66px;flex-direction:row;gap:16px}.kick-x{grid-column:1/4;grid-row:2}.kick-b{grid-column:4/7;grid-row:2}.kickResult .divider{color:rgba(255,255,255,.2);font-size:24px}
-.actBtn b{font-size:29px}
-.actBtn span{font-size:14px;font-weight:700}
-.stacked .actBtn span{font-size:12px}
-.kickPrimary,.shootGrid .actBtn{flex-direction:row;gap:12px}
-.kickPrimary b,.shootGrid .actBtn b{padding-right:12px;border-right:1px solid rgba(255,255,255,.22)}
-.actBtn:disabled{opacity:.35;border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.4);cursor:not-allowed}
-.actBtn:not(:disabled):hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.32)}
-.actBtn:not(:disabled):active{transform:scale(.98);box-shadow:inset 0 2px 4px rgba(0,0,0,.3)}
+.editTitle {
+  visibility: hidden
+}
+
+.editActions button {
+  height: 28px;
+  width: 100%;
+  padding: 0 10px;
+  border-radius: 5px;
+  font-weight: 800;
+  font-size: 12.5px;
+  letter-spacing: .02em;
+  cursor: pointer;
+  border: 1px solid transparent
+}
+
+.editApply {
+  background: #f0b429;
+  border-color: #f0b429;
+  color: #191919
+}
+
+.editApply:hover {
+  background: #ffc84a
+}
+
+.editDelete {
+  background: rgba(217, 90, 90, .15);
+  border-color: rgba(217, 90, 90, .5);
+  color: #e07a7a
+}
+
+.editDelete:hover {
+  background: rgba(217, 90, 90, .28)
+}
+
+.editCancel {
+  background: rgba(255, 255, 255, .06);
+  border-color: rgba(255, 255, 255, .16);
+  color: #ddd
+}
+
+.editCancel:hover {
+  background: rgba(255, 255, 255, .14)
+}
+
+section.right {
+  position: relative;
+  width: 567.3359px;
+  min-width: 567.3359px;
+  min-height: 0;
+  background: #1e2126;
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+  gap: 10px;
+  overflow: hidden
+}
+
+section.right h1 {
+  margin: 0;
+  text-align: center;
+  color: #fff;
+  font-size: 20px
+}
+
+.group {
+  border: 1px solid rgba(255, 255, 255, .1);
+  padding: 7px;
+  background: rgba(255, 255, 255, .02)
+}
+
+.group:last-of-type {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column
+}
+
+.groupTitle {
+  color: #eee;
+  font-weight: 800;
+  margin-bottom: 8px;
+  font-size: 18px
+}
+
+.kickGrid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-rows: 96px 66px;
+  gap: 5px
+}
+
+.stacked {
+  grid-column: 5/7;
+  grid-row: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  gap: 3px
+}
+
+.actBtn {
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  height: 76px;
+  border-radius: 0;
+  border: 1px solid rgba(255, 255, 255, .18);
+  background: linear-gradient(135deg, rgba(255, 255, 255, .075), rgba(255, 255, 255, .035));
+  color: rgba(255, 255, 255, .45);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06), inset 0 -2px 0 rgba(0, 0, 0, .18);
+  cursor: pointer;
+  transition: opacity .15s, background .15s, transform .1s, box-shadow .1s
+}
+
+.actBtn.small {
+  height: auto;
+  min-height: 0;
+  flex-direction: row;
+  justify-content: flex-start;
+  padding: 0 14px;
+  gap: 12px
+}
+
+.kickPrimary {
+  height: 96px
+}
+
+.kick-c {
+  grid-column: 1/3;
+  grid-row: 1
+}
+
+.kick-p {
+  grid-column: 3/5;
+  grid-row: 1
+}
+
+.kickResult {
+  height: 66px;
+  flex-direction: row;
+  gap: 16px
+}
+
+.kick-x {
+  grid-column: 1/4;
+  grid-row: 2
+}
+
+.kick-b {
+  grid-column: 4/7;
+  grid-row: 2
+}
+
+.kickResult .divider {
+  color: rgba(255, 255, 255, .2);
+  font-size: 24px
+}
+
+.actBtn b {
+  font-size: 29px
+}
+
+.actBtn span {
+  font-size: 14px;
+  font-weight: 700
+}
+
+.stacked .actBtn span {
+  font-size: 12px
+}
+
+.kickPrimary,
+.shootGrid .actBtn {
+  flex-direction: row;
+  gap: 12px
+}
+
+.kickPrimary b,
+.shootGrid .actBtn b {
+  padding-right: 12px;
+  border-right: 1px solid rgba(255, 255, 255, .22)
+}
+
+.actBtn:disabled {
+  opacity: .35;
+  border-color: rgba(255, 255, 255, .15);
+  color: rgba(255, 255, 255, .4);
+  cursor: not-allowed
+}
+
+.actBtn:not(:disabled):hover {
+  background: rgba(255, 255, 255, .1);
+  border-color: rgba(255, 255, 255, .32)
+}
+
+.actBtn:not(:disabled):active {
+  transform: scale(.98);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, .3)
+}
+
 /* 3단계: 기본(회색) → 위치를 찍으면 available(테두리+텍스트만 노란색) → 실제 사용한 것만 on(안까지 채움).
    X/B(결과)는 이 셋 중 어느 클래스도 받지 않으므로 항상 기본 회색 그대로다. */
-.actBtn.available:not(:disabled){border-color:#f0b429;background:linear-gradient(135deg,rgba(240,180,41,.14),rgba(240,180,41,.06));color:#f0b429;box-shadow:inset 0 1px 0 rgba(240,180,41,.18),inset 0 -2px 0 rgba(0,0,0,.16)}
-.actBtn.available:not(:disabled):hover{background:rgba(240,180,41,.2)}
-.actBtn.on:not(:disabled){background:linear-gradient(135deg,#f0b429,#d79e20);border-color:#f0b429;color:#191919;box-shadow:inset 0 1px 0 rgba(255,255,255,.25),inset 0 -2px 0 rgba(120,75,0,.28),0 2px 5px rgba(0,0,0,.2)}
-.actBtn.on:not(:disabled):hover{background:#ffc84a}
-/* X/B 는 절대 노란색이 되지 않는다 — 결과로 선택된 상태는 회색 계열로 채운다 (specificity 로 위 규칙을 덮는다) */
-.actBtn.kickResult.on:not(:disabled){background:rgba(255,255,255,.35);border-color:rgba(255,255,255,.55);color:#161616}
-.actBtn.kickResult.on:not(:disabled):hover{background:rgba(255,255,255,.45)}
-
-.shootGrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px}
-
-.goal{position:relative;flex:0 0 285px;min-height:0;margin-top:54px;opacity:.5;pointer-events:none;transition:opacity .2s,transform .2s;transform:scale(.985);cursor:crosshair;background:linear-gradient(180deg,rgba(255,255,255,.018),transparent 40%)}
-.goal.active{opacity:1;pointer-events:auto;transform:scale(1)}
-.goalFrame{
-  position:absolute;left:15%;right:15%;top:42%;bottom:0;width:auto;height:auto;margin:0;
-  border:10px solid #e8e8e8;border-bottom:none;border-radius:2px 2px 0 0;cursor:crosshair;
-  background:
-    linear-gradient(180deg,rgba(86,110,105,.16),transparent 16%),
-    repeating-linear-gradient(0deg,rgba(122,160,151,.10) 0 1px,transparent 1px 18px),
-    repeating-linear-gradient(90deg,rgba(122,160,151,.07) 0 1px,transparent 1px 22px),
-    linear-gradient(180deg,#27302d,#151b1b 62%,#101414);
-  box-shadow:inset 0 18px 26px rgba(0,0,0,.35),inset 0 -22px 30px rgba(0,0,0,.5),0 4px 10px rgba(0,0,0,.5),0 0 0 2px rgba(190,205,201,.12);
+.actBtn.available:not(:disabled) {
+  border-color: #f0b429;
+  background: linear-gradient(135deg, rgba(240, 180, 41, .14), rgba(240, 180, 41, .06));
+  color: #f0b429;
+  box-shadow: inset 0 1px 0 rgba(240, 180, 41, .18), inset 0 -2px 0 rgba(0, 0, 0, .16)
 }
+
+.actBtn.available:not(:disabled):hover {
+  background: rgba(240, 180, 41, .2)
+}
+
+.actBtn.on:not(:disabled) {
+  background: linear-gradient(135deg, #f0b429, #d79e20);
+  border-color: #f0b429;
+  color: #191919;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .25), inset 0 -2px 0 rgba(120, 75, 0, .28), 0 2px 5px rgba(0, 0, 0, .2)
+}
+
+.actBtn.on:not(:disabled):hover {
+  background: #ffc84a
+}
+
+/* X/B 는 절대 노란색이 되지 않는다 — 결과로 선택된 상태는 회색 계열로 채운다 (specificity 로 위 규칙을 덮는다) */
+.actBtn.kickResult.on:not(:disabled) {
+  background: rgba(255, 255, 255, .35);
+  border-color: rgba(255, 255, 255, .55);
+  color: #161616
+}
+
+.actBtn.kickResult.on:not(:disabled):hover {
+  background: rgba(255, 255, 255, .45)
+}
+
+.shootGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 12px
+}
+
+.goal {
+  position: relative;
+  flex: 0 0 285px;
+  min-height: 0;
+  margin-top: 54px;
+  opacity: .5;
+  pointer-events: none;
+  transition: opacity .2s, transform .2s;
+  transform: scale(.985);
+  cursor: crosshair;
+  background: linear-gradient(180deg, rgba(255, 255, 255, .018), transparent 40%)
+}
+
+.goal.active {
+  opacity: 1;
+  pointer-events: auto;
+  transform: scale(1)
+}
+
+.goalFrame {
+  position: absolute;
+  left: 15%;
+  right: 15%;
+  top: 42%;
+  bottom: 0;
+  width: auto;
+  height: auto;
+  margin: 0;
+  border: 10px solid #e8e8e8;
+  border-bottom: none;
+  border-radius: 2px 2px 0 0;
+  cursor: crosshair;
+  background:
+    linear-gradient(180deg, rgba(86, 110, 105, .16), transparent 16%),
+    repeating-linear-gradient(0deg, rgba(122, 160, 151, .10) 0 1px, transparent 1px 18px),
+    repeating-linear-gradient(90deg, rgba(122, 160, 151, .07) 0 1px, transparent 1px 22px),
+    linear-gradient(180deg, #27302d, #151b1b 62%, #101414);
+  box-shadow: inset 0 18px 26px rgba(0, 0, 0, .35), inset 0 -22px 30px rgba(0, 0, 0, .5), 0 4px 10px rgba(0, 0, 0, .5), 0 0 0 2px rgba(190, 205, 201, .12);
+}
+
 /* 포스트·크로스바 바깥 1m DSP 기준선: 골문과 이 U자 선 사이 띠가 클릭 가능한 DSP 범위다. */
 /* 1m 경계선 위치(18.23%/5.44%)는 스크립트의 GUIDE_TOP/GUIDE_SIDE(실측 규격 기준 계산값)와
    반드시 같이 맞춰야 한다 — 프레임 크기(70%×58%)를 7.32m×2.44m 기준으로 1m 환산한 값이다. */
-.hxDivider{position:absolute;left:0;right:0;top:18.23%;border-top:2px solid rgba(225,229,232,.7);box-shadow:0 1px 0 rgba(0,0,0,.3);pointer-events:none;z-index:3}
-.meterGuide{position:absolute;left:5.44%;right:5.44%;top:18.23%;bottom:0;border:2px solid rgba(225,229,232,.7);border-bottom:0;box-shadow:0 0 0 1px rgba(0,0,0,.3);pointer-events:none;z-index:3}
-.goalZone{cursor:pointer;color:#f0b429;font-weight:800;font-size:11px;display:grid;place-items:center}
-.hx{position:absolute;left:0;right:0;top:0;height:18.23%;text-align:center;color:rgba(255,255,255,.6);font-size:10px;letter-spacing:.08em}
-.lx{position:absolute;left:0;top:42%;bottom:0;width:5.44%;color:rgba(255,255,255,.68)}
-.rx{position:absolute;right:0;top:42%;bottom:0;width:5.44%;color:rgba(255,255,255,.68)}
+.hxDivider {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 18.23%;
+  border-top: 2px solid rgba(225, 229, 232, .7);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, .3);
+  pointer-events: none;
+  z-index: 3
+}
+
+.meterGuide {
+  position: absolute;
+  left: 5.44%;
+  right: 5.44%;
+  top: 18.23%;
+  bottom: 0;
+  border: 2px solid rgba(225, 229, 232, .7);
+  border-bottom: 0;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .3);
+  pointer-events: none;
+  z-index: 3
+}
+
+.goalZone {
+  cursor: pointer;
+  color: #f0b429;
+  font-weight: 800;
+  font-size: 11px;
+  display: grid;
+  place-items: center
+}
+
+.hx {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 18.23%;
+  text-align: center;
+  color: rgba(255, 255, 255, .6);
+  font-size: 10px;
+  letter-spacing: .08em
+}
+
+.lx {
+  position: absolute;
+  left: 0;
+  top: 42%;
+  bottom: 0;
+  width: 5.44%;
+  color: rgba(255, 255, 255, .68)
+}
+
+.rx {
+  position: absolute;
+  right: 0;
+  top: 42%;
+  bottom: 0;
+  width: 5.44%;
+  color: rgba(255, 255, 255, .68)
+}
+
 /* H/L/R — HX/LX/RX 와 나란히 있는 "1m 이내(근접 미스)" 칸. 예전엔 이 경계선(hxDivider/
    meterGuide) 안쪽인지 바깥쪽인지를 클릭 좌표 계산으로 구분했는데, 터치로는 경계선
    정확히 어느 쪽을 짚었는지 맞추기 어려워서 아예 각각 별도로 누를 수 있는 칸으로 나눴다. */
-.h{position:absolute;left:0;right:0;top:18.23%;height:23.77%;text-align:center;color:rgba(255,255,255,.6);font-size:10px;letter-spacing:.08em}
-.l{position:absolute;left:5.44%;top:42%;bottom:0;width:9.56%;color:rgba(255,255,255,.68)}
-.r{position:absolute;right:5.44%;top:42%;bottom:0;width:9.56%;color:rgba(255,255,255,.68)}
-.goalCenter{position:absolute;inset:0;color:transparent;font-size:0;pointer-events:none}
-.goal:hover .hx,.goal:hover .h,.goal:hover .lx,.goal:hover .l,.goal:hover .rx,.goal:hover .r{background:rgba(240,180,41,.08)}
-.goalResultButtons{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px}
-.goalResultBtn{height:40px;border:1px solid rgba(255,255,255,.38);background:#292d31;color:#f1f1f1;font-weight:900;font-size:15px;cursor:pointer}
-.goalResultBtn:hover{background:#353a3f}
-.goalResultBtn.resGoal{border-color:#f0b429;background:rgba(240,180,41,.16);color:#f0b429}
-.goalResultBtn.resGoal:hover{background:rgba(240,180,41,.3)}
+.h {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 18.23%;
+  height: 23.77%;
+  text-align: center;
+  color: rgba(255, 255, 255, .6);
+  font-size: 10px;
+  letter-spacing: .08em
+}
+
+.l {
+  position: absolute;
+  left: 5.44%;
+  top: 42%;
+  bottom: 0;
+  width: 9.56%;
+  color: rgba(255, 255, 255, .68)
+}
+
+.r {
+  position: absolute;
+  right: 5.44%;
+  top: 42%;
+  bottom: 0;
+  width: 9.56%;
+  color: rgba(255, 255, 255, .68)
+}
+
+.goalCenter {
+  position: absolute;
+  inset: 0;
+  color: transparent;
+  font-size: 0;
+  pointer-events: none
+}
+
+.goal:hover .hx,
+.goal:hover .h,
+.goal:hover .lx,
+.goal:hover .l,
+.goal:hover .rx,
+.goal:hover .r {
+  background: rgba(240, 180, 41, .08)
+}
+
+.goalResultButtons {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px
+}
+
+.goalResultBtn {
+  height: 40px;
+  border: 1px solid rgba(255, 255, 255, .38);
+  background: #292d31;
+  color: #f1f1f1;
+  font-weight: 900;
+  font-size: 15px;
+  cursor: pointer
+}
+
+.goalResultBtn:hover {
+  background: #353a3f
+}
+
+.goalResultBtn.resGoal {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .16);
+  color: #f0b429
+}
+
+.goalResultBtn.resGoal:hover {
+  background: rgba(240, 180, 41, .3)
+}
+
 /* 프레임 안쪽에 찍어둔 위치 마커. 결과가 확정되기 전까지(B/GOAL/X 누르기 전) 계속 보인다. */
-.frameMarker{position:absolute;width:16px;height:16px;margin:-8px;border-radius:50%;background:rgba(240,180,41,.85);border:2px solid #fff;box-shadow:0 0 0 5px rgba(240,180,41,.3);pointer-events:none;z-index:4}
+.frameMarker {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  margin: -8px;
+  border-radius: 50%;
+  background: rgba(240, 180, 41, .85);
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 5px rgba(240, 180, 41, .3);
+  pointer-events: none;
+  z-index: 4
+}
 
 /* ---- 선수 교체 --------------------------------------------------------------
    선수선택(pickGroup)과 같은 자리 — 액트 입력창 영역 안에서만 화면을 바꾼다.
    왼쪽 경기장·기록표는 계속 보여야 하므로 절대 덮지 않는다. */
-.swapIcon.on{border-color:rgba(240,180,41,.7);background:rgba(240,180,41,.18);color:#f0b429}
-.subGroup{display:flex;flex-direction:column;gap:12px;min-height:0}
-.subTimeRow{display:flex;align-items:center;justify-content:center;gap:10px}
-.subTimeLabel{color:rgba(255,255,255,.6);font-size:13px;margin-right:4px}
-.subTimeColon{color:#f0b429;font-weight:700;font-size:16px}
-.subTimeStepper{display:flex;align-items:center;gap:4px}
-.subTimeBtn{width:26px;height:26px;border-radius:5px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#ddd;font-size:14px;line-height:1;cursor:pointer;padding:0}
-.subTimeBtn:hover{border-color:rgba(240,180,41,.6);color:#f0b429}
-.subTimeNum{display:inline-block;min-width:34px;text-align:center;color:#f0b429;font-family:ui-monospace,monospace;font-size:16px;font-weight:700}
-.subCols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.subSection{min-width:0}
-.subColHead{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
-.subColHead span:first-child{color:rgba(255,255,255,.85);font-weight:700;font-size:13px}
-.subColHint{color:rgba(255,255,255,.4);font-size:10px}
-.subGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
-.subCard{position:relative;display:flex;flex-direction:column;align-items:center;gap:4px;padding:18px 4px;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);cursor:pointer;overflow:hidden}
-.subCard:hover{border-color:rgba(255,255,255,.35)}
-.subNo{font-weight:700;font-size:28px;line-height:1}
-.subName{color:rgba(255,255,255,.65);font-size:11px;line-height:1.2;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.swapIcon.on {
+  border-color: rgba(240, 180, 41, .7);
+  background: rgba(240, 180, 41, .18);
+  color: #f0b429
+}
+
+.subGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0
+}
+
+.subTimeRow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px
+}
+
+.subTimeLabel {
+  color: rgba(255, 255, 255, .6);
+  font-size: 13px;
+  margin-right: 4px
+}
+
+.subTimeColon {
+  color: #f0b429;
+  font-weight: 700;
+  font-size: 16px
+}
+
+.subTimeStepper {
+  display: flex;
+  align-items: center;
+  gap: 4px
+}
+
+.subTimeBtn {
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, .18);
+  background: rgba(255, 255, 255, .06);
+  color: #ddd;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0
+}
+
+.subTimeBtn:hover {
+  border-color: rgba(240, 180, 41, .6);
+  color: #f0b429
+}
+
+.subTimeNum {
+  display: inline-block;
+  min-width: 34px;
+  text-align: center;
+  color: #f0b429;
+  font-family: ui-monospace, monospace;
+  font-size: 16px;
+  font-weight: 700
+}
+
+.subCols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px
+}
+
+.subSection {
+  min-width: 0
+}
+
+.subColHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px
+}
+
+.subColHead span:first-child {
+  color: rgba(255, 255, 255, .85);
+  font-weight: 700;
+  font-size: 13px
+}
+
+.subColHint {
+  color: rgba(255, 255, 255, .4);
+  font-size: 10px
+}
+
+.subGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px
+}
+
+.subCard {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 18px 4px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  background: rgba(255, 255, 255, .04);
+  cursor: pointer;
+  overflow: hidden
+}
+
+.subCard:hover {
+  border-color: rgba(255, 255, 255, .35)
+}
+
+.subNo {
+  font-weight: 700;
+  font-size: 28px;
+  line-height: 1
+}
+
+.subName {
+  color: rgba(255, 255, 255, .65);
+  font-size: 11px;
+  line-height: 1.2;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%
+}
+
 /* 포지션 색 — TeamSelection.vue 의 .player.gk/fw/mf/df strong 색을 그대로 옮긴 것(§831행대) */
-.subCard.posGK .subNo{color:rgba(255,255,255,.55)}
-.subCard.posFW .subNo{color:#5fb8c9}
-.subCard.posMF .subNo{color:#d98671}
-.subCard.posDF .subNo{color:#93b56a}
-.subCard.out{border-color:#ef4444;background:rgba(239,68,68,.16)}
-.subCard.in{border-color:#f0b429;background:rgba(240,180,41,.18)}
-.subCard.done{opacity:.4;cursor:not-allowed}
-.subCard.done:hover{border-color:rgba(255,255,255,.12)}
-.subDoneTag{position:absolute;top:1px;right:1px;font-size:7px;color:rgba(255,255,255,.5);border:1px solid rgba(255,255,255,.2);border-radius:3px;padding:0 2px}
+.subCard.posGK .subNo {
+  color: rgba(255, 255, 255, .55)
+}
 
-.subHistory{border:1px solid rgba(255,255,255,.08);border-radius:6px;display:flex;flex-direction:column}
-.subHistHead,.subHistRow{display:grid;grid-template-columns:60px 64px 1fr 1fr 60px;align-items:center;gap:8px;padding:8px 10px;font-size:13px}
-.subHistHead{background:#1b2130;color:rgba(255,255,255,.45);font-weight:600;border-radius:6px 6px 0 0}
-.subHistRow{border-top:1px solid rgba(255,255,255,.06);color:rgba(255,255,255,.8)}
-.subHistRow .hP{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.subHistRow .outP{color:#f87171}
-.subHistRow .inP{color:#f0b429}
-.subHistEmpty{padding:18px;text-align:center;color:rgba(255,255,255,.35);font-size:12px}
-.subUndo{border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:rgba(255,255,255,.6);font-size:11px;border-radius:4px;padding:3px 8px;cursor:pointer}
-.subUndo:hover{color:#fff;border-color:rgba(239,68,68,.5)}
+.subCard.posFW .subNo {
+  color: #5fb8c9
+}
 
-.subActions{display:flex;justify-content:center;gap:16px}
-.subCancel,.subSubmit{min-width:140px;padding:14px 20px;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer}
-.subCancel{border:1px solid rgba(255,255,255,.18);background:transparent;color:rgba(255,255,255,.7)}
-.subCancel:hover{color:#fff;border-color:rgba(255,255,255,.4)}
-.subSubmit{border:1px solid rgba(240,180,41,.6);background:rgba(240,180,41,.2);color:#f0b429;font-weight:700}
-.subSubmit:hover:not(:disabled){background:rgba(240,180,41,.32)}
-.subSubmit:disabled{opacity:.35;cursor:not-allowed}
+.subCard.posMF .subNo {
+  color: #d98671
+}
 
+.subCard.posDF .subNo {
+  color: #93b56a
+}
+
+.subCard.out {
+  border-color: #ef4444;
+  background: rgba(239, 68, 68, .16)
+}
+
+.subCard.in {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .18)
+}
+
+.subCard.done {
+  opacity: .4;
+  cursor: not-allowed
+}
+
+.subCard.done:hover {
+  border-color: rgba(255, 255, 255, .12)
+}
+
+.subDoneTag {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  font-size: 7px;
+  color: rgba(255, 255, 255, .5);
+  border: 1px solid rgba(255, 255, 255, .2);
+  border-radius: 3px;
+  padding: 0 2px
+}
+
+.subHistory {
+  border: 1px solid rgba(255, 255, 255, .08);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column
+}
+
+.subHistHead,
+.subHistRow {
+  display: grid;
+  grid-template-columns: 60px 64px 1fr 1fr 60px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 13px
+}
+
+.subHistHead {
+  background: #1b2130;
+  color: rgba(255, 255, 255, .45);
+  font-weight: 600;
+  border-radius: 6px 6px 0 0
+}
+
+.subHistRow {
+  border-top: 1px solid rgba(255, 255, 255, .06);
+  color: rgba(255, 255, 255, .8)
+}
+
+.subHistRow .hP {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis
+}
+
+.subHistRow .outP {
+  color: #f87171
+}
+
+.subHistRow .inP {
+  color: #f0b429
+}
+
+.subHistEmpty {
+  padding: 18px;
+  text-align: center;
+  color: rgba(255, 255, 255, .35);
+  font-size: 12px
+}
+
+.subUndo {
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: rgba(255, 255, 255, .05);
+  color: rgba(255, 255, 255, .6);
+  font-size: 11px;
+  border-radius: 4px;
+  padding: 3px 8px;
+  cursor: pointer
+}
+
+.subUndo:hover {
+  color: #fff;
+  border-color: rgba(239, 68, 68, .5)
+}
+
+.subActions {
+  display: flex;
+  justify-content: center;
+  gap: 16px
+}
+
+.subCancel,
+.subSubmit {
+  min-width: 140px;
+  padding: 14px 20px;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer
+}
+
+.subCancel {
+  border: 1px solid rgba(255, 255, 255, .18);
+  background: transparent;
+  color: rgba(255, 255, 255, .7)
+}
+
+.subCancel:hover {
+  color: #fff;
+  border-color: rgba(255, 255, 255, .4)
+}
+
+.subSubmit {
+  border: 1px solid rgba(240, 180, 41, .6);
+  background: rgba(240, 180, 41, .2);
+  color: #f0b429;
+  font-weight: 700
+}
+
+.subSubmit:hover:not(:disabled) {
+  background: rgba(240, 180, 41, .32)
+}
+
+.subSubmit:disabled {
+  opacity: .35;
+  cursor: not-allowed
+}
 </style>

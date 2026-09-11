@@ -474,24 +474,43 @@ export function computeAttackPaths(
   }
 
   // DAP존(구역 1~6)에서 B(막힘)/X(끊김)로 끝난 경우, 그 레코드 자체는 액트가 없어도
-  // "공이 그 지역까지 들어갔다"는 사실은 유효하다 — 체인 경계와 무관하게 시간순으로
-  // 바로 앞에 있던 액트 있는 레코드 최대 2개까지는(그게 DAP존 바깥에서 있었던
-  // 액트여도) DAP로 인정한다. classifyChain 은 체인 단위로만 판정해서 이 경우를
-  // 못 잡는다 — 원인이 된 레코드가 이미 끝난 별개의 체인에 속해 있을 수 있어서다.
-  for (let i = 0; i < ordered.length; i++) {
-    const r = ordered[i]!
+  // "공이 그 지역까지 들어갔다"는 사실은 유효하다 — 바로 직전 체인(같은 액트에서 갈라진
+  // 결과 레코드, 또는 자기 체인이 구역 밖에서 끝나 UTP 승격을 못 받은 직전 체인)에 있던
+  // 액트 있는 레코드 최대 2개까지는 DAP로 인정한다. classifyChain 은 체인 단위로만
+  // 판정해서 이 경우를 못 잡는다 — 원인이 된 레코드가 이미 끝난 별개의 체인에 속해
+  // 있을 수 있어서다.
+  //
+  // 단, 반드시 "바로 직전 체인" 하나까지만 넘겨봐야 한다. 그보다 더 이전 체인까지
+  // 넘어가면, 이미 각자 B/X 로 완전히 끝나버린 서로 무관한 별개의 루트(예: P→B 로 끝난
+  // 건과 그 뒤에 이어진 C→X 로 끝난 건)를 하나로 잘못 엮어 둘 다 부당하게 DAP 로
+  // 인정해버린다. 그리고 UTP 최소 포인트 규칙(count >= 2, 예외 K/F 단독)도 그대로
+  // 지켜야 한다 — 안 그러면 C/P 액트 딱 1개만으로 DAP 가 인정되어 버린다.
+  // 자기 체인이 이미 UTP/DTP/STP 로 정상 판정된 경우는 classifyChain 결과를 그대로 믿고
+  // 건드리지 않는다(이중 판정으로 무관한 직전 체인까지 끌어오는 걸 막는다).
+  const chainIndexOfId = new Map<string, number>()
+  chains.forEach((chain, idx) => {
+    for (const rec of chain) chainIndexOfId.set(rec.id, idx)
+  })
+  for (const r of ordered) {
     if (r.area >= 7) continue
     if (r.res !== 'B' && r.res !== 'X') continue
-    let granted = 0
-    for (let j = i - 1; j >= 0 && granted < 2; j--) {
-      const prev = ordered[j]!
-      if (!prev.act) continue
+    const ci = chainIndexOfId.get(r.id)
+    if (ci === undefined || paths[ci]?.ptype !== 'UPP') continue
+    const prevChain = chains[ci - 1]
+    if (!prevChain) continue
+
+    const candidates: DidRecord[] = []
+    for (let j = prevChain.length - 1; j >= 0 && candidates.length < 2; j--) {
+      const prev = prevChain[j]!
+      if (prev.act) candidates.push(prev)
+    }
+    if (candidates.length < 2 && candidates[0]?.act !== 'K' && candidates[0]?.act !== 'F') continue
+    for (const prev of candidates) {
       const f = flags.get(prev.id)
       if (f) {
         f.isDap = true
         f.isDapS = f.isDap && (prev.res === 'O' || isGoal(prev.res))
       }
-      granted++
     }
   }
 
