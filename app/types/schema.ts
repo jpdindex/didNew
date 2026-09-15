@@ -453,16 +453,48 @@ export interface CoachDoc extends AuditFields {
   legacyCoachId?: number
 }
 
-/** coaches/{coachId}/contracts/{contractId} — 감독 계약 원장. 추가 전용 (ContractDoc 과 동일 패턴) */
+/**
+ * coachContracts/{id} — 감독 재임기간 원장. coaches/{id}/contracts 서브컬렉션이 아니라
+ * 최상위 컬렉션이다 — 지금은 감독 개인 프로필(생년월일 등)이 필요 없어서 CoachDoc과 굳이
+ * 분리하지 않고 이름을 여기 그대로 들고 있는다(coach-import 참고). 나중에 프로필 필드가
+ * 필요해지면 CoachDoc을 참조하는 방식으로 옮길 수 있다.
+ *
+ * 추가 전용에 가깝게 쓴다: 같은 감독이 같은 팀에서 시즌 경계로 계속 재임하면(정식/대행
+ * 상태도 안 바뀌면) 문서를 새로 안 만들고 `to`만 갱신한다. 다른 사람으로 바뀌거나, 같은
+ * 사람이어도 정식↔대행 상태가 바뀌거나, 다른 팀으로 옮기면 새 문서를 만든다.
+ *
+ * seasonId는 저장하지 않는다 — 시즌 경계(8/1~5/31)가 고정이라 `from`/`to`에서 언제든
+ * 역산 가능해서, 중복 저장해서 어긋날 여지를 만들지 않는다.
+ */
 export interface CoachContractDoc extends AuditFields {
+  /** 감독 한 명을 구분하는 값(현재는 이관 원본의 고유번호). 다른 컬렉션을 가리키는 참조가 아니다 */
+  coachId: string
+  coachName: string
+  coachNameEn: string
+  /** teams 문서 ID와 동일한 값(T_Code, 예: 'E-AR') */
   teamId: string
-  leagueId?: string
-  seasonId?: string
   from: string
   /** null 이면 현재 재임 중 */
   to: string | null
-  /** 직전 소속팀. 이 한 문서로 "A→B" 이동 한 건이 완성된다 */
-  fromTeamId?: string
+  status: 'MANAGER' | 'CARETAKER'
+}
+
+/**
+ * coachRounds/{id} — 라운드별로 미리 펼쳐둔 감독 배정(coach-import 참고). 아직 matches에
+ * 연결하지 않은 원본 그대로다 — 지금 Firestore matches가 일부 시즌만 들어와 있어서 대부분
+ * 못 붙는다. 나중에 레거시 매치가 더 들어오면 (teamId, plSeason, round) 로 조인해서
+ * recordings.coachId를 채우는 데 쓴다.
+ */
+export interface CoachRoundDoc {
+  coachId: string
+  coachName: string
+  coachNameEn: string
+  teamId: string
+  round: number
+  plSeason: string
+  status: 'MANAGER' | 'CARETAKER'
+  createdAt: Timestamp
+  createdBy: string
 }
 
 /** teams/{teamId} (§10.4) */
@@ -477,8 +509,12 @@ export interface TeamDoc extends AuditFields {
   currentCoachId?: string
   foundedAt?: string
   dissolvedAt?: string
-  /** 목록 필터용 캐시일 뿐. 승강제는 teams/{id}/seasons 서브컬렉션으로 표현한다 */
+  /** 목록 필터용 캐시일 뿐. 승강제 전체 이력은 teams/{id}/seasons 서브컬렉션으로 표현한다 */
   currentLeagueId?: string
+  /** 목록 필터용 캐시일 뿐(currentLeagueId와 같은 패턴) — "지금 1부인지"만 담는다. 시즌별
+   *  전체 승강 이력은 teams/{id}/seasons가 생기면 그쪽이 정본이 된다(아직 매치 데이터가
+   *  부족해 못 만든다) */
+  currentDivision?: 'D1' | 'D2'
   crestUrl?: string
 }
 

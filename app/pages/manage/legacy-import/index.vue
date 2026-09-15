@@ -258,7 +258,26 @@ async function runImport() {
       for (const r of rows) {
         if (r.t_coach_kr) coachesByName.set(coachId(s(r.t_coach_kr)), { nameKr: s(r.t_coach_kr) })
       }
-      await commitInChunks(rows.map(r => ({
+      // ff_team은 같은 t_code가 리그/대회 컨텍스트별로 여러 행이다(EPL 행 하나, UCL/UEL
+      // 행 하나...). 문서 ID가 t_code 하나뿐이라 그중 "진짜 소속 리그"를 나타내는 행 하나만
+      // 골라야 한다 — t_end가 '9999.99.99'(무기한, 지금도 유효)인 행을 최우선으로 하고,
+      // 없으면 t_begin이 가장 최근인 행으로 대체한다. 안 그러면 마지막에 처리된 행이 그냥
+      // 덮어써서, 2일짜리 UEL 결승전 참가 기록 같은 게 "현재 리그"로 남는 사고가 난다
+      // (아스날/첼시 등에서 실제로 발생 확인됨).
+      const bestRowByCode = new Map<string, Record<string, unknown>>()
+      for (const r of rows) {
+        const code = s(r.t_code)
+        const prev = bestRowByCode.get(code)
+        if (!prev) { bestRowByCode.set(code, r); continue }
+        const isIndefinite = (row: Record<string, unknown>) => s(row.t_end) === '9999.99.99'
+        if (isIndefinite(r) && !isIndefinite(prev)) { bestRowByCode.set(code, r); continue }
+        if (isIndefinite(r) === isIndefinite(prev) && s(r.t_begin) > s(prev.t_begin)) bestRowByCode.set(code, r)
+      }
+      // foundedAt/dissolvedAt는 만들지 않는다 — t_begin/t_end는 "창단일/해체일"이 아니라
+      // 그 리그/대회 컨텍스트에 속했던 기간(승격일, 대회 참가 기간 등)이라 애초에 창단일로
+      // 쓸 수 있는 값이 아니다(레거시에 진짜 창단연도 데이터 자체가 없다). 필요하면 나중에
+      // 별도 출처로 수동 입력한다.
+      await commitInChunks([...bestRowByCode.values()].map(r => ({
         path: 'teams', id: s(r.t_code),
         data: {
           name: s(r.t_name), nameKr: s(r.t_name_kr), nameFull: s(r.t_name_full), nameShort: s(r.t_name_short),
@@ -266,8 +285,6 @@ async function runImport() {
           stadiumId: r.s_code ? s(r.s_code) : null,
           currentCoachId: r.t_coach_kr ? coachId(s(r.t_coach_kr)) : null,
           currentLeagueId: r.l_code ? s(r.l_code) : null,
-          foundedAt: r.t_begin ? s(r.t_begin) : null,
-          dissolvedAt: r.t_end ? s(r.t_end) : null,
           createdAt: NOW(), createdBy: 'legacy-import', updatedAt: NOW(), updatedBy: 'legacy-import'
         }
       })))

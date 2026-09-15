@@ -1,10 +1,14 @@
 <script setup lang="ts">
+const inputMenus = [
+  { label: '팀 관리', desc: '팀 정보와 엠블럼을 빠르게 등록·수정', to: '/manage/teams', ready: true },
+  { label: '선수 관리', desc: '선수·등번호·포지션을 한 번에 등록·수정', to: '/manage/players', ready: false },
+  { label: '감독 관리', desc: '감독 정보와 소속 팀을 빠르게 등록·수정', to: '/manage/coaches', ready: true },
+  { label: '경기 일정 관리', desc: '경기 날짜·팀·리그 일정을 빠르게 등록·수정', to: '/manage/schedules', ready: false }
+]
 const menus = [
-  { label: '팀 관리', desc: '팀 추가/수정', to: '/manage/teams', ready: false },
-  { label: '선수 관리', desc: '선수 정보 + 이적시장', to: '/manage/players', ready: false },
-  { label: '경기 일정 관리', desc: '경기 일정 등록/수정', to: '/manage/schedules', ready: false },
   { label: '기록 잠금 관리', desc: '갱신으로 잠긴 반(半) 잠금 해제', to: '/manage/locks', ready: true },
   { label: 'SQL 데이터 이관', desc: '레거시 SQL 경기 데이터를 Firestore로 이관 (1회성)', to: '/manage/legacy-import', ready: true },
+  { label: '감독 재임 이력 이관', desc: 'PL 감독 연혁 엑셀을 coachContracts/coachRounds로 이관 (1회성)', to: '/manage/coach-import', ready: true },
   { label: 'Firestore 데이터 뷰어', desc: '컬렉션 조회 + 값 수정 (삭제는 없음)', to: '/manage/data-viewer', ready: true },
   { label: '입력 데이터 (경기 기록)', desc: '경기 → 팀 → 레코드/KPI/카드 순으로 클릭만으로 조회', to: '/manage/input-data', ready: true }
 ]
@@ -20,6 +24,21 @@ const menus = [
         <NuxtLink class="backBtn" to="/schedule">← 경기 선택으로</NuxtLink>
       </div>
 
+      <div class="grid">
+        <template v-for="menu in inputMenus" :key="menu.label">
+          <NuxtLink v-if="menu.ready" :to="menu.to" class="card inputCard">
+            <div class="label">{{ menu.label }}</div>
+            <div class="desc">{{ menu.desc }}</div>
+          </NuxtLink>
+          <div v-else class="card disabled inputCard">
+            <div class="label">{{ menu.label }}</div>
+            <div class="desc">{{ menu.desc }}</div>
+            <div class="badge">준비 중</div>
+          </div>
+        </template>
+      </div>
+
+      <div class="sectionTitle">관리 도구</div>
       <div class="grid">
         <NuxtLink
           v-for="menu in menus.filter(menu => menu.ready)"
@@ -99,6 +118,15 @@ const menus = [
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 16px;
+}
+.sectionTitle {
+  margin: 28px 0 12px;
+  padding-top: 18px;
+  border-top: 1px solid rgba(255,255,255,0.08);
+  color: rgba(255,255,255,0.72);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: .04em;
 }
 
 .card {

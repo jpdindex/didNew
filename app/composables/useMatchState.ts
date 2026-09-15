@@ -1,4 +1,5 @@
 import type { DidRecord } from '~/utils/didLogic'
+import type { CardRecord } from '~/utils/card'
 import type { GrassLines, GrassPattern } from '~/utils/grass'
 import type { Half, HalfStatus, RecorderLevel } from '~/types/schema'
 
@@ -9,6 +10,9 @@ import type { Half, HalfStatus, RecorderLevel } from '~/types/schema'
 //
 // HalfStatus/RecorderLevel 은 types/schema.ts 가 정본이다 — recordings.status /
 // recorders.level 과 같은 타입을 써야 나중에 Firestore 연동 시 값이 어긋나지 않는다.
+// CardRecord 는 utils/card.ts 가 정본이다 — 카드 판정 로직(isSentOff 등)과 같은 곳에 둬서
+// 타입과 로직이 갈라지지 않게 한다. (여기서는 재수출하지 않는다 — 쓰는 쪽은 '~/utils/card'에서
+// 직접 import 한다. 재수출하면 Nuxt 자동 import가 두 경로를 같은 이름으로 보고 경고를 낸다.)
 // 기존 import 경로(~/composables/useMatchState)를 쓰는 다른 파일들이 계속 동작하도록 재수출한다.
 export type { HalfStatus, RecorderLevel }
 
@@ -27,7 +31,6 @@ export interface SubRecord {
   outPlayer: number
   inPlayer: number
 }
-export interface CardRecord { half: Half; seconds: number; player: number; card: 'Y' | 'R' }
 
 export interface MatchState {
   // 어느 경기의 상태인지. schedule 에서 다른 경기를 새로 선택하면 초기화 판단 기준이 된다.

@@ -16,7 +16,8 @@ import {
   type GrassPattern,
 } from '~/utils/grass'
 import { GOAL_TARGET, goalFramePoint, goalOuterPoint, isWithinGoalOneMeter } from '~/utils/goalCoordinates'
-import type { HalfStatus, SubRecord, CardRecord } from '~/composables/useMatchState'
+import { canPickForCard, groupCardsByPlayer, isSentOff, type CardRecord } from '~/utils/card'
+import type { HalfStatus, SubRecord } from '~/composables/useMatchState'
 
 const route = useRoute()
 const home = computed(() => String(route.query.home ?? route.query.homeName ?? 'Vallecano').trim() || 'Vallecano')
@@ -448,18 +449,36 @@ const subOpen = ref(false)
 const cardOpen = ref(false)
 const cardPlayer = ref<number | null>(null)
 const cardType = ref<'Y' | 'R'>('Y')
+// 아직 Submit 안 한 카드 초안. 패널이 어떤 경로로 닫히든(Cancel, 토글로 닫기, 교체
+// 패널로 전환) resetCardDraft() 를 거쳐 반드시 비워야 한다 — 안 비우면 제출도 안 한
+// 카드가 cardByPlayer(→ isSentOff → onFieldSlots)에 계속 반영되어, 확정되지 않은
+// 퇴장 처리 때문에 선수가 그라운드/벤치 목록에서 사라진 채로 남는다.
 const cardQueue = ref<CardRecord[]>([])
-const cardByPlayer = computed(() => {
-  const map = new Map<number, CardRecord[]>()
-  for (const c of [...game.value.cards, ...cardQueue.value]) map.set(c.player, [...(map.get(c.player) ?? []), c])
-  return map
-})
-function openCardPanel() { cardOpen.value = !cardOpen.value; if (cardOpen.value) { subOpen.value = false; cardType.value = 'Y' }; cardPlayer.value = null; cardPlayerEditTarget.value = null; cardEditSnapshot.value = null }
+const cardByPlayer = computed(() => groupCardsByPlayer(game.value.cards, cardQueue.value))
+/** 카드 패널을 완전히 새로 여는 경우에만 쓰는 초기화. 편집 중이던 큐는 버린다. */
+function resetCardDraft() {
+  cardPlayer.value = null
+  cardQueue.value = []
+  cardPlayerEditTarget.value = null
+  cardEditSnapshot.value = null
+}
+function openCardPanel() {
+  if (cardOpen.value) {
+    // 토글로 닫는 경우 — Cancel 을 누른 것과 동일하게 취급해 미제출 큐를 버린다.
+    cardOpen.value = false
+    resetCardDraft()
+    return
+  }
+  cardOpen.value = true
+  subOpen.value = false
+  cardType.value = 'Y'
+  resetCardDraft()
+}
 // 카드 시각은 스테퍼로 미리 정해두는 게 아니라, 실제로 선수를 큐에 담는 이 순간의
 // 흘러가는 시계(seconds)값을 그대로 쓴다 — 패널을 열어둔 시간과 실제 입력 시각이 다를 수 있어서다.
 function queueCard() { if (cardPlayer.value === null) return; cardQueue.value.push({ half: halfCode.value, seconds: seconds.value, player: cardPlayer.value, card: cardType.value }); cardPlayer.value = null }
-function submitCards() { queueCard(); game.value.cards.push(...cardQueue.value); cardQueue.value = []; cardOpen.value = false; cardPlayerEditTarget.value = null; cardEditSnapshot.value = null }
-function cancelCards() { cardOpen.value = false; cardPlayer.value = null; cardQueue.value = []; cardPlayerEditTarget.value = null; cardEditSnapshot.value = null }
+function submitCards() { queueCard(); game.value.cards.push(...cardQueue.value); cardOpen.value = false; resetCardDraft() }
+function cancelCards() { cardOpen.value = false; resetCardDraft() }
 function removeQueuedCard(index: number) { cardQueue.value.splice(index, 1) }
 function removeCard(index: number) { game.value.cards.splice(index, 1) }
 
@@ -570,13 +589,11 @@ const fieldSlotsRaw = computed(() =>
     .filter(s => s.p)
 )
 // 명시적 퇴장(R) 카드뿐 아니라, 경고(Y) 카드를 두 장 받아 경고 누적으로 퇴장된 경우도
-// 더는 뛸 수 없다. 다만 그 두 번째 경고 카드 자체는 기록/표시에서 여전히 "경고"로 남아야
-// 하므로, 여기서는 판정에만 쓰고 카드 종류(c.card)는 건드리지 않는다.
-function isSentOff(playerIdx: number) {
-  const cards = cardByPlayer.value.get(playerIdx) ?? []
-  return cards.some(c => c.card === 'R') || cards.filter(c => c.card === 'Y').length >= 2
+// 더는 뛸 수 없다 (utils/card.ts 의 isSentOff — 판정에만 쓰고 카드 종류는 건드리지 않는다).
+function isPlayerSentOff(playerIdx: number) {
+  return isSentOff(cardByPlayer.value.get(playerIdx) ?? [])
 }
-const onFieldSlots = computed(() => fieldSlotsRaw.value.filter(s => !isSentOff(game.value.assigned[s.id]!)))
+const onFieldSlots = computed(() => fieldSlotsRaw.value.filter(s => !isPlayerSentOff(game.value.assigned[s.id]!)))
 const benchSlots = computed(() =>
   Object.keys(game.value.assigned)
     .filter(id => id.startsWith('b'))
@@ -589,13 +606,14 @@ const benchSlots = computed(() =>
 const byNo = <T extends { p: SquadPlayer | null }>(list: T[]) =>
   [...list].sort((a, b) => Number(a.p!.no) - Number(b.p!.no))
 // 이미 퇴장 처리된(명시적 R, 또는 경고 누적) 선수는 새로 카드를 줄 수 없어 목록에서 빠지지만,
-// 지금 그 선수의 카드를 "수정" 중이라면 목록에 남아 있어야 한다 — 그래야 경고 카드를 고치다가
-// 취소 없이 바로 다른 선수의 퇴장 카드도 이어서 고칠 수 있다.
-function canPickForCard(playerIdx: number) {
-  return !isSentOff(playerIdx) || playerIdx === cardHighlightPlayer.value
-}
-const cardStarterSlots = computed(() => byNo(fieldSlotsRaw.value.filter(s => canPickForCard(game.value.assigned[s.id]!))))
-const cardSubSlots = computed(() => byNo(benchSlots.value.filter(s => canPickForCard(game.value.assigned[s.id]!))))
+// 지금 그 선수의 카드를 "수정" 중이라면(utils/card.ts 의 canPickForCard 예외) 목록에 남아
+// 있어야 한다 — 그래야 경고 카드를 고치다가 취소 없이 바로 다른 선수의 퇴장 카드도 이어서 고칠 수 있다.
+const cardStarterSlots = computed(() =>
+  byNo(fieldSlotsRaw.value.filter(s => canPickForCard(game.value.assigned[s.id]!, cardByPlayer.value, cardHighlightPlayer.value)))
+)
+const cardSubSlots = computed(() =>
+  byNo(benchSlots.value.filter(s => canPickForCard(game.value.assigned[s.id]!, cardByPlayer.value, cardHighlightPlayer.value)))
+)
 
 /** 한 번 빠진 선수는 다시 못 들어온다(축구 규칙) — 벤치에 있어도 고를 수 없게 막는다 */
 const subbedOutPlayers = computed(() => new Set(game.value.subs.map(s => s.outPlayer)))
@@ -607,7 +625,8 @@ function isSubbedOut(slotId: string) {
 const canSubmitSub = computed(() => subOutSlot.value !== null && subInSlot.value !== null)
 
 function openSubPanel() {
-  cardOpen.value = false
+  // 카드 패널이 열려 있었다면 강제로 닫는다 — Cancel 과 동일하게 미제출 큐도 버린다.
+  if (cardOpen.value) { cardOpen.value = false; resetCardDraft() }
   subOutSlot.value = null
   subInSlot.value = null
   subMinute.value = Math.floor(seconds.value / 60)
