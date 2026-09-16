@@ -3,12 +3,11 @@ const inputMenus = [
   { label: '팀 관리', desc: '팀 정보와 엠블럼을 빠르게 등록·수정', to: '/manage/teams', ready: true },
   { label: '선수 관리', desc: '선수·등번호·포지션을 한 번에 등록·수정', to: '/manage/players', ready: false },
   { label: '감독 관리', desc: '감독 정보와 소속 팀을 빠르게 등록·수정', to: '/manage/coaches', ready: true },
-  { label: '경기 일정 관리', desc: '경기 날짜·팀·리그 일정을 빠르게 등록·수정', to: '/manage/schedules', ready: false }
+  { label: '경기 일정 관리', desc: '경기 날짜·팀·리그 일정을 빠르게 등록·수정', to: '/manage/schedules', ready: true }
 ]
 const menus = [
   { label: '기록 잠금 관리', desc: '갱신으로 잠긴 반(半) 잠금 해제', to: '/manage/locks', ready: true },
   { label: 'SQL 데이터 이관', desc: '레거시 SQL 경기 데이터를 Firestore로 이관 (1회성)', to: '/manage/legacy-import', ready: true },
-  { label: '감독 재임 이력 이관', desc: 'PL 감독 연혁 엑셀을 coachContracts/coachRounds로 이관 (1회성)', to: '/manage/coach-import', ready: true },
   { label: 'Firestore 데이터 뷰어', desc: '컬렉션 조회 + 값 수정 (삭제는 없음)', to: '/manage/data-viewer', ready: true },
   { label: '입력 데이터 (경기 기록)', desc: '경기 → 팀 → 레코드/KPI/카드 순으로 클릭만으로 조회', to: '/manage/input-data', ready: true }
 ]

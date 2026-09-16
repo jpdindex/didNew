@@ -1,10 +1,8 @@
 <script setup lang="ts">
 import {
   applyResult,
-  closePrecedingOpenAct,
   computeAttackPaths,
   createActRecord,
-  createResultRecord,
   type ActCode,
   type DidRecord,
   type ResCode,
@@ -17,14 +15,7 @@ import {
   type GrassLines,
   type GrassPattern,
 } from '~/utils/grass'
-import {
-  GOAL_TARGET,
-  goalFramePoint,
-  goalOuterPoint,
-  goalPointToScreenFraction,
-  isWithinGoalOneMeter,
-  type GoalZoneResult,
-} from '~/utils/goalCoordinates'
+import { GOAL_TARGET, goalFramePoint, goalOuterPoint, isWithinGoalOneMeter } from '~/utils/goalCoordinates'
 import { canPickForCard, groupCardsByPlayer, isSentOff, type CardRecord } from '~/utils/card'
 import type { HalfStatus, SubRecord } from '~/composables/useMatchState'
 
@@ -185,14 +176,21 @@ const rows = computed(() => {
   // 위치만 찍고 아직 액트를 안 고른 상태 — 확정 레코드가 아니라 표시 전용 "가안" 행이다.
   // records.value 에는 안 들어가므로 채점 로직(computeAttackPaths 등)에는 전혀 영향이 없다.
   // 수정 중일 때는 안 보여준다(수정 중엔 pendingPos 가 그 레코드의 임시 위치라 다른 의미다).
-  // 슛(S/H/R)은 클릭 즉시 records 에 실제 레코드로 들어가므로(res:'O') 위 .map() 에서
-  // 이미 표시된다 — C/P/K/F 가 결과를 기다리는 동안 그대로 보이는 것과 같다.
-  if (!editingId.value && pendingPos.value) {
-    list.push({
-      id: '__draft__', no: list.length + 1, time: fmtTime(seconds.value),
-      act: '', result: '', area: areaFromPos(pendingPos.value),
-      isDap: false, playerName: '', draft: true,
-    })
+  if (!editingId.value) {
+    if (pendingShot.value) {
+      const shot = pendingShot.value
+      list.push({
+        id: '__draft__', no: list.length + 1, time: fmtTime(shot.seconds),
+        act: shot.act, result: '', area: String(shot.area),
+        isDap: false, playerName: '', draft: true,
+      })
+    } else if (pendingPos.value) {
+      list.push({
+        id: '__draft__', no: list.length + 1, time: fmtTime(seconds.value),
+        act: '', result: '', area: areaFromPos(pendingPos.value),
+        isDap: false, playerName: '', draft: true,
+      })
+    }
   }
   return list
 })
@@ -204,16 +202,31 @@ const tableExpanded = ref(false)
 // 템플릿에 긴 문자열 리터럴을 직접 두면 에디터 자동 포맷터가 줄바꿈을 문자열 안에 넣어
 // 컴파일 에러를 내는 일이 반복돼서, 라벨을 computed로 빼 템플릿에는 짧은 표현식만 남긴다.
 const tableToggleLabel = computed(() => tableExpanded.value ? '▼ 기록 접기' : '▲ 기록 더보기')
+
+// ---- 구간수정: 연속된 여러 레코드의 시간을 한 번에 밀기 ----
+// 녹화 시작이 실제보다 늦게/일찍 눌려서 특정 구간 전체가 몇 초씩 밀려 있는 경우를 위한 기능.
+// 1) 구간수정 모드에서 레코드 두 개를 탭하면 그 사이 전체가 구간으로 잡힌다.
+// 2) 구간을 길게 누르면 델타(±초) 조절 바가 뜨고, 적용하면 구간 내 모든 레코드의 시간이 같이 밀린다.
 const rangeMode = ref(false)
 const rangeStartId = ref<string | null>(null)
 const rangeEndId = ref<string | null>(null)
 const rangeEditingOpen = ref(false)
 const rangeDelta = ref(0)
-function toggleRangeMode() { rangeMode.value = !rangeMode.value; rangeStartId.value = null; rangeEndId.value = null; rangeEditingOpen.value = false; rangeDelta.value = 0 }
+
+function toggleRangeMode() {
+  rangeMode.value = !rangeMode.value
+  rangeStartId.value = null
+  rangeEndId.value = null
+  rangeEditingOpen.value = false
+  rangeDelta.value = 0
+}
+
+// 구간이 완성됐을 때만(시작+끝 둘 다 골랐을 때) [시작 인덱스, 끝 인덱스] 를 준다.
 const rangeIndices = computed(() => {
   if (!rangeStartId.value || !rangeEndId.value) return null
   const ids = visibleRecords.value.map(r => r.id)
-  const a = ids.indexOf(rangeStartId.value), b = ids.indexOf(rangeEndId.value)
+  const a = ids.indexOf(rangeStartId.value)
+  const b = ids.indexOf(rangeEndId.value)
   if (a < 0 || b < 0) return null
   return [Math.min(a, b), Math.max(a, b)] as const
 })
@@ -222,20 +235,39 @@ const rangeSelectedIds = computed(() => {
   if (!idx) return new Set<string>()
   return new Set(visibleRecords.value.slice(idx[0], idx[1] + 1).map(r => r.id))
 })
+
+/** 구간수정 모드에서 레코드를 탭했을 때. 시작이 없으면 시작으로, 시작만 있으면 끝으로 잡는다.
+ *  둘 다 이미 잡혀 있으면(구간 완성 상태) 새로 시작한다. */
 function tapRangeRow(id: string) {
   if (rangeEditingOpen.value) return
-  if (!rangeStartId.value || rangeEndId.value) { rangeStartId.value = id; rangeEndId.value = null }
-  else rangeEndId.value = id
+  if (!rangeStartId.value || rangeEndId.value) {
+    rangeStartId.value = id
+    rangeEndId.value = null
+  } else {
+    rangeEndId.value = id
+  }
 }
-function openRangeEdit() { if (rangeIndices.value) { rangeDelta.value = 0; rangeEditingOpen.value = true } }
-function stepRangeDelta(delta: number) { rangeDelta.value += delta }
-function cancelRangeEdit() { rangeEditingOpen.value = false }
+function openRangeEdit() {
+  if (!rangeIndices.value) return
+  rangeDelta.value = 0
+  rangeEditingOpen.value = true
+}
+function stepRangeDelta(delta: number) {
+  rangeDelta.value += delta
+}
+function cancelRangeEdit() {
+  rangeEditingOpen.value = false
+}
 function applyRangeEdit() {
   const ids = rangeSelectedIds.value
-  if (ids.size && rangeDelta.value) {
-    for (const rec of records.value) if (ids.has(rec.id)) { rec.seconds = Math.max(0, rec.seconds + rangeDelta.value); rec.edited = true }
+  if (ids.size && rangeDelta.value !== 0) {
+    for (const rec of records.value) {
+      if (ids.has(rec.id)) {
+        rec.seconds = Math.max(0, rec.seconds + rangeDelta.value)
+        rec.edited = true
+      }
+    }
     records.value.sort((a, b) => (a.seconds - b.seconds) || ((a.seq ?? 0) - (b.seq ?? 0)))
-    game.value.records = records.value
   }
   toggleRangeMode()
 }
@@ -256,12 +288,6 @@ const editRes = ref<'X' | 'B' | null>(null)
 // 나타내는 act='' 레코드"를 항상 짝으로 만든다. 둘은 늘 같은 res 값을 가져야 하므로,
 // 한쪽을 수정하면 짝도 같이 바꿔준다. (예: 17번 P|B 와 18번 (빈 act)|B)
 const editPairedId = ref<string | null>(null)
-// 슛(GOAL/GB/GX/H/HX/L/LX/R/RX) 레코드를 수정 중일 때만 쓰는 골대 좌표 임시값.
-// 이 값이 있어야만(=슛 레코드를 수정 중일 때만) 골대 UI(.goal)가 활성화돼 다시 찍을 수
-// 있다 — 그냥 보기(peek)만 하는 중엔 null 로 유지해 클릭해도 아무 반응이 없게 막는다.
-const editShootZone = ref<GoalZoneResult | null>(null)
-const editShootPos = ref<{ x: number; y: number } | null>(null)
-const editShootDspRange = ref<boolean | undefined>(undefined)
 /** rec 와 짝을 이루는 결과 레코드의 id 를 찾는다. 없으면 null. */
 function findPairedResultRecordId(rec: DidRecord): string | null {
   const idx = records.value.findIndex(r => r.id === rec.id)
@@ -309,7 +335,12 @@ function startPress(id: string, isTouch = false) {
   longPressed = false
   if (isTouch) touchMoved = false
   else if (Date.now() < suppressMouseUntil) return
-  if (rangeMode.value) { if (rangeIndices.value) pressTimer = setTimeout(() => { longPressed = true; openRangeEdit() }, 500); return }
+  if (rangeMode.value) {
+    // 구간이 아직 안 잡혔으면 타이머를 걸지 않는다 — 그래야 오래 눌러도 longPressed 가
+    // true 로 세팅되지 않고, 손을 떼는 순간 tapRangeRow 가 정상적으로 호출된다.
+    if (rangeIndices.value) pressTimer = setTimeout(() => { longPressed = true; openRangeEdit() }, 500)
+    return
+  }
   pressTimer = setTimeout(() => { longPressed = true; openEdit(id) }, 500)
 }
 function cancelPress() {
@@ -338,13 +369,12 @@ function clearPendingEntry() {
   pendingShot.value = null
   flashCell.value = null
   if (flashTimer) clearTimeout(flashTimer)
-  // 골대 프레임 안에서 확정 전(B/GOAL/X 누르기 전) 임시로 찍어둔 위치도 여기서 같이
-  // 지운다 — 안 지우면 다른 레코드를 보러 갔다가 그 레코드의 B/GOAL/X를 눌렀을 때 지금
-  // 레코드와 무관한 옛 좌표가 엉뚱하게 다시 적용된다.
-  pendingFramePos.value = null
 }
 function clickRecord(id: string) {
-  if (rangeMode.value) { tapRangeRow(id); return }
+  if (rangeMode.value) {
+    tapRangeRow(id)
+    return
+  }
   // 다른 기록을 선택하면 현재 열려 있던 수정 모드를 닫는다.
   // 수정 중인 행의 버튼/입력 상태가 다른 행으로 남지 않도록 한다.
   if (editingId.value && editingId.value !== id) {
@@ -365,15 +395,6 @@ function openEdit(id: string) {
   editPos.value = rec.posX !== undefined && rec.posY !== undefined ? { x: rec.posX, y: rec.posY } : null
   editRes.value = rec.res === 'X' || rec.res === 'B' ? rec.res : null
   editPairedId.value = editRes.value ? findPairedResultRecordId(rec) : null
-  if (GOAL_ZONE_RESULTS.has(rec.res) && rec.shootPosX !== undefined && rec.shootPosY !== undefined) {
-    editShootZone.value = rec.res as GoalZoneResult
-    editShootPos.value = { x: rec.shootPosX, y: rec.shootPosY }
-    editShootDspRange.value = rec.shootDspRange
-  } else {
-    editShootZone.value = null
-    editShootPos.value = null
-    editShootDspRange.value = undefined
-  }
 }
 function stepEditSeconds(delta: number) {
   editSeconds.value = Math.max(0, editSeconds.value + delta)
@@ -413,12 +434,6 @@ function applyEdit() {
     // 고치면 맨 아래로, 가장 이른 시간으로 고치면 맨 위로 옮겨간다. didLogic.ts의
     // resolvedOnly() 와 같은 기준(seconds asc, seq asc)으로 정렬해 화면과 판정이 어긋나지 않게 한다.
     records.value.sort((a, b) => (a.seconds - b.seconds) || ((a.seq ?? 0) - (b.seq ?? 0)))
-    // 액트 없는 단독 결과 레코드(X/B)를 수정 중이었다면, 고친 시간 기준으로 바로 앞에
-    // 오게 된 진행중(res:'O') 액트가 있는지 다시 찾아 그 액트도 이 결과로 마감한다.
-    if (!rec.act && (rec.res === 'X' || rec.res === 'B')) {
-      closePrecedingOpenAct(records.value, rec.id)
-    }
-    game.value.records = records.value
   }
   editingId.value = null
 }
@@ -426,7 +441,6 @@ function deleteEdit() {
   if (!editingId.value) return
   if (!confirm('이 기록을 삭제하시겠습니까?')) return
   records.value = records.value.filter(r => r.id !== editingId.value)
-  game.value.records = records.value
   editingId.value = null
 }
 function cancelEdit() {
@@ -461,11 +475,9 @@ function confirmMirror() {
 }
 
 const pendingPos = ref<{ x: number; y: number } | null>(null)
-// 슛(S/H/R)도 C/P/K/F 와 동일하게 버튼을 누르는 즉시 실제 레코드를 만든다(res:'O').
-// 골 존 결과가 나오기 전까지는 그 레코드의 id 만 여기 들고 있다가, 결과가 정해지면
-// applyResult() 로 같은 레코드의 res 를 덮어쓴다 — 새 레코드를 만들지 않는다.
+// 슛(S/H/R)은 결과(HX/LX/RX/H/L/R, GB/GOAL/GX)가 정해지기 전엔 레코드를 만들지 않는다 —
+// res:'O' 로 남는 슛은 존재하지 않는다. 골 존 결과가 나올 때까지는 여기 초안으로만 들고 있는다.
 interface PendingShot {
-  id: string
   act: Exclude<ActCode, ''>
   seconds: number
   area: number
@@ -871,27 +883,6 @@ const infoCellRect = computed(() => {
   }
 })
 
-// 골 기록(GOAL/GB/GX/H/HX/L/LX/R/RX)을 보고 있는 중이면, 그때 찍은 골대 안 좌표(shootPosX/Y,
-// footballX 628x300 원본 좌표)를 .goal 래퍼 전체 대비 비율로 바꿔 점으로 보여준다.
-// .goal 은 이 좌표계(628x300)를 기준으로 goalZone/hxDivider/meterGuide 가 이미 배치돼 있어
-// 그대로 나눠 쓰면 프레임 안/밖 어느 위치든 정확히 맞는다.
-const GOAL_ZONE_RESULTS = new Set<string>(['GOAL', 'GB', 'GX', 'H', 'HX', 'L', 'LX', 'R', 'RX'])
-// 수정(long-press) 중인 슛 레코드만 골대를 다시 찍을 수 있다 — 그냥 보기(peek, 짧게 클릭)만
-// 하는 중엔 editShootZone 이 비어 있으므로 .goal 이 활성화되지 않는다.
-const isEditingShoot = computed(() => editingId.value !== null && editShootZone.value !== null)
-const infoGoalPos = computed(() => {
-  if (editingId.value) {
-    if (!editShootZone.value || !editShootPos.value) return null
-    const frac = goalPointToScreenFraction(editShootZone.value, editShootPos.value)
-    return { left: frac.left * 100 + '%', top: frac.top * 100 + '%' }
-  }
-  const r = infoRecord.value
-  if (!r || r.shootPosX === undefined || r.shootPosY === undefined) return null
-  if (!GOAL_ZONE_RESULTS.has(r.res)) return null
-  const frac = goalPointToScreenFraction(r.res as GoalZoneResult, { x: r.shootPosX, y: r.shootPosY })
-  return { left: frac.left * 100 + '%', top: frac.top * 100 + '%' }
-})
-
 function cellFromPos(pos: { x: number; y: number }) {
   const px = (pos.x / 100) * 971
   const py = (pos.y / 100) * 634
@@ -966,9 +957,9 @@ function areaFromPos(pos: { x: number; y: number }) {
   return String(zone)
 }
 
-// 액트 버튼(C/P/K/F/S/H/R): 새 레코드를 만든다. res 는 'O'(진행중)로 시작 — 슛(S/H/R)도
-// 예외 없이 마찬가지다. 다만 슛은 골 존 결과가 나오기 전까지 res:'O' 로 표에 남아있고,
-// 그 id 를 pendingShot 에 들고 있다가 결과가 정해지면 같은 레코드를 덮어쓴다.
+// 액트 버튼(C/P/K/F/S/H/R): 새 레코드를 만든다. res 는 'O'(진행중)로 시작.
+// 단, 슛(S/H/R)은 예외다 — 슛은 반드시 방향/골키퍼 결과가 있어야 하고 res:'O' 로
+// 남는 슛은 없으므로, 결과가 정해질 때까지 레코드를 만들지 않고 초안(pendingShot)으로만 둔다.
 function clickAct(actKey: string, isShot: boolean) {
   // 수정 중이면 새 레코드를 만들지 않고, 지금 수정 중인 레코드의 액트만 바꾼다.
   if (editingId.value) {
@@ -976,6 +967,19 @@ function clickAct(actKey: string, isShot: boolean) {
     return
   }
   if (!pendingPos.value) return
+  if (isShot) {
+    pendingShot.value = {
+      act: actKey as Exclude<ActCode, ''>,
+      seconds: seconds.value,
+      area: Number(areaFromPos(pendingPos.value)),
+      posX: pendingPos.value.x,
+      posY: pendingPos.value.y,
+    }
+    pendingPos.value = null
+    pendingCell.value = null
+    flashCell.value = null
+    return
+  }
   const rec = createActRecord(
     actKey as Exclude<ActCode, ''>,
     seconds.value,
@@ -983,16 +987,6 @@ function clickAct(actKey: string, isShot: boolean) {
     { posX: pendingPos.value.x, posY: pendingPos.value.y, half: halfCode.value }
   )
   records.value.push(rec)
-  if (isShot) {
-    pendingShot.value = {
-      id: rec.id,
-      act: rec.act as Exclude<ActCode, ''>,
-      seconds: rec.seconds,
-      area: rec.area,
-      posX: rec.posX,
-      posY: rec.posY,
-    }
-  }
   pendingPos.value = null
   pendingCell.value = null
   flashCell.value = null
@@ -1010,58 +1004,30 @@ function clickResult(res: 'X' | 'B') {
   }
   if (!pendingPos.value) return
   const last = records.value[records.value.length - 1]
-  if (last && last.res === 'O') {
-    applyResult(records.value, last.id, res, {
-      seconds: seconds.value,
-      area: Number(areaFromPos(pendingPos.value)),
-      pos: { x: pendingPos.value.x, y: pendingPos.value.y },
-    })
-    // 골 존 결과를 기다리던 슛이 여기(킥 패널 X/B)로 먼저 마감되면(골문 도달 전 저지),
-    // 그 레코드는 이미 끝난 것이므로 골 존을 또 눌러 덮어쓰지 못하게 참조를 지운다.
-    if (pendingShot.value?.id === last.id) pendingShot.value = null
-  } else {
-    // 진행중(res:'O')인 액트가 없을 때는 액트 없이 X/B 만 단독으로 입력한다
-    // (예: 특정 액트 없이 벌어진 실책/블락). 나중에 이 레코드의 시간을 고쳐 어떤
-    // 액트 바로 뒤로 옮기면 그 액트도 자동으로 마감된다 — closePrecedingOpenAct 참고.
-    const rec = createResultRecord(res, seconds.value, Number(areaFromPos(pendingPos.value)), {
-      posX: pendingPos.value.x, posY: pendingPos.value.y, half: halfCode.value,
-    })
-    records.value.push(rec)
-    closePrecedingOpenAct(records.value, rec.id)
-  }
+  if (!last || last.res !== 'O') return
+  applyResult(records.value, last.id, res, {
+    seconds: seconds.value,
+    area: Number(areaFromPos(pendingPos.value)),
+    pos: { x: pendingPos.value.x, y: pendingPos.value.y },
+  })
   pendingPos.value = null
   pendingCell.value = null
   flashCell.value = null
 }
 
-// 골대 존: 새 레코드를 만들지 않고, clickAct 에서 이미 만들어둔 슛 레코드(res:'O')의
-// res 만 덮어쓴다 — C/P/K/F 를 X/B 로 마감할 때와 같은 방식(applyResult 재사용).
-// 수정 중(editingId)이면, 시간/액트/위치 같은 다른 필드와 달리 "적용"을 기다리지 않고
-// 버튼을 누르는 즉시 레코드에 반영한다 — 위치를 찍고 B/GOAL/X로 결과를 고르는 그 자체가
-// 이미 확정 동작이라, 한 번 더 적용을 눌러야 하면 오히려 방금 한 조정이 아직 안 끝난
-// 것처럼 헷갈린다.
+// 골대 존: 결과가 정해진 순간에야 비로소 슛 레코드를 만든다(act+res 를 함께 채워서 push) —
+// 그전까지는 records 배열에 아무것도 남기지 않는다.
 function recordGoalResult(zone: Exclude<ResCode, 'O' | ''>, point?: { x: number; y: number }) {
-  if (editingId.value) {
-    editShootZone.value = zone as GoalZoneResult
-    editShootPos.value = point ?? null
-    editShootDspRange.value = point ? isWithinGoalOneMeter(point) : undefined
-    const rec = records.value.find(r => r.id === editingId.value)
-    if (rec) {
-      rec.res = zone
-      rec.edited = true
-      if (point) {
-        rec.shootPosX = point.x
-        rec.shootPosY = point.y
-        rec.shootDspRange = isWithinGoalOneMeter(point)
-      }
-    }
-    return
-  }
   if (!pendingShot.value) return
-  applyResult(records.value, pendingShot.value.id, zone, {
-    shootPos: point,
-    shootDspRange: point ? isWithinGoalOneMeter(point) : undefined,
-  })
+  const shot = pendingShot.value
+  const rec = createActRecord(shot.act, shot.seconds, shot.area, { posX: shot.posX, posY: shot.posY, half: halfCode.value })
+  rec.res = zone
+  if (point) {
+    rec.shootPosX = point.x
+    rec.shootPosY = point.y
+    rec.shootDspRange = isWithinGoalOneMeter(point)
+  }
+  records.value.push(rec)
   if (zone === 'GOAL') homeScore.value++
   pendingShot.value = null
 }
@@ -1088,36 +1054,13 @@ function clickGoalFrame(e: MouseEvent) {
     y: (e.clientY - rect.top) / rect.height,
   }
 }
-// 확정 전 임시 마커(.frameMarker)를 .goalFrame 안에서 CSS 퍼센트로 두면, .goalFrame 의
-// border(10px)만큼 자식 위치 기준 박스가 줄어들어(퍼센트는 padding box 기준) 클릭 지점과
-// 실제 표시 위치가 살짝 어긋난다 — getBoundingClientRect() 로 잰 클릭 비율은 border 를
-// 포함한 박스 기준이라 서로 다른 기준을 쓰게 되는 셈이다. 그래서 버튼을 눌러 확정하는
-// 순간(같은 비율을 goalPointToScreenFraction 로 .goal 전체 기준 변환) 위치가 다시 튀어
-// 보였다. 애초에 같은 .goal 기준 변환식을 써서 임시 마커도 .goal 의 자식으로 두면
-// 클릭 시점과 확정 시점의 위치가 완전히 같아진다.
-const pendingFrameScreenPos = computed(() => {
-  if (!pendingFramePos.value) return null
-  return {
-    left: (FRAME_SIDE + pendingFramePos.value.x * FRAME_WIDTH_FRAC) * 100 + '%',
-    top: (FRAME_TOP + pendingFramePos.value.y * FRAME_HEIGHT_FRAC) * 100 + '%',
-  }
-})
-// B/GOAL/X: 프레임 안쪽에서 마커로 찍어둔 위치를 결과로 확정한다. 새로 찍은 위치가 없으면,
-// 수정 중인 슛의 기존 프레임 위치를 그대로 써서 결과만 바꾼다(아래 분기).
+// B/GOAL/X: 프레임 안쪽에서 마커로 찍어둔 위치를 결과로 확정한다. 마커가 없으면 무시한다.
 // 버튼 표시는 B/GOAL/X 그대로지만, 골키퍼 액션이므로 저장값은 GB/GX로 킥 패널의 B/X와 구분한다.
 function confirmGoalFrame(result: 'B' | 'GOAL' | 'X') {
+  if (!pendingFramePos.value) return
   const zone = result === 'B' ? 'GB' : result === 'X' ? 'GX' : 'GOAL'
-  if (pendingFramePos.value) {
-    recordGoalResult(zone, goalFramePoint(pendingFramePos.value.x, pendingFramePos.value.y))
-    pendingFramePos.value = null
-    return
-  }
-  // 수정 중이고 이미 프레임 안에 위치가 있으면(새로 찍지 않았어도) 그 자리 그대로 결과만
-  // 바꾼다 — 위치는 안 건드리고 B/GB/X 분류만 고치고 싶을 때 새로 다시 찍을 필요가 없게 한다.
-  if (editingId.value && editShootPos.value &&
-    (editShootZone.value === 'GOAL' || editShootZone.value === 'GB' || editShootZone.value === 'GX')) {
-    recordGoalResult(zone, editShootPos.value)
-  }
+  recordGoalResult(zone, goalFramePoint(pendingFramePos.value.x, pendingFramePos.value.y))
+  pendingFramePos.value = null
 }
 
 // 중앙 정렬된 골대 주변 영역(프레임 바깥)은 클릭 즉시 기록한다 — 버튼 필요 없음.
@@ -1131,11 +1074,6 @@ function clickOuterZone(e: MouseEvent, zone: 'H' | 'HX' | 'L' | 'LX' | 'R' | 'RX
   const rect = (e.currentTarget as HTMLElement).closest('.goal')!.getBoundingClientRect()
   const x = (e.clientX - rect.left) / rect.width
   const y = (e.clientY - rect.top) / rect.height
-
-  // 바깥 존은 클릭 즉시 확정되므로, 그 전에 프레임 안에서 찍어둔(아직 B/GOAL/X 를
-  // 안 눌러 확정 안 된) 임시 위치가 남아 있었다면 여기서 버린다 — 안 지우면 나중에
-  // B/GOAL/X 를 눌렀을 때 방금 고른 바깥 존 위치 대신 그 옛 프레임 좌표가 되살아난다.
-  pendingFramePos.value = null
 
   if (zone === 'H' || zone === 'HX') {
     recordGoalResult(zone, goalOuterPoint('HX', x, y / FRAME_TOP))
@@ -1158,10 +1096,7 @@ function cancelPlayerPick() {
 function submitPlayer() {
   if (!pickedNo.value) return
   const rec = records.value.find(r => r.id === playerPickFor.value)
-  if (rec) {
-    rec.playerId = pickedNo.value
-    game.value.records = records.value
-  }
+  if (rec) rec.playerId = pickedNo.value
   cancelPlayerPick()
 }
 
@@ -1284,14 +1219,20 @@ function finishHalf() {
 
           <div v-if="isEditMode" class="tableBar">
             <button class="tableToggle" @click="tableExpanded = !tableExpanded">{{ tableToggleLabel }}</button>
-            <button class="rangeToggle" :class="{ on: rangeMode }" @click="toggleRangeMode">구간 수정</button>
+            <button class="rangeToggle" :class="{ on: rangeMode }" @click="toggleRangeMode">구간수정</button>
           </div>
-          <div v-if="rangeMode" class="rangeHint">{{ rangeEditingOpen ? '델타를 조절하고 적용을 누르세요' : (!rangeStartId ? '구간 시작 레코드를 탭하세요' : (!rangeEndId ? '구간 끝 레코드를 탭하세요' : '길게 눌러 이 구간을 수정하세요')) }}</div>
+          <div v-if="rangeMode" class="rangeHint">
+            {{ rangeEditingOpen ? '델타를 조절하고 적용을 누르세요' : (!rangeStartId ? '구간 시작 레코드를 탭하세요'
+            : (!rangeEndId ? '구간 끝 레코드를 탭하세요' : '길게 눌러 이 구간을 수정하세요')) }}
+          </div>
           <div v-if="rangeEditingOpen" class="rangeEditBar" @mousedown.stop @touchstart.stop>
             <span class="rangeEditLabel">{{ rangeDelta > 0 ? '+' : '' }}{{ rangeDelta }}초</span>
-            <button @click="stepRangeDelta(-10)">−10</button><button @click="stepRangeDelta(-1)">−1</button>
-            <button @click="stepRangeDelta(1)">+1</button><button @click="stepRangeDelta(10)">+10</button>
-            <button class="rangeApply" @click="applyRangeEdit">적용</button><button class="rangeCancel" @click="cancelRangeEdit">취소</button>
+            <button @click="stepRangeDelta(-10)">−10</button>
+            <button @click="stepRangeDelta(-1)">−1</button>
+            <button @click="stepRangeDelta(1)">+1</button>
+            <button @click="stepRangeDelta(10)">+10</button>
+            <button class="rangeApply" @click="applyRangeEdit">적용</button>
+            <button class="rangeCancel" @click="cancelRangeEdit">취소</button>
           </div>
           <div ref="tableEl" class="table" :class="{ expanded: tableExpanded }"
             @mousedown.capture="closeOverlayPanelsOnOutsideTouch"
@@ -1301,7 +1242,7 @@ function finishHalf() {
             </div>
             <div class="tbody">
               <div v-for="r in rows" :key="r.id" class="trow"
-                :class="{ pending: r.isDap, editing: editingId === r.id, peeking: peekId === r.id, edited: records.find(x => x.id === r.id)?.edited, rangeSel: rangeMode && rangeSelectedIds.has(r.id), rangeAnchor: rangeMode && r.id === rangeStartId && !rangeEndId, draft: r.draft }"
+                :class="{ pending: r.result === 'O', editing: editingId === r.id, peeking: peekId === r.id, edited: records.find(x => x.id === r.id)?.edited, draft: r.draft, rangeSel: rangeMode && rangeSelectedIds.has(r.id), rangeAnchor: rangeMode && r.id === rangeStartId && !rangeEndId }"
                 @mousedown="!r.draft && startPress(r.id)" @mouseup="!r.draft && endPress(r.id)"
                 @mouseleave="cancelPress" @touchstart="!r.draft && startPress(r.id, true)" @touchmove="handleTouchMove"
                 @touchend="!r.draft && endPress(r.id, true)" @contextmenu.prevent>
@@ -1317,8 +1258,6 @@ function finishHalf() {
                           @click.stop="stepEditSecond(1)">+</button></span>
                       <button class="editApply editApplyInline" @mousedown.stop @touchstart.stop
                         @click.stop="applyEdit">적용</button>
-                      <button class="editDelete editDeleteInline" @mousedown.stop @touchstart.stop
-                        @click.stop="deleteEdit">삭제</button>
                     </div>
                     <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn" @mousedown.stop @touchstart.stop
                       @click.stop="openPlayerPick(r.id)">{{ r.playerName || '선수 선택' }}</button>
@@ -1524,7 +1463,7 @@ function finishHalf() {
                   @click="clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
               </div>
 
-              <div class="goal" :class="{ active: pendingShot !== null || isEditingShoot }">
+              <div class="goal" :class="{ active: pendingShot !== null }">
                 <div class="goalZone hx" @click="clickOuterZone($event, 'HX')">HX</div>
                 <div class="goalZone h" @click="clickOuterZone($event, 'H')">H</div>
                 <div class="goalZone lx" @click="clickOuterZone($event, 'LX')">LX</div>
@@ -1535,9 +1474,9 @@ function finishHalf() {
                 <div class="meterGuide" aria-hidden="true" />
                 <div class="goalFrame" @click="clickGoalFrame">
                   <div class="goalZone goalCenter" aria-hidden="true" />
+                  <div v-if="pendingFramePos" class="frameMarker"
+                    :style="{ left: pendingFramePos.x * 100 + '%', top: pendingFramePos.y * 100 + '%' }" />
                 </div>
-                <div v-if="infoGoalPos && !pendingFramePos" class="marker editMarker" :style="infoGoalPos" />
-                <div v-if="pendingFrameScreenPos" class="marker editMarker" :style="pendingFrameScreenPos" />
               </div>
               <div class="goalResultButtons">
                 <button class="goalResultBtn resB" @click="confirmGoalFrame('B')">B</button>
@@ -1628,7 +1567,7 @@ button {
   background: #1b1e22;
   display: flex;
   flex-direction: column;
-  padding-bottom: 250px
+  transition: padding-bottom .18s ease
 }
 
 .statBar {
@@ -2374,8 +2313,13 @@ button {
   }
 }
 
-.tableToggle {
+.tableBar {
   flex: 0 0 auto;
+  display: flex
+}
+
+.tableToggle {
+  flex: 1;
   height: 20px;
   border: none;
   border-top: 1px solid rgba(255, 255, 255, .08);
@@ -2388,6 +2332,78 @@ button {
 
 .tableToggle:hover {
   background: #262b33
+}
+
+.rangeToggle {
+  flex: 0 0 92px;
+  height: 20px;
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, .08);
+  border-left: 1px solid rgba(255, 255, 255, .08);
+  background: #20242b;
+  color: #9db8f0;
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer
+}
+
+.rangeToggle:hover {
+  background: #262b33
+}
+
+.rangeToggle.on {
+  background: #3a5fc0;
+  color: #fff
+}
+
+.rangeHint {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  background: #232838;
+  color: #9db8f0;
+  font-size: 11px;
+  text-align: center
+}
+
+.rangeEditBar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: #232838;
+  border-top: 1px solid rgba(255, 255, 255, .08)
+}
+
+.rangeEditBar button {
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .2);
+  background: rgba(255, 255, 255, .06);
+  color: #ddd;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer
+}
+
+.rangeEditLabel {
+  min-width: 56px;
+  text-align: center;
+  color: #9db8f0;
+  font-weight: 800;
+  font-size: 13px
+}
+
+.rangeApply {
+  border-color: #f0b429 !important;
+  background: rgba(240, 180, 41, .15) !important;
+  color: #f0b429 !important
+}
+
+.rangeCancel {
+  border-color: rgba(255, 255, 255, .3) !important
 }
 
 .table {
@@ -2456,7 +2472,7 @@ button {
   color: rgba(255, 255, 255, .4);
   font-style: italic;
   cursor: default;
-  background: rgba(255, 255, 255, .07)
+  background: rgba(255, 255, 255, .03)
 }
 
 .trow.editing {
@@ -2465,6 +2481,32 @@ button {
 
 .trow.peeking {
   background: rgba(240, 180, 41, .06)
+}
+
+.trow.edited {
+  color: #78c58a
+}
+
+.trow.edited button {
+  color: #78c58a;
+  border-color: #78c58a
+}
+
+.trow.pending.edited {
+  color: #78c58a
+}
+
+.trow.edited .playerBtn.assigned {
+  color: #191919
+}
+
+.trow.rangeSel {
+  background: rgba(90, 140, 255, .18)
+}
+
+.trow.rangeAnchor {
+  outline: 2px solid #5a8cff;
+  outline-offset: -2px
 }
 
 .playerBtn {
@@ -2560,8 +2602,7 @@ button {
   background: rgba(240, 180, 41, .25)
 }
 
-.editApplyInline,
-.editDeleteInline {
+.editApplyInline {
   height: 24px;
   padding: 0 12px;
   border-radius: 4px;
@@ -2569,14 +2610,6 @@ button {
   font-weight: 800;
   cursor: pointer;
   flex-shrink: 0
-}
-
-.editApplyInline {
-  margin-left: 28px
-}
-
-.editDeleteInline {
-  margin-left: 10px
 }
 
 .editTimeVal {
@@ -3205,6 +3238,20 @@ section.right h1 {
   background: rgba(240, 180, 41, .3)
 }
 
+/* 프레임 안쪽에 찍어둔 위치 마커. 결과가 확정되기 전까지(B/GOAL/X 누르기 전) 계속 보인다. */
+.frameMarker {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  margin: -8px;
+  border-radius: 50%;
+  background: rgba(240, 180, 41, .85);
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 5px rgba(240, 180, 41, .3);
+  pointer-events: none;
+  z-index: 4
+}
+
 /* ---- 선수 교체 --------------------------------------------------------------
    선수선택(pickGroup)과 같은 자리 — 액트 입력창 영역 안에서만 화면을 바꾼다.
    왼쪽 경기장·기록표는 계속 보여야 하므로 절대 덮지 않는다. */
@@ -3497,34 +3544,4 @@ section.right h1 {
   opacity: .35;
   cursor: not-allowed
 }
-</style>
-
-<style scoped>
-.tableBar { display:flex; gap:4px; flex:0 0 auto; }
-.tableBar .tableToggle { flex:1; }
-.rangeToggle { height:20px; padding:0 10px; border:1px solid rgba(240,180,41,.45); background:#20242b; color:#f0b429; font-size:10px; font-weight:800; cursor:pointer; }
-.rangeToggle.on { background:rgba(240,180,41,.2); }
-.rangeHint { flex:0 0 auto; text-align:center; padding:4px; color:#9da4af; background:#1b1f25; font-size:10px; }
-.rangeEditBar { display:flex; align-items:center; justify-content:center; gap:5px; padding:6px; background:#302b20; }
-.rangeEditBar button { border:1px solid #b88712; background:#24272d; color:#f0b429; border-radius:3px; padding:3px 7px; font-size:10px; font-weight:800; }
-.rangeEditLabel { min-width:42px; text-align:center; color:#f0b429; font-weight:800; font-size:11px; }
-.rangeEditBar .rangeApply { background:#f0b429; color:#161a20; }
-.rangeEditBar .rangeCancel { color:#e38b8b; border-color:#8d4c4c; }
-.trow.rangeSel { background:rgba(240,180,41,.16); box-shadow:inset 3px 0 #f0b429; }
-.trow.rangeAnchor { outline:1px solid rgba(120,197,138,.8); outline-offset:-1px; }
-</style>
-
-<style scoped>
-/* 수정된 기록은 배경을 바꾸지 않고 초록색으로만 구분한다. */
-.trow.edited { color: #78c58a; }
-.trow.edited button { color: #78c58a; border-color: #78c58a; }
-.trow.pending.edited { color: #78c58a; }
-.trow.edited .playerBtn.assigned { color: #191919; }
-</style>
-<style scoped>
-/* 아직 결과가 확정되지 않은 DAP/진행 기록은 기존처럼 노란색으로 표시한다. */
-.trow.pending { color: #f0b429; }
-.trow.pending span { color: #f0b429; }
-.trow.pending.edited,
-.trow.pending.edited span { color: #78c58a; }
 </style>
