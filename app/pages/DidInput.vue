@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import {
   applyResult,
+  closePrecedingOpenAct,
   computeAttackPaths,
   createActRecord,
+  createResultRecord,
   type ActCode,
   type DidRecord,
   type ResCode,
@@ -15,7 +17,14 @@ import {
   type GrassLines,
   type GrassPattern,
 } from '~/utils/grass'
-import { GOAL_TARGET, goalFramePoint, goalOuterPoint, isWithinGoalOneMeter } from '~/utils/goalCoordinates'
+import {
+  GOAL_TARGET,
+  goalFramePoint,
+  goalOuterPoint,
+  goalPointToScreenFraction,
+  isWithinGoalOneMeter,
+  type GoalZoneResult,
+} from '~/utils/goalCoordinates'
 import { canPickForCard, groupCardsByPlayer, isSentOff, type CardRecord } from '~/utils/card'
 import type { HalfStatus, SubRecord } from '~/composables/useMatchState'
 
@@ -173,21 +182,14 @@ const rows = computed(() => {
   // 위치만 찍고 아직 액트를 안 고른 상태 — 확정 레코드가 아니라 표시 전용 "가안" 행이다.
   // records.value 에는 안 들어가므로 채점 로직(computeAttackPaths 등)에는 전혀 영향이 없다.
   // 수정 중일 때는 안 보여준다(수정 중엔 pendingPos 가 그 레코드의 임시 위치라 다른 의미다).
-  if (!editingId.value) {
-    if (pendingShot.value) {
-      const shot = pendingShot.value
-      list.push({
-        id: '__draft__', no: list.length + 1, time: fmtTime(shot.seconds),
-        act: shot.act, result: '', area: String(shot.area),
-        isDap: false, playerName: '', draft: true,
-      })
-    } else if (pendingPos.value) {
-      list.push({
-        id: '__draft__', no: list.length + 1, time: fmtTime(seconds.value),
-        act: '', result: '', area: areaFromPos(pendingPos.value),
-        isDap: false, playerName: '', draft: true,
-      })
-    }
+  // 슛(S/H/R)은 클릭 즉시 records 에 실제 레코드로 들어가므로(res:'O') 위 .map() 에서
+  // 이미 표시된다 — C/P/K/F 가 결과를 기다리는 동안 그대로 보이는 것과 같다.
+  if (!editingId.value && pendingPos.value) {
+    list.push({
+      id: '__draft__', no: list.length + 1, time: fmtTime(seconds.value),
+      act: '', result: '', area: areaFromPos(pendingPos.value),
+      isDap: false, playerName: '', draft: true,
+    })
   }
   return list
 })
@@ -216,6 +218,12 @@ const editRes = ref<'X' | 'B' | null>(null)
 // 나타내는 act='' 레코드"를 항상 짝으로 만든다. 둘은 늘 같은 res 값을 가져야 하므로,
 // 한쪽을 수정하면 짝도 같이 바꿔준다. (예: 17번 P|B 와 18번 (빈 act)|B)
 const editPairedId = ref<string | null>(null)
+// 슛(GOAL/GB/GX/H/HX/L/LX/R/RX) 레코드를 수정 중일 때만 쓰는 골대 좌표 임시값.
+// 이 값이 있어야만(=슛 레코드를 수정 중일 때만) 골대 UI(.goal)가 활성화돼 다시 찍을 수
+// 있다 — 그냥 보기(peek)만 하는 중엔 null 로 유지해 클릭해도 아무 반응이 없게 막는다.
+const editShootZone = ref<GoalZoneResult | null>(null)
+const editShootPos = ref<{ x: number; y: number } | null>(null)
+const editShootDspRange = ref<boolean | undefined>(undefined)
 /** rec 와 짝을 이루는 결과 레코드의 id 를 찾는다. 없으면 null. */
 function findPairedResultRecordId(rec: DidRecord): string | null {
   const idx = records.value.findIndex(r => r.id === rec.id)
@@ -291,6 +299,10 @@ function clearPendingEntry() {
   pendingShot.value = null
   flashCell.value = null
   if (flashTimer) clearTimeout(flashTimer)
+  // 골대 프레임 안에서 확정 전(B/GOAL/X 누르기 전) 임시로 찍어둔 위치도 여기서 같이
+  // 지운다 — 안 지우면 다른 레코드를 보러 갔다가 그 레코드의 B/GOAL/X를 눌렀을 때 지금
+  // 레코드와 무관한 옛 좌표가 엉뚱하게 다시 적용된다.
+  pendingFramePos.value = null
 }
 function clickRecord(id: string) {
   // 다른 기록을 선택하면 현재 열려 있던 수정 모드를 닫는다.
@@ -313,6 +325,15 @@ function openEdit(id: string) {
   editPos.value = rec.posX !== undefined && rec.posY !== undefined ? { x: rec.posX, y: rec.posY } : null
   editRes.value = rec.res === 'X' || rec.res === 'B' ? rec.res : null
   editPairedId.value = editRes.value ? findPairedResultRecordId(rec) : null
+  if (GOAL_ZONE_RESULTS.has(rec.res) && rec.shootPosX !== undefined && rec.shootPosY !== undefined) {
+    editShootZone.value = rec.res as GoalZoneResult
+    editShootPos.value = { x: rec.shootPosX, y: rec.shootPosY }
+    editShootDspRange.value = rec.shootDspRange
+  } else {
+    editShootZone.value = null
+    editShootPos.value = null
+    editShootDspRange.value = undefined
+  }
 }
 function stepEditSeconds(delta: number) {
   editSeconds.value = Math.max(0, editSeconds.value + delta)
@@ -352,12 +373,16 @@ function applyEdit() {
     // 고치면 맨 아래로, 가장 이른 시간으로 고치면 맨 위로 옮겨간다. didLogic.ts의
     // resolvedOnly() 와 같은 기준(seconds asc, seq asc)으로 정렬해 화면과 판정이 어긋나지 않게 한다.
     records.value.sort((a, b) => (a.seconds - b.seconds) || ((a.seq ?? 0) - (b.seq ?? 0)))
+    // 액트 없는 단독 결과 레코드(X/B)를 수정 중이었다면, 고친 시간 기준으로 바로 앞에
+    // 오게 된 진행중(res:'O') 액트가 있는지 다시 찾아 그 액트도 이 결과로 마감한다.
+    if (!rec.act && (rec.res === 'X' || rec.res === 'B')) {
+      closePrecedingOpenAct(records.value, rec.id)
+    }
   }
   editingId.value = null
 }
 function deleteEdit() {
   if (!editingId.value) return
-  if (!confirm('이 기록을 삭제하시겠습니까?')) return
   records.value = records.value.filter(r => r.id !== editingId.value)
   editingId.value = null
 }
@@ -393,9 +418,11 @@ function confirmMirror() {
 }
 
 const pendingPos = ref<{ x: number; y: number } | null>(null)
-// 슛(S/H/R)은 결과(HX/LX/RX/H/L/R, GB/GOAL/GX)가 정해지기 전엔 레코드를 만들지 않는다 —
-// res:'O' 로 남는 슛은 존재하지 않는다. 골 존 결과가 나올 때까지는 여기 초안으로만 들고 있는다.
+// 슛(S/H/R)도 C/P/K/F 와 동일하게 버튼을 누르는 즉시 실제 레코드를 만든다(res:'O').
+// 골 존 결과가 나오기 전까지는 그 레코드의 id 만 여기 들고 있다가, 결과가 정해지면
+// applyResult() 로 같은 레코드의 res 를 덮어쓴다 — 새 레코드를 만들지 않는다.
 interface PendingShot {
+  id: string
   act: Exclude<ActCode, ''>
   seconds: number
   area: number
@@ -802,6 +829,27 @@ const infoCellRect = computed(() => {
   }
 })
 
+// 골 기록(GOAL/GB/GX/H/HX/L/LX/R/RX)을 보고 있는 중이면, 그때 찍은 골대 안 좌표(shootPosX/Y,
+// footballX 628x300 원본 좌표)를 .goal 래퍼 전체 대비 비율로 바꿔 점으로 보여준다.
+// .goal 은 이 좌표계(628x300)를 기준으로 goalZone/hxDivider/meterGuide 가 이미 배치돼 있어
+// 그대로 나눠 쓰면 프레임 안/밖 어느 위치든 정확히 맞는다.
+const GOAL_ZONE_RESULTS = new Set<string>(['GOAL', 'GB', 'GX', 'H', 'HX', 'L', 'LX', 'R', 'RX'])
+// 수정(long-press) 중인 슛 레코드만 골대를 다시 찍을 수 있다 — 그냥 보기(peek, 짧게 클릭)만
+// 하는 중엔 editShootZone 이 비어 있으므로 .goal 이 활성화되지 않는다.
+const isEditingShoot = computed(() => editingId.value !== null && editShootZone.value !== null)
+const infoGoalPos = computed(() => {
+  if (editingId.value) {
+    if (!editShootZone.value || !editShootPos.value) return null
+    const frac = goalPointToScreenFraction(editShootZone.value, editShootPos.value)
+    return { left: frac.left * 100 + '%', top: frac.top * 100 + '%' }
+  }
+  const r = infoRecord.value
+  if (!r || r.shootPosX === undefined || r.shootPosY === undefined) return null
+  if (!GOAL_ZONE_RESULTS.has(r.res)) return null
+  const frac = goalPointToScreenFraction(r.res as GoalZoneResult, { x: r.shootPosX, y: r.shootPosY })
+  return { left: frac.left * 100 + '%', top: frac.top * 100 + '%' }
+})
+
 function cellFromPos(pos: { x: number; y: number }) {
   const px = (pos.x / 100) * 971
   const py = (pos.y / 100) * 634
@@ -876,9 +924,9 @@ function areaFromPos(pos: { x: number; y: number }) {
   return String(zone)
 }
 
-// 액트 버튼(C/P/K/F/S/H/R): 새 레코드를 만든다. res 는 'O'(진행중)로 시작.
-// 단, 슛(S/H/R)은 예외다 — 슛은 반드시 방향/골키퍼 결과가 있어야 하고 res:'O' 로
-// 남는 슛은 없으므로, 결과가 정해질 때까지 레코드를 만들지 않고 초안(pendingShot)으로만 둔다.
+// 액트 버튼(C/P/K/F/S/H/R): 새 레코드를 만든다. res 는 'O'(진행중)로 시작 — 슛(S/H/R)도
+// 예외 없이 마찬가지다. 다만 슛은 골 존 결과가 나오기 전까지 res:'O' 로 표에 남아있고,
+// 그 id 를 pendingShot 에 들고 있다가 결과가 정해지면 같은 레코드를 덮어쓴다.
 function clickAct(actKey: string, isShot: boolean) {
   // 수정 중이면 새 레코드를 만들지 않고, 지금 수정 중인 레코드의 액트만 바꾼다.
   if (editingId.value) {
@@ -886,19 +934,6 @@ function clickAct(actKey: string, isShot: boolean) {
     return
   }
   if (!pendingPos.value) return
-  if (isShot) {
-    pendingShot.value = {
-      act: actKey as Exclude<ActCode, ''>,
-      seconds: seconds.value,
-      area: Number(areaFromPos(pendingPos.value)),
-      posX: pendingPos.value.x,
-      posY: pendingPos.value.y,
-    }
-    pendingPos.value = null
-    pendingCell.value = null
-    flashCell.value = null
-    return
-  }
   const rec = createActRecord(
     actKey as Exclude<ActCode, ''>,
     seconds.value,
@@ -906,6 +941,16 @@ function clickAct(actKey: string, isShot: boolean) {
     { posX: pendingPos.value.x, posY: pendingPos.value.y, half: halfCode.value }
   )
   records.value.push(rec)
+  if (isShot) {
+    pendingShot.value = {
+      id: rec.id,
+      act: rec.act as Exclude<ActCode, ''>,
+      seconds: rec.seconds,
+      area: rec.area,
+      posX: rec.posX,
+      posY: rec.posY,
+    }
+  }
   pendingPos.value = null
   pendingCell.value = null
   flashCell.value = null
@@ -923,30 +968,58 @@ function clickResult(res: 'X' | 'B') {
   }
   if (!pendingPos.value) return
   const last = records.value[records.value.length - 1]
-  if (!last || last.res !== 'O') return
-  applyResult(records.value, last.id, res, {
-    seconds: seconds.value,
-    area: Number(areaFromPos(pendingPos.value)),
-    pos: { x: pendingPos.value.x, y: pendingPos.value.y },
-  })
+  if (last && last.res === 'O') {
+    applyResult(records.value, last.id, res, {
+      seconds: seconds.value,
+      area: Number(areaFromPos(pendingPos.value)),
+      pos: { x: pendingPos.value.x, y: pendingPos.value.y },
+    })
+    // 골 존 결과를 기다리던 슛이 여기(킥 패널 X/B)로 먼저 마감되면(골문 도달 전 저지),
+    // 그 레코드는 이미 끝난 것이므로 골 존을 또 눌러 덮어쓰지 못하게 참조를 지운다.
+    if (pendingShot.value?.id === last.id) pendingShot.value = null
+  } else {
+    // 진행중(res:'O')인 액트가 없을 때는 액트 없이 X/B 만 단독으로 입력한다
+    // (예: 특정 액트 없이 벌어진 실책/블락). 나중에 이 레코드의 시간을 고쳐 어떤
+    // 액트 바로 뒤로 옮기면 그 액트도 자동으로 마감된다 — closePrecedingOpenAct 참고.
+    const rec = createResultRecord(res, seconds.value, Number(areaFromPos(pendingPos.value)), {
+      posX: pendingPos.value.x, posY: pendingPos.value.y, half: halfCode.value,
+    })
+    records.value.push(rec)
+    closePrecedingOpenAct(records.value, rec.id)
+  }
   pendingPos.value = null
   pendingCell.value = null
   flashCell.value = null
 }
 
-// 골대 존: 결과가 정해진 순간에야 비로소 슛 레코드를 만든다(act+res 를 함께 채워서 push) —
-// 그전까지는 records 배열에 아무것도 남기지 않는다.
+// 골대 존: 새 레코드를 만들지 않고, clickAct 에서 이미 만들어둔 슛 레코드(res:'O')의
+// res 만 덮어쓴다 — C/P/K/F 를 X/B 로 마감할 때와 같은 방식(applyResult 재사용).
+// 수정 중(editingId)이면, 시간/액트/위치 같은 다른 필드와 달리 "적용"을 기다리지 않고
+// 버튼을 누르는 즉시 레코드에 반영한다 — 위치를 찍고 B/GOAL/X로 결과를 고르는 그 자체가
+// 이미 확정 동작이라, 한 번 더 적용을 눌러야 하면 오히려 방금 한 조정이 아직 안 끝난
+// 것처럼 헷갈린다.
 function recordGoalResult(zone: Exclude<ResCode, 'O' | ''>, point?: { x: number; y: number }) {
-  if (!pendingShot.value) return
-  const shot = pendingShot.value
-  const rec = createActRecord(shot.act, shot.seconds, shot.area, { posX: shot.posX, posY: shot.posY, half: halfCode.value })
-  rec.res = zone
-  if (point) {
-    rec.shootPosX = point.x
-    rec.shootPosY = point.y
-    rec.shootDspRange = isWithinGoalOneMeter(point)
+  if (editingId.value) {
+    editShootZone.value = zone as GoalZoneResult
+    editShootPos.value = point ?? null
+    editShootDspRange.value = point ? isWithinGoalOneMeter(point) : undefined
+    const rec = records.value.find(r => r.id === editingId.value)
+    if (rec) {
+      rec.res = zone
+      rec.edited = true
+      if (point) {
+        rec.shootPosX = point.x
+        rec.shootPosY = point.y
+        rec.shootDspRange = isWithinGoalOneMeter(point)
+      }
+    }
+    return
   }
-  records.value.push(rec)
+  if (!pendingShot.value) return
+  applyResult(records.value, pendingShot.value.id, zone, {
+    shootPos: point,
+    shootDspRange: point ? isWithinGoalOneMeter(point) : undefined,
+  })
   if (zone === 'GOAL') homeScore.value++
   pendingShot.value = null
 }
@@ -973,13 +1046,36 @@ function clickGoalFrame(e: MouseEvent) {
     y: (e.clientY - rect.top) / rect.height,
   }
 }
-// B/GOAL/X: 프레임 안쪽에서 마커로 찍어둔 위치를 결과로 확정한다. 마커가 없으면 무시한다.
+// 확정 전 임시 마커(.frameMarker)를 .goalFrame 안에서 CSS 퍼센트로 두면, .goalFrame 의
+// border(10px)만큼 자식 위치 기준 박스가 줄어들어(퍼센트는 padding box 기준) 클릭 지점과
+// 실제 표시 위치가 살짝 어긋난다 — getBoundingClientRect() 로 잰 클릭 비율은 border 를
+// 포함한 박스 기준이라 서로 다른 기준을 쓰게 되는 셈이다. 그래서 버튼을 눌러 확정하는
+// 순간(같은 비율을 goalPointToScreenFraction 로 .goal 전체 기준 변환) 위치가 다시 튀어
+// 보였다. 애초에 같은 .goal 기준 변환식을 써서 임시 마커도 .goal 의 자식으로 두면
+// 클릭 시점과 확정 시점의 위치가 완전히 같아진다.
+const pendingFrameScreenPos = computed(() => {
+  if (!pendingFramePos.value) return null
+  return {
+    left: (FRAME_SIDE + pendingFramePos.value.x * FRAME_WIDTH_FRAC) * 100 + '%',
+    top: (FRAME_TOP + pendingFramePos.value.y * FRAME_HEIGHT_FRAC) * 100 + '%',
+  }
+})
+// B/GOAL/X: 프레임 안쪽에서 마커로 찍어둔 위치를 결과로 확정한다. 새로 찍은 위치가 없으면,
+// 수정 중인 슛의 기존 프레임 위치를 그대로 써서 결과만 바꾼다(아래 분기).
 // 버튼 표시는 B/GOAL/X 그대로지만, 골키퍼 액션이므로 저장값은 GB/GX로 킥 패널의 B/X와 구분한다.
 function confirmGoalFrame(result: 'B' | 'GOAL' | 'X') {
-  if (!pendingFramePos.value) return
   const zone = result === 'B' ? 'GB' : result === 'X' ? 'GX' : 'GOAL'
-  recordGoalResult(zone, goalFramePoint(pendingFramePos.value.x, pendingFramePos.value.y))
-  pendingFramePos.value = null
+  if (pendingFramePos.value) {
+    recordGoalResult(zone, goalFramePoint(pendingFramePos.value.x, pendingFramePos.value.y))
+    pendingFramePos.value = null
+    return
+  }
+  // 수정 중이고 이미 프레임 안에 위치가 있으면(새로 찍지 않았어도) 그 자리 그대로 결과만
+  // 바꾼다 — 위치는 안 건드리고 B/GB/X 분류만 고치고 싶을 때 새로 다시 찍을 필요가 없게 한다.
+  if (editingId.value && editShootPos.value &&
+    (editShootZone.value === 'GOAL' || editShootZone.value === 'GB' || editShootZone.value === 'GX')) {
+    recordGoalResult(zone, editShootPos.value)
+  }
 }
 
 // 중앙 정렬된 골대 주변 영역(프레임 바깥)은 클릭 즉시 기록한다 — 버튼 필요 없음.
@@ -993,6 +1089,11 @@ function clickOuterZone(e: MouseEvent, zone: 'H' | 'HX' | 'L' | 'LX' | 'R' | 'RX
   const rect = (e.currentTarget as HTMLElement).closest('.goal')!.getBoundingClientRect()
   const x = (e.clientX - rect.left) / rect.width
   const y = (e.clientY - rect.top) / rect.height
+
+  // 바깥 존은 클릭 즉시 확정되므로, 그 전에 프레임 안에서 찍어둔(아직 B/GOAL/X 를
+  // 안 눌러 확정 안 된) 임시 위치가 남아 있었다면 여기서 버린다 — 안 지우면 나중에
+  // B/GOAL/X 를 눌렀을 때 방금 고른 바깥 존 위치 대신 그 옛 프레임 좌표가 되살아난다.
+  pendingFramePos.value = null
 
   if (zone === 'H' || zone === 'HX') {
     recordGoalResult(zone, goalOuterPoint('HX', x, y / FRAME_TOP))
@@ -1161,6 +1262,8 @@ function finishHalf() {
                           @click.stop="stepEditSecond(1)">+</button></span>
                       <button class="editApply editApplyInline" @mousedown.stop @touchstart.stop
                         @click.stop="applyEdit">적용</button>
+                      <button class="editDelete editDeleteInline" @mousedown.stop @touchstart.stop
+                        @click.stop="deleteEdit">삭제</button>
                     </div>
                     <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn" @mousedown.stop @touchstart.stop
                       @click.stop="openPlayerPick(r.id)">{{ r.playerName || '선수 선택' }}</button>
@@ -1366,7 +1469,7 @@ function finishHalf() {
                   @click="clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
               </div>
 
-              <div class="goal" :class="{ active: pendingShot !== null }">
+              <div class="goal" :class="{ active: pendingShot !== null || isEditingShoot }">
                 <div class="goalZone hx" @click="clickOuterZone($event, 'HX')">HX</div>
                 <div class="goalZone h" @click="clickOuterZone($event, 'H')">H</div>
                 <div class="goalZone lx" @click="clickOuterZone($event, 'LX')">LX</div>
@@ -1377,9 +1480,9 @@ function finishHalf() {
                 <div class="meterGuide" aria-hidden="true" />
                 <div class="goalFrame" @click="clickGoalFrame">
                   <div class="goalZone goalCenter" aria-hidden="true" />
-                  <div v-if="pendingFramePos" class="frameMarker"
-                    :style="{ left: pendingFramePos.x * 100 + '%', top: pendingFramePos.y * 100 + '%' }" />
                 </div>
+                <div v-if="infoGoalPos && !pendingFramePos" class="marker editMarker" :style="infoGoalPos" />
+                <div v-if="pendingFrameScreenPos" class="marker editMarker" :style="pendingFrameScreenPos" />
               </div>
               <div class="goalResultButtons">
                 <button class="goalResultBtn resB" @click="confirmGoalFrame('B')">B</button>
@@ -2298,7 +2401,7 @@ button {
   color: rgba(255, 255, 255, .4);
   font-style: italic;
   cursor: default;
-  background: rgba(255, 255, 255, .03)
+  background: rgba(255, 255, 255, .07)
 }
 
 .trow.editing {
@@ -2402,7 +2505,8 @@ button {
   background: rgba(240, 180, 41, .25)
 }
 
-.editApplyInline {
+.editApplyInline,
+.editDeleteInline {
   height: 24px;
   padding: 0 12px;
   border-radius: 4px;
@@ -2410,6 +2514,14 @@ button {
   font-weight: 800;
   cursor: pointer;
   flex-shrink: 0
+}
+
+.editApplyInline {
+  margin-left: 28px
+}
+
+.editDeleteInline {
+  margin-left: 10px
 }
 
 .editTimeVal {
@@ -3036,20 +3148,6 @@ section.right h1 {
 
 .goalResultBtn.resGoal:hover {
   background: rgba(240, 180, 41, .3)
-}
-
-/* 프레임 안쪽에 찍어둔 위치 마커. 결과가 확정되기 전까지(B/GOAL/X 누르기 전) 계속 보인다. */
-.frameMarker {
-  position: absolute;
-  width: 16px;
-  height: 16px;
-  margin: -8px;
-  border-radius: 50%;
-  background: rgba(240, 180, 41, .85);
-  border: 2px solid #fff;
-  box-shadow: 0 0 0 5px rgba(240, 180, 41, .3);
-  pointer-events: none;
-  z-index: 4
 }
 
 /* ---- 선수 교체 --------------------------------------------------------------

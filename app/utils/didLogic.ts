@@ -17,11 +17,13 @@
 // -----------------------------------------------------------------------------
 //   1) 액트 버튼(C/P/K/F/S/H/R)을 누르면        → act = 누른 값, res = 'O'
 //      ('O' 는 앱이 실제로 저장하는 값이다. APK onClickAction: setResCode("O"))
-//   2) 결과 버튼(X/B, 골대 존)을 누르면          → 같은 레코드의 res 만 덮어쓴다
-//   3) 예외: 슛(S/H/R)에 X/B 가 찍힌 경우에만    → act 를 '' 로 비운다
-//      (APK onClickResult: setActCode(null))
-//   4) 3) 이 발생하면 서버가 직전 레코드의 res 도 같은 값으로 덮어쓴다 (write-back)
-//      (extra.lib.php:1211) → applyResult() 가 이걸 재현한다
+//   2) X/B 를 누르면                            → 액트 레코드는 act 를 유지한 채 res 만
+//      채우고, 바로 뒤에 act 없는 결과 레코드(res 만 있음)를 하나 더 남긴다.
+//      C/P/K/F 와 슛(S/H/R) 모두 동일하다 — 레거시 APK 는 슛만 예외로 act 를 지우고
+//      직전 레코드에 write-back 했지만(extra.lib.php:1211), 여기서는 표시 일관성을
+//      위해 모든 액트에 같은 규칙을 적용한다.
+//   3) 골대 존 결과(L/H/R/LX/HX/RX/GB/GX/GOAL)를 누르면 → 그 슛 레코드의 res 만 덮어쓴다
+//      (새 레코드 없음)
 //
 // -----------------------------------------------------------------------------
 // [판정 기준] 서버 배치가 아니라 "단말(APK)" 로직을 따른다
@@ -46,7 +48,7 @@
 //   분류/플래그 산출(classifyChain)은 두 구현이 동일하므로 그대로 포팅했다.
 // =============================================================================
 
-/** 액트 코드. C/P/K/F = 연결 액션, S/H/R = 슈팅 액션. '' = 슛이 X/B 로 끝나 비워진 상태. */
+/** 액트 코드. C/P/K/F = 연결 액션, S/H/R = 슈팅 액션. '' = X/B 결과만 나타내는 레코드(액트 없음). */
 export type ActCode = 'C' | 'P' | 'K' | 'F' | 'S' | 'H' | 'R' | ''
 
 /**
@@ -138,16 +140,13 @@ export function createActRecord(
  * 결과 버튼(X/B, 골대 존)을 누른 것을 반영한다.
  *
  * X/B 는 액트의 "결과"이므로 액트 레코드에 결과를 기록하되,
- * **결과 자체를 나타내는 act 없는 레코드를 하나 더 남긴다.** 레거시와 동일한 형태다.
+ * **결과 자체를 나타내는 act 없는 레코드를 하나 더 남긴다.** C/P/K/F 와 슛(S/H/R) 모두
+ * 같은 규칙이다 — 액트 레코드는 act 를 유지한 채 res 만 채우고, 바로 뒤에
+ * `act='', res=X|B` 레코드를 추가한다. 액트 레코드는 여전히 그 행동(P/C/S/...)이므로
+ * DAP 대상이 되고, 추가된 결과 레코드는 act 가 없어 DAP 에서 자동 제외된다.
  *
- *   비-슛 (C/P/K/F) + X/B →  액트 레코드는 act 를 유지한 채 res 만 채우고,
- *                            바로 뒤에 `act='' , res=X|B` 레코드를 추가한다.
- *                            액트 레코드는 여전히 P/C 라는 행동이므로 DAP 대상이 되고,
- *                            추가된 결과 레코드는 act 가 없어 DAP 에서 자동 제외된다.
- *   슛 (S/H/R) + X/B      →  슛 레코드 자체의 act 가 비워져 그것이 결과 레코드가 되고
- *                            (APK onClickResult), 직전 레코드에 write-back 한다
- *                            (extra.lib.php:1211). 별도 레코드를 만들지 않는다.
- *   골대 존 결과           →  해당 슛 레코드의 res 만 덮어쓴다.
+ * 골대 존 결과(L/H/R/LX/HX/RX/GB/GX/GOAL)는 새 레코드를 만들지 않고 해당 슛 레코드의
+ * res 만 덮어쓴다.
  *
  * @param records 시간순 레코드 배열 (제자리에서 수정된다)
  * @param recordId 결과를 적용할 레코드 id
@@ -169,7 +168,6 @@ export function applyResult(
   if (idx < 0) return
 
   const rec = records[idx]!
-  const wasShot = isShotAct(rec.act)
 
   rec.res = res
   if (opts.shootPos) {
@@ -180,18 +178,10 @@ export function applyResult(
 
   // GOAL/L/H/R/LX/HX/RX 는 물론, GB/GX(골키퍼 선방·무위협)도 여기서 걸러진다 —
   // 셋 다 "S | GB" 처럼 같은 레코드에 res 만 얹고 끝난다(액트 안 지움, 새 행 안 만듦).
-  // 아래 write-back/새 행 로직은 킥 패널의 순수 B/X(수비수 차단·실책) 전용이다.
+  // 아래 새 행 로직은 킥 패널의 순수 B/X(수비수 차단·실책) 전용이다.
   if (res !== 'X' && res !== 'B') return
 
-  if (wasShot) {
-    // 슛 레코드가 곧 결과 레코드가 된다 + 직전 레코드에 write-back
-    rec.act = ''
-    const prev = records[idx - 1]
-    if (prev) prev.res = res
-    return
-  }
-
-  // 비-슛: 결과 레코드를 액트 레코드 "뒤"에 하나 더 남긴다.
+  // 결과 레코드를 액트 레코드 "뒤"에 하나 더 남긴다.
   // area/좌표는 X/B 를 누르기 전에 새로 클릭한 위치(실책·블락이 일어난 지점)를 쓴다.
   // 넘어오지 않으면(레거시 재현 등) 직전 액트 레코드의 area 로 대체한다.
   records.splice(idx + 1, 0, {
@@ -205,6 +195,45 @@ export function applyResult(
     seq: recSeq,
     half: rec.half,
   })
+}
+
+/**
+ * 액트 없이 X/B 만 단독으로 입력할 때 쓴다. applyResult() 가 만드는 "짝 결과 레코드"와
+ * 데이터 모양은 같지만(act=''), 앞서 마감할 액트 레코드가 없다는 점이 다르다 — 위치만
+ * 찍고 바로 X/B 를 누른 경우(예: 액트 없이 벌어진 실책/블락)에 이 함수로 만든다.
+ */
+export function createResultRecord(
+  res: Exclude<ResCode, 'O' | ''>,
+  seconds: number,
+  area: number,
+  extra: Partial<Pick<DidRecord, 'posX' | 'posY' | 'half'>> = {}
+): DidRecord {
+  return { id: `rec_${++recSeq}`, seconds, act: '', res, area, seq: recSeq, ...extra }
+}
+
+/**
+ * 액트 없는 결과 전용 레코드(act='')를 새로 만들었거나 그 시간을 옮겼을 때 쓴다.
+ * 그 시점 바로 앞(같은 half 안에서 시간순)에 아직 res:'O' 로 진행중인 액트 레코드가 있으면,
+ * 그 액트도 이 결과로 마감한다 — "위치만 찍고 액트 없이 X/B" 로 넣었더라도, 시간을 고쳐서
+ * 어떤 액트 바로 뒤에 놓이게 되면 그 액트의 결과도 자동으로 채워지도록 하기 위함이다.
+ */
+export function closePrecedingOpenAct(records: DidRecord[], resultRecordId: string): void {
+  const resultRec = records.find(r => r.id === resultRecordId)
+  if (!resultRec || resultRec.act) return
+
+  const key = (r: DidRecord) => r.seconds * 100000 + (r.seq ?? 0)
+  const resultKey = key(resultRec)
+
+  let prev: DidRecord | null = null
+  for (const r of records) {
+    if (r.id === resultRec.id) continue
+    if ((r.half ?? 'H1') !== (resultRec.half ?? 'H1')) continue
+    if (key(r) > resultKey) continue
+    if (!prev || key(r) > key(prev)) prev = r
+  }
+  if (prev && prev.res === 'O') {
+    prev.res = resultRec.res
+  }
 }
 
 // =============================================================================

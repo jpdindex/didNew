@@ -83,3 +83,43 @@ export function goalPointMeters(point: GoalPoint) {
     y: ((point.y - frame.yMin) / (frame.yMax - frame.yMin)) * meters.height,
   }
 }
+
+/** 화면 .goal 래퍼 안에서 골문 프레임이 차지하는 비율. DidInput.vue 의 .goalFrame{left:15%;top:42%}
+ *  CSS 값과 반드시 같이 맞춘다 — 여기서 어긋나면 goalPointToScreenFraction 결과가 실제 화면과 어긋난다. */
+const GOAL_LAYOUT = { frameLeft: 0.15, frameTop: 0.42 } as const
+
+export type GoalZoneResult = 'GOAL' | 'GB' | 'GX' | 'H' | 'HX' | 'L' | 'LX' | 'R' | 'RX'
+
+/**
+ * 저장된 원본 좌표(GoalPoint)를 .goal 래퍼 전체 기준 화면 비율(0~1, left/top)로 되돌린다.
+ * goalFramePoint/goalOuterPoint 의 역변환이며, 존마다 forward 공식이 다르므로 그 결과가
+ * 어느 존(res)에서 나왔는지를 함께 받아야 한다 — 좌표만으로는 존을 되짚을 수 없다
+ * (예: 프레임 클릭은 0~1 비율로 클램프돼 저장되므로 프레임 경계 좌표만으로 outer 존과
+ * 구분이 안 된다).
+ */
+export function goalPointToScreenFraction(res: GoalZoneResult, point: GoalPoint) {
+  const { frame, canvas } = GOAL_TARGET
+  const { frameLeft, frameTop } = GOAL_LAYOUT
+  const frameWidthFrac = 1 - frameLeft * 2
+  const frameHeightFrac = 1 - frameTop
+
+  if (res === 'GOAL' || res === 'GB' || res === 'GX') {
+    const xRatio = (point.x - frame.xMin) / (frame.xMax - frame.xMin)
+    const yRatio = (point.y - frame.yMin) / (frame.yMax - frame.yMin)
+    return { left: frameLeft + xRatio * frameWidthFrac, top: frameTop + yRatio * frameHeightFrac }
+  }
+  if (res === 'H' || res === 'HX') {
+    const xRatio = (point.x - 1) / (canvas.width - 1)
+    const yRatio = (point.y - 1) / (frame.yMin - 2)
+    return { left: xRatio, top: yRatio * frameTop }
+  }
+  if (res === 'L' || res === 'LX') {
+    const xRatio = (point.x - 1) / (frame.xMin - 2)
+    const yRatio = (point.y - frame.yMin) / (canvas.height - frame.yMin)
+    return { left: xRatio * frameLeft, top: frameTop + yRatio * frameHeightFrac }
+  }
+  // R / RX
+  const xRatio = (point.x - frame.xMax - 1) / (canvas.width - frame.xMax - 1)
+  const yRatio = (point.y - frame.yMin) / (canvas.height - frame.yMin)
+  return { left: (1 - frameLeft) + xRatio * frameLeft, top: frameTop + yRatio * frameHeightFrac }
+}
