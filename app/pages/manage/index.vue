@@ -6,6 +6,7 @@ const inputMenus = [
   { label: '경기 일정 관리', desc: '경기 날짜·팀·리그 일정을 빠르게 등록·수정', to: '/manage/schedules', ready: true }
 ]
 const menus = [
+  { label: 'BASIC 기록 승인', desc: '승인 대기 Draft 검토 후 최종 RAW로 승격', to: '/manage/input-approvals', ready: true },
   { label: '기록 잠금 관리', desc: '갱신으로 잠긴 반(半) 잠금 해제', to: '/manage/locks', ready: true },
   { label: 'SQL 데이터 이관', desc: '레거시 SQL 경기 데이터를 Firestore로 이관 (1회성)', to: '/manage/legacy-import', ready: true },
   { label: 'Firestore 데이터 뷰어', desc: '컬렉션 조회 + 값 수정 (삭제는 없음)', to: '/manage/data-viewer', ready: true },

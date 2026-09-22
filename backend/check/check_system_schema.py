@@ -1,4 +1,4 @@
-from backend.system.system_base import RecordDoc
+from backend.system.system_schema import RecordDoc
 
 
 def test_record_area_contract_is_enforced() -> None:

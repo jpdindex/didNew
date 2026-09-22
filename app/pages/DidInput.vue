@@ -9,7 +9,6 @@ import {
   type DidRecord,
   type ResCode,
 } from '~/utils/didLogic'
-import { AWAY_SQUAD, HOME_SQUAD, type SquadPlayer } from '~/utils/squads'
 import {
   GRASS_LINE_OPTIONS,
   GRASS_PATTERNS,
@@ -26,7 +25,7 @@ import {
   type GoalZoneResult,
 } from '~/utils/goalCoordinates'
 import { canPickForCard, groupCardsByPlayer, isSentOff, type CardRecord } from '~/utils/card'
-import type { HalfStatus, SubRecord } from '~/composables/useMatchState'
+import type { HalfStatus, MatchSquadPlayer, SubRecord } from '~/composables/useMatchState'
 
 const route = useRoute()
 const home = computed(() => String(route.query.home ?? route.query.homeName ?? 'Vallecano').trim() || 'Vallecano')
@@ -37,11 +36,16 @@ const inputMode = computed(() => (route.query.mode === '실시간' ? '실시간'
 // TeamSelection(대기 화면)과 공유하는 상태. 전반/후반 종료 시 여기에 저장하고
 // TeamSelection 으로 돌아가며, "수정"/"후반전 시작"으로 다시 들어올 때 이어서 불러온다.
 const game = useMatchState()
+const { request } = useBackendApi()
+const { save: saveDraft, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
 // "수정"으로 들어온 경우(이미 끝난 half를 고치러 옴)와 실시간으로 기록 중인 경우를
 // 구분한다. 수정 화면은 시계가 멈춰 있고, 우상단 버튼도 "{half} 종료"가 아니라
 // 항상 "대기방으로 나가기"로 보여야 한다 — editHalf()/editPausedHalf() 가 이 쿼리를 붙여 보낸다.
 const isEditMode = route.query.edit === '1'
+// 최종 RAW를 다시 열어 고치는 경우에는 대기방 복귀가 아니라, 즉시 RAW를 교체하는
+// "수정 완료" 흐름을 쓴다. 일반 전/후반 편집과 상태 전이를 섞지 않는다.
+const isFinalCorrection = route.query.finalCorrection === '1'
 // 수정 화면에서 "대기방으로 나가기"를 누르면 돌아갈 상태. 끝난 half 를 고치러 왔으면
 // 'H1_done'/'H2_done' 이 들어있어 후반전 시작 화면으로, 정지 중이던 half 를 고치러
 // 왔으면 'H1'/'H2' 가 들어있어 그 정지 화면으로 정확히 되돌아간다. 없으면(수정이 아닌
@@ -64,6 +68,7 @@ const seconds = ref(
 )
 // 수정 화면에서는 시간이 멈춰 있어야 한다 — 끝난(또는 나가기 직전 멈춘) 시각 그대로 고정.
 const paused = ref(isEditMode)
+const halfFinishBusy = ref(false)
 const clock = computed(() => {
   const m = String(Math.floor(seconds.value / 60)).padStart(2, '0')
   const s = String(seconds.value % 60).padStart(2, '0')
@@ -98,20 +103,68 @@ function startTicking() {
   // 브라우저가 백그라운드 탭의 타이머를 지연시켜도 초가 10초 단위로 튀지 않는다.
   tickStartedAt = Date.now()
   tickBaseSeconds = seconds.value
+  game.value.clockStartedAt = tickStartedAt - tickBaseSeconds * 1000
   timer = setInterval(() => {
     const elapsed = Math.floor((Date.now() - tickStartedAt) / 1000)
     seconds.value = tickBaseSeconds + elapsed
+    game.value.seconds = seconds.value
   }, 250)
 }
-onMounted(() => {
-  if (!isEditMode) startTicking() // 수정 모드는 시간을 멈춘 채로 시작한다
+onMounted(async () => {
+  const matchId = String(route.query.matchId ?? '')
+
+  // 이미 TeamSelection에서 만들어 둔 진행 중 상태가 있으면 절대 Draft로 덮어쓰지 않는다.
+  // 새로고침/직접 URL 진입처럼 메모리 상태가 실제로 비어 있을 때만 복구를 시도한다.
+  const hasActiveClientState = Boolean(
+    matchId &&
+    game.value.matchId === matchId &&
+    (
+      Object.keys(game.value.assigned).length ||
+      game.value.squads.home.length ||
+      game.value.squads.away.length ||
+      game.value.records.length
+    )
+  )
+
+  if (matchId && !hasActiveClientState) {
+    if (!game.value.matchId) game.value.matchId = matchId
+    if (!game.value.team) game.value.team = route.query.team === 'away' ? 'away' : 'home'
+    game.value.inputMode = inputMode.value
+    await recoverDraft(game.value).catch(() => false)
+  }
+
+  if (matchId && !game.value.squads.home.length && !game.value.squads.away.length) {
+    try {
+      const payload = await request<{ H: MatchSquadPlayer[]; A: MatchSquadPlayer[] }>(
+        `/api/v1/match-input/matches/${encodeURIComponent(matchId)}/squads`
+      )
+      game.value.squads = { home: payload.H, away: payload.A }
+    } catch {
+      // 개발·오프라인 입력은 기존 임시 명단으로도 화면을 열 수 있다.
+    }
+  }
+
+  if (!isEditMode && game.value.clockStartedAt) {
+    seconds.value = Math.max(seconds.value, Math.floor((Date.now() - game.value.clockStartedAt) / 1000))
+  }
+
+  // clockStartedAt이 있으면 진행 중, 없으면 기존 일시정지 상태를 유지한다.
+  // 완전히 새로 시작한 0초 세션만 여기서 시계를 시작한다.
+  if (!isEditMode) {
+    const isFreshStart = seconds.value === 0 && !game.value.clockStartedAt
+    if (game.value.clockStartedAt || isFreshStart) startTicking()
+    else paused.value = true
+  }
+
   nextTick(() => {
     if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
   })
 })
+
 onUnmounted(() => {
   if (timer) clearInterval(timer)
   if (flashTimer) clearTimeout(flashTimer)
+  if (draftSaveTimer) clearTimeout(draftSaveTimer)
 })
 
 function togglePause() {
@@ -128,11 +181,23 @@ function togglePause() {
 // 지금까지의 기록·스코어·경과초를 공유 상태에 저장한 뒤 TeamSelection 으로 나간다.
 // 돌아갈 상태는 editReturnStatus 가 있으면 그걸 그대로 쓰고(수정 화면 — 원래 있던
 // 화면으로 정확히 복귀), 없으면 진행중인 half 를 정지시키는 것뿐이므로 'H1'/'H2'.
-function exitToLobby() {
-  if (!confirm(`대기방으로 나가시겠습니까?\n${clock.value} 시점부터 다시 입장할 수 있습니다.`)) return
+async function exitToLobby() {
+  const clockMessage = paused.value
+    ? `${clock.value}에 일시정지된 상태로 대기방으로 나갑니다.`
+    : '대기방으로 나가도 경기 시간은 계속 흐릅니다.'
+  if (!confirm(`대기방으로 나가시겠습니까?\n${clockMessage}`)) return
 
+  if (timer) clearInterval(timer)
   saveToStore()
+
+  // 대기방 이동 자체는 half 종료가 아니다.
+  // 진행 중이면 clockStartedAt을 그대로 둬 대기방에서도 시간이 흐르게 하고,
+  // 사용자가 먼저 일시정지한 경우에만 null로 유지해 정지 상태를 보존한다.
+  if (paused.value) game.value.clockStartedAt = null
   game.value.halfStatus = editReturnStatus ?? (half.value === '전반' ? 'H1' : 'H2')
+
+  // 저장 성공 여부가 화면 이동을 막으면 안 된다. 로컬/서버 Draft 저장은 비동기로 시도한다.
+  void saveDraft(game.value).catch(() => false)
   goTeamSelection()
 }
 
@@ -141,10 +206,38 @@ function exitToLobby() {
 // 직전 레코드의 res 를 덮어쓴다. 근거는 docs/03_kpi_terminology.md 참고.
 // 이어서 입력/수정하는 경우(resumeHalf) 저장해둔 기록을 그대로 불러온다.
 const records = ref<DidRecord[]>(resumeHalf ? [...game.value.records] : [])
+let draftSaveTimer: ReturnType<typeof setTimeout> | undefined
+
+function queueDraftSave() {
+  if (draftSaveTimer) clearTimeout(draftSaveTimer)
+  draftSaveTimer = setTimeout(() => {
+    saveToStore()
+    void saveDraft(game.value).catch(() => {
+      // IndexedDB remains the retry source when metadata/network is unavailable.
+    })
+  }, 500)
+}
+
+async function completeFinalCorrection() {
+  if (!confirm('수정한 내용을 최종 RAW에 반영하시겠습니까?')) return
+  saveToStore()
+  game.value.halfStatus = 'final'
+  try {
+    await finalizeAdvanced(game.value)
+    goTeamSelection()
+  } catch (error) {
+    game.value.halfStatus = 'H2_done'
+    alert(error instanceof Error ? error.message : '최종 RAW 갱신에 실패했습니다.')
+  }
+}
+
+watch([records, homeScore, awayScore, () => game.value.cards, () => game.value.subs], queueDraftSave, { deep: true })
 
 // 입력 중인 팀. TeamSelection 에서 team 쿼리로 넘어온다.
 const team = computed(() => (route.query.team === 'away' ? 'away' : 'home'))
-const squad = computed<SquadPlayer[]>(() => (team.value === 'away' ? AWAY_SQUAD : HOME_SQUAD))
+const squad = computed<MatchSquadPlayer[]>(() => {
+  return team.value === 'away' ? game.value.squads.away : game.value.squads.home
+})
 const editingId = ref<string | null>(null)
 
 // 지금 보고 있는 half(전반/후반)의 레코드만 추린다. half 태그가 없는 과거 레코드는
@@ -179,7 +272,7 @@ const rows = computed(() => {
       // 경우는 레거시 규칙(UTP 는 포인트 2개 이상)에 의해 UPP 로 강등되어 자동 제외되고,
       // 뒤따라 생기는 act 없는 결과 레코드도 isDap = !!act 규칙으로 자동 제외된다.
       isDap: flags.get(r.id)?.isDap ?? false,
-      playerName: squad.value.find(p => p.no === r.playerId)?.name ?? '',
+      playerName: squad.value.find(p => p.playerId === r.playerId)?.name ?? '',
       draft: false,
     }))
   // 위치만 찍고 아직 액트를 안 고른 상태 — 확정 레코드가 아니라 표시 전용 "가안" 행이다.
@@ -483,29 +576,66 @@ watch(() => rows.value.length, async () => {
 })
 
 const playerPickFor = ref<string | null>(null) // 선수 입력창을 띄운 레코드
-const pickedNo = ref<string | null>(null) // 선수선택 화면에서 고른 등번호 (Submit 전)
+const pickedPlayerId = ref<string | null>(null)
 
-// 선발 라인업. TeamSelection 에서 넘겨받는 구조가 아직 없어 임시로 스쿼드 앞에서 채운다.
-// 좌표는 4-2-3-1 기준이며, 실제 포메이션 연동 시 이 부분만 교체하면 된다.
-const LINEUP_SLOTS = [
+// 선수 선택창도 TeamSelection에서 확정한 포메이션 좌표를 그대로 쓴다.
+// 예전 고정 LINEUP_SLOTS를 쓰면 4-3-3으로 세팅해도 별도 모양으로 다시 배치되는 문제가 있었다.
+const FORMATION_LINEUP_SLOTS: Record<string, { x: number; y: number }[]> = {
+  '4-4-2': [
+    { x: 14, y: 72 }, { x: 38, y: 72 }, { x: 62, y: 72 }, { x: 86, y: 72 },
+    { x: 14, y: 46 }, { x: 38, y: 46 }, { x: 62, y: 46 }, { x: 86, y: 46 },
+    { x: 35, y: 18 }, { x: 65, y: 18 },
+  ],
+  '4-3-3': [
+    { x: 14, y: 72 }, { x: 38, y: 72 }, { x: 62, y: 72 }, { x: 86, y: 72 },
+    { x: 26, y: 48 }, { x: 50, y: 48 }, { x: 74, y: 48 },
+    { x: 20, y: 16 }, { x: 50, y: 16 }, { x: 80, y: 16 },
+  ],
+  '3-5-2': [
+    { x: 26, y: 75 }, { x: 50, y: 75 }, { x: 74, y: 75 },
+    { x: 10, y: 46 }, { x: 30, y: 46 }, { x: 50, y: 46 }, { x: 70, y: 46 }, { x: 90, y: 46 },
+    { x: 35, y: 16 }, { x: 65, y: 16 },
+  ],
+  '4-2-3-1': [
+    { x: 14, y: 75 }, { x: 38, y: 75 }, { x: 62, y: 75 }, { x: 86, y: 75 },
+    { x: 36, y: 54 }, { x: 64, y: 54 },
+    { x: 18, y: 32 }, { x: 50, y: 32 }, { x: 82, y: 32 },
+    { x: 50, y: 12 },
+  ],
+}
+const GK_LINEUP_SLOT = { x: 50, y: 94 }
+const FALLBACK_LINEUP_SLOTS = [
   { x: 50, y: 8 },
   { x: 20, y: 26 }, { x: 50, y: 26 }, { x: 80, y: 26 },
   { x: 33, y: 45 }, { x: 67, y: 45 },
   { x: 14, y: 64 }, { x: 38, y: 64 }, { x: 62, y: 64 }, { x: 86, y: 64 },
-  { x: 50, y: 85 },
 ]
 const lineup = computed(() => {
-  const byPos = (pos: SquadPlayer['pos'], n: number) =>
-    squad.value.filter(p => p.pos === pos).slice(0, n)
+  const formationSlots = FORMATION_LINEUP_SLOTS[game.value.formationKey] ?? FALLBACK_LINEUP_SLOTS
+  const assigned = Object.entries(game.value.assigned)
+    .filter(([slot]) => slot === 'gk' || slot.startsWith('o'))
+    .sort(([left], [right]) => {
+      if (left === 'gk') return 1
+      if (right === 'gk') return -1
+      return Number(left.slice(1)) - Number(right.slice(1))
+    })
+    .map(([slot, playerId]) => {
+      const player = squad.value.find(item => item.playerId === playerId)
+      const position = slot === 'gk' ? GK_LINEUP_SLOT : formationSlots[Number(slot.slice(1))]
+      return player && position ? { ...player, slot: position } : null
+    })
+    .filter((player): player is MatchSquadPlayer & { slot: { x: number; y: number } } => Boolean(player))
+  if (assigned.length) return assigned
+
+  // 초기 라인업을 아직 배정하지 않은 개발/오프라인 화면의 fallback.
+  const byPos = (pos: string, n: number) => squad.value.filter(p => p.pos === pos).slice(0, n)
   const mf = byPos('MF', 5)
-  const ordered: SquadPlayer[] = [
-    ...byPos('FW', 1), // 최전방
-    ...mf.slice(0, 3), // 2선
-    ...mf.slice(3, 5), // 중앙
-    ...byPos('DF', 4), // 수비
-    ...byPos('GK', 1), // GK
+  const ordered: MatchSquadPlayer[] = [
+    ...byPos('FW', 1), ...mf.slice(0, 3), ...mf.slice(3, 5), ...byPos('DF', 4),
   ]
-  return ordered.map((p, i) => ({ ...p, slot: LINEUP_SLOTS[i] ?? { x: 50, y: 50 } }))
+  const fallback = ordered.map((p, i) => ({ ...p, slot: formationSlots[i] ?? { x: 50, y: 50 } }))
+  const gk = byPos('GK', 1)[0]
+  return gk ? [...fallback, { ...gk, slot: GK_LINEUP_SLOT }] : fallback
 })
 
 // ---------------------------------------------------------------------------
@@ -517,7 +647,7 @@ const lineup = computed(() => {
 // ---------------------------------------------------------------------------
 const subOpen = ref(false)
 const cardOpen = ref(false)
-const cardPlayer = ref<number | null>(null)
+const cardPlayer = ref<string | null>(null)
 const cardType = ref<'Y' | 'R'>('Y')
 // 아직 Submit 안 한 카드 초안. 패널이 어떤 경로로 닫히든(Cancel, 토글로 닫기, 교체
 // 패널로 전환) resetCardDraft() 를 거쳐 반드시 비워야 한다 — 안 비우면 제출도 안 한
@@ -556,7 +686,7 @@ function removeCard(index: number) { game.value.cards.splice(index, 1) }
 // 그 카드의 값으로 채워지고 — 거기서 선수를 다시 고르거나 시각을 바꾸면 바로 반영된다.
 // 원래 값은 스냅샷으로 들고 있다가, "적용"이면 버리고 "취소"면 되돌린다.
 const cardPlayerEditTarget = ref<{ queue: boolean; index: number } | null>(null)
-const cardEditSnapshot = ref<{ player: number; seconds: number } | null>(null)
+const cardEditSnapshot = ref<{ player: string; seconds: number } | null>(null)
 const cardMinute = ref(0)
 const cardSecond = ref(0)
 function openCardPlayerEdit(queue: boolean, index: number) {
@@ -615,12 +745,12 @@ function setCardType(t: 'Y' | 'R') {
   const rec = (target.queue ? cardQueue.value : game.value.cards)[target.index]
   if (rec) rec.card = t
 }
-function selectCardPlayer(idx: number) {
+function selectCardPlayer(playerId: string) {
   const target = cardPlayerEditTarget.value
-  if (!target) { cardPlayer.value = idx; return }
+  if (!target) { cardPlayer.value = playerId; return }
   const list = target.queue ? cardQueue.value : game.value.cards
   const rec = list[target.index]
-  if (rec) rec.player = idx
+  if (rec) rec.player = playerId
   // 선수를 고르면 그걸로 끝 — 바로 적용하고 수정 모드를 닫는다.
   applyCardPlayerEdit()
 }
@@ -645,9 +775,9 @@ function bumpSubSecond(delta: number) {
 }
 
 /** 슬롯 id → 그 자리에 있는 선수. 배치가 없으면 null */
-function playerAtSlot(slotId: string): SquadPlayer | null {
-  const idx = game.value.assigned[slotId]
-  return idx === undefined ? null : (squad.value[idx] ?? null)
+function playerAtSlot(slotId: string): MatchSquadPlayer | null {
+  const playerId = game.value.assigned[slotId]
+  return playerId === undefined ? null : squad.value.find(player => player.playerId === playerId) ?? null
 }
 
 /** 'gk' + 'o0..oN' = 그라운드에 있는 선수, 'b0..bN' = 벤치 */
@@ -660,8 +790,8 @@ const fieldSlotsRaw = computed(() =>
 )
 // 명시적 퇴장(R) 카드뿐 아니라, 경고(Y) 카드를 두 장 받아 경고 누적으로 퇴장된 경우도
 // 더는 뛸 수 없다 (utils/card.ts 의 isSentOff — 판정에만 쓰고 카드 종류는 건드리지 않는다).
-function isPlayerSentOff(playerIdx: number) {
-  return isSentOff(cardByPlayer.value.get(playerIdx) ?? [])
+function isPlayerSentOff(playerId: string) {
+  return isSentOff(cardByPlayer.value.get(playerId) ?? [])
 }
 const onFieldSlots = computed(() => fieldSlotsRaw.value.filter(s => !isPlayerSentOff(game.value.assigned[s.id]!)))
 const benchSlots = computed(() =>
@@ -673,7 +803,7 @@ const benchSlots = computed(() =>
 )
 // 카드는 필드 위 11명뿐 아니라 후보 선수에게도 매길 수 있어야 한다(경고 누적 관리 등).
 // 선발/후보로 나누고 각각 등번호 순으로 정렬해서 보여준다 — 슬롯 순서 그대로면 뒤섞여 보인다.
-const byNo = <T extends { p: SquadPlayer | null }>(list: T[]) =>
+const byNo = <T extends { p: MatchSquadPlayer | null }>(list: T[]) =>
   [...list].sort((a, b) => Number(a.p!.no) - Number(b.p!.no))
 // 이미 퇴장 처리된(명시적 R, 또는 경고 누적) 선수는 새로 카드를 줄 수 없어 목록에서 빠지지만,
 // 지금 그 선수의 카드를 "수정" 중이라면(utils/card.ts 의 canPickForCard 예외) 목록에 남아
@@ -688,8 +818,8 @@ const cardSubSlots = computed(() =>
 /** 한 번 빠진 선수는 다시 못 들어온다(축구 규칙) — 벤치에 있어도 고를 수 없게 막는다 */
 const subbedOutPlayers = computed(() => new Set(game.value.subs.map(s => s.outPlayer)))
 function isSubbedOut(slotId: string) {
-  const idx = game.value.assigned[slotId]
-  return idx !== undefined && subbedOutPlayers.value.has(idx)
+  const playerId = game.value.assigned[slotId]
+  return playerId !== undefined && subbedOutPlayers.value.has(playerId)
 }
 
 const canSubmitSub = computed(() => subOutSlot.value !== null && subInSlot.value !== null)
@@ -758,8 +888,8 @@ function undoSub(index: number) {
 }
 
 const subHalfLabel: Record<string, string> = { H1: '전반', H2: '후반', H3: '연장전반', H4: '연장후반' }
-function playerLabel(idx: number) {
-  const p = squad.value[idx]
+function playerLabel(playerId: string | null) {
+  const p = squad.value.find(player => player.playerId === playerId)
   return p ? `${p.no} ${p.name}` : '-'
 }
 
@@ -1062,7 +1192,10 @@ function recordGoalResult(zone: Exclude<ResCode, 'O' | ''>, point?: { x: number;
     shootPos: point,
     shootDspRange: point ? isWithinGoalOneMeter(point) : undefined,
   })
-  if (zone === 'GOAL') homeScore.value++
+  if (zone === 'GOAL') {
+    if (team.value === 'away') awayScore.value++
+    else homeScore.value++
+  }
   pendingShot.value = null
 }
 
@@ -1149,17 +1282,17 @@ function clickOuterZone(e: MouseEvent, zone: 'H' | 'HX' | 'L' | 'LX' | 'R' | 'RX
 // DAP 레코드의 선수 입력
 function openPlayerPick(recordId: string) {
   playerPickFor.value = recordId
-  pickedNo.value = records.value.find(r => r.id === recordId)?.playerId ?? null
+  pickedPlayerId.value = records.value.find(r => r.id === recordId)?.playerId ?? null
 }
 function cancelPlayerPick() {
   playerPickFor.value = null
-  pickedNo.value = null
+  pickedPlayerId.value = null
 }
 function submitPlayer() {
-  if (!pickedNo.value) return
+  if (!pickedPlayerId.value) return
   const rec = records.value.find(r => r.id === playerPickFor.value)
   if (rec) {
-    rec.playerId = pickedNo.value
+    rec.playerId = pickedPlayerId.value
     game.value.records = records.value
   }
   cancelPlayerPick()
@@ -1191,17 +1324,51 @@ function goTeamSelection() {
       stadium: route.query.stadium,
       home: home.value,
       away: away.value,
+      // 입력 화면으로 들어올 때 사용한 팀/모드/진영/잔디 설정을 그대로 돌려준다.
+      // 이 값들을 빼면 TeamSelection이 입력 중이던 팀/선수 배치를 잃은 것처럼 보일 수 있다.
+      team: route.query.team ?? game.value.team,
+      mode: route.query.mode ?? game.value.inputMode,
+      side: route.query.side ?? game.value.side,
+      grass: route.query.grass,
+      lines: route.query.lines,
     },
   })
 }
 
-function finishHalf() {
+async function finishHalf() {
+  if (halfFinishBusy.value) return
   if (!confirm(`${half.value}을 종료하시겠습니까?`)) return
 
+  const wasPaused = paused.value
+  const runningStatus = half.value === '전반' ? 'H1' : 'H2'
+  const doneStatus = half.value === '전반' ? 'H1_done' : 'H2_done'
+
+  halfFinishBusy.value = true
   if (timer) clearInterval(timer)
   saveToStore()
-  game.value.halfStatus = half.value === '전반' ? 'H1_done' : 'H2_done'
-  goTeamSelection()
+  game.value.clockStartedAt = null
+  game.value.halfStatus = doneStatus
+
+  try {
+    // 전/후반 종료 시점에는 해당 상태의 Draft가 Firestore에 저장된 것이 확인된 뒤에만
+    // 대기방으로 이동한다. RAW 승격은 여기서 하지 않는다.
+    if (!await saveDraft(game.value)) {
+      throw new Error(`${half.value} Draft를 Firestore에 저장하지 못했습니다. 네트워크 연결을 확인하고 다시 종료해 주세요.`)
+    }
+    goTeamSelection()
+  } catch (error) {
+    game.value.halfStatus = runningStatus
+    if (wasPaused) {
+      paused.value = true
+      game.value.clockStartedAt = null
+    } else {
+      paused.value = false
+      startTicking()
+    }
+    alert(error instanceof Error ? error.message : `${half.value} 종료 저장에 실패했습니다.`)
+  } finally {
+    halfFinishBusy.value = false
+  }
 }
 </script>
 
@@ -1344,9 +1511,17 @@ function finishHalf() {
             <button class="editDelete" @click="deleteEdit">삭제</button>
             <button class="editCancel" @click="cancelEdit">취소</button>
           </div>
-          <!-- 수정 화면(isEditMode)이거나 정지 중이면 "대기방으로 나가기". 실제로 기록 중일 때만 "{half} 종료". -->
-          <button v-else-if="isEditMode || paused" class="finishBtn" @click="exitToLobby">대기방으로 나가기</button>
-          <button v-else class="finishBtn" @click="finishHalf">{{ half }} 종료</button>
+          <!-- 종료/복귀 액션. 일반 입력에서는 일시정지 여부와 관계없이 두 버튼을 항상 유지한다. -->
+          <div v-if="!editingId" class="finishControls">
+            <!-- 최종 RAW 수정은 같은 자리에서 바로 반영하고 final 상태로 되돌린다. -->
+            <button v-if="isFinalCorrection" class="finishBtn" @click="completeFinalCorrection">수정 완료</button>
+            <!-- 기존 half 수정 화면에서는 종료 상태를 바꾸지 않고 대기방으로만 복귀한다. -->
+            <button v-else-if="isEditMode" class="finishBtn" @click="exitToLobby">대기방으로 나가기</button>
+            <template v-else>
+              <button class="lobbyExitBtn" @click="exitToLobby">대기방으로 나가기</button>
+              <button class="finishBtn" :disabled="halfFinishBusy" @click="finishHalf">{{ halfFinishBusy ? '저장 중...' : `${half} 종료` }}</button>
+            </template>
+          </div>
 
           <div v-if="!editingId" class="mirrorWrap">
             <button class="mirrorIcon" :class="{ on: mirrorOpen }" @click="openMirrorPopup">⇄</button>
@@ -1551,15 +1726,15 @@ function finishHalf() {
           <!-- 선수선택: PPT 대로 액트 입력창 자리에서 UI 를 전환한다 -->
           <div v-if="!cardOpen && !subOpen && playerPickFor" class="group pickGroup">
             <div class="pickField">
-              <button v-for="p in lineup" :key="p.no" class="jersey" :class="{ on: pickedNo === p.no }"
-                :style="{ left: p.slot.x + '%', top: p.slot.y + '%' }" @click="pickedNo = p.no">
+              <button v-for="p in lineup" :key="p.playerId" class="jersey" :class="{ on: pickedPlayerId === p.playerId }"
+                :style="{ left: p.slot.x + '%', top: p.slot.y + '%' }" @click="pickedPlayerId = p.playerId">
                 <span class="shirt">{{ p.no }}</span>
                 <span class="jname">{{ p.name }}</span>
               </button>
             </div>
             <div class="pickActions">
               <button class="pickCancel" @click="cancelPlayerPick">Cancel</button>
-              <button class="pickSubmit" :disabled="!pickedNo" @click="submitPlayer">Submit</button>
+              <button class="pickSubmit" :disabled="!pickedPlayerId" @click="submitPlayer">Submit</button>
             </div>
           </div>
         </section>
@@ -2688,10 +2863,18 @@ button {
   background: rgba(240, 180, 41, .15)
 }
 
-.finishBtn {
+.finishControls {
   position: absolute;
   top: 8px;
   right: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  z-index: 4
+}
+
+.finishBtn,
+.lobbyExitBtn {
   height: 26px;
   padding: 0 12px;
   border-radius: 4px;
@@ -2701,6 +2884,11 @@ button {
   font-weight: 700;
   font-size: 11px;
   cursor: pointer
+}
+
+.lobbyExitBtn {
+  color: rgba(255, 255, 255, .72);
+  background: rgba(255, 255, 255, .035)
 }
 
 .mirrorWrap {
@@ -2749,7 +2937,8 @@ button {
   grid-template-columns: repeat(2, 1fr)
 }
 
-.finishBtn:hover {
+.finishBtn:hover,
+.lobbyExitBtn:hover {
   background: rgba(255, 255, 255, .14);
   border-color: rgba(255, 255, 255, .3)
 }

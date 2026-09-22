@@ -11,18 +11,16 @@ async function logout() {
 
 
 
-// Db 에서 불러와야 할 목록
-// ff_user. ]anjanjanjanj
-
 type MatchItem = {
   id: string
+  date: string
   time: string
   league: string
   round: string
   stadium: string
   home: { name: string; short?: string }
   away: { name: string; short?: string }
-  status: 'READY' | 'LIVE' | 'DONE'
+  inputStatus: { H: { rawStatus: string | null; completed: boolean }; A: { rawStatus: string | null; completed: boolean } }
 }
 
 const today = new Date()
@@ -31,6 +29,10 @@ const viewMonth = ref(today.getMonth()) // 0-11
 
 const selectedDate = ref<string>('') // YYYY-MM-DD
 const selectedMatchId = ref<string>('')
+const matches = ref<MatchItem[]>([])
+const loadingMatches = ref(false)
+const loadError = ref('')
+const { request } = useBackendApi()
 
 const ymLabel = computed(() => {
   const y = viewYear.value
@@ -72,6 +74,7 @@ function prevMonth() {
   } else viewMonth.value -= 1
   selectedDate.value = ''
   selectedMatchId.value = ''
+  loadMatches()
 }
 
 function nextMonth() {
@@ -81,6 +84,7 @@ function nextMonth() {
   } else viewMonth.value += 1
   selectedDate.value = ''
   selectedMatchId.value = ''
+  loadMatches()
 }
 
 function pickDate(ymd?: string) {
@@ -89,35 +93,44 @@ function pickDate(ymd?: string) {
   selectedMatchId.value = '' // 날짜 바꾸면 경기 선택 초기화
 }
 
-// ---- 더미 경기 데이터 (나중에 API로 교체될 자리) ----
-const dummyByDate = ref<Record<string, MatchItem[]>>({
-  [toYMD(viewYear.value, viewMonth.value, 14)]: [
-    {
-      id: 'M20241214-01',
-      time: '12:00',
-      league: 'LALIGA',
-      round: '17R',
-      stadium: 'Estadio de Vallecas',
-      home: { name: 'Vallecano' },
-      away: { name: 'Real Madrid' },
-      status: 'READY',
-    },
-    {
-      id: 'M20241214-02',
-      time: '15:00',
-      league: 'LALIGA',
-      round: '17R',
-      stadium: 'Camp de Futbol',
-      home: { name: 'Alaves' },
-      away: { name: 'Athletic' },
-      status: 'READY',
-    },
-  ],
-})
+function normalizeDate(value: string) {
+  const digits = value.replace(/\D/g, '')
+  return digits.length >= 8 ? `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}` : value
+}
+
+async function loadMatches() {
+  loadingMatches.value = true
+  loadError.value = ''
+  try {
+    const payload = await request<{ matches: Array<{
+      gmId: string; date: string; kickoffTime: string | null; leagueId: string; round: number | null
+      stadiumName: string; home: { name: string }; away: { name: string }
+      inputStatus: { H: { rawStatus: string | null; completed: boolean }; A: { rawStatus: string | null; completed: boolean } }
+    }> }>(`/api/v1/match-input/matches?year=${viewYear.value}&month=${viewMonth.value + 1}`)
+    matches.value = payload.matches.map((item) => ({
+      id: item.gmId,
+      date: normalizeDate(item.date),
+      time: item.kickoffTime ?? '',
+      league: item.leagueId,
+      round: item.round === null ? '-' : `${item.round}R`,
+      stadium: item.stadiumName,
+      home: item.home,
+      away: item.away,
+      inputStatus: item.inputStatus,
+    }))
+  } catch (error) {
+    matches.value = []
+    loadError.value = error instanceof Error ? error.message : '경기 목록을 불러오지 못했습니다.'
+  } finally {
+    loadingMatches.value = false
+  }
+}
+
+onMounted(loadMatches)
 
 const matchList = computed(() => {
   if (!selectedDate.value) return []
-  return dummyByDate.value[selectedDate.value] ?? []
+  return matches.value.filter(match => match.date === selectedDate.value)
 })
 
 function selectMatch(id: string) {
@@ -127,6 +140,14 @@ function selectMatch(id: string) {
 const selectedMatch = computed(() => {
   return matchList.value.find(m => m.id === selectedMatchId.value) || null
 })
+
+function teamAnalysisLabel(completed: boolean) {
+  return completed ? '분석 종료' : '분석 대기'
+}
+
+function isMatchComplete(match: MatchItem) {
+  return match.inputStatus.H.completed && match.inputStatus.A.completed
+}
 
 async function goTeamSelection(match?: MatchItem) {
   const m = match ?? selectedMatch.value
@@ -200,7 +221,7 @@ function onCancel() {
               :class="{
                 empty: !c.day,
                 active: c.ymd && c.ymd === selectedDate,
-                hasMatch: c.ymd && (dummyByDate[c.ymd]?.length ?? 0) > 0,
+                hasMatch: c.ymd && matches.some(match => match.date === c.ymd),
               }"
               :disabled="!c.day"
               @click="pickDate(c.ymd)"
@@ -219,15 +240,22 @@ function onCancel() {
           </div>
 
           <div v-else class="list">
-            <button
-              v-for="m in matchList"
-              :key="m.id"
-              class="matchRow"
-              :class="{ selected: m.id === selectedMatchId }"
-              @click="selectMatch(m.id)"
-              @dblclick="goTeamSelection(m)"
-              @keyup.enter="goTeamSelection(m)"
-            >
+            <div v-if="loadingMatches" class="hint">경기 목록을 불러오는 중입니다.</div>
+            <div v-else-if="loadError" class="hint">{{ loadError }}</div>
+            <template v-else>
+              <button
+                v-for="m in matchList"
+                :key="m.id"
+                class="matchRow"
+                :class="{
+                  selected: m.id === selectedMatchId,
+                  'match-complete': isMatchComplete(m),
+                  'match-pending': !isMatchComplete(m),
+                }"
+                @click="selectMatch(m.id)"
+                @dblclick="goTeamSelection(m)"
+                @keyup.enter="goTeamSelection(m)"
+              >
               <div class="time">
                 <div class="t">{{ m.time }}</div>
                 <div class="sub">{{ m.league }}</div>
@@ -235,20 +263,30 @@ function onCancel() {
               </div>
 
               <div class="vs">
-                <div class="team">{{ m.home.name }}</div>
+                <div class="teamCell teamHome">
+                  <div class="team">{{ m.home.name }}</div>
+                  <div class="teamStatus" :class="m.inputStatus.H.completed ? 'teamStatus-done' : 'teamStatus-waiting'">
+                    {{ teamAnalysisLabel(m.inputStatus.H.completed) }}
+                  </div>
+                </div>
                 <div class="mid">
                   <div class="vsTxt">VS</div>
-                  <div class="status">시작전</div>
                 </div>
-                <div class="team">{{ m.away.name }}</div>
+                <div class="teamCell teamAway">
+                  <div class="team">{{ m.away.name }}</div>
+                  <div class="teamStatus" :class="m.inputStatus.A.completed ? 'teamStatus-done' : 'teamStatus-waiting'">
+                    {{ teamAnalysisLabel(m.inputStatus.A.completed) }}
+                  </div>
+                </div>
               </div>
 
               <div class="round">{{ m.round }}</div>
-            </button>
+              </button>
 
-            <div v-if="matchList.length === 0" class="hint">
-              선택한 날짜에 경기가 없어.
-            </div>
+              <div v-if="matchList.length === 0" class="hint">
+                선택한 날짜에 경기가 없어.
+              </div>
+            </template>
           </div>
         </section>
       </div>
@@ -391,24 +429,56 @@ function onCancel() {
 
 .matchRow {
   display: grid;
-  grid-template-columns: 220px 1fr 64px;
-  gap: 10px;
+  grid-template-columns: 220px minmax(0, 1fr) 64px;
+  gap: 14px;
   align-items: center;
+  min-height: 78px;
   padding: 10px 12px;
   border-radius: 6px;
-  border: 1px solid rgba(255,255,255,0.08);
   background: rgba(255,255,255,0.03);
   cursor: pointer;
   text-align: left;
+  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
 }
-.matchRow.selected { border-color: rgba(241,180,0,0.7); background: rgba(241,180,0,0.06); }
+/* 한 팀이라도 입력 대기면 경기 카드 자체를 살아있는 작업 대상으로 표시한다. */
+.matchRow.match-pending {
+  border: 1px solid rgba(0,217,255,0.44);
+  box-shadow: inset 0 0 0 1px rgba(0,217,255,0.04);
+}
+/* 양 팀 모두 final이면 완료 경기의 테두리만 의도적으로 흐리게 한다. */
+.matchRow.match-complete {
+  border: 1px solid rgba(255,255,255,0.055);
+  box-shadow: none;
+}
+.matchRow.selected {
+  background: rgba(241,180,0,0.055);
+  box-shadow: 0 0 0 2px rgba(241,180,0,0.46);
+}
 .time .t { color: rgba(255,255,255,0.85); font-weight: 700; }
 .time .sub { color: rgba(255,255,255,0.45); font-size: 12px; margin-top: 2px; }
-.vs { display: grid; grid-template-columns: 1fr 80px 1fr; align-items: center; gap: 8px; }
-.team { color: rgba(255,255,255,0.85); font-weight: 700; }
-.mid { display: grid; place-items: center; }
-.vsTxt { color: rgba(255,255,255,0.7); font-weight: 900; letter-spacing: 0.06em; }
-.status { color: rgba(241,180,0,0.9); font-size: 12px; margin-top: 2px; }
+.vs {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) 54px minmax(150px, 1fr);
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+.teamCell { min-width: 0; display: grid; gap: 5px; }
+.teamHome { text-align: right; justify-items: end; }
+.teamAway { text-align: left; justify-items: start; }
+.team {
+  max-width: 100%;
+  color: rgba(255,255,255,0.88);
+  font-weight: 750;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.teamStatus { font-size: 11px; line-height: 1; white-space: nowrap; font-weight: 700; }
+.teamStatus-waiting { color: rgba(241,180,0,0.96); }
+.teamStatus-done { color: rgba(92,200,255,0.88); }
+.mid { display: grid; place-items: center; align-self: center; }
+.vsTxt { color: rgba(255,255,255,0.64); font-weight: 900; letter-spacing: 0.06em; }
 .round { color: rgba(255,255,255,0.6); text-align: right; font-weight: 700; }
 
 .bottomBar {

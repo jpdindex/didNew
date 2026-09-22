@@ -13,8 +13,8 @@ import type { Half } from '~/types/schema'
 export interface CardRecord {
   half: Half
   seconds: number
-  /** players(HOME_SQUAD/AWAY_SQUAD) 배열의 인덱스 */
-  player: number
+  /** Firestore players 문서 ID. 배열 순서가 바뀌어도 카드 대상은 유지된다. */
+  player: string
   card: 'Y' | 'R'
 }
 
@@ -25,8 +25,8 @@ export interface CardRecord {
  * 다른 패널로 전환) 반드시 비워야 한다. 비우지 않으면 제출도 안 한 카드가 선수를
  * 계속 그라운드에서 빼놓는 상태로 남는다.
  */
-export function groupCardsByPlayer(committed: CardRecord[], queued: CardRecord[] = []): Map<number, CardRecord[]> {
-  const map = new Map<number, CardRecord[]>()
+export function groupCardsByPlayer(committed: CardRecord[], queued: CardRecord[] = []): Map<string, CardRecord[]> {
+  const map = new Map<string, CardRecord[]>()
   for (const c of [...committed, ...queued]) {
     map.set(c.player, [...(map.get(c.player) ?? []), c])
   }
@@ -45,10 +45,10 @@ export function isSentOff(cards: CardRecord[]): boolean {
  * 경고/퇴장 카드 자체를 고치는 도중에 목록에서 사라져 되돌릴 수 없게 되는 일이 없다.
  */
 export function canPickForCard(
-  playerIdx: number,
-  cardsByPlayer: Map<number, CardRecord[]>,
-  editingPlayer: number | null,
+  playerId: string,
+  cardsByPlayer: Map<string, CardRecord[]>,
+  editingPlayer: string | null,
 ): boolean {
-  if (playerIdx === editingPlayer) return true
-  return !isSentOff(cardsByPlayer.get(playerIdx) ?? [])
+  if (playerId === editingPlayer) return true
+  return !isSentOff(cardsByPlayer.get(playerId) ?? [])
 }

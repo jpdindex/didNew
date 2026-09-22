@@ -16,20 +16,46 @@ import type { Half, HalfStatus, RecorderLevel } from '~/types/schema'
 // 기존 import 경로(~/composables/useMatchState)를 쓰는 다른 파일들이 계속 동작하도록 재수출한다.
 export type { HalfStatus, RecorderLevel }
 
+export interface MatchSquadPlayer {
+  playerId: string
+  no: string
+  name: string
+  pos: string
+}
+
 /**
  * 선수 교체 1건. 레거시 ff_game_player_log 대응이지만, 새 스키마에는 별도 컬렉션이
  * 없고 RecordingDoc.lineup[playerId] 의 inHalf/inSeconds/outHalf/outSeconds 로 병합된다
  * (docs/05_legacy_field_mapping.md). 화면에서는 "교체 이력" 표를 그려야 해서 이벤트
  * 단위로 들고 있다가, Firestore 저장 단계에서 lineup 쪽으로 접어 넣는다.
  *
- * outPlayer/inPlayer 는 players(HOME_SQUAD/AWAY_SQUAD) 배열의 인덱스다 —
+ * outPlayer/inPlayer 는 API에서 읽은 팀 명단 배열의 인덱스다 —
  * assigned 와 같은 키 체계를 써야 슬롯이 바뀌어도 사람이 안 바뀐다.
  */
 export interface SubRecord {
   half: Half
   seconds: number
-  outPlayer: number
-  inPlayer: number
+  outPlayer: string
+  inPlayer: string
+}
+
+export interface FormationChange {
+  half: Half
+  seconds: number
+  formationKey: string
+  assigned: Record<string, string>
+}
+
+export interface MatchSnapshot {
+  leagueId: string
+  seasonId: string
+  round: number | null
+  date: string
+  kickoffTime: string | null
+  stadiumId: string | null
+  matchType: string | null
+  homeTeamId: string
+  awayTeamId: string
 }
 
 export interface MatchState {
@@ -38,7 +64,7 @@ export interface MatchState {
   // TeamSelection 라인업 관련
   team: 'home' | 'away'
   formationKey: string
-  assigned: Record<string, number> // slotId -> players 배열 인덱스
+  assigned: Record<string, string> // slotId -> Firestore playerId
   side: 'left' | 'right' | null
   inputMode: '분석' | '실시간'
   grassPattern: GrassPattern
@@ -63,6 +89,11 @@ export interface MatchState {
   // 여기 남기지 않는다 — 그건 그냥 명단을 고치는 것이다.
   subs: SubRecord[]
   cards: CardRecord[]
+  squads: { home: MatchSquadPlayer[]; away: MatchSquadPlayer[] }
+  matchSnapshot: MatchSnapshot | null
+  // 대기실로 나가도 경기 시계가 계속 흐르도록, 실행 기준 시각을 별도로 둔다.
+  clockStartedAt: number | null
+  formationChanges: FormationChange[]
   // ---- 갱신(=KPI 확정) 흐름. §11.2.1 참고 ----
   recorderLevel: RecorderLevel
   // 전반전/후반전 갱신을 누르면 true. basic 등급에서만 의미가 있으며, true 인 동안은
@@ -91,6 +122,10 @@ function defaultMatchState(): MatchState {
     records: [],
     subs: [],
     cards: [],
+    squads: { home: [], away: [] },
+    matchSnapshot: null,
+    clockStartedAt: null,
+    formationChanges: [],
     recorderLevel: 'advanced',
     h1Locked: false,
     h2Locked: false,

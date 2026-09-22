@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from backend.system.system_control import (
+from backend.system.system_firestore import (
     Settings,
     get_settings,
     firebase_is_configured,

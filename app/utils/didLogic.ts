@@ -126,6 +126,13 @@ function resolvedOnly(records: DidRecord[]) {
 
 let recSeq = 0
 
+function nextRecordId() {
+  // H1 → H2 화면 전환은 모듈을 다시 로드할 수 있다. 화면-local counter만 쓰면
+  // rec_1 같은 ID가 반별로 다시 생겨 Draft의 raw 승격이 막힌다.
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return `rec_${crypto.randomUUID()}`
+  return `rec_${Date.now()}_${++recSeq}`
+}
+
 /** 액트 버튼을 누른 시점의 레코드를 만든다. res 는 항상 'O'. */
 export function createActRecord(
   act: Exclude<ActCode, ''>,
@@ -133,7 +140,7 @@ export function createActRecord(
   area: number,
   extra: Partial<Pick<DidRecord, 'playerId' | 'shootPosX' | 'shootPosY' | 'posX' | 'posY' | 'half'>> = {}
 ): DidRecord {
-  return { id: `rec_${++recSeq}`, seconds, act, res: 'O', area, seq: recSeq, isShot: isShotAct(act), ...extra }
+  return { id: nextRecordId(), seconds, act, res: 'O', area, seq: ++recSeq, isShot: isShotAct(act), ...extra }
 }
 
 /**
@@ -185,14 +192,14 @@ export function applyResult(
   // area/좌표는 X/B 를 누르기 전에 새로 클릭한 위치(실책·블락이 일어난 지점)를 쓴다.
   // 넘어오지 않으면(레거시 재현 등) 직전 액트 레코드의 area 로 대체한다.
   records.splice(idx + 1, 0, {
-    id: `rec_${++recSeq}`,
+    id: nextRecordId(),
     seconds: opts.seconds ?? rec.seconds,
     act: '',
     posX: opts.pos?.x,
     posY: opts.pos?.y,
     res,
     area: opts.area ?? rec.area,
-    seq: recSeq,
+    seq: ++recSeq,
     half: rec.half,
   })
 }
@@ -208,7 +215,7 @@ export function createResultRecord(
   area: number,
   extra: Partial<Pick<DidRecord, 'posX' | 'posY' | 'half'>> = {}
 ): DidRecord {
-  return { id: `rec_${++recSeq}`, seconds, act: '', res, area, seq: recSeq, ...extra }
+  return { id: nextRecordId(), seconds, act: '', res, area, seq: ++recSeq, ...extra }
 }
 
 /**

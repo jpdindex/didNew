@@ -34,17 +34,44 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
     assert "/health" in schema["paths"]
     assert set(schema["paths"]) == {
         "/health",
-        "/api/v1/match-kpis/raw-change/all",
-        "/api/v1/match-kpis/raw-change/round",
-        "/api/v1/match-kpis/logic-change/all",
-        "/api/v1/match-kpis/logic-change/round",
-    }
+        "/api/v1/match-kpis/build",
+        "/api/v1/match-ratings/build",
+            "/api/v1/match-ratings/read",
+            "/api/v1/legacy-import",
+            "/api/v1/legacy-import/jobs/{job_id}",
+                "/api/v1/match-input/matches",
+                "/api/v1/match-input/matches/{gm_id}/squads",
+                "/api/v1/match-input/matches/{gm_id}/squads/refresh",
+                "/api/v1/match-input/drafts/{gm_id}/{side}",
+            "/api/v1/match-input/drafts/{gm_id}/{side}/restore-raw",
+            "/api/v1/match-input/drafts/{gm_id}/{side}/promote-h1",
+            "/api/v1/match-input/drafts/{gm_id}/{side}/finalize",
+            "/api/v1/match-input/approvals",
+            "/api/v1/match-input/approvals/{gm_id}/{side}/promote",
+        }
     assert schema["components"]["securitySchemes"]["SwaggerKey"]["name"] == "X-Swagger-Key"
-    assert schema["paths"]["/api/v1/match-kpis/raw-change/all"]["post"]["security"] == [{"SwaggerKey": []}]
+    assert schema["paths"]["/api/v1/match-kpis/build"]["post"]["security"] == [{"SwaggerKey": []}]
+    assert schema["paths"]["/api/v1/match-ratings/build"]["post"]["security"] == [{"SwaggerKey": []}]
+    rating_operation = schema["paths"]["/api/v1/match-ratings/build"]["post"]
+    assert "requestBody" in rating_operation
+    assert "parameters" not in rating_operation
+    assert "application/x-www-form-urlencoded" in rating_operation["requestBody"]["content"]
+    rating_schema = rating_operation["requestBody"]["content"]["application/x-www-form-urlencoded"]["schema"]
+    rating_properties = schema["components"]["schemas"][rating_schema["$ref"].split("/")[-1]]["properties"]
+    assert rating_properties["force"]["default"] is False
+    kpi_operation = schema["paths"]["/api/v1/match-kpis/build"]["post"]
+    kpi_schema = kpi_operation["requestBody"]["content"]["application/x-www-form-urlencoded"]["schema"]
+    kpi_properties = schema["components"]["schemas"][kpi_schema["$ref"].split("/")[-1]]["properties"]
+    assert kpi_properties["force"]["default"] is False
+    input_operation = schema["paths"]["/api/v1/match-input/drafts/{gm_id}/{side}"]["put"]
+    assert "application/json" in input_operation["requestBody"]["content"]
+    import_operation = schema["paths"]["/api/v1/legacy-import"]["post"]
+    assert import_operation["security"] == [{"SwaggerKey": []}]
+    assert "multipart/form-data" in import_operation["requestBody"]["content"]
 
 
 def test_kpi_build_rejects_missing_swagger_key() -> None:
     with TestClient(app) as client:
-        response = client.post("/api/v1/match-kpis/raw-change/all")
+        response = client.post("/api/v1/match-kpis/build")
 
     assert response.status_code == 401

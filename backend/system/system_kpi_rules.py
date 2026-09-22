@@ -24,6 +24,7 @@ class KpiRecord:
     shoot_dsp_range: bool | None = None
     is_shot: bool | None = None
     created_by: str = ""
+    created_at: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +92,9 @@ def _is_goal(result: str) -> bool:
 def _ordered(records: list[KpiRecord]) -> list[KpiRecord]:
     return sorted(
         records,
-        key=lambda item: (item.seconds, item.seq, item.created_by),
+        # PHP batch jobs order by gr_seconds then gr_regdt. seq is retained
+        # only as a deterministic fallback for imports without a timestamp.
+        key=lambda item: (item.seconds, item.created_at, item.seq, item.created_by),
     )
 
 
@@ -157,7 +160,7 @@ def _classify_chain(chain: list[KpiRecord], path_id: str) -> tuple[AttackPath, d
         act = "" if own_goal else record.act
         if act:
             act_count += 1
-        if record.is_shot or (act and _is_shot_act(act)):
+        if act and _is_shot_act(act):
             path_type = "DTP"
             is_goal_chain = is_goal_chain or _is_goal(record.res)
             has_position = bool((record.shoot_pos_x or 0) > 0 or (record.shoot_pos_y or 0) > 0)
@@ -213,10 +216,13 @@ def _classify_chain(chain: list[KpiRecord], path_id: str) -> tuple[AttackPath, d
     result_flags: dict[str, RecordFlags] = {}
     for record in chain:
         flags = mutable_flags[record.id]
+        own_goal = _is_goal(record.res) and record.player_id == "OWN"
+        effective_act = "" if own_goal else record.act
         has_position = bool((record.shoot_pos_x or 0) > 0 or (record.shoot_pos_y or 0) > 0)
-        is_shot = _is_shot_act(record.act) or bool(record.is_shot)
-        flags["is_tap"] = bool(record.act)
-        flags["is_tap_success"] = bool(record.act) and record.res in {"O", "GOAL"}
+        is_shot = _is_shot_act(effective_act)
+        # Legacy PHP clears an own-goal action before deriving TAP and SHOT.
+        flags["is_tap"] = bool(effective_act)
+        flags["is_tap_success"] = bool(effective_act) and record.res in {"O", "GOAL"}
         flags["is_shot"] = is_shot
         flags["is_shot_success"] = is_shot and (
             record.res in {"GOAL", "R", "L", "H", "GB"}
@@ -242,7 +248,7 @@ def compute_attack_paths(
     return paths, flags
 
 
-def compute_bap(records: list[KpiRecord]) -> list[BapEvent]:
+def compute_bap(records: list[KpiRecord], *, close_trailing_ready: bool = False) -> list[BapEvent]:
     """Reproduce the verified legacy PHP server-batch BAP calculation."""
     events: list[BapEvent] = []
     ready = False
@@ -291,6 +297,9 @@ def compute_bap(records: list[KpiRecord]) -> list[BapEvent]:
             deferred = False
         elif ready:
             deferred = False
+    if close_trailing_ready and ready and ordered:
+        # Finalized PHP runs call dplay_game_bap_reset(..., $uplast=true).
+        events.append(BapEvent(ordered[-1].id, "LAST READY"))
     return events
 
 
@@ -298,11 +307,11 @@ def _empty(fields: tuple[str, ...]) -> dict[str, int]:
     return {field: 0 for field in fields}
 
 
-def _percentage(numerator: int, denominator: int) -> int:
-    return round(numerator / denominator * 100) if denominator else 0
+def _ratio(numerator: int, denominator: int) -> float:
+    return numerator / denominator if denominator else 0.0
 
 
-def calculate_kpis(records: list[KpiRecord]) -> KpiCalculation:
+def calculate_kpis(records: list[KpiRecord], *, close_trailing_bap: bool = True) -> KpiCalculation:
     paths: list[AttackPath] = []
     flags: dict[str, RecordFlags] = {}
     bap_events: list[BapEvent] = []
@@ -313,9 +322,10 @@ def calculate_kpis(records: list[KpiRecord]) -> KpiCalculation:
         half_paths, half_flags = compute_attack_paths(half_records, path_prefix=f"{half.lower()}_")
         paths.extend(half_paths)
         flags.update(half_flags)
-        bap_events.extend(compute_bap(half_records))
+        bap_events.extend(compute_bap(half_records, close_trailing_ready=close_trailing_bap))
     team = _empty(TEAM_KPI_FIELDS)
     players: defaultdict[str, dict[str, int]] = defaultdict(lambda: _empty(PLAYER_KPI_FIELDS))
+    player_path_ids: defaultdict[str, set[str]] = defaultdict(set)
     path_type_by_id = {path.id: path.path_type for path in paths}
     dap_success = 0
     player_dap_success: Counter[str] = Counter()
@@ -343,31 +353,39 @@ def calculate_kpis(records: list[KpiRecord]) -> KpiCalculation:
         player["GOAL"] += int(flag.is_goal)
         for field, attr in (("DTB", "is_dtb"), ("DTM", "is_dtm"), ("DTA", "is_dta"), ("DTS", "is_dts"), ("GTB", "is_gtb"), ("GTM", "is_gtm")):
             player[field] += int(getattr(flag, attr))
-        path_type = path_type_by_id[flag.path_id]
-        if flag.is_dap:
-            player["UTP"] += int(path_type == "UTP")
-            player["DTP"] += int(path_type in {"DTP", "STP"})
+        player_path_ids[record.player_id].add(flag.path_id)
 
     team["TTP"] = sum(int(path.ttp) for path in paths)
-    team["DTP"] = sum(int(path.path_type in {"DTP", "STP"}) for path in paths)
+    team["DTP"] = sum(int(path.path_type == "DTP") for path in paths)
     team["BAP"] = len(bap_events)
-    team["ASR"] = _percentage(dap_success, team["DAP"])
-    team["SSR"] = _percentage(team["GOAL"] - team["OG"], team["SHOT"])
+    team["ASR"] = _ratio(dap_success, team["DAP"])
+    team["SSR"] = _ratio(team["GOAL"] - team["OG"], team["SHOT"])
     for player_id, player in players.items():
+        # Legacy ff_game_player uses distinct gt_id rows for each player, not
+        # the number of DAP records the player created inside one attack path.
+        path_types = (path_type_by_id[path_id] for path_id in player_path_ids[player_id])
+        for path_type in path_types:
+            player["UTP"] += int(path_type == "UTP")
+            player["DTP"] += int(path_type == "DTP")
         player["TTP"] = player["UTP"] + player["DTP"]
-        player["ASR"] = _percentage(player_dap_success[player_id], player["DAP"])
-        player["SSR"] = _percentage(player["GOAL"], player["SHOT"])
+        player["ASR"] = _ratio(player_dap_success[player_id], player["DAP"])
+        player["SSR"] = _ratio(player["GOAL"], player["SHOT"])
     return KpiCalculation(team, dict(players), tuple(paths), flags, tuple(bap_events))
 
 
-def calculate_team_kpi_5min(records: list[KpiRecord]) -> list[dict[str, int]]:
+def calculate_team_kpi_5min(
+    records: list[KpiRecord],
+    half_end_seconds: dict[str, int] | None = None,
+) -> list[dict[str, int]]:
     """Return 20 cumulative five-minute team snapshots for the rating API."""
     snapshots: list[dict[str, int]] = []
     for half, offset in (("H1", 0), ("H2", 10)):
         completed_halves = [record for record in records if record.half in ({"H1"} if half == "H1" else {"H1", "H2"})]
         for interval in range(1, 11):
             cutoff = interval * 300
+            if interval == 10 and half_end_seconds:
+                cutoff = max(cutoff, half_end_seconds.get(half, cutoff))
             scoped = [record for record in completed_halves if record.half != half or record.seconds <= cutoff]
-            kpi = calculate_kpis(scoped).team_kpi
+            kpi = calculate_kpis(scoped, close_trailing_bap=False).team_kpi
             snapshots.append({field: kpi[field] for field in ("DAP", "DTP", "SHOT", "SSR", "GOAL")})
     return snapshots

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computeAttackPaths, computeBap } from '~/utils/didLogic'
-import type { HalfStatus, SubRecord } from '~/composables/useMatchState'
+import type { HalfStatus, MatchSnapshot, MatchSquadPlayer, SubRecord } from '~/composables/useMatchState'
 import type { Half } from '~/types/schema'
 import {
   GRASS_LINE_OPTIONS,
@@ -16,18 +16,6 @@ const match = computed(() => ({
   stadium: String(route.query.stadium ?? '') || 'Fubol de Vallecas',
   home: String(route.query.home ?? '') || 'Vallecano', away: String(route.query.away ?? '') || 'Real Madrid',
 }))
-const homePlayers = [
-  ['1','D. Raya','GK'],['13','A. Ramsdale','GK'],['30','M. Turner','GK'],['7','B. Saka','FW'],['9','G. Jesus','FW'],['12','J. Timber','FW'],['14','E. Nketiah','FW'],
-  ['18','T. Tomiyasu','FW'],['19','L. Trossard','FW'],['21','F. Vieira','FW'],['28','Marquinhos','FW'],['6','Gabriel','MF'],['8','Odegaard','MF'],['10','Smith Rowe','MF'],
-  ['11','Martinelli','MF'],['15','Kiwior','MF'],['17','Soares','MF'],['23','Lokonga','MF'],['29','Havertz','MF'],['2','Saliba','DF'],['3','Tierney','DF'],
-  ['4','B. White','DF'],['5','Partey','DF'],['16','Holding','DF'],['20','Jorginho','DF'],['22','P. Mari','DF'],['24','Nelson','DF'],['26','Balogun','DF'],['27','M. Smith','DF'],
-]
-const awayPlayers = [
-  ['1','T. Courtois','GK'],['13','A. Lunin','GK'],['26','K. Fernandez','GK'],['9','K. Mbappe','FW'],['7','Vinicius Jr','FW'],['11','R. Diaz','FW'],['14','Endrick','FW'],
-  ['20','Rodrygo','FW'],['24','A. Gonzalez','FW'],['21','B. Mayoral','FW'],['17','L. Vazquez','FW'],['5','Jude Bellingham','MF'],['15','F. Valverde','MF'],['12','Eduardo Camavinga','MF'],
-  ['8','Toni Kroos','MF'],['19','D. Ceballos','MF'],['6','Nacho','MF'],['22','Aurelien Tchouameni','MF'],['16','A. Modric','MF'],['4','David Alaba','DF'],['2','Dani Carvajal','DF'],
-  ['3','Eder Militao','DF'],['23','Fran Garcia','DF'],['18','Alvaro Odriozola','DF'],['25','Antonio Rudiger','DF'],['27','Nacho Fernandez','DF'],['28','Jesus Vallejo','DF'],['32','Rafa Marin','DF'],['35','Chema Andres','DF'],
-]
 const kpis = ['TAP','DAP','DTP','Shoot','Goal','SSR','BAP','ASR']
 const kpiHalf = ref<'all' | 'H1' | 'H2'>('all')
 
@@ -36,11 +24,16 @@ const kpiHalf = ref<'all' | 'H1' | 'H2'>('all')
 // 이 화면(대기 화면)으로 돌아왔을 때 라인업·스코어·기록이 그대로 남아있어야 하므로,
 // selectedTeam/formationKey/assigned/side/inputMode/잔디 설정을 전부 여기로 옮겼다.
 const game = useMatchState()
+const { request } = useBackendApi()
+const { saveLocal, save: saveDraft, promoteH1, finalizeAdvanced, restoreFinalRaw, recover: recoverDraft } = useMatchDraft()
+const lifecycleBusy = ref(false)
+const lifecycleError = ref('')
 
 // 전반 시작~종료 구간에는 전반 데이터를, 후반 시작~종료 구간에는 후반 데이터를 자동으로 보여준다.
 watch(() => game.value.halfStatus, (st) => {
   if (st === 'H1' || st === 'H1_done') kpiHalf.value = 'H1'
   else if (st === 'H2' || st === 'H2_done') kpiHalf.value = 'H2'
+  else if (st === 'final') kpiHalf.value = 'all'
 }, { immediate: true })
 
 // schedule 에서 다른 경기를 새로 선택해 들어온 경우(matchId 가 바뀐 경우)에는
@@ -50,25 +43,68 @@ if (matchId.value && game.value.matchId !== matchId.value) {
   game.value.matchId = matchId.value
 }
 
-const players = computed(() => (game.value.team === 'home' ? homePlayers : awayPlayers))
+const players = computed<MatchSquadPlayer[]>(() => (game.value.team === 'home' ? game.value.squads.home : game.value.squads.away))
+
+type FieldSide = 'left' | 'right'
+type InputSideStatus = { rawStatus: string | null; completed: boolean; fieldSide: FieldSide | null }
+const inputStatus = ref<{ H: InputSideStatus; A: InputSideStatus }>({
+  H: { rawStatus: null, completed: false, fieldSide: null },
+  A: { rawStatus: null, completed: false, fieldSide: null },
+})
+
+async function loadSquads() {
+  if (!matchId.value) return
+  const payload = await request<{
+    H: MatchSquadPlayer[]
+    A: MatchSquadPlayer[]
+    matchSnapshot: MatchSnapshot
+    inputStatus: { H: InputSideStatus; A: InputSideStatus }
+  }>(`/api/v1/match-input/matches/${encodeURIComponent(matchId.value)}/squads`)
+  const squads = { home: payload.H, away: payload.A }
+  game.value.squads = squads
+  game.value.matchSnapshot = payload.matchSnapshot
+  inputStatus.value = payload.inputStatus
+  return { squads, snapshot: payload.matchSnapshot }
+}
+
+function oppositeFieldSide(side: FieldSide): FieldSide {
+  return side === 'left' ? 'right' : 'left'
+}
+
+function counterpartFieldSide(team: 'home' | 'away'): FieldSide | null {
+  const other = team === 'home' ? inputStatus.value.A : inputStatus.value.H
+  return other.fieldSide ? oppositeFieldSide(other.fieldSide) : null
+}
+
+function applyOpponentFieldSideDefault(team: 'home' | 'away') {
+  if (game.value.side !== null) return
+  const automatic = counterpartFieldSide(team)
+  if (automatic) game.value.side = automatic
+}
+
+function applyCurrentMatchSquads(squads: { home: MatchSquadPlayer[]; away: MatchSquadPlayer[] }, snapshot: MatchSnapshot) {
+  // Draft/RAW 복원에는 당시의 화면 스냅샷도 포함되어 있다. 그 스냅샷으로 현재
+  // 계약 기간 기준 명단을 덮으면 새로 합류한 선수(예: 사카)가 목록에서 사라진다.
+  // 기록과 배치는 그대로 두되, 선택 목록의 정본만 이번 조회 결과로 유지한다.
+  game.value.squads = squads
+  game.value.matchSnapshot = snapshot
+}
 
 // ---- Player List 정렬 (포지션 / 등번호 / 이름) ----
-// 배치 정보(game.assigned)는 players 배열의 "원본 인덱스"를 키로 쓰므로,
-// 정렬해도 인덱스가 어긋나지 않도록 { p, i } 짝으로 넘긴다.
 type SortKey = 'position' | 'number' | 'name'
 const sortKey = ref<SortKey>('position')
 const POS_ORDER: Record<string, number> = { GK: 0, FW: 1, MF: 2, DF: 3 }
 
 const sortedPlayers = computed(() => {
-  const list = players.value.map((p, i) => ({ p, i }))
+  const list = players.value.map(p => ({ p, id: p.playerId }))
   if (sortKey.value === 'number') {
-    return list.sort((a, b) => Number(a.p[0]) - Number(b.p[0]))
+    return list.sort((a, b) => Number(a.p.no) - Number(b.p.no))
   }
   if (sortKey.value === 'name') {
-    return list.sort((a, b) => String(a.p[1]).localeCompare(String(b.p[1])))
+    return list.sort((a, b) => a.p.name.localeCompare(b.p.name))
   }
   // 포지션: GK → FW → MF → DF. 같은 포지션 안에서는 원래 순서를 유지한다(안정 정렬).
-  return list.sort((a, b) => (POS_ORDER[a.p[2] ?? ''] ?? 9) - (POS_ORDER[b.p[2] ?? ''] ?? 9))
+  return list.sort((a, b) => (POS_ORDER[a.p.pos ?? ''] ?? 9) - (POS_ORDER[b.p.pos ?? ''] ?? 9))
 })
 
 // ---- 포메이션 ----
@@ -96,21 +132,41 @@ const formations: Record<string, { label: string; slots: { x: number; y: number 
   ] },
 }
 const gkSlot = { x: 50, y: 94 }
-const BENCH_COUNT = 7
+const BENCH_COUNT = 15
 const benchIds = Array.from({ length: BENCH_COUNT }, (_, i) => `b${i}`)
 
 // 화면 전환/편집 중에만 의미있는 순수 UI 상태 — 공유할 필요 없어 로컬로 둔다.
 const menuOpen = ref(false)
 const activeSlot = ref<string | null>(null)
+const matchInfoEditMode = ref(false)
+const isLiveLobby = computed(() => game.value.halfStatus === 'H1' || game.value.halfStatus === 'H2')
+const matchInfoEditable = computed(() => !isLiveLobby.value || matchInfoEditMode.value)
+let formationSaveTimer: ReturnType<typeof setTimeout> | undefined
+let lobbyClockTimer: ReturnType<typeof setInterval> | undefined
 
 const outfieldSlots = computed(() => (game.value.formationKey ? formations[game.value.formationKey].slots : []))
 
+// 라인업 입력 순서는 화면 좌표 기준이다: 좌상단 → 우측, 그 다음 아래 줄 → ... → GK → 벤치.
+// formation 배열의 원래 인덱스(o0...)는 수비부터 시작하므로 그대로 쓰면 좌하단이 첫 슬롯이 된다.
+const lineupAssignmentOrder = computed(() => {
+  const field = outfieldSlots.value
+    .map((slot, index) => ({ id: `o${index}`, x: slot.x, y: slot.y }))
+    .sort((a, b) => (a.y - b.y) || (a.x - b.x))
+    .map(item => item.id)
+  return [...field, 'gk', ...benchIds]
+})
+
+function firstEmptyLineupSlot() {
+  return lineupAssignmentOrder.value.find(id => game.value.assigned[id] === undefined) ?? null
+}
+
 function pickFormation(key: string) {
+  if (!matchInfoEditable.value) return
   game.value.formationKey = key
   menuOpen.value = false
   // 포메이션 바꾸면 배치 초기화
   Object.keys(game.value.assigned).forEach(k => delete game.value.assigned[k])
-  activeSlot.value = 'o0'
+  activeSlot.value = firstEmptyLineupSlot()
 }
 
 // 개발용 등급 토글. recorders/{uid}.level 연동 전까지 화면에서 직접 전환한다.
@@ -122,42 +178,111 @@ function toggleRecorderLevel() {
 
 // 테스트용: 포메이션/진영/전체 슬롯을 랜덤으로 한 번에 채움
 function fillTestData() {
+  if (!matchInfoEditable.value) return
   const keys = Object.keys(formations)
   const key = keys[Math.floor(Math.random() * keys.length)]
   game.value.formationKey = key
   menuOpen.value = false
   Object.keys(game.value.assigned).forEach(k => delete game.value.assigned[k])
 
-  const pool = Array.from({ length: players.value.length }, (_, i) => i)
+  const pool = [...players.value]
   for (let i = pool.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1))
     ;[pool[i], pool[j]] = [pool[j], pool[i]]
   }
 
-  const gkPool = pool.filter(i => players.value[i]?.[2] === 'GK')
-  const outfieldPool = pool.filter(i => players.value[i]?.[2] !== 'GK')
+  const gkPool = pool.filter(player => player.pos === 'GK')
+  const outfieldPool = pool.filter(player => player.pos !== 'GK')
   const gk = gkPool[0]
-  if (gk !== undefined) game.value.assigned.gk = gk
+  if (gk) game.value.assigned.gk = gk.playerId
   const outfieldIds = outfieldSlots.value.map((_, i) => `o${i}`)
   outfieldIds.forEach((id, i) => {
     const player = outfieldPool[i]
-    if (player !== undefined) game.value.assigned[id] = player
+    if (player) game.value.assigned[id] = player.playerId
   })
+  const alreadyAssigned = new Set(Object.values(game.value.assigned))
+  const benchPool = pool.filter(player => !alreadyAssigned.has(player.playerId))
   benchIds.forEach((id, i) => {
-    const player = outfieldPool[outfieldIds.length + i]
-    if (player !== undefined) game.value.assigned[id] = player
+    const player = benchPool[i]
+    if (player) game.value.assigned[id] = player.playerId
   })
 
   activeSlot.value = null
   game.value.side = Math.random() < 0.5 ? 'left' : 'right'
 }
 
-function pickTeam(team: 'home' | 'away') {
-  if (game.value.team === team) return
-  game.value.team = team
-  // 팀이 바뀌면 선수 명단 자체가 달라지므로 기존 배치는 초기화
-  Object.keys(game.value.assigned).forEach(k => delete game.value.assigned[k])
-  activeSlot.value = game.value.formationKey ? 'o0' : null
+const canSwitchInputTeam = computed(() => game.value.halfStatus === 'ready' || game.value.halfStatus === 'final')
+
+function resetForInputTeam(team: 'home' | 'away') {
+  // match/squad와 화면 공통 설정은 유지하되, 실제 입력 세션은 H/A별로 완전히 분리한다.
+  // 점수는 경기 공통 정보라 현재 값을 이어받는다. records/lineup/half 상태는 절대 넘기지 않는다.
+  const shared = {
+    matchId: game.value.matchId,
+    squads: game.value.squads,
+    matchSnapshot: game.value.matchSnapshot,
+    homeScore: game.value.homeScore,
+    awayScore: game.value.awayScore,
+    inputMode: game.value.inputMode,
+    grassPattern: game.value.grassPattern,
+    grassLines: game.value.grassLines,
+    mirrored: game.value.mirrored,
+    recorderLevel: game.value.recorderLevel,
+  }
+  Object.assign(game.value, {
+    ...shared,
+    team,
+    formationKey: '',
+    assigned: {},
+    side: null,
+    halfStatus: 'ready',
+    seconds: 0,
+    h1Seconds: 0,
+    h2Seconds: 0,
+    records: [],
+    subs: [],
+    cards: [],
+    clockStartedAt: null,
+    formationChanges: [],
+    h1Locked: false,
+    h2Locked: false,
+  })
+}
+
+async function pickTeam(team: 'home' | 'away') {
+  if (!canSwitchInputTeam.value || game.value.team === team || lifecycleBusy.value) return
+  lifecycleBusy.value = true
+  lifecycleError.value = ''
+  const squads = game.value.squads
+  const snapshot = game.value.matchSnapshot
+  const previousTeam = game.value.team
+  const previousFieldSide = game.value.side as FieldSide | null
+  try {
+    // 서버 lifecycle과 별개로, 현재 팀의 프론트 상태를 IndexedDB에 먼저 보존한다.
+    // H/A는 `${gmId}_H`, `${gmId}_A`로 분리되므로 팀을 왕복해도 KPI/라인업/기록이 섞이지 않는다.
+    await saveLocal(game.value, game.value.halfStatus === 'final')
+    resetForInputTeam(team)
+    const recovered = await recoverDraft(game.value)
+    if (snapshot) applyCurrentMatchSquads(squads, snapshot)
+    if (!recovered) {
+      // 처음 입력하는 반대 팀은 완전히 새 세션으로 시작한다.
+      // 먼저 입력하던 팀의 진영을 알고 있으면 즉시 반대로 잡고,
+      // 새로고침/다른 기기처럼 로컬 상태가 없으면 RAW recording의 fieldSide를 사용한다.
+      game.value.halfStatus = 'ready'
+      game.value.formationKey = ''
+      game.value.assigned = {}
+      game.value.side = previousTeam !== team && previousFieldSide
+        ? oppositeFieldSide(previousFieldSide)
+        : counterpartFieldSide(team)
+    }
+    matchInfoEditMode.value = false
+    subOpen.value = false
+    menuOpen.value = false
+    activeSlot.value = game.value.halfStatus === 'ready' && game.value.formationKey ? firstEmptyLineupSlot() : null
+  } catch (error) {
+    lifecycleError.value = error instanceof Error ? error.message : '입력 팀 상태를 전환하지 못했습니다.'
+  } finally {
+    lifecycleBusy.value = false
+  }
 }
 
 // 탭-탭으로 자리 교환: 채워진 슬롯을 탭해 선택한 뒤 다른 슬롯을 탭하면 두 선수 자리가
@@ -165,6 +290,7 @@ function pickTeam(team: 'home' | 'away') {
 // 이 방식을 쓴다. 같은 슬롯을 다시 탭하면 선택 취소.
 // 선택된 슬롯이 비어 있으면(=일반적인 배정 흐름) 기존처럼 activeSlot 만 바뀐다.
 function clickSlot(id: string) {
+  if (!matchInfoEditable.value) return
   if (id !== 'gk' && !game.value.formationKey) return
   const prev = activeSlot.value
   if (prev === id) {
@@ -172,85 +298,112 @@ function clickSlot(id: string) {
     return
   }
   if (prev && game.value.assigned[prev] !== undefined) {
-    const fromIdx = game.value.assigned[prev]!
-    const toIdx = game.value.assigned[id]
+    const fromPlayerId = game.value.assigned[prev]!
+    const toPlayerId = game.value.assigned[id]
     // GK와 필드/벤치 슬롯을 서로 바꾸면 포지션 계약이 깨진다.
     // 빈 슬롯으로 옮기는 경우도 assignToSlot과 동일한 제약을 적용한다.
-    const fromIsGk = players.value[fromIdx]?.[2] === 'GK'
-    const toIsGk = toIdx === undefined ? fromIsGk : players.value[toIdx]?.[2] === 'GK'
-    if ((id === 'gk') !== fromIsGk || (toIdx !== undefined && (prev === 'gk') !== toIsGk)) {
+    const byId = new Map(players.value.map(player => [player.playerId, player]))
+    const fromIsGk = byId.get(fromPlayerId)?.pos === 'GK'
+    const toIsGk = toPlayerId === undefined ? fromIsGk : byId.get(toPlayerId)?.pos === 'GK'
+    const allows = (slot: string, isGk: boolean) => slot.startsWith('b') || (slot === 'gk' ? isGk : !isGk)
+    if (!allows(id, fromIsGk) || (toPlayerId !== undefined && !allows(prev, toIsGk))) {
       activeSlot.value = null
       return
     }
-    if (toIdx === undefined) delete game.value.assigned[prev]
-    else game.value.assigned[prev] = toIdx
-    game.value.assigned[id] = fromIdx
+    if (toPlayerId === undefined) delete game.value.assigned[prev]
+    else game.value.assigned[prev] = toPlayerId
+    game.value.assigned[id] = fromPlayerId
     activeSlot.value = null
     return
   }
   activeSlot.value = id
 }
 
-const usedPlayerIndexes = computed(() => new Set(Object.values(game.value.assigned)))
+const usedPlayerIds = computed(() => new Set(Object.values(game.value.assigned)))
 
 function advanceAfter(slotId: string) {
-  if (slotId.startsWith('o')) {
-    const n = outfieldSlots.value.length
-    const next = Array.from({ length: n }, (_, i) => `o${i}`).find(id => game.value.assigned[id] === undefined)
-    activeSlot.value = next ?? null // 필드 10명 다 차면 GK로 자동 이동 안 함
-  } else if (slotId.startsWith('b')) {
-    const next = benchIds.find(id => game.value.assigned[id] === undefined)
-    activeSlot.value = next ?? null
-  } else {
-    activeSlot.value = null
+  const order = lineupAssignmentOrder.value
+  const currentIndex = order.indexOf(slotId)
+  if (currentIndex < 0) {
+    activeSlot.value = firstEmptyLineupSlot()
+    return
   }
+  activeSlot.value = order.slice(currentIndex + 1).find(id => game.value.assigned[id] === undefined) ?? null
 }
 
-function assignToSlot(slotId: string, index: number) {
-  const player = players.value[index]
+function assignToSlot(slotId: string, playerId: string) {
+  if (!matchInfoEditable.value) return
+  const player = players.value.find(item => item.playerId === playerId)
   if (!player) return
 
   // 포지션이 맞지 않는 배정은 DID 입력 단계에서 되돌릴 수 없으므로
   // 여기서 차단한다. GK 슬롯에는 GK만, 필드/벤치에는 GK 외 선수만 둔다.
-  const isGk = player[2] === 'GK'
+  const isGk = player.pos === 'GK'
   if (slotId === 'gk' && !isGk) return
-  if (slotId !== 'gk' && isGk) return
+  if (slotId.startsWith('o') && isGk) return
 
   // 이미 다른 슬롯에 배정된 선수는 중복 배정하지 않는다. 현재 슬롯에
   // 같은 선수가 있는 경우에는 그대로 두어 탭 입력이 무해하게 동작한다.
   const current = game.value.assigned[slotId]
-  if (current === index) {
+  if (current === playerId) {
     advanceAfter(slotId)
     return
   }
-  if (usedPlayerIndexes.value.has(index)) return
-  game.value.assigned[slotId] = index
+  if (usedPlayerIds.value.has(playerId)) return
+  game.value.assigned[slotId] = playerId
   advanceAfter(slotId)
 }
 
-function pickPlayer(index: number) {
-  if (!activeSlot.value) return
-  assignToSlot(activeSlot.value, index)
+function pickPlayer(playerId: string) {
+  if (!matchInfoEditable.value || !activeSlot.value) return
+  assignToSlot(activeSlot.value, playerId)
 }
 
 // ---- 드래그 앤 드롭으로 선수 배정 ----
 // (Player List 패널에서 슬롯으로 끌어다 놓는 기존 기능. 마우스 기준이라 태블릿에서도
 // 되는지는 별개 — 여기서는 손대지 않는다.)
-const dragIndex = ref<number | null>(null)
-function onDragStart(index: number) {
-  dragIndex.value = index
+const dragPlayerId = ref<string | null>(null)
+function onDragStart(playerId: string) {
+  if (!matchInfoEditable.value) return
+  dragPlayerId.value = playerId
 }
+
+function recordFormationChange() {
+  if (game.value.halfStatus !== 'H1' && game.value.halfStatus !== 'H2') return
+  if (!game.value.matchSnapshot) return
+  if (formationSaveTimer) clearTimeout(formationSaveTimer)
+  formationSaveTimer = setTimeout(() => {
+    const half = game.value.halfStatus
+    if (half !== 'H1' && half !== 'H2') return
+    game.value.formationChanges.push({
+      half,
+      seconds: game.value.seconds,
+      formationKey: game.value.formationKey,
+      assigned: { ...game.value.assigned },
+    })
+    void saveDraft(game.value)
+  }, 300)
+}
+
+watch([() => game.value.formationKey, () => game.value.assigned], recordFormationChange, { deep: true })
 function onDrop(slotId: string) {
-  if (dragIndex.value === null) return
+  if (!matchInfoEditable.value || dragPlayerId.value === null) return
   if (slotId !== 'gk' && !slotId.startsWith('b') && !game.value.formationKey) return
-  assignToSlot(slotId, dragIndex.value)
-  dragIndex.value = null
+  assignToSlot(slotId, dragPlayerId.value)
+  dragPlayerId.value = null
 }
 
 const filledCount = computed(() => Object.keys(game.value.assigned).length)
 const totalSlots = computed(() => outfieldSlots.value.length + 1 + BENCH_COUNT)
-// 후보까지 전부(18/18) 채워야 전반전 시작 가능
-const canStart = computed(() => !!game.value.formationKey && !!game.value.side && filledCount.value >= totalSlots.value)
+const starterCount = computed(() => outfieldSlots.value.filter((_, index) => game.value.assigned[`o${index}`]).length + (game.value.assigned.gk ? 1 : 0))
+// 후보는 선택 사항이다. 포메이션의 필드 10명과 GK만 확정되면 시작할 수 있다.
+const canStart = computed(() => !!game.value.formationKey && !!game.value.side && starterCount.value === outfieldSlots.value.length + 1)
+
+function removeFromSlot(slotId: string) {
+  if (!matchInfoEditable.value || game.value.assigned[slotId] === undefined) return
+  delete game.value.assigned[slotId]
+  activeSlot.value = slotId
+}
 
 // DidInput 으로 넘어갈 때 공통으로 실어보내는 쿼리.
 // date/league/round/stadium/time 은 TeamSelection 표시에만 쓰지만, DidInput 은 이 값을
@@ -258,7 +411,7 @@ const canStart = computed(() => !!game.value.formationKey && !!game.value.side &
 // editReturnStatus: 수정 화면에서 "대기방으로 나가기"를 눌렀을 때 되돌아갈 halfStatus.
 // 이미 끝난 half 를 고치러 온 거면 'H1_done'/'H2_done' 으로, 정지 중이던 half 를
 // 고치러 온 거면 'H1'/'H2' 로 넘긴다 — 그래야 나갈 때 원래 있던 화면으로 정확히 복귀한다.
-function didInputQuery(resumeHalf?: '전반' | '후반', edit?: boolean, editReturnStatus?: HalfStatus) {
+function didInputQuery(resumeHalf?: '전반' | '후반', edit?: boolean, editReturnStatus?: HalfStatus, finalCorrection = false) {
   return {
     matchId: matchId.value,
     date: match.value.date,
@@ -276,14 +429,16 @@ function didInputQuery(resumeHalf?: '전반' | '후반', edit?: boolean, editRet
     ...(resumeHalf ? { resumeHalf } : {}),
     ...(edit ? { edit: '1' } : {}),
     ...(editReturnStatus ? { editReturn: editReturnStatus } : {}),
+    ...(finalCorrection ? { finalCorrection: '1' } : {}),
   }
 }
 
 function startFirstHalf() {
   if (!canStart.value) return
-  if (!confirm('전반전을 시작하시겠습니까?\n시작 후에는 라인업을 수정할 수 없습니다.')) return
+  if (!confirm('전반전을 시작하시겠습니까?')) return
   game.value.halfStatus = 'H1'
   game.value.seconds = 0 // 새 half 는 0초부터
+  game.value.clockStartedAt = Date.now()
   navigateTo({ path: '/DidInput', query: didInputQuery() })
 }
 
@@ -298,11 +453,29 @@ const pausedClock = computed(() => {
 function reenterHalf() {
   navigateTo({ path: '/DidInput', query: didInputQuery(pausedHalf.value) })
 }
-// 정지된 채로 나온 상태에서도 "수정"이 가능해야 한다. halfStatus 는 이미 H1/H2 로
-// 올바르게 남아있으므로 건드리지 않고, edit=1 만 붙여 시간이 멈춘 채로 들어간다.
-// editReturn 에도 지금 상태(H1/H2)를 그대로 넘겨서, 나갈 때 같은 "정지" 화면으로 돌아오게 한다.
-function editPausedHalf() {
-  navigateTo({ path: '/DidInput', query: didInputQuery(pausedHalf.value, true, game.value.halfStatus) })
+// 진행 중 대기방에서는 경기 정보가 기본 잠금 상태다.
+// 이 버튼을 눌렀을 때만 라인업/포메이션/진영을 바꿀 수 있고, 변경 완료 시 Draft를 다시 저장한다.
+async function toggleMatchInfoEdit() {
+  lifecycleError.value = ''
+  if (!matchInfoEditMode.value) {
+    matchInfoEditMode.value = true
+    subOpen.value = false
+    menuOpen.value = false
+    activeSlot.value = firstEmptyLineupSlot()
+    return
+  }
+
+  lifecycleBusy.value = true
+  try {
+    if (!await saveDraft(game.value)) throw new Error('경기 정보 변경 내용을 Firestore Draft에 저장하지 못했습니다.')
+    matchInfoEditMode.value = false
+    activeSlot.value = null
+    menuOpen.value = false
+  } catch (error) {
+    lifecycleError.value = error instanceof Error ? error.message : '경기 정보 변경 저장에 실패했습니다.'
+  } finally {
+    lifecycleBusy.value = false
+  }
 }
 
 // 전반 종료 후 대기 화면(이 화면)에서 고르는 두 가지 선택.
@@ -319,18 +492,83 @@ function editHalf() {
   game.value.halfStatus = prevStatus === 'H2_done' ? 'H2' : 'H1'
   navigateTo({ path: '/DidInput', query: didInputQuery(game.value.halfStatus === 'H2' ? '후반' : '전반', true, prevStatus) })
 }
-function startSecondHalf() {
+async function startSecondHalf() {
   if (!confirm('후반전을 시작하시겠습니까?')) return
+  lifecycleBusy.value = true
+  lifecycleError.value = ''
+  try {
+    // Advanced only: H1 becomes raw at the instant H2 starts.
+    if (game.value.recorderLevel === 'advanced') await promoteH1(game.value)
+    else if (!await saveDraft(game.value)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 저장되었습니다.')
+  } catch (error) {
+    lifecycleError.value = error instanceof Error ? error.message : '전반 Draft 처리에 실패했습니다.'
+    return
+  } finally {
+    lifecycleBusy.value = false
+  }
   game.value.halfStatus = 'H2'
-  game.value.seconds = 0 // 새 half 는 0초부터
+  game.value.seconds = 0
+  game.value.clockStartedAt = Date.now()
   navigateTo({ path: '/DidInput', query: didInputQuery('후반') })
 }
-function finishMatch() {
+
+onMounted(async () => {
+  let loaded: { squads: { home: MatchSquadPlayer[]; away: MatchSquadPlayer[] }; snapshot: MatchSnapshot } | undefined
+  try {
+    loaded = await loadSquads()
+  } catch (error) {
+    lifecycleError.value = error instanceof Error ? error.message : '선수 명단을 불러오지 못했습니다.'
+  }
+  const recovered = await recoverDraft(game.value)
+  if (loaded) applyCurrentMatchSquads(loaded.squads, loaded.snapshot)
+  // 현재 팀에 저장된 세션이 없는 신규 입력이라면, 이미 RAW가 있는 상대 팀의
+  // 진영을 기준으로 자동 반대 진영을 지정한다. 저장된 세션의 값은 절대 덮지 않는다.
+  if (!recovered && game.value.halfStatus === 'ready') applyOpponentFieldSideDefault(game.value.team)
+  if (game.value.halfStatus === 'ready' && game.value.formationKey && !activeSlot.value) {
+    activeSlot.value = firstEmptyLineupSlot()
+  }
+  lobbyClockTimer = setInterval(() => {
+    if ((game.value.halfStatus === 'H1' || game.value.halfStatus === 'H2') && game.value.clockStartedAt) {
+      game.value.seconds = Math.max(game.value.seconds, Math.floor((Date.now() - game.value.clockStartedAt) / 1000))
+    }
+  }, 250)
+})
+
+onUnmounted(() => {
+  if (formationSaveTimer) clearTimeout(formationSaveTimer)
+  if (lobbyClockTimer) clearInterval(lobbyClockTimer)
+})
+
+async function finishMatch() {
   if (!confirm('경기를 종료하시겠습니까?')) return
-  // TODO: 여기서 파이썬 평점 서비스(jpd-rating) 호출 — 전체 확정 집계 + 평점 + JaionX 전송.
-  // 백엔드 연동 전까지는 상태 전환만 한다.
+  lifecycleBusy.value = true
+  lifecycleError.value = ''
   game.value.halfStatus = 'final'
-  navigateTo('/schedule')
+  game.value.clockStartedAt = null
+  try {
+    if (game.value.recorderLevel === 'advanced') await finalizeAdvanced(game.value)
+    else if (!await saveDraft(game.value)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 저장되었습니다.')
+  } catch (error) {
+    game.value.halfStatus = 'H2_done'
+    lifecycleError.value = error instanceof Error ? error.message : '최종 데이터 처리에 실패했습니다.'
+    return
+  } finally {
+    lifecycleBusy.value = false
+  }
+}
+
+async function editFinal() {
+  lifecycleBusy.value = true
+  lifecycleError.value = ''
+  try {
+    if (game.value.recorderLevel === 'advanced') await restoreFinalRaw(game.value)
+    else game.value.halfStatus = 'H2_done'
+    navigateTo({ path: '/DidInput', query: didInputQuery('후반', true, 'H2_done', true) })
+  } catch (error) {
+    lifecycleError.value = error instanceof Error ? error.message : '최종 RAW를 수정용 Draft로 복원하지 못했습니다.'
+  } finally {
+    lifecycleBusy.value = false
+  }
 }
 
 // basic 등급 전용: 전반/후반 갱신. 누르면 확인 후 그 half 의 수정 버튼과 함께 잠긴다.
@@ -454,7 +692,7 @@ function openGrass() {
 // PPT 슬라이드 37: 좌측 = 교체 아웃 선수, 우측 = 교체 투입 선수, 선택 후 저장.
 // Player List 자리에서 화면을 전환한다.
 const subOpen = ref(false)
-const cardForPlayer = (idx: number) => game.value.cards.filter(c => c.player === idx)
+const cardForPlayer = (playerId: string) => game.value.cards.filter(c => c.player === playerId)
 const subOut = ref<string | null>(null) // 빠질 선수의 슬롯 id (선발)
 const subIn = ref<string | null>(null) //  들어올 선수의 슬롯 id (후보)
 const editingSubIndex = ref<number | null>(null)
@@ -484,7 +722,7 @@ const benchSlots = computed(() =>
 
 // 교체는 고르는 즉시 반영해서 왼쪽 포메이션에 바로 보이게 한다.
 // 취소를 누르면 열었을 때 상태로 되돌리기 위해 스냅샷을 떠둔다.
-let subSnapshot: Record<string, number> | null = null
+let subSnapshot: Record<string, string> | null = null
 const subDragId = ref<string | null>(null)
 
 const isBenchSlot = (id: string) => id.startsWith('b')
@@ -605,8 +843,8 @@ function cancelSub() {
   closeSub()
 }
 function playerAt(id: string) {
-  const idx = game.value.assigned[id]
-  return idx === undefined ? null : players.value[idx]
+  const playerId = game.value.assigned[id]
+  return playerId === undefined ? null : players.value.find(player => player.playerId === playerId) ?? null
 }
 
 // ---- 교체 이력 표시 — DidInput.vue 의 교체 패널과 같은 형식으로 보여준다 ----
@@ -615,9 +853,9 @@ const subHalfLabel: Record<string, string> = { H1: '전반', H2: '후반', H3: '
 function fmtTime(sec: number) {
   return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
 }
-function playerLabel(idx: number) {
-  const p = players.value[idx]
-  return p ? `${p[0]} ${p[1]}` : '-'
+function playerLabel(playerId: string) {
+  const player = players.value.find(item => item.playerId === playerId)
+  return player ? `${player.no} ${player.name}` : '-'
 }
 /** 잘못 저장된 교체 되돌리기 — 자리도 원래대로 돌려놓는다(DidInput.vue 의 undoSub 와 동일 로직) */
 function undoSub(index: number) {
@@ -635,14 +873,15 @@ function undoSub(index: number) {
 
 <template>
   <div class="page"><div class="bg" />
+    <button type="button" class="topBack" @click="navigateTo('/schedule')">← 경기 선택</button>
     <div class="frame">
       <aside class="sidebar">
         <div class="matchDate">{{ match.date.replaceAll('-', '.') }}</div>
         <div class="teamPick">입력할 팀 선택</div>
         <div class="teams">
-          <button class="club" :class="{ active: game.team === 'home' }" @click="pickTeam('home')"><div class="crest homeCrest">V</div><span>{{ match.home }}</span></button>
+          <button class="club" :class="{ active: game.team === 'home' }" :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('home')"><div class="crest homeCrest">V</div><span>{{ match.home }}</span></button>
           <span class="versus">VS</span>
-          <button class="club" :class="{ active: game.team === 'away' }" @click="pickTeam('away')"><div class="crest awayCrest">RM</div><span>{{ match.away }}</span></button>
+          <button class="club" :class="{ active: game.team === 'away' }" :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('away')"><div class="crest awayCrest">RM</div><span>{{ match.away }}</span></button>
         </div>
         <div class="score">{{ game.homeScore }} : {{ game.awayScore }}</div><div class="status">{{ statusLabel }}</div>
         <div class="matchMeta">{{ match.time }} | {{ match.league }} | {{ match.round }}</div><div class="stadium">{{ match.stadium }}</div>
@@ -678,7 +917,7 @@ function undoSub(index: number) {
             <span v-else class="errDetailEmpty">선수 미입력 없음</span>
           </div>
         </div>
-        <button class="testBtn" @click="fillTestData">TEST</button>
+        <button class="testBtn" :disabled="!matchInfoEditable" @click="fillTestData">TEST</button>
         <!-- 개발용 등급 토글. 실제로는 recorders/{uid}.level 을 읽어와야 하지만
              그 연동 전까지 여기서 basic/advanced 화면을 바로 바꿔가며 확인한다. -->
         <button class="levelToggle" :class="{ basic: game.recorderLevel === 'basic' }" @click="toggleRecorderLevel">
@@ -690,7 +929,7 @@ function undoSub(index: number) {
         <div class="workspace">
         <div class="topRow">
           <section class="formationPanel">
-            <div class="selectBar" :class="{ open: menuOpen }" @click="menuOpen = !menuOpen">
+            <div class="selectBar" :class="{ open: menuOpen, locked: !matchInfoEditable }" @click="matchInfoEditable && (menuOpen = !menuOpen)">
               <span>{{ game.formationKey ? `${formations[game.formationKey].label} 포메이션` : '포메이션을 선택하세요' }}</span><span>⌄</span>
               <div v-if="menuOpen" class="menu" @click.stop>
                 <div v-for="(f, key) in formations" :key="key" class="menuItem" @click="pickFormation(key)">{{ f.label }}</div>
@@ -704,19 +943,23 @@ function undoSub(index: number) {
               <template v-if="game.formationKey">
                 <button
                   v-for="(s, i) in outfieldSlots" :key="`o${i}`"
-                  class="slot" :class="[{ active: activeSlot === `o${i}`, filled: game.assigned[`o${i}`] !== undefined }, playerAt(`o${i}`)?.[2]?.toLowerCase()]"
+                  class="slot" :class="[{ active: activeSlot === `o${i}`, filled: game.assigned[`o${i}`] !== undefined }, playerAt(`o${i}`)?.pos?.toLowerCase()]"
                   :style="{ left: s.x + '%', top: s.y + '%' }"
+                  :disabled="!matchInfoEditable"
                   @click="clickSlot(`o${i}`)"
+                  @dblclick.prevent="removeFromSlot(`o${i}`)"
                   @dragover.prevent
                   @drop="onDrop(`o${i}`)"
-                >{{ playerAt(`o${i}`)?.[0] ?? '' }}</button>
+                >{{ playerAt(`o${i}`)?.no ?? '' }}</button>
                 <button
                   class="slot gk" :class="{ active: activeSlot === 'gk', filled: game.assigned['gk'] !== undefined }"
                   :style="{ left: gkSlot.x + '%', top: gkSlot.y + '%' }"
+                  :disabled="!matchInfoEditable"
                   @click="clickSlot('gk')"
+                  @dblclick.prevent="removeFromSlot('gk')"
                   @dragover.prevent
                   @drop="onDrop('gk')"
-                >{{ playerAt('gk')?.[0] ?? 'GK' }}</button>
+                >{{ playerAt('gk')?.no ?? 'GK' }}</button>
               </template>
               <div v-else class="shirt"/>
               <b class="count">{{ filledCount }} / {{ game.formationKey ? totalSlots : 16 }}</b>
@@ -724,11 +967,13 @@ function undoSub(index: number) {
             <div v-if="game.formationKey" class="bench">
               <button
                 v-for="id in benchIds" :key="id" class="slot benchSlot"
-                :class="[{ active: activeSlot === id, filled: game.assigned[id] !== undefined }, playerAt(id)?.[2]?.toLowerCase()]"
+                :class="[{ active: activeSlot === id, filled: game.assigned[id] !== undefined }, playerAt(id)?.pos?.toLowerCase()]"
+                :disabled="!matchInfoEditable"
                 @click="clickSlot(id)"
+                @dblclick.prevent="removeFromSlot(id)"
                 @dragover.prevent
                 @drop="onDrop(id)"
-              >{{ playerAt(id)?.[0] ?? '' }}</button>
+              >{{ playerAt(id)?.no ?? '' }}</button>
             </div>
           </section>
           <section class="playerPanel">
@@ -740,11 +985,12 @@ function undoSub(index: number) {
               </div>
               <div class="playerGrid">
                 <button
-                  v-for="{ p, i } in sortedPlayers" :key="i" class="player" :class="[p[2]?.toLowerCase(), { used: usedPlayerIndexes.has(i), pickable: !usedPlayerIndexes.has(i) }]"
-                  :draggable="!usedPlayerIndexes.has(i)"
-                  @click="pickPlayer(i)"
-                  @dragstart="onDragStart(i)"
-                ><strong>{{ p[0] }}</strong><span>{{ p[1] }}</span></button>
+                  v-for="{ p, id } in sortedPlayers" :key="id" class="player" :class="[p.pos?.toLowerCase(), { used: usedPlayerIds.has(id), pickable: !usedPlayerIds.has(id) }]"
+                  :draggable="matchInfoEditable && !usedPlayerIds.has(id)"
+                  :disabled="!matchInfoEditable || usedPlayerIds.has(id)"
+                  @click="pickPlayer(id)"
+                  @dragstart="onDragStart(id)"
+                ><strong>{{ p.no }}</strong><span>{{ p.name }}</span></button>
                 <div v-for="i in 13" :key="`e${i}`" class="player empty"/>
               </div>
               <div class="legend"><span class="gk">GK</span><span class="fw">FW</span><span class="mf">MF</span><span class="df">DF</span></div>
@@ -772,14 +1018,14 @@ function undoSub(index: number) {
                   <div class="subList" @dragover.prevent>
                     <button
                       v-for="s in starterSlots" :key="s.id"
-                      class="subItem" :class="[s.p?.[2]?.toLowerCase(), { on: subOut === s.id, dragging: subDragId === s.id }]"
+                      class="subItem" :class="[s.p?.pos?.toLowerCase(), { on: subOut === s.id, dragging: subDragId === s.id }]"
                       draggable="true"
                       @click="pickOut(s.id)"
                       @dragstart="onSubDragStart(s.id)"
                       @dragend="subDragId = null"
                       @dragover.prevent
                       @drop="onSubDrop(s.id)"
-                    ><strong>{{ s.p?.[0] }} <i v-if="cardForPlayer(game.assigned[s.id]!).some(c => c.card === 'R')">🟥</i><i v-else-if="cardForPlayer(game.assigned[s.id]!).length">🟨</i></strong><span>{{ s.p?.[1] }}</span></button>
+                    ><strong>{{ s.p?.no }} <i v-if="cardForPlayer(game.assigned[s.id]!).some(c => c.card === 'R')">🟥</i><i v-else-if="cardForPlayer(game.assigned[s.id]!).length">🟨</i></strong><span>{{ s.p?.name }}</span></button>
                   </div>
                 </div>
                 <div class="subCol">
@@ -787,14 +1033,14 @@ function undoSub(index: number) {
                   <div class="subList" @dragover.prevent>
                     <button
                       v-for="s in benchSlots" :key="s.id"
-                      class="subItem" :class="[s.p?.[2]?.toLowerCase(), { on: subIn === s.id, dragging: subDragId === s.id }]"
+                      class="subItem" :class="[s.p?.pos?.toLowerCase(), { on: subIn === s.id, dragging: subDragId === s.id }]"
                       draggable="true"
                       @click="pickIn(s.id)"
                       @dragstart="onSubDragStart(s.id)"
                       @dragend="subDragId = null"
                       @dragover.prevent
                       @drop="onSubDrop(s.id)"
-                    ><strong>{{ s.p?.[0] }}</strong><span>{{ s.p?.[1] }}</span></button>
+                    ><strong>{{ s.p?.no }}</strong><span>{{ s.p?.name }}</span></button>
                     <div v-if="!benchSlots.length" class="subEmpty">후보 선수가 없습니다</div>
                   </div>
                 </div>
@@ -832,8 +1078,8 @@ function undoSub(index: number) {
             <h2>진영선택</h2>
             <div class="miniPitch">
               <div class="miniHalf"/><div class="miniCircle"/><div class="miniPenalty left"/><div class="miniPenalty right"/><div class="miniGoal left"/><div class="miniGoal right"/>
-              <div class="miniBox leftBox" :class="{ active: game.side === 'left' }" @click="game.side = 'left'"/>
-              <div class="miniBox rightBox" :class="{ active: game.side === 'right' }" @click="game.side = 'right'"/>
+              <div class="miniBox leftBox" :class="{ active: game.side === 'left', locked: !matchInfoEditable }" @click="matchInfoEditable && (game.side = 'left')"/>
+              <div class="miniBox rightBox" :class="{ active: game.side === 'right', locked: !matchInfoEditable }" @click="matchInfoEditable && (game.side = 'right')"/>
             </div>
           </section>
           <section class="toolPanel">
@@ -885,40 +1131,34 @@ function undoSub(index: number) {
             </template>
             <template v-else-if="game.halfStatus === 'H1_done'">
               <p>전반 기록을 확인하세요<br><b>기록을 수정하거나 후반전을 시작할 수 있습니다.</b></p>
-              <p v-if="game.recorderLevel === 'basic' && game.h1Locked" class="lockNotice">🔒 갱신됨 — 관리자만 수정 잠금을 풀 수 있습니다. (데이터 관리에서 해제)</p>
-              <div v-if="game.recorderLevel === 'basic'" class="halfActions halfActions3">
-                <button class="editBtn" :disabled="game.h1Locked" @click="editHalf">수정</button>
-                <button class="refreshBtn" :disabled="game.h1Locked" @click="refreshH1">전반전 갱신</button>
-                <button class="startBtn" @click="startSecondHalf">후반전 시작</button>
-              </div>
-              <div v-else class="halfActions">
-                <button class="editBtn" @click="editHalf">수정</button>
-                <button class="startBtn" @click="startSecondHalf">후반전 시작</button>
+              <p v-if="game.recorderLevel === 'basic'" class="draftNotice">BASIC 기록은 관리자 승인 전까지 Draft에만 저장됩니다.</p>
+              <div class="halfActions">
+                <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
+                <button class="startBtn" :disabled="lifecycleBusy" @click="startSecondHalf">후반전 시작</button>
               </div>
             </template>
             <template v-else-if="game.halfStatus === 'H2_done'">
               <p>후반 기록을 확인하세요<br><b>기록을 수정하거나 경기를 종료할 수 있습니다.</b></p>
-              <p v-if="game.recorderLevel === 'basic' && game.h2Locked" class="lockNotice">🔒 갱신됨 — 관리자만 수정 잠금을 풀 수 있습니다. (데이터 관리에서 해제)</p>
-              <div v-if="game.recorderLevel === 'basic'" class="halfActions halfActions3">
-                <button class="editBtn" :disabled="game.h2Locked" @click="editHalf">수정</button>
-                <button class="refreshBtn" :disabled="game.h2Locked" @click="refreshH2">후반전 갱신</button>
-                <button class="startBtn" @click="finishMatch">최종 데이터 갱신 &amp; 경기 종료</button>
-              </div>
-              <div v-else class="halfActions">
-                <button class="editBtn" @click="editHalf">수정</button>
-                <button class="startBtn" @click="finishMatch">최종 데이터 갱신 &amp; 경기 종료</button>
+              <p v-if="game.recorderLevel === 'basic'" class="draftNotice">종료하면 관리자 승인 대기 Draft로 제출됩니다.</p>
+              <div class="halfActions">
+                <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
+                <button class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">{{ game.recorderLevel === 'basic' ? '승인 대기 제출 & 경기 종료' : '최종 데이터 갱신 & 경기 종료' }}</button>
               </div>
             </template>
             <template v-else-if="isPaused">
               <p>{{ pausedHalf }} 기록이 대기 중입니다<br><b>{{ pausedClock }} 시점부터 이어서 입력합니다.</b></p>
+              <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
               <div class="halfActions">
-                <button class="editBtn" @click="editPausedHalf">수정</button>
-                <button class="startBtn" @click="reenterHalf">{{ pausedHalf }}전 입장</button>
+                <button class="editBtn" :disabled="lifecycleBusy" @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? '변경 완료' : '경기 정보 변경' }}</button>
+                <button class="startBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="reenterHalf">{{ pausedHalf }}전 입장</button>
               </div>
             </template>
             <template v-else>
-              <p>{{ statusLabel }}</p>
+              <p>{{ game.recorderLevel === 'basic' ? '관리자 승인 대기' : statusLabel }}</p>
+              <p v-if="game.recorderLevel === 'basic'" class="draftNotice">관리자 페이지에서 RAW 승격 전까지 Draft만 유지됩니다.</p>
+              <button class="editBtn" :disabled="lifecycleBusy" @click="editFinal">수정</button>
             </template>
+            <p v-if="lifecycleError" class="lifecycleError">{{ lifecycleError }}</p>
             <small v-if="matchId">matchId: {{ matchId }}</small>
           </section>
         </div>
@@ -932,6 +1172,8 @@ function undoSub(index: number) {
 *{box-sizing:border-box}button{font:inherit}
 .page{width:1280px;height:800px;padding:0;display:grid;place-items:center;overflow:hidden;position:relative;background:#0b0f17;color:#fff;font-family:Arial,"Noto Sans KR",sans-serif}
 .bg{position:absolute;inset:0;background:radial-gradient(1200px 500px at 50% 25%,rgba(255,255,255,.08),transparent 60%),radial-gradient(900px 400px at 20% 70%,rgba(111,159,186,.09),transparent 55%),radial-gradient(900px 400px at 80% 70%,rgba(241,180,0,.08),transparent 55%),linear-gradient(180deg,rgba(0,0,0,.55),rgba(0,0,0,.78))}
+.topBack{position:absolute;z-index:2;top:14px;right:16px;height:30px;padding:0 10px;border:1px solid rgba(255,255,255,.22);border-radius:4px;background:rgba(10,14,22,.88);color:rgba(255,255,255,.86);font-size:12px;font-weight:800;cursor:pointer}
+.topBack:hover{border-color:#f0b429;color:#f0b429}
 
 .frame{position:relative;width:1280px;height:800px;border-radius:0;display:grid;grid-template-columns:266px 1014px;overflow:hidden;border:1px solid rgba(255,255,255,.08);background:rgba(10,14,22,.78);backdrop-filter:blur(8px);box-shadow:0 18px 60px rgba(0,0,0,.55)}
 
@@ -1003,10 +1245,15 @@ function undoSub(index: number) {
 .cornerArc.left{left:-9px}
 .cornerArc.right{right:-9px}
 .shirt{position:absolute;left:50%;bottom:47px;width:46px;height:37px;transform:translateX(-50%);background:#e7ecf5;clip-path:polygon(22% 0,38% 10%,62% 10%,78% 0,100% 25%,82% 42%,75% 34%,75% 100%,25% 100%,25% 34%,18% 42%,0 25%)}
-.bench{min-height:0;display:flex;align-items:center;justify-content:center;gap:10px;border-radius:6px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.02)}
-.slot.benchSlot{position:static;width:40px;height:40px;transform:none;font-size:15px}
+.bench{min-height:0;display:flex;align-items:center;justify-content:flex-start;gap:8px;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;-ms-overflow-style:none;padding:0 8px;border-radius:6px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.02)}
+.bench::-webkit-scrollbar{display:none}
+.slot.benchSlot{position:static;flex:0 0 40px;width:40px;height:40px;transform:none;font-size:15px}
 .count{position:absolute;right:12px;bottom:8px;color:rgba(241,180,0,.95);font-size:13px;font-weight:800}
 .slot{position:absolute;transform:translate(-50%,-50%);width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.14);border:2px solid rgba(255,255,255,.25);color:#fff;font-size:16px;font-weight:800;cursor:pointer;display:grid;place-items:center;padding:0}
+.selectBar.locked{opacity:.58;cursor:not-allowed}
+.slot:disabled{cursor:not-allowed;opacity:.78}
+.player:disabled{cursor:not-allowed}
+.miniBox.locked{cursor:not-allowed;opacity:.45}
 .slot:hover{background:rgba(255,255,255,.22)}
 .slot.filled{background:rgba(111,159,186,.22);border-color:#5fb8c9}
 .slot.active{outline:2px solid #f0b429;outline-offset:2px}
@@ -1146,6 +1393,8 @@ function undoSub(index: number) {
 .refreshBtn:hover:not(:disabled){background:rgba(240,180,41,.18)}
 .refreshBtn:disabled{opacity:.35;cursor:not-allowed;color:rgba(255,255,255,.35);border-color:rgba(255,255,255,.16);background:transparent}
 .lockNotice{margin:0 0 8px;font-size:11px;color:#f0b429;text-align:center}
+.draftNotice{margin:0 0 8px;font-size:11px;color:#f0b429;text-align:center}
+.lifecycleError{margin:8px 0 0;font-size:11px;color:#ff8b8b;text-align:center;line-height:1.4}
 .levelToggle{margin-top:6px;height:26px;border-radius:4px;border:1px dashed rgba(240,180,41,.5);background:rgba(240,180,41,.08);color:#f0b429;cursor:pointer;font-size:10px;font-weight:800;letter-spacing:.03em}
 .levelToggle.basic{background:rgba(99,192,162,.12);border-color:rgba(99,192,162,.5);color:#63c0a2}
 

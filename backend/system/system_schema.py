@@ -114,14 +114,16 @@ class RecordingDoc(SchemaModel):
     h1Locked: bool
     h2Locked: bool
     maxSeq: int
-    # Legacy derived fields may exist on imported documents. New raw recordings
-    # do not write them; the derived result belongs to matchKpis instead.
+    # KPI and rating are derived from this recording's raw records.
     kpi: RecordingKpi | None = None
     kpiComputedAt: datetime | None = None
     kpiVersion: int = 0
+    kpiSourceFingerprint: str | None = None
     teamRating: TeamRatingSnapshot | None = None
     ratingBasedOn: int | None = None
-    legacyGiId: int | None = None
+    # Legacy imports use either the old numeric game ID or a Firestore-style ID.
+    legacyGiId: int | str | None = None
+    legacyRecorderId: str | None = None
     syncedAt: datetime | None = None
     createdAt: datetime
     updatedAt: datetime
@@ -329,61 +331,27 @@ class RecorderProfileDoc(SchemaModel):
 
 class PlayerKpi(SchemaModel):
     playerId: str
-    TAP: int
-    DAP: int
-    UTP: int
-    DTP: int
-    TTP: int
-    SHOT: int
-    AST: int
-    GOAL: int
-    DTB: int
-    DTM: int
-    DTA: int
-    DTS: int
-    GTB: int
-    GTM: int
-    ASR: int
-    SSR: int
+    TAP: int | float
+    DAP: int | float
+    UTP: int | float
+    DTP: int | float
+    TTP: int | float
+    SHOT: int | float
+    AST: int | float
+    GOAL: int | float
+    DTB: int | float
+    DTM: int | float
+    DTA: int | float
+    DTS: int | float
+    GTB: int | float
+    GTM: int | float
+    ASR: int | float
+    SSR: int | float
 
 
 class TeamKpi5Min(SchemaModel):
-    DAP: int
-    DTP: int
-    SHOT: int
-    SSR: int
-    GOAL: int
-
-
-class MatchKpiRating(SchemaModel):
-    teamRating: TeamRatingSnapshot | None = None
-    playerRatings: dict[str, dict[str, float | str | None]] = Field(default_factory=dict)
-    basedOnKpiVersion: int | None = None
-    calculatedAt: datetime | None = None
-
-
-class MatchKpiDoc(SchemaModel):
-    """Derived output only. Source records always remain under matches/{gm_id}."""
-
-    schemaVersion: int = 1
-    gmId: str
-    side: Side
-    leagueId: str
-    seasonId: str
-    matchType: Literal["league", "tournament"]
-    round: int | None = None
-    stage: str | None = None
-    group: str | None = None
-    leg: int | None = None
-    teamId: str
-    opponentTeamId: str
-    sourceRecordCount: int
-    sourceFingerprint: str
-    kpiVersion: int
-    teamKpi: RecordingKpi
-    teamKpi5min: list[TeamKpi5Min] = Field(min_length=20, max_length=20)
-    playerKpis: dict[str, PlayerKpi]
-    status: Literal["kpi_ready", "rating_pending", "rated", "footballx_pending", "sent", "failed"]
-    rating: MatchKpiRating = Field(default_factory=MatchKpiRating)
-    calculatedAt: datetime
-    updatedAt: datetime
+    DAP: int | float
+    DTP: int | float
+    SHOT: int | float
+    SSR: int | float
+    GOAL: int | float
