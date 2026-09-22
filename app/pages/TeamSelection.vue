@@ -16,7 +16,7 @@ const match = computed(() => ({
   stadium: String(route.query.stadium ?? '') || 'Fubol de Vallecas',
   home: String(route.query.home ?? '') || 'Vallecano', away: String(route.query.away ?? '') || 'Real Madrid',
 }))
-const kpis = ['TAP','DAP','DTP','Shoot','Goal','SSR','BAP','ASR']
+const kpis = ['TAP', 'DAP', 'DTP', 'Shoot', 'Goal', 'SSR', 'BAP', 'ASR']
 const kpiHalf = ref<'all' | 'H1' | 'H2'>('all')
 
 // ---- 공유 상태 ----
@@ -109,27 +109,35 @@ const sortedPlayers = computed(() => {
 
 // ---- 포메이션 ----
 const formations: Record<string, { label: string; slots: { x: number; y: number }[] }> = {
-  '4-4-2': { label: '4-4-2', slots: [
-    { x: 14, y: 72 }, { x: 38, y: 72 }, { x: 62, y: 72 }, { x: 86, y: 72 },
-    { x: 14, y: 46 }, { x: 38, y: 46 }, { x: 62, y: 46 }, { x: 86, y: 46 },
-    { x: 35, y: 18 }, { x: 65, y: 18 },
-  ] },
-  '4-3-3': { label: '4-3-3', slots: [
-    { x: 14, y: 72 }, { x: 38, y: 72 }, { x: 62, y: 72 }, { x: 86, y: 72 },
-    { x: 26, y: 48 }, { x: 50, y: 48 }, { x: 74, y: 48 },
-    { x: 20, y: 16 }, { x: 50, y: 16 }, { x: 80, y: 16 },
-  ] },
-  '3-5-2': { label: '3-5-2', slots: [
-    { x: 26, y: 75 }, { x: 50, y: 75 }, { x: 74, y: 75 },
-    { x: 10, y: 46 }, { x: 30, y: 46 }, { x: 50, y: 46 }, { x: 70, y: 46 }, { x: 90, y: 46 },
-    { x: 35, y: 16 }, { x: 65, y: 16 },
-  ] },
-  '4-2-3-1': { label: '4-2-3-1', slots: [
-    { x: 14, y: 75 }, { x: 38, y: 75 }, { x: 62, y: 75 }, { x: 86, y: 75 },
-    { x: 36, y: 54 }, { x: 64, y: 54 },
-    { x: 18, y: 32 }, { x: 50, y: 32 }, { x: 82, y: 32 },
-    { x: 50, y: 12 },
-  ] },
+  '4-4-2': {
+    label: '4-4-2', slots: [
+      { x: 14, y: 72 }, { x: 38, y: 72 }, { x: 62, y: 72 }, { x: 86, y: 72 },
+      { x: 14, y: 46 }, { x: 38, y: 46 }, { x: 62, y: 46 }, { x: 86, y: 46 },
+      { x: 35, y: 18 }, { x: 65, y: 18 },
+    ]
+  },
+  '4-3-3': {
+    label: '4-3-3', slots: [
+      { x: 14, y: 72 }, { x: 38, y: 72 }, { x: 62, y: 72 }, { x: 86, y: 72 },
+      { x: 26, y: 48 }, { x: 50, y: 48 }, { x: 74, y: 48 },
+      { x: 20, y: 16 }, { x: 50, y: 16 }, { x: 80, y: 16 },
+    ]
+  },
+  '3-5-2': {
+    label: '3-5-2', slots: [
+      { x: 26, y: 75 }, { x: 50, y: 75 }, { x: 74, y: 75 },
+      { x: 10, y: 46 }, { x: 30, y: 46 }, { x: 50, y: 46 }, { x: 70, y: 46 }, { x: 90, y: 46 },
+      { x: 35, y: 16 }, { x: 65, y: 16 },
+    ]
+  },
+  '4-2-3-1': {
+    label: '4-2-3-1', slots: [
+      { x: 14, y: 75 }, { x: 38, y: 75 }, { x: 62, y: 75 }, { x: 86, y: 75 },
+      { x: 36, y: 54 }, { x: 64, y: 54 },
+      { x: 18, y: 32 }, { x: 50, y: 32 }, { x: 82, y: 32 },
+      { x: 50, y: 12 },
+    ]
+  },
 }
 const gkSlot = { x: 50, y: 94 }
 const BENCH_COUNT = 15
@@ -188,7 +196,7 @@ function fillTestData() {
   const pool = [...players.value]
   for (let i = pool.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1))
-    ;[pool[i], pool[j]] = [pool[j], pool[i]]
+      ;[pool[i], pool[j]] = [pool[j], pool[i]]
   }
 
   const gkPool = pool.filter(player => player.pos === 'GK')
@@ -393,8 +401,7 @@ function onDrop(slotId: string) {
   dragPlayerId.value = null
 }
 
-const filledCount = computed(() => Object.keys(game.value.assigned).length)
-const totalSlots = computed(() => outfieldSlots.value.length + 1 + BENCH_COUNT)
+const benchFilledCount = computed(() => benchIds.filter(id => game.value.assigned[id] !== undefined).length)
 const starterCount = computed(() => outfieldSlots.value.filter((_, index) => game.value.assigned[`o${index}`]).length + (game.value.assigned.gk ? 1 : 0))
 // 후보는 선택 사항이다. 포메이션의 필드 10명과 GK만 확정되면 시작할 수 있다.
 const canStart = computed(() => !!game.value.formationKey && !!game.value.side && starterCount.value === outfieldSlots.value.length + 1)
@@ -683,10 +690,23 @@ function toggleErrorDetail(kind: 'time' | 'player') {
 // 레거시 APK 이미지 7종(p000/p1xx/p2xx)과 동일한 조합. 상세는 app/utils/grass.ts.
 // 여기서 고른 값을 DidInput 으로 넘겨 경기장 배경에 그대로 적용한다.
 const grassOpen = ref(false)
+const grassPanelRef = ref<HTMLElement | null>(null)
+const playerPanelRef = ref<HTMLElement | null>(null)
 const grassBg = computed(() => grassBackground(game.value.grassPattern, game.value.grassLines))
 function openGrass() {
   grassOpen.value = !grassOpen.value
 }
+// 잔디 팝업/선수교체 패널 바깥을 누르면 각각 닫는다. 선수교체 토글 버튼도 toolPanel
+// 안에 있어서, 그 버튼을 눌러 직접 여닫을 때는 아래 취소 로직이 끼어들지 않는다.
+function handleOutsideClick(e: PointerEvent) {
+  const target = e.target as Node
+  if (grassOpen.value && grassPanelRef.value && !grassPanelRef.value.contains(target)) grassOpen.value = false
+  if (subOpen.value && playerPanelRef.value && !playerPanelRef.value.contains(target) && !grassPanelRef.value?.contains(target)) {
+    cancelSub()
+  }
+}
+onMounted(() => document.addEventListener('pointerdown', handleOutsideClick))
+onUnmounted(() => document.removeEventListener('pointerdown', handleOutsideClick))
 
 // ---- 선수교체 ----
 // PPT 슬라이드 37: 좌측 = 교체 아웃 선수, 우측 = 교체 투입 선수, 선택 후 저장.
@@ -695,7 +715,6 @@ const subOpen = ref(false)
 const cardForPlayer = (playerId: string) => game.value.cards.filter(c => c.player === playerId)
 const subOut = ref<string | null>(null) // 빠질 선수의 슬롯 id (선발)
 const subIn = ref<string | null>(null) //  들어올 선수의 슬롯 id (후보)
-const editingSubIndex = ref<number | null>(null)
 const subTimeMinute = ref(0)
 const subTimeSecond = ref(0)
 const subTimeTotal = computed(() => subTimeMinute.value * 60 + subTimeSecond.value)
@@ -709,21 +728,30 @@ function bumpSubSecond(delta: number) {
   subTimeMinute.value = minute
 }
 
+const byNo = (a: { p: { no: string } | null }, b: { p: { no: string } | null }) => Number(a.p?.no ?? 0) - Number(b.p?.no ?? 0)
 const starterSlots = computed(() =>
   [...outfieldSlots.value.map((_, i) => `o${i}`), 'gk']
     .filter(id => game.value.assigned[id] !== undefined)
     .map(id => ({ id, p: playerAt(id) }))
+    .sort(byNo)
 )
 const benchSlots = computed(() =>
   benchIds
     .filter(id => game.value.assigned[id] !== undefined)
     .map(id => ({ id, p: playerAt(id) }))
+    .sort(byNo)
 )
 
 // 교체는 고르는 즉시 반영해서 왼쪽 포메이션에 바로 보이게 한다.
 // 취소를 누르면 열었을 때 상태로 되돌리기 위해 스냅샷을 떠둔다.
 let subSnapshot: Record<string, string> | null = null
 const subDragId = ref<string | null>(null)
+/**
+ * 저장 전, 지금 화면에서 진행 중인 교체를 일어난 순서 그대로 쌓아둔다. 스냅샷과의
+ * 차이만 비교하면 같은 자리를 두 번 이상 재교체했을 때 중간 기록이 사라지므로,
+ * swapSlots 에서 교체가 일어날 때마다 바로 한 건씩 추가한다.
+ */
+const pendingSubs = ref<SubRecord[]>([])
 
 const isBenchSlot = (id: string) => id.startsWith('b')
 
@@ -737,7 +765,7 @@ function openSub() {
   subOpen.value = true
   subOut.value = null
   subIn.value = null
-  editingSubIndex.value = null
+  pendingSubs.value = []
   const moment = subMoment()
   subTimeMinute.value = moment ? Math.floor(moment.seconds / 60) : 0
   subTimeSecond.value = moment ? moment.seconds % 60 : 0
@@ -747,16 +775,26 @@ function closeSub() {
   subSnapshot = null
   subOut.value = null
   subIn.value = null
-  editingSubIndex.value = null
   subDragId.value = null
+  pendingSubs.value = []
 }
-/** 선발 ↔ 후보 자리를 맞바꾼다. 즉시 반영되므로 포메이션에 바로 보인다. */
+/**
+ * 선발 ↔ 후보 자리를 맞바꾼다. 즉시 반영되므로 포메이션에 바로 보인다.
+ * 교체 한 건을 그 즉시 pendingSubs 에 쌓는다 — 같은 자리를 다시 교체(재교체)해도
+ * 이전 기록이 사라지지 않고 목록에 별도 항목으로 남는다.
+ */
 function swapSlots(a: string, b: string) {
+  const starterSlot = isBenchSlot(a) ? b : a
+  const benchSlot = isBenchSlot(a) ? a : b
+  const outPlayer = game.value.assigned[starterSlot]!
+  const inPlayer = game.value.assigned[benchSlot]!
   const tmp = game.value.assigned[a]!
   game.value.assigned[a] = game.value.assigned[b]!
   game.value.assigned[b] = tmp
   subOut.value = null
   subIn.value = null
+  const moment = subMoment()
+  if (moment) pendingSubs.value = [...pendingSubs.value, { half: moment.half, seconds: subTimeTotal.value, outPlayer, inPlayer }]
 }
 function pickOut(id: string) {
   subOut.value = id
@@ -780,59 +818,43 @@ function onSubDrop(targetId: string) {
 /**
  * 이 화면에서 교체를 "언제" 한 것으로 볼지.
  * 대기 화면이라 시계가 안 도니까 halfStatus 로 시점을 정한다.
- *  - ready        : 아직 경기 전 → 교체가 아니라 그냥 명단 수정이다. 기록 안 남김(null)
+ *  - ready        : 아직 경기 전 → 보통 후반 막판에 나올 교체이므로 후반 45:00을 기본값으로 미리 채운다.
+ *  - final        : 경기가 끝났으니 교체가 아니다. 기록 안 남김(null)
  *  - H1/H2/H3/H4  : 그 half 를 정지시켜 두고 나온 상태 → 정지된 그 시각
- *  - H1_done      : 하프타임 교체 → 후반 시작(0초)에 들어온 것으로 본다(축구 통례)
+ *  - H1_done      : 하프타임 교체 → 후반으로 들어오되, ready 와 같은 이유로 45:00을 기본값으로 채운다
  *  - H2_done      : 연장 전반 시작(0초)
  */
 function subMoment(): { half: Half; seconds: number } | null {
   const st = game.value.halfStatus
-  if (st === 'ready' || st === 'final') return null
-  if (st === 'H1_done') return { half: 'H2', seconds: 0 }
+  if (st === 'ready') return { half: 'H2', seconds: 45 * 60 }
+  if (st === 'final') return null
+  if (st === 'H1_done') return { half: 'H2', seconds: 45 * 60 }
   if (st === 'H2_done') return { half: 'H3', seconds: 0 }
   if (st === 'H3_done') return { half: 'H4', seconds: 0 }
   if (st === 'H4_done') return null
   return { half: st, seconds: game.value.seconds }
 }
 
-/**
- * 저장: 이미 반영된 상태를 그대로 유지하고 닫는다.
- * 다만 열었을 때 스냅샷과 비교해서 "선발 자리에 벤치 선수가 들어온" 것만 교체로 기록한다 —
- * 선발끼리 자리만 바꾼 건 포지션 변경이지 교체가 아니다.
- */
+/** 저장: 미리보기로 떠 있던 교체를 실제 기록(game.subs)으로 확정하고 닫는다. */
 function saveSub() {
-  const moment = subMoment()
-  if (subSnapshot && moment) {
-    const before = subSnapshot
-    const benchBefore = new Set(benchIds.map(id => before[id]).filter(v => v !== undefined))
-    const newSubs: SubRecord[] = []
-    for (const { id } of starterSlots.value) {
-      const outPlayer = before[id]
-      const inPlayer = game.value.assigned[id]
-      if (outPlayer === undefined || inPlayer === undefined) continue
-      if (outPlayer === inPlayer) continue
-      if (!benchBefore.has(inPlayer)) continue // 벤치에서 올라온 게 아니면 교체가 아니다
-      newSubs.push({ half: moment.half, seconds: subTimeTotal.value, outPlayer, inPlayer })
-    }
-    if (editingSubIndex.value !== null && newSubs[0]) {
-      game.value.subs = game.value.subs.map((s, i) => i === editingSubIndex.value ? newSubs[0]! : s)
-    } else if (newSubs.length) {
-      game.value.subs = [...game.value.subs, ...newSubs].sort(
-        (a, b) => HALF_ORDER[a.half] * 100000 + a.seconds - (HALF_ORDER[b.half] * 100000 + b.seconds)
-      )
-    }
+  if (pendingSubs.value.length) {
+    game.value.subs = [...game.value.subs, ...pendingSubs.value].sort(
+      (a, b) => HALF_ORDER[a.half]! * 100000 + a.seconds - (HALF_ORDER[b.half]! * 100000 + b.seconds)
+    )
   }
   closeSub()
 }
-function editSub(index: number) {
-  const s = game.value.subs[index]
-  if (!s) return
-  openSub()
-  editingSubIndex.value = index
-  const outSlot = Object.entries(game.value.assigned).find(([, idx]) => idx === s.inPlayer)?.[0]
-  const inSlot = Object.entries(game.value.assigned).find(([, idx]) => idx === s.outPlayer)?.[0]
-  subOut.value = outSlot ?? null
-  subIn.value = inSlot ?? null
+/** 아직 저장 전인 교체 미리보기 한 건을 되돌린다 — 배치만 원래대로, game.subs 는 손대지 않는다. */
+function cancelPendingSub(index: number) {
+  const sub = pendingSubs.value[index]
+  if (!sub) return
+  const entries = Object.entries(game.value.assigned)
+  const inSlot = entries.find(([, idx]) => idx === sub.inPlayer)?.[0]
+  const outSlot = entries.find(([, idx]) => idx === sub.outPlayer)?.[0]
+  if (inSlot && outSlot) {
+    game.value.assigned = { ...game.value.assigned, [inSlot]: sub.outPlayer, [outSlot]: sub.inPlayer }
+  }
+  pendingSubs.value = pendingSubs.value.filter((_, i) => i !== index)
 }
 /** 취소: 열었을 때 상태로 되돌린다. */
 function cancelSub() {
@@ -872,19 +894,28 @@ function undoSub(index: number) {
 </script>
 
 <template>
-  <div class="page"><div class="bg" />
+  <div class="page">
+    <div class="bg" />
     <button type="button" class="topBack" @click="navigateTo('/schedule')">← 경기 선택</button>
     <div class="frame">
       <aside class="sidebar">
         <div class="matchDate">{{ match.date.replaceAll('-', '.') }}</div>
         <div class="teamPick">입력할 팀 선택</div>
         <div class="teams">
-          <button class="club" :class="{ active: game.team === 'home' }" :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('home')"><div class="crest homeCrest">V</div><span>{{ match.home }}</span></button>
+          <button class="club" :class="{ active: game.team === 'home' }"
+            :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('home')">
+            <div class="crest homeCrest">V</div><span>{{ match.home }}</span>
+          </button>
           <span class="versus">VS</span>
-          <button class="club" :class="{ active: game.team === 'away' }" :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('away')"><div class="crest awayCrest">RM</div><span>{{ match.away }}</span></button>
+          <button class="club" :class="{ active: game.team === 'away' }"
+            :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('away')">
+            <div class="crest awayCrest">RM</div><span>{{ match.away }}</span>
+          </button>
         </div>
-        <div class="score">{{ game.homeScore }} : {{ game.awayScore }}</div><div class="status">{{ statusLabel }}</div>
-        <div class="matchMeta">{{ match.time }} | {{ match.league }} | {{ match.round }}</div><div class="stadium">{{ match.stadium }}</div>
+        <div class="score">{{ game.homeScore }} : {{ game.awayScore }}</div>
+        <div class="status">{{ statusLabel }}</div>
+        <div class="matchMeta">{{ match.time }} | {{ match.league }} | {{ match.round }}</div>
+        <div class="stadium">{{ match.stadium }}</div>
         <div class="kpiHalfToggle">
           <button :class="{ active: kpiHalf === 'all' }" @click="kpiHalf = 'all'">전체</button>
           <button :class="{ active: kpiHalf === 'H1' }" @click="kpiHalf = 'H1'">전반</button>
@@ -892,27 +923,26 @@ function undoSub(index: number) {
         </div>
         <div class="kpis">
           <div v-for="key in kpis" :key="key" class="kpiRow">
-            <span>{{ game.team === 'home' ? kpiValues[key] : 0 }}</span><b>{{ key }}</b><span>{{ game.team === 'away' ? kpiValues[key] : 0 }}</span>
+            <span>{{ game.team === 'home' ? kpiValues[key] : 0 }}</span><b>{{ key }}</b><span>{{ game.team === 'away' ?
+              kpiValues[key] : 0 }}</span>
           </div>
         </div>
         <div class="kpiErrors">
-          <div
-            class="errRow" :class="{ has: kpiErrors.eTime > 0, open: errorDetailOpen === 'time' }"
-            @click="toggleErrorDetail('time')"
-          ><span>E-Time</span><b>{{ kpiErrors.eTime }}개</b></div>
+          <div class="errRow" :class="{ has: kpiErrors.eTime > 0, open: errorDetailOpen === 'time' }"
+            @click="toggleErrorDetail('time')"><span>E-Time</span><b>{{ kpiErrors.eTime }}개</b></div>
           <div v-if="errorDetailOpen === 'time'" class="errDetail">
             <div v-if="kpiErrors.timeList.length" class="errDetailGrid">
-              <span v-for="(g, i) in kpiErrors.timeList" :key="i" class="errDetailItem">{{ g.half }} {{ g.time }}{{ i < kpiErrors.timeList.length - 1 ? ',' : '' }}</span>
+              <span v-for="(g, i) in kpiErrors.timeList" :key="i" class="errDetailItem">{{ g.half }} {{ g.time }}{{ i <
+                kpiErrors.timeList.length - 1 ? ',' : '' }}</span>
             </div>
             <span v-else class="errDetailEmpty">중복된 시간 없음</span>
           </div>
-          <div
-            class="errRow" :class="{ has: kpiErrors.ePlayer > 0, open: errorDetailOpen === 'player' }"
-            @click="toggleErrorDetail('player')"
-          ><span>E-Player</span><b>{{ kpiErrors.ePlayer }}개</b></div>
+          <div class="errRow" :class="{ has: kpiErrors.ePlayer > 0, open: errorDetailOpen === 'player' }"
+            @click="toggleErrorDetail('player')"><span>E-Player</span><b>{{ kpiErrors.ePlayer }}개</b></div>
           <div v-if="errorDetailOpen === 'player'" class="errDetail">
             <div v-if="kpiErrors.playerList.length" class="errDetailGrid">
-              <span v-for="(p, i) in kpiErrors.playerList" :key="i" class="errDetailItem">{{ p.half }} {{ p.time }}{{ i < kpiErrors.playerList.length - 1 ? ',' : '' }}</span>
+              <span v-for="(p, i) in kpiErrors.playerList" :key="i" class="errDetailItem">{{ p.half }} {{ p.time }}{{ i
+                < kpiErrors.playerList.length - 1 ? ',' : '' }}</span>
             </div>
             <span v-else class="errDetailEmpty">선수 미입력 없음</span>
           </div>
@@ -925,243 +955,244 @@ function undoSub(index: number) {
         </button>
         <button class="backBtn" @click="navigateTo('/schedule')">◀ 이전화면으로</button>
       </aside>
-      <main class="content"><h1>Player List</h1>
+      <main class="content">
+        <h1>Player List</h1>
         <div class="workspace">
-        <div class="topRow">
-          <section class="formationPanel">
-            <div class="selectBar" :class="{ open: menuOpen, locked: !matchInfoEditable }" @click="matchInfoEditable && (menuOpen = !menuOpen)">
-              <span>{{ game.formationKey ? `${formations[game.formationKey].label} 포메이션` : '포메이션을 선택하세요' }}</span><span>⌄</span>
-              <div v-if="menuOpen" class="menu" @click.stop>
-                <div v-for="(f, key) in formations" :key="key" class="menuItem" @click="pickFormation(key)">{{ f.label }}</div>
+          <div class="topRow">
+            <section class="formationPanel">
+              <div class="selectBar" :class="{ open: menuOpen, locked: !matchInfoEditable }"
+                @click="matchInfoEditable && (menuOpen = !menuOpen)">
+                <span>{{ game.formationKey ? `${formations[game.formationKey].label} 포메이션` : '포메이션을 선택하세요'
+                }}</span><span>⌄</span>
+                <div v-if="menuOpen" class="menu" @click.stop>
+                  <div v-for="(f, key) in formations" :key="key" class="menuItem" @click="pickFormation(key)">{{ f.label
+                  }}</div>
+                </div>
               </div>
-            </div>
-            <div class="pitch">
-              <div class="halfway"/><div class="centerCircle"/>
-              <div class="penaltyArc"/><div class="penaltyBox"/><div class="penaltySpot"/>
-              <div class="goalBox"/><div class="goalPost"/>
-              <div class="cornerArc left"/><div class="cornerArc right"/>
-              <template v-if="game.formationKey">
-                <button
-                  v-for="(s, i) in outfieldSlots" :key="`o${i}`"
-                  class="slot" :class="[{ active: activeSlot === `o${i}`, filled: game.assigned[`o${i}`] !== undefined }, playerAt(`o${i}`)?.pos?.toLowerCase()]"
-                  :style="{ left: s.x + '%', top: s.y + '%' }"
-                  :disabled="!matchInfoEditable"
-                  @click="clickSlot(`o${i}`)"
-                  @dblclick.prevent="removeFromSlot(`o${i}`)"
-                  @dragover.prevent
-                  @drop="onDrop(`o${i}`)"
-                >{{ playerAt(`o${i}`)?.no ?? '' }}</button>
-                <button
-                  class="slot gk" :class="{ active: activeSlot === 'gk', filled: game.assigned['gk'] !== undefined }"
-                  :style="{ left: gkSlot.x + '%', top: gkSlot.y + '%' }"
-                  :disabled="!matchInfoEditable"
-                  @click="clickSlot('gk')"
-                  @dblclick.prevent="removeFromSlot('gk')"
-                  @dragover.prevent
-                  @drop="onDrop('gk')"
-                >{{ playerAt('gk')?.no ?? 'GK' }}</button>
+              <div class="pitch">
+                <div class="halfway" />
+                <div class="centerCircle" />
+                <div class="penaltyArc" />
+                <div class="penaltyBox" />
+                <div class="penaltySpot" />
+                <div class="goalBox" />
+                <div class="goalPost" />
+                <div class="cornerArc left" />
+                <div class="cornerArc right" />
+                <template v-if="game.formationKey">
+                  <button v-for="(s, i) in outfieldSlots" :key="`o${i}`" class="slot"
+                    :class="[{ active: activeSlot === `o${i}`, filled: game.assigned[`o${i}`] !== undefined }, playerAt(`o${i}`)?.pos?.toLowerCase()]"
+                    :style="{ left: s.x + '%', top: s.y + '%' }" :disabled="!matchInfoEditable"
+                    @click="clickSlot(`o${i}`)" @dblclick.prevent="removeFromSlot(`o${i}`)" @dragover.prevent
+                    @drop="onDrop(`o${i}`)">{{ playerAt(`o${i}`)?.no ?? '' }}</button>
+                  <button class="slot gk"
+                    :class="{ active: activeSlot === 'gk', filled: game.assigned['gk'] !== undefined }"
+                    :style="{ left: gkSlot.x + '%', top: gkSlot.y + '%' }" :disabled="!matchInfoEditable"
+                    @click="clickSlot('gk')" @dblclick.prevent="removeFromSlot('gk')" @dragover.prevent
+                    @drop="onDrop('gk')">{{ playerAt('gk')?.no ?? 'GK' }}</button>
+                </template>
+                <div v-else class="shirt" />
+              </div>
+              <div v-if="game.formationKey" class="benchHeader">
+                <span>후보</span><b>{{ benchFilledCount }} / {{ BENCH_COUNT }}</b>
+              </div>
+              <div v-if="game.formationKey" class="bench">
+                <button v-for="id in benchIds" :key="id" class="slot benchSlot"
+                  :class="[{ active: activeSlot === id, filled: game.assigned[id] !== undefined }, playerAt(id)?.pos?.toLowerCase()]"
+                  :disabled="!matchInfoEditable" @click="clickSlot(id)" @dblclick.prevent="removeFromSlot(id)"
+                  @dragover.prevent @drop="onDrop(id)">{{ playerAt(id)?.no ?? '' }}</button>
+              </div>
+            </section>
+            <section class="playerPanel" ref="playerPanelRef">
+              <template v-if="!subOpen">
+                <div class="tabs">
+                  <button :class="{ off: sortKey !== 'position' }" @click="sortKey = 'position'">Position</button>
+                  <button :class="{ off: sortKey !== 'number' }" @click="sortKey = 'number'">Number</button>
+                  <button :class="{ off: sortKey !== 'name' }" @click="sortKey = 'name'">Name</button>
+                </div>
+                <div class="playerGrid">
+                  <button v-for="{ p, id } in sortedPlayers" :key="id" class="player"
+                    :class="[p.pos?.toLowerCase(), { used: usedPlayerIds.has(id), pickable: !usedPlayerIds.has(id) }]"
+                    :draggable="matchInfoEditable && !usedPlayerIds.has(id)"
+                    :disabled="!matchInfoEditable || usedPlayerIds.has(id)" @click="pickPlayer(id)"
+                    @dragstart="onDragStart(id)"><strong>{{ p.no }}</strong><span>{{ p.name }}</span></button>
+                  <div v-for="i in 13" :key="`e${i}`" class="player empty" />
+                </div>
+                <div class="legend"><span class="gk">GK</span><span class="fw">FW</span><span class="mf">MF</span><span
+                    class="df">DF</span></div>
               </template>
-              <div v-else class="shirt"/>
-              <b class="count">{{ filledCount }} / {{ game.formationKey ? totalSlots : 16 }}</b>
-            </div>
-            <div v-if="game.formationKey" class="bench">
-              <button
-                v-for="id in benchIds" :key="id" class="slot benchSlot"
-                :class="[{ active: activeSlot === id, filled: game.assigned[id] !== undefined }, playerAt(id)?.pos?.toLowerCase()]"
-                :disabled="!matchInfoEditable"
-                @click="clickSlot(id)"
-                @dblclick.prevent="removeFromSlot(id)"
-                @dragover.prevent
-                @drop="onDrop(id)"
-              >{{ playerAt(id)?.no ?? '' }}</button>
-            </div>
-          </section>
-          <section class="playerPanel">
-            <template v-if="!subOpen">
-              <div class="tabs">
-                <button :class="{ off: sortKey !== 'position' }" @click="sortKey = 'position'">Position</button>
-                <button :class="{ off: sortKey !== 'number' }" @click="sortKey = 'number'">Number</button>
-                <button :class="{ off: sortKey !== 'name' }" @click="sortKey = 'name'">Name</button>
-              </div>
-              <div class="playerGrid">
-                <button
-                  v-for="{ p, id } in sortedPlayers" :key="id" class="player" :class="[p.pos?.toLowerCase(), { used: usedPlayerIds.has(id), pickable: !usedPlayerIds.has(id) }]"
-                  :draggable="matchInfoEditable && !usedPlayerIds.has(id)"
-                  :disabled="!matchInfoEditable || usedPlayerIds.has(id)"
-                  @click="pickPlayer(id)"
-                  @dragstart="onDragStart(id)"
-                ><strong>{{ p.no }}</strong><span>{{ p.name }}</span></button>
-                <div v-for="i in 13" :key="`e${i}`" class="player empty"/>
-              </div>
-              <div class="legend"><span class="gk">GK</span><span class="fw">FW</span><span class="mf">MF</span><span class="df">DF</span></div>
-            </template>
 
-            <!-- 선수 교체: 좌 = OUT(선발), 우 = IN(후보) -->
-            <template v-else>
-              <div class="tabs subTabs">
-                <button class="subTitle">선수 교체</button>
-              </div>
-              <p class="subHint">서로 끌어다 놓거나, 양쪽에서 하나씩 눌러 교체하세요</p>
-              <div class="subTimeRow">
-                <span>교체 시각</span>
-                <button class="subTimeBtn" @click="bumpSubMinute(-1)">−</button>
-                <strong>{{ String(subTimeMinute).padStart(2, '0') }}</strong>
-                <button class="subTimeBtn" @click="bumpSubMinute(1)">＋</button>
-                <b>:</b>
-                <button class="subTimeBtn" @click="bumpSubSecond(-1)">−</button>
-                <strong>{{ String(subTimeSecond).padStart(2, '0') }}</strong>
-                <button class="subTimeBtn" @click="bumpSubSecond(1)">＋</button>
-              </div>
-              <div class="subCols">
-                <div class="subCol">
-                  <div class="subColHead out">교체 OUT · 선발</div>
-                  <div class="subList" @dragover.prevent>
-                    <button
-                      v-for="s in starterSlots" :key="s.id"
-                      class="subItem" :class="[s.p?.pos?.toLowerCase(), { on: subOut === s.id, dragging: subDragId === s.id }]"
-                      draggable="true"
-                      @click="pickOut(s.id)"
-                      @dragstart="onSubDragStart(s.id)"
-                      @dragend="subDragId = null"
-                      @dragover.prevent
-                      @drop="onSubDrop(s.id)"
-                    ><strong>{{ s.p?.no }} <i v-if="cardForPlayer(game.assigned[s.id]!).some(c => c.card === 'R')">🟥</i><i v-else-if="cardForPlayer(game.assigned[s.id]!).length">🟨</i></strong><span>{{ s.p?.name }}</span></button>
+              <!-- 선수 교체: 좌 = OUT(선발), 우 = IN(후보) -->
+              <template v-else>
+                <div class="tabs subTabs">
+                  <button class="subTitle">선수 교체</button>
+                </div>
+                <div class="subTimeRow">
+                  <span>교체 시각</span>
+                  <button class="subTimeBtn" @click="bumpSubMinute(-1)">−</button>
+                  <strong>{{ String(subTimeMinute).padStart(2, '0') }}</strong>
+                  <button class="subTimeBtn" @click="bumpSubMinute(1)">＋</button>
+                  <b>:</b>
+                  <button class="subTimeBtn" @click="bumpSubSecond(-1)">−</button>
+                  <strong>{{ String(subTimeSecond).padStart(2, '0') }}</strong>
+                  <button class="subTimeBtn" @click="bumpSubSecond(1)">＋</button>
+                </div>
+                <div class="subCols">
+                  <div class="subCol">
+                    <div class="subColHead out">교체 OUT · 선발</div>
+                    <div class="subList" @dragover.prevent>
+                      <button v-for="s in starterSlots" :key="s.id" class="subItem"
+                        :class="[s.p?.pos?.toLowerCase(), { on: subOut === s.id, dragging: subDragId === s.id }]"
+                        draggable="true" @click="pickOut(s.id)" @dragstart="onSubDragStart(s.id)"
+                        @dragend="subDragId = null" @dragover.prevent @drop="onSubDrop(s.id)"><strong>{{ s.p?.no }} <i
+                            v-if="cardForPlayer(game.assigned[s.id]!).some(c => c.card === 'R')">🟥</i><i
+                            v-else-if="cardForPlayer(game.assigned[s.id]!).length">🟨</i></strong><span>{{ s.p?.name
+                            }}</span></button>
+                    </div>
+                  </div>
+                  <div class="subCol">
+                    <div class="subColHead in">교체 IN · 후보</div>
+                    <div class="subList" @dragover.prevent>
+                      <button v-for="s in benchSlots" :key="s.id" class="subItem"
+                        :class="[s.p?.pos?.toLowerCase(), { on: subIn === s.id, dragging: subDragId === s.id }]"
+                        draggable="true" @click="pickIn(s.id)" @dragstart="onSubDragStart(s.id)"
+                        @dragend="subDragId = null" @dragover.prevent @drop="onSubDrop(s.id)"><strong>{{ s.p?.no
+                        }}</strong><span>{{ s.p?.name }}</span></button>
+                      <div v-if="!benchSlots.length" class="subEmpty">후보 선수가 없습니다</div>
+                    </div>
                   </div>
                 </div>
-                <div class="subCol">
-                  <div class="subColHead in">교체 IN · 후보</div>
-                  <div class="subList" @dragover.prevent>
-                    <button
-                      v-for="s in benchSlots" :key="s.id"
-                      class="subItem" :class="[s.p?.pos?.toLowerCase(), { on: subIn === s.id, dragging: subDragId === s.id }]"
-                      draggable="true"
-                      @click="pickIn(s.id)"
-                      @dragstart="onSubDragStart(s.id)"
-                      @dragend="subDragId = null"
-                      @dragover.prevent
-                      @drop="onSubDrop(s.id)"
-                    ><strong>{{ s.p?.no }}</strong><span>{{ s.p?.name }}</span></button>
-                    <div v-if="!benchSlots.length" class="subEmpty">후보 선수가 없습니다</div>
+
+                <div class="subHistory">
+                  <div class="subHistHead">
+                    <span class="hHalf">Half</span>
+                    <span class="hTime">Time</span>
+                    <span class="hP">Out</span>
+                    <span class="hP">In</span>
+                    <span class="hAct"></span>
+                  </div>
+                  <div class="subHistBody">
+                    <div v-if="!game.subs.length && !pendingSubs.length" class="subHistEmpty">교체 기록이 없습니다.</div>
+                    <div v-for="(s, i) in game.subs" :key="`saved${i}`" class="subHistRow">
+                      <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
+                      <span class="hTime">{{ fmtTime(s.seconds) }}</span>
+                      <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
+                      <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
+                      <span class="hAct"><button class="subUndo" @click="undoSub(i)">취소</button></span>
+                    </div>
+                    <div v-for="(s, i) in pendingSubs" :key="`pending${i}`" class="subHistRow pending">
+                      <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
+                      <span class="hTime">{{ fmtTime(s.seconds) }}</span>
+                      <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
+                      <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
+                      <span class="hAct"><button class="subUndo" @click="cancelPendingSub(i)">취소</button></span>
+                    </div>
                   </div>
                 </div>
+
+                <div class="subActions">
+                  <button class="subCancel" @click="cancelSub">취소</button>
+                  <button class="subSave" @click="saveSub">저장</button>
+                </div>
+              </template>
+            </section>
+          </div>
+          <div class="bottomRow">
+            <section class="fieldChoice">
+              <h2>진영선택</h2>
+              <div class="miniPitch">
+                <div class="miniHalf" />
+                <div class="miniCircle" />
+                <div class="miniPenalty left" />
+                <div class="miniPenalty right" />
+                <div class="miniGoal left" />
+                <div class="miniGoal right" />
+                <div class="miniBox leftBox" :class="{ active: game.side === 'left', locked: !matchInfoEditable }"
+                  @click="matchInfoEditable && (game.side = 'left')" />
+                <div class="miniBox rightBox" :class="{ active: game.side === 'right', locked: !matchInfoEditable }"
+                  @click="matchInfoEditable && (game.side = 'right')" />
+              </div>
+            </section>
+            <section class="toolPanel" ref="grassPanelRef">
+              <div class="toolGrid">
+                <button class="toolBtn" :class="{ on: grassOpen }" @click="openGrass">
+                  <span class="toolIcon grassIcon" :style="{ background: grassBg }" />
+                  <span class="toolLabel">잔디선택</span>
+                </button>
+                <button type="button" class="toolBtn" :class="{ on: subOpen }" @click.stop="openSub" @pointerup.stop>
+                  <span class="toolIcon subIcon">⇄</span>
+                  <span class="toolLabel">선수교체</span>
+                </button>
               </div>
 
-              <div class="subHistory">
-                <div class="subHistHead">
-                  <span class="hHalf">Half</span>
-                  <span class="hTime">Time</span>
-                  <span class="hP">Out</span>
-                  <span class="hP">In</span>
-                  <span class="hAct"></span>
-                </div>
-                <div class="subHistBody">
-                  <div v-if="!game.subs.length" class="subHistEmpty">교체 기록이 없습니다.</div>
-                  <div v-for="(s, i) in game.subs" v-else :key="i" class="subHistRow">
-                    <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
-                    <span class="hTime">{{ fmtTime(s.seconds) }}</span>
-                    <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
-                    <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
-                    <span class="hAct"><button class="subUndo" @click="editSub(i)">수정</button><button class="subUndo" @click="undoSub(i)">취소</button></span>
+              <div v-if="grassOpen" class="grassPop">
+                <div class="popRow">
+                  <span class="popLabel">잔디 패턴(중계화면 왼쪽에서부터)</span>
+                  <div class="popOpts">
+                    <button v-for="g in GRASS_PATTERNS" :key="g.value" class="popBtn"
+                      :class="{ on: game.grassPattern === g.value }" @click="game.grassPattern = g.value">{{ g.label
+                      }}</button>
                   </div>
                 </div>
-              </div>
-
-              <div class="subActions">
-                <button class="subCancel" @click="cancelSub">취소</button>
-                <button class="subSave" @click="saveSub">저장</button>
-              </div>
-            </template>
-          </section>
-        </div>
-        <div class="bottomRow">
-          <section class="fieldChoice">
-            <h2>진영선택</h2>
-            <div class="miniPitch">
-              <div class="miniHalf"/><div class="miniCircle"/><div class="miniPenalty left"/><div class="miniPenalty right"/><div class="miniGoal left"/><div class="miniGoal right"/>
-              <div class="miniBox leftBox" :class="{ active: game.side === 'left', locked: !matchInfoEditable }" @click="matchInfoEditable && (game.side = 'left')"/>
-              <div class="miniBox rightBox" :class="{ active: game.side === 'right', locked: !matchInfoEditable }" @click="matchInfoEditable && (game.side = 'right')"/>
-            </div>
-          </section>
-          <section class="toolPanel">
-            <div class="toolGrid">
-              <button class="toolBtn" :class="{ on: grassOpen }" @click="openGrass">
-                <span class="toolIcon grassIcon" :style="{ background: grassBg }" />
-                <span class="toolLabel">잔디선택</span>
-              </button>
-              <button type="button" class="toolBtn" :class="{ on: subOpen }" @click.stop="openSub" @pointerup.stop>
-                <span class="toolIcon subIcon">⇄</span>
-                <span class="toolLabel">선수교체</span>
-              </button>
-            </div>
-
-            <div v-if="grassOpen" class="grassPop">
-              <div class="popRow">
-                <span class="popLabel">잔디 패턴</span>
-                <div class="popOpts">
-                  <button
-                    v-for="g in GRASS_PATTERNS" :key="g.value"
-                    class="popBtn" :class="{ on: game.grassPattern === g.value }"
-                    @click="game.grassPattern = g.value"
-                  >{{ g.label }}</button>
+                <div class="popRow">
+                  <span class="popLabel">잔디 라인(하프기준)</span>
+                  <div class="popOpts">
+                    <button v-for="n in GRASS_LINE_OPTIONS" :key="n" class="popBtn"
+                      :class="{ on: game.grassLines === n }" :disabled="game.grassPattern === 0"
+                      @click="game.grassLines = n">{{ n }}줄</button>
+                  </div>
                 </div>
+                <div class="popPreview" :style="{ background: grassBg }" />
+                <button class="popOk" @click="grassOpen = false">확인</button>
               </div>
-              <div class="popRow">
-                <span class="popLabel">잔디 라인</span>
-                <div class="popOpts">
-                  <button
-                    v-for="n in GRASS_LINE_OPTIONS" :key="n"
-                    class="popBtn" :class="{ on: game.grassLines === n }"
-                    :disabled="game.grassPattern === 0"
-                    @click="game.grassLines = n"
-                  >{{ n }}줄</button>
+            </section>
+            <section class="startPanel">
+              <template v-if="game.halfStatus === 'ready'">
+                <div v-if="game.recorderLevel === 'advanced'" class="modeToggle">
+                  <button class="modeBtn" :class="{ on: game.inputMode === '분석' }"
+                    @click="game.inputMode = '분석'">분석<small>정지 가능</small></button>
+                  <button class="modeBtn" :class="{ on: game.inputMode === '실시간' }"
+                    @click="game.inputMode = '실시간'">실시간<small>정지 불가</small></button>
                 </div>
-              </div>
-              <div class="popPreview" :style="{ background: grassBg }" />
-              <button class="popOk" @click="grassOpen = false">확인</button>
-            </div>
-          </section>
-          <section class="startPanel">
-            <template v-if="game.halfStatus === 'ready'">
-              <div v-if="game.recorderLevel === 'advanced'" class="modeToggle">
-                <button class="modeBtn" :class="{ on: game.inputMode === '분석' }" @click="game.inputMode = '분석'">분석<small>정지 가능</small></button>
-                <button class="modeBtn" :class="{ on: game.inputMode === '실시간' }" @click="game.inputMode = '실시간'">실시간<small>정지 불가</small></button>
-              </div>
-              <p>아래의 버튼을 터치하시면<br><b>경기데이터 입력이 시작됩니다.</b></p>
-              <button class="startBtn" :disabled="!canStart" @click="startFirstHalf">전반전 시작</button>
-            </template>
-            <template v-else-if="game.halfStatus === 'H1_done'">
-              <p>전반 기록을 확인하세요<br><b>기록을 수정하거나 후반전을 시작할 수 있습니다.</b></p>
-              <p v-if="game.recorderLevel === 'basic'" class="draftNotice">BASIC 기록은 관리자 승인 전까지 Draft에만 저장됩니다.</p>
-              <div class="halfActions">
-                <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
-                <button class="startBtn" :disabled="lifecycleBusy" @click="startSecondHalf">후반전 시작</button>
-              </div>
-            </template>
-            <template v-else-if="game.halfStatus === 'H2_done'">
-              <p>후반 기록을 확인하세요<br><b>기록을 수정하거나 경기를 종료할 수 있습니다.</b></p>
-              <p v-if="game.recorderLevel === 'basic'" class="draftNotice">종료하면 관리자 승인 대기 Draft로 제출됩니다.</p>
-              <div class="halfActions">
-                <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
-                <button class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">{{ game.recorderLevel === 'basic' ? '승인 대기 제출 & 경기 종료' : '최종 데이터 갱신 & 경기 종료' }}</button>
-              </div>
-            </template>
-            <template v-else-if="isPaused">
-              <p>{{ pausedHalf }} 기록이 대기 중입니다<br><b>{{ pausedClock }} 시점부터 이어서 입력합니다.</b></p>
-              <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
-              <div class="halfActions">
-                <button class="editBtn" :disabled="lifecycleBusy" @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? '변경 완료' : '경기 정보 변경' }}</button>
-                <button class="startBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="reenterHalf">{{ pausedHalf }}전 입장</button>
-              </div>
-            </template>
-            <template v-else>
-              <p>{{ game.recorderLevel === 'basic' ? '관리자 승인 대기' : statusLabel }}</p>
-              <p v-if="game.recorderLevel === 'basic'" class="draftNotice">관리자 페이지에서 RAW 승격 전까지 Draft만 유지됩니다.</p>
-              <button class="editBtn" :disabled="lifecycleBusy" @click="editFinal">수정</button>
-            </template>
-            <p v-if="lifecycleError" class="lifecycleError">{{ lifecycleError }}</p>
-            <small v-if="matchId">matchId: {{ matchId }}</small>
-          </section>
-        </div>
+                <p>아래의 버튼을 터치하시면<br><b>경기데이터 입력이 시작됩니다.</b></p>
+                <button class="startBtn" :disabled="!canStart" @click="startFirstHalf">전반전 시작</button>
+              </template>
+              <template v-else-if="game.halfStatus === 'H1_done'">
+                <p>전반 기록을 확인하세요<br><b>기록을 수정하거나 후반전을 시작할 수 있습니다.</b></p>
+                <p v-if="game.recorderLevel === 'basic'" class="draftNotice">BASIC 기록은 관리자 승인 전까지 Draft에만 저장됩니다.</p>
+                <div class="halfActions">
+                  <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
+                  <button class="startBtn" :disabled="lifecycleBusy" @click="startSecondHalf">후반전 시작</button>
+                </div>
+              </template>
+              <template v-else-if="game.halfStatus === 'H2_done'">
+                <p>후반 기록을 확인하세요<br><b>기록을 수정하거나 경기를 종료할 수 있습니다.</b></p>
+                <p v-if="game.recorderLevel === 'basic'" class="draftNotice">종료하면 관리자 승인 대기 Draft로 제출됩니다.</p>
+                <div class="halfActions">
+                  <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
+                  <button class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">{{ game.recorderLevel ===
+                    'basic' ? '승인 대기 제출 & 경기 종료' : '최종 데이터 갱신 & 경기 종료' }}</button>
+                </div>
+              </template>
+              <template v-else-if="isPaused">
+                <p>{{ pausedHalf }} 기록이 대기 중입니다<br><b>{{ pausedClock }} 시점부터 이어서 입력합니다.</b></p>
+                <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
+                <div class="halfActions">
+                  <button class="editBtn" :disabled="lifecycleBusy" @click="toggleMatchInfoEdit">{{ matchInfoEditMode ?
+                    '변경 완료' : '경기 정보 변경' }}</button>
+                  <button class="startBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="reenterHalf">{{
+                    pausedHalf }}전 입장</button>
+                </div>
+              </template>
+              <template v-else>
+                <p>{{ game.recorderLevel === 'basic' ? '관리자 승인 대기' : statusLabel }}</p>
+                <p v-if="game.recorderLevel === 'basic'" class="draftNotice">관리자 페이지에서 RAW 승격 전까지 Draft만 유지됩니다.</p>
+                <button class="editBtn" :disabled="lifecycleBusy" @click="editFinal">수정</button>
+              </template>
+              <p v-if="lifecycleError" class="lifecycleError">{{ lifecycleError }}</p>
+              <small v-if="matchId">matchId: {{ matchId }}</small>
+            </section>
+          </div>
         </div>
       </main>
     </div>
@@ -1169,233 +1200,1545 @@ function undoSub(index: number) {
 </template>
 
 <style scoped>
-*{box-sizing:border-box}button{font:inherit}
-.page{width:1280px;height:800px;padding:0;display:grid;place-items:center;overflow:hidden;position:relative;background:#0b0f17;color:#fff;font-family:Arial,"Noto Sans KR",sans-serif}
-.bg{position:absolute;inset:0;background:radial-gradient(1200px 500px at 50% 25%,rgba(255,255,255,.08),transparent 60%),radial-gradient(900px 400px at 20% 70%,rgba(111,159,186,.09),transparent 55%),radial-gradient(900px 400px at 80% 70%,rgba(241,180,0,.08),transparent 55%),linear-gradient(180deg,rgba(0,0,0,.55),rgba(0,0,0,.78))}
-.topBack{position:absolute;z-index:2;top:14px;right:16px;height:30px;padding:0 10px;border:1px solid rgba(255,255,255,.22);border-radius:4px;background:rgba(10,14,22,.88);color:rgba(255,255,255,.86);font-size:12px;font-weight:800;cursor:pointer}
-.topBack:hover{border-color:#f0b429;color:#f0b429}
+* {
+  box-sizing: border-box
+}
 
-.frame{position:relative;width:1280px;height:800px;border-radius:0;display:grid;grid-template-columns:266px 1014px;overflow:hidden;border:1px solid rgba(255,255,255,.08);background:rgba(10,14,22,.78);backdrop-filter:blur(8px);box-shadow:0 18px 60px rgba(0,0,0,.55)}
+button {
+  font: inherit
+}
 
-.sidebar{padding:12px 12px 10px;border-right:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column}
-.matchDate{text-align:center;font-size:16px;line-height:22px;font-weight:900;color:rgba(255,255,255,.85)}
-.teamPick{margin-top:8px;text-align:center;font-size:13px;font-weight:800;letter-spacing:.03em;color:rgba(255,255,255,.7)}
-.teams{height:92px;display:grid;grid-template-columns:1fr 22px 1fr;align-items:center;border-bottom:1px solid rgba(255,255,255,.08)}
-.club{min-width:0;display:grid;justify-items:center;gap:7px;font-size:10px;font-weight:800;text-align:center;color:rgba(255,255,255,.85);background:none;border:1px solid transparent;border-radius:6px;padding:6px 4px;cursor:pointer}
-.club:hover{background:rgba(255,255,255,.04)}
-.club.active{border-color:#f0b429;background:rgba(240,180,41,.1)}
-.crest{width:30px;height:34px;display:grid;place-items:center;border-radius:45% 45% 55% 55%;font-size:9px;font-weight:900;color:white;border:2px solid #e7d365}
-.homeCrest{background:linear-gradient(135deg,#fff 0 38%,#e43f3f 38% 53%,#fff 53%);color:#273246}
-.awayCrest{background:#fff;color:#2649a2;border-color:#e0bc42}
-.versus{width:21px;height:21px;display:grid;place-items:center;border-radius:50%;background:rgba(255,255,255,.9);color:#222;font-size:8px;font-weight:900}
-.score{margin-top:12px;text-align:center;font-size:20px;line-height:24px;font-weight:900;color:rgba(255,255,255,.9)}
-.status{color:rgba(241,180,0,.95);text-align:center;font-size:12px;font-weight:800}
-.matchMeta,.stadium{margin-top:8px;text-align:center;color:rgba(255,255,255,.45);font-size:11px}
-.stadium{margin-top:2px}
-.kpiHalfToggle{margin-top:12px;display:grid;grid-template-columns:repeat(3,1fr);gap:4px}
-.kpiHalfToggle button{height:22px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:rgba(255,255,255,.55);cursor:pointer;font-size:10px;font-weight:700;letter-spacing:.03em}
-.kpiHalfToggle button.active{background:rgba(240,180,41,.12);border-color:rgba(240,180,41,.5);color:#f0b429}
-.kpis{margin-top:6px;display:grid;gap:4px}
-.kpiRow{height:32px;display:grid;grid-template-columns:1fr 1.15fr 1fr;place-items:center;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.07);border-radius:4px;color:rgba(255,255,255,.7);font-size:14px}
-.kpiRow b{font-size:13px;letter-spacing:.04em;color:rgba(255,255,255,.55)}
-.kpiErrors{margin-top:6px;display:grid;gap:4px}
-.errRow{height:26px;display:flex;align-items:center;justify-content:space-between;padding:0 10px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.07);border-radius:4px;color:rgba(255,255,255,.45);font-size:11px;font-weight:700;cursor:pointer}
-.errRow b{font-size:12px;color:rgba(255,255,255,.45)}
-.errRow.has{background:rgba(224,62,62,.12);border-color:rgba(224,62,62,.5);color:#e05c5c}
-.errRow.has b{color:#e05c5c}
-.errRow.open{border-color:rgba(240,180,41,.5)}
-.errDetail{margin:-2px 0 2px;padding:4px 8px;background:rgba(0,0,0,.2);border:1px solid rgba(255,255,255,.07);border-radius:4px}
-.errDetailGrid{display:grid;grid-template-columns:repeat(4,1fr);gap:2px 4px}
-.errDetailItem{font-size:10px;color:rgba(255,255,255,.6);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.errDetailEmpty{display:block;font-size:10px;color:rgba(255,255,255,.3);text-align:center;padding:2px 0}
-.testBtn{margin-top:auto;height:30px;border-radius:4px;border:1px dashed rgba(240,180,41,.5);background:rgba(240,180,41,.08);color:#f0b429;cursor:pointer;font-size:11px;font-weight:800;letter-spacing:.05em}
-.backBtn{margin-top:8px;height:34px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.02);color:rgba(255,255,255,.75);cursor:pointer;font-size:12px}
+.page {
+  width: 1280px;
+  height: 800px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  position: relative;
+  background: #0b0f17;
+  color: #fff;
+  font-family: Arial, "Noto Sans KR", sans-serif
+}
 
-.content{min-width:0;padding:14px 18px 18px}
-.content h1{height:28px;margin:0;text-align:center;font-size:18px;font-weight:900;line-height:28px;color:rgba(255,255,255,.85)}
-.workspace{height:calc(100% - 28px);display:flex;flex-direction:column;gap:10px}
-.topRow{flex:2.2;min-height:0;display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.bottomRow{flex:1;min-height:0;max-height:170px;display:grid;grid-template-columns:0.7fr 1.3fr 1fr;gap:10px}
+.bg {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(1200px 500px at 50% 25%, rgba(255, 255, 255, .08), transparent 60%), radial-gradient(900px 400px at 20% 70%, rgba(111, 159, 186, .09), transparent 55%), radial-gradient(900px 400px at 80% 70%, rgba(241, 180, 0, .08), transparent 55%), linear-gradient(180deg, rgba(0, 0, 0, .55), rgba(0, 0, 0, .78))
+}
 
-.formationPanel,.playerPanel,.fieldChoice,.toolPanel,.startPanel{min-width:0;min-height:0;padding:12px;border-radius:6px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03)}
-.formationPanel{display:grid;grid-template-rows:28px minmax(0,1fr) 46px;gap:8px}
-.playerPanel{display:flex;flex-direction:column}
-.fieldChoice{display:flex;flex-direction:column}
-.toolPanel{display:flex;flex-direction:column;justify-content:center}
-.startPanel{position:relative;display:flex;flex-direction:column;justify-content:center}
+.topBack {
+  position: absolute;
+  z-index: 2;
+  top: 14px;
+  right: 16px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, .22);
+  border-radius: 4px;
+  background: rgba(10, 14, 22, .88);
+  color: rgba(255, 255, 255, .86);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer
+}
 
-.selectBar{position:relative;display:flex;align-items:center;justify-content:space-between;padding:0 10px;background:#f2f2f2;color:#252525;font-size:11px;border-radius:4px;border:1px solid rgba(255,255,255,.15);cursor:pointer;user-select:none}
-.selectBar.open{border-radius:4px 4px 0 0}
-.menu{position:absolute;left:0;right:0;top:100%;z-index:5;background:#fff;border:1px solid rgba(255,255,255,.15);border-top:none;border-radius:0 0 4px 4px;box-shadow:0 8px 20px rgba(0,0,0,.4)}
-.menuItem{padding:8px 10px;color:#252525;font-size:11px;cursor:pointer}
-.menuItem:hover{background:#eef6f8}
+.topBack:hover {
+  border-color: #f0b429;
+  color: #f0b429
+}
 
-.pitch{position:relative;overflow:hidden;background:rgba(0,0,0,.18);border-radius:6px;border:1px solid rgba(255,255,255,.1)}
-.halfway{position:absolute;left:0;right:0;top:0;height:43%;border-bottom:2px solid rgba(255,255,255,.22)}
-.centerCircle{position:absolute;width:104px;height:104px;border:2px solid rgba(255,255,255,.22);border-radius:50%;left:50%;top:-53px;transform:translateX(-50%)}
+.frame {
+  position: relative;
+  width: 1280px;
+  height: 800px;
+  border-radius: 0;
+  display: grid;
+  grid-template-columns: 266px 1014px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .08);
+  background: rgba(10, 14, 22, .78);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .55)
+}
+
+.sidebar {
+  padding: 12px 12px 10px;
+  border-right: 1px solid rgba(255, 255, 255, .06);
+  display: flex;
+  flex-direction: column
+}
+
+.matchDate {
+  text-align: center;
+  font-size: 16px;
+  line-height: 22px;
+  font-weight: 900;
+  color: rgba(255, 255, 255, .85)
+}
+
+.teamPick {
+  margin-top: 8px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: .03em;
+  color: rgba(255, 255, 255, .7)
+}
+
+.teams {
+  height: 92px;
+  display: grid;
+  grid-template-columns: 1fr 22px 1fr;
+  align-items: center;
+  border-bottom: 1px solid rgba(255, 255, 255, .08)
+}
+
+.club {
+  min-width: 0;
+  display: grid;
+  justify-items: center;
+  gap: 7px;
+  font-size: 10px;
+  font-weight: 800;
+  text-align: center;
+  color: rgba(255, 255, 255, .85);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 6px 4px;
+  cursor: pointer
+}
+
+.club:hover {
+  background: rgba(255, 255, 255, .04)
+}
+
+.club.active {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .1)
+}
+
+.crest {
+  width: 30px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 45% 45% 55% 55%;
+  font-size: 9px;
+  font-weight: 900;
+  color: white;
+  border: 2px solid #e7d365
+}
+
+.homeCrest {
+  background: linear-gradient(135deg, #fff 0 38%, #e43f3f 38% 53%, #fff 53%);
+  color: #273246
+}
+
+.awayCrest {
+  background: #fff;
+  color: #2649a2;
+  border-color: #e0bc42
+}
+
+.versus {
+  width: 21px;
+  height: 21px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .9);
+  color: #222;
+  font-size: 8px;
+  font-weight: 900
+}
+
+.score {
+  margin-top: 12px;
+  text-align: center;
+  font-size: 20px;
+  line-height: 24px;
+  font-weight: 900;
+  color: rgba(255, 255, 255, .9)
+}
+
+.status {
+  color: rgba(241, 180, 0, .95);
+  text-align: center;
+  font-size: 12px;
+  font-weight: 800
+}
+
+.matchMeta,
+.stadium {
+  margin-top: 8px;
+  text-align: center;
+  color: rgba(255, 255, 255, .45);
+  font-size: 11px
+}
+
+.stadium {
+  margin-top: 2px
+}
+
+.kpiHalfToggle {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px
+}
+
+.kpiHalfToggle button {
+  height: 22px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .1);
+  background: rgba(255, 255, 255, .03);
+  color: rgba(255, 255, 255, .55);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .03em
+}
+
+.kpiHalfToggle button.active {
+  background: rgba(240, 180, 41, .12);
+  border-color: rgba(240, 180, 41, .5);
+  color: #f0b429
+}
+
+.kpis {
+  margin-top: 6px;
+  display: grid;
+  gap: 4px
+}
+
+.kpiRow {
+  height: 32px;
+  display: grid;
+  grid-template-columns: 1fr 1.15fr 1fr;
+  place-items: center;
+  background: rgba(255, 255, 255, .02);
+  border: 1px solid rgba(255, 255, 255, .07);
+  border-radius: 4px;
+  color: rgba(255, 255, 255, .7);
+  font-size: 14px
+}
+
+.kpiRow b {
+  font-size: 13px;
+  letter-spacing: .04em;
+  color: rgba(255, 255, 255, .55)
+}
+
+.kpiErrors {
+  margin-top: 6px;
+  display: grid;
+  gap: 4px
+}
+
+.errRow {
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+  background: rgba(255, 255, 255, .02);
+  border: 1px solid rgba(255, 255, 255, .07);
+  border-radius: 4px;
+  color: rgba(255, 255, 255, .45);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer
+}
+
+.errRow b {
+  font-size: 12px;
+  color: rgba(255, 255, 255, .45)
+}
+
+.errRow.has {
+  background: rgba(224, 62, 62, .12);
+  border-color: rgba(224, 62, 62, .5);
+  color: #e05c5c
+}
+
+.errRow.has b {
+  color: #e05c5c
+}
+
+.errRow.open {
+  border-color: rgba(240, 180, 41, .5)
+}
+
+.errDetail {
+  margin: -2px 0 2px;
+  padding: 4px 8px;
+  background: rgba(0, 0, 0, .2);
+  border: 1px solid rgba(255, 255, 255, .07);
+  border-radius: 4px
+}
+
+.errDetailGrid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 2px 4px
+}
+
+.errDetailItem {
+  font-size: 10px;
+  color: rgba(255, 255, 255, .6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis
+}
+
+.errDetailEmpty {
+  display: block;
+  font-size: 10px;
+  color: rgba(255, 255, 255, .3);
+  text-align: center;
+  padding: 2px 0
+}
+
+.testBtn {
+  margin-top: auto;
+  height: 30px;
+  border-radius: 4px;
+  border: 1px dashed rgba(240, 180, 41, .5);
+  background: rgba(240, 180, 41, .08);
+  color: #f0b429;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .05em
+}
+
+.backBtn {
+  margin-top: 8px;
+  height: 34px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .1);
+  background: rgba(255, 255, 255, .02);
+  color: rgba(255, 255, 255, .75);
+  cursor: pointer;
+  font-size: 12px
+}
+
+.content {
+  min-width: 0;
+  padding: 14px 18px 18px
+}
+
+.content h1 {
+  height: 28px;
+  margin: 0;
+  text-align: center;
+  font-size: 18px;
+  font-weight: 900;
+  line-height: 28px;
+  color: rgba(255, 255, 255, .85)
+}
+
+.workspace {
+  height: calc(100% - 28px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px
+}
+
+.topRow {
+  flex: 2.2;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px
+}
+
+.bottomRow {
+  flex: 1;
+  min-height: 0;
+  max-height: 170px;
+  display: grid;
+  grid-template-columns: 0.7fr 1.3fr 1fr;
+  gap: 10px
+}
+
+.formationPanel,
+.playerPanel,
+.fieldChoice,
+.toolPanel,
+.startPanel {
+  min-width: 0;
+  min-height: 0;
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, .08);
+  background: rgba(255, 255, 255, .03)
+}
+
+.formationPanel {
+  display: grid;
+  grid-template-rows: 28px minmax(0, 1fr) 16px 46px;
+  gap: 8px
+}
+
+.benchHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: rgba(255, 255, 255, .6)
+}
+
+.benchHeader b {
+  color: rgba(241, 180, 0, .95);
+  font-size: 13px;
+  font-weight: 800
+}
+
+.playerPanel {
+  display: flex;
+  flex-direction: column
+}
+
+.fieldChoice {
+  display: flex;
+  flex-direction: column
+}
+
+.toolPanel {
+  display: flex;
+  flex-direction: column;
+  justify-content: center
+}
+
+.startPanel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center
+}
+
+.selectBar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+  background: #f2f2f2;
+  color: #252525;
+  font-size: 11px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .15);
+  cursor: pointer;
+  user-select: none
+}
+
+.selectBar.open {
+  border-radius: 4px 4px 0 0
+}
+
+.menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  z-index: 5;
+  background: #fff;
+  border: 1px solid rgba(255, 255, 255, .15);
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, .4)
+}
+
+.menuItem {
+  padding: 8px 10px;
+  color: #252525;
+  font-size: 11px;
+  cursor: pointer
+}
+
+.menuItem:hover {
+  background: #eef6f8
+}
+
+.pitch {
+  position: relative;
+  overflow: hidden;
+  background: rgba(0, 0, 0, .18);
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, .1)
+}
+
+.halfway {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 43%;
+  border-bottom: 2px solid rgba(255, 255, 255, .22)
+}
+
+.centerCircle {
+  position: absolute;
+  width: 104px;
+  height: 104px;
+  border: 2px solid rgba(255, 255, 255, .22);
+  border-radius: 50%;
+  left: 50%;
+  top: -53px;
+  transform: translateX(-50%)
+}
+
 /* 페널티 에어리어 — 실제 규격 비율로 그린다.
    페널티박스 40.32×16.5m, 골에어리어 18.32×5.5m, 페널티마크 11m,
    아크 반지름 9.15m(박스 위로 3.65m, 폭 14.6m), 골대 7.32m. 아래쪽이 골라인. */
-.penaltyBox{position:absolute;left:50%;bottom:0;transform:translateX(-50%);width:58%;height:24%;border:2px solid rgba(255,255,255,.22);border-bottom:0}
-.goalBox{position:absolute;left:50%;bottom:0;transform:translateX(-50%);width:26.3%;height:8%;border:2px solid rgba(255,255,255,.22);border-bottom:0}
-.penaltySpot{position:absolute;left:50%;bottom:16%;width:4px;height:4px;margin:0 0 -2px -2px;border-radius:50%;background:rgba(255,255,255,.4)}
-.penaltyArc{position:absolute;left:50%;bottom:24%;transform:translateX(-50%);width:21%;height:5.3%;border:2px solid rgba(255,255,255,.22);border-bottom:0;border-radius:50% 50% 0 0 / 100% 100% 0 0}
-.goalPost{position:absolute;left:50%;bottom:0;transform:translateX(-50%);width:10.5%;height:2.6%;border:2px solid rgba(255,255,255,.45);border-bottom:0;background:rgba(255,255,255,.05)}
-.cornerArc{position:absolute;bottom:-9px;width:18px;height:18px;border:2px solid rgba(255,255,255,.18);border-radius:50%}
-.cornerArc.left{left:-9px}
-.cornerArc.right{right:-9px}
-.shirt{position:absolute;left:50%;bottom:47px;width:46px;height:37px;transform:translateX(-50%);background:#e7ecf5;clip-path:polygon(22% 0,38% 10%,62% 10%,78% 0,100% 25%,82% 42%,75% 34%,75% 100%,25% 100%,25% 34%,18% 42%,0 25%)}
-.bench{min-height:0;display:flex;align-items:center;justify-content:flex-start;gap:8px;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;-ms-overflow-style:none;padding:0 8px;border-radius:6px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.02)}
-.bench::-webkit-scrollbar{display:none}
-.slot.benchSlot{position:static;flex:0 0 40px;width:40px;height:40px;transform:none;font-size:15px}
-.count{position:absolute;right:12px;bottom:8px;color:rgba(241,180,0,.95);font-size:13px;font-weight:800}
-.slot{position:absolute;transform:translate(-50%,-50%);width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.14);border:2px solid rgba(255,255,255,.25);color:#fff;font-size:16px;font-weight:800;cursor:pointer;display:grid;place-items:center;padding:0}
-.selectBar.locked{opacity:.58;cursor:not-allowed}
-.slot:disabled{cursor:not-allowed;opacity:.78}
-.player:disabled{cursor:not-allowed}
-.miniBox.locked{cursor:not-allowed;opacity:.45}
-.slot:hover{background:rgba(255,255,255,.22)}
-.slot.filled{background:rgba(111,159,186,.22);border-color:#5fb8c9}
-.slot.active{outline:2px solid #f0b429;outline-offset:2px}
-.slot.gk{background:rgba(255,255,255,.2)}
-.slot.gk.filled{background:rgba(180,190,200,.4);border-color:#c9d2db}
-.slot.fw.filled{background:rgba(95,184,201,.3);border-color:#5fb8c9}
-.slot.mf.filled{background:rgba(217,134,113,.3);border-color:#d98671}
-.slot.df.filled{background:rgba(147,181,106,.3);border-color:#93b56a}
+.penaltyBox {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+  width: 58%;
+  height: 24%;
+  border: 2px solid rgba(255, 255, 255, .22);
+  border-bottom: 0
+}
 
-.fieldChoice h2{margin:0 0 8px;font-size:13px;text-align:center;color:rgba(255,255,255,.8);font-weight:800}
+.goalBox {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+  width: 26.3%;
+  height: 8%;
+  border: 2px solid rgba(255, 255, 255, .22);
+  border-bottom: 0
+}
+
+.penaltySpot {
+  position: absolute;
+  left: 50%;
+  bottom: 16%;
+  width: 4px;
+  height: 4px;
+  margin: 0 0 -2px -2px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .4)
+}
+
+.penaltyArc {
+  position: absolute;
+  left: 50%;
+  bottom: 24%;
+  transform: translateX(-50%);
+  width: 21%;
+  height: 5.3%;
+  border: 2px solid rgba(255, 255, 255, .22);
+  border-bottom: 0;
+  border-radius: 50% 50% 0 0 / 100% 100% 0 0
+}
+
+.goalPost {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+  width: 10.5%;
+  height: 2.6%;
+  border: 2px solid rgba(255, 255, 255, .45);
+  border-bottom: 0;
+  background: rgba(255, 255, 255, .05)
+}
+
+.cornerArc {
+  position: absolute;
+  bottom: -9px;
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255, 255, 255, .18);
+  border-radius: 50%
+}
+
+.cornerArc.left {
+  left: -9px
+}
+
+.cornerArc.right {
+  right: -9px
+}
+
+.shirt {
+  position: absolute;
+  left: 50%;
+  bottom: 47px;
+  width: 46px;
+  height: 37px;
+  transform: translateX(-50%);
+  background: #e7ecf5;
+  clip-path: polygon(22% 0, 38% 10%, 62% 10%, 78% 0, 100% 25%, 82% 42%, 75% 34%, 75% 100%, 25% 100%, 25% 34%, 18% 42%, 0 25%)
+}
+
+.bench {
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none
+}
+
+.bench::-webkit-scrollbar {
+  display: none
+}
+
+.slot.benchSlot {
+  position: static;
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  transform: none;
+  font-size: 15px
+}
+
+.slot {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .14);
+  border: 2px solid rgba(255, 255, 255, .25);
+  color: #fff;
+  font-size: 16px;
+  font-weight: 800;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0
+}
+
+.selectBar.locked {
+  opacity: .58;
+  cursor: not-allowed
+}
+
+.slot:disabled {
+  cursor: not-allowed;
+  opacity: .78
+}
+
+.player:disabled {
+  cursor: not-allowed
+}
+
+.miniBox.locked {
+  cursor: not-allowed;
+  opacity: .45
+}
+
+.slot:hover {
+  background: rgba(255, 255, 255, .22)
+}
+
+.slot.filled {
+  background: rgba(111, 159, 186, .22);
+  border-color: #5fb8c9
+}
+
+.slot.active {
+  outline: 2px solid #f0b429;
+  outline-offset: 2px
+}
+
+.slot.gk {
+  background: rgba(255, 255, 255, .2)
+}
+
+.slot.gk.filled {
+  background: rgba(180, 190, 200, .4);
+  border-color: #c9d2db
+}
+
+.slot.fw.filled {
+  background: rgba(95, 184, 201, .3);
+  border-color: #5fb8c9
+}
+
+.slot.mf.filled {
+  background: rgba(217, 134, 113, .3);
+  border-color: #d98671
+}
+
+.slot.df.filled {
+  background: rgba(147, 181, 106, .3);
+  border-color: #93b56a
+}
+
+.fieldChoice h2 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  text-align: center;
+  color: rgba(255, 255, 255, .8);
+  font-weight: 800
+}
 
 /* 잔디선택 / 선수교체 */
-.toolPanel{position:relative}
-.toolGrid{flex:1;min-height:0;display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.toolBtn.on{border-color:#f0b429;background:rgba(240,180,41,.12)}
+.toolPanel {
+  position: relative
+}
 
-.grassPop{position:absolute;z-index:30;left:12px;right:12px;bottom:calc(100% + 8px);padding:10px;border-radius:6px;border:1px solid rgba(255,255,255,.16);background:#1b1e22;box-shadow:0 14px 40px rgba(0,0,0,.6);display:flex;flex-direction:column;gap:9px}
-.popRow{display:flex;flex-direction:column;gap:5px}
-.popLabel{font-size:10px;font-weight:800;color:rgba(255,255,255,.5)}
-.popOpts{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}
-.popBtn{height:24px;border-radius:4px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.05);color:#ddd;font-size:10px;font-weight:700;cursor:pointer;padding:0}
-.popBtn.on{border-color:#f0b429;background:rgba(240,180,41,.2);color:#f0b429}
-.popBtn:disabled{opacity:.35;cursor:not-allowed}
-.popPreview{height:34px;border-radius:4px;border:1px solid rgba(255,255,255,.18)}
-.popOk{height:26px;border-radius:4px;border:none;background:#f0b429;color:#191919;font-weight:800;font-size:11px;cursor:pointer}
-.toolBtn{min-width:0;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:10px;border-radius:6px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:rgba(255,255,255,.85);cursor:pointer}
-.toolBtn:hover{border-color:#f0b429;background:rgba(240,180,41,.12)}
-.toolBtn:active{transform:scale(.98)}
-.toolIcon{width:52px;height:44px;border-radius:4px;display:grid;place-items:center;font-size:24px;color:#eee}
-.grassIcon{background:repeating-linear-gradient(90deg,#2f7d3c 0 8px,#256a31 8px 16px);border:1px solid rgba(255,255,255,.25)}
-.subIcon{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.2);color:#f0b429}
-.toolLabel{font-size:13px;font-weight:800;letter-spacing:.02em}
-.miniPitch{flex:1;min-height:0;position:relative;border-radius:6px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.14);overflow:hidden}
-.miniHalf{position:absolute;left:50%;top:0;bottom:0;border-left:1px solid rgba(255,255,255,.25);z-index:1;pointer-events:none}
-.miniCircle{position:absolute;width:34%;aspect-ratio:1;max-width:60px;border:1px solid rgba(255,255,255,.25);border-radius:50%;left:50%;top:50%;transform:translate(-50%,-50%);z-index:1;pointer-events:none}
-.miniPenalty{position:absolute;top:18%;bottom:18%;width:14%;border:1px solid rgba(255,255,255,.25);z-index:1;pointer-events:none}
-.miniPenalty.left{left:0;border-left:none}
-.miniPenalty.right{right:0;border-right:none}
-.miniGoal{position:absolute;top:38%;bottom:38%;width:4%;border:1px solid rgba(255,255,255,.25);z-index:1;pointer-events:none}
-.miniGoal.left{left:0;border-left:none}
-.miniGoal.right{right:0;border-right:none}
-.miniBox{position:absolute;top:0;bottom:0;width:50%;cursor:pointer}
-.miniBox:hover{background:rgba(255,255,255,.08)}
-.miniBox.active{background:rgba(111,159,186,.22)}
-.leftBox{left:0}.rightBox{right:0}
+.toolGrid {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px
+}
 
-.playerPanel{}
-.tabs{height:30px;display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
-.tabs button{padding:0;font:inherit;display:grid;place-items:center;background:#f2f2f2;border-radius:4px;border:1px solid rgba(255,255,255,.15);color:#222;font-size:10px;font-weight:800;cursor:pointer}
-.tabs .off{background:rgba(255,255,255,.04);border-color:rgba(255,255,255,.1);color:rgba(255,255,255,.5)}
-.tabs .off:hover{background:rgba(255,255,255,.1);color:rgba(255,255,255,.8)}
-.playerGrid{flex:1;margin-top:8px;display:grid;grid-template-columns:repeat(7,1fr);grid-template-rows:repeat(6,1fr);gap:1px;background:rgba(255,255,255,.06);border-radius:4px;overflow:hidden}
-.player{min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.04);background:rgba(255,255,255,.03);overflow:hidden;padding:0;cursor:default}
-.player.pickable{cursor:grab}
-.player.pickable:active{cursor:grabbing}
-.player.pickable:hover{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.15)}
-.player.used{opacity:.3;cursor:not-allowed}
-.player strong{font-size:19px;line-height:20px;color:rgba(255,255,255,.85)}
-.player span{max-width:100%;padding:0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(255,255,255,.45);font-size:8px}
-.player.gk strong{color:rgba(255,255,255,.55)}
-.player.fw strong{color:#5fb8c9}
-.player.mf strong{color:#d98671}
-.player.df strong{color:#93b56a}
-.player.empty{min-height:20px}
+.toolBtn.on {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .12)
+}
+
+.grassPop {
+  position: absolute;
+  z-index: 30;
+  left: 12px;
+  right: 12px;
+  bottom: calc(100% + 8px);
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, .16);
+  background: #1b1e22;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
+  display: flex;
+  flex-direction: column;
+  gap: 9px
+}
+
+.popRow {
+  display: flex;
+  flex-direction: column;
+  gap: 5px
+}
+
+.popLabel {
+  font-size: 10px;
+  font-weight: 800;
+  color: rgba(255, 255, 255, .5)
+}
+
+.popOpts {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 5px
+}
+
+.popBtn {
+  height: 24px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .14);
+  background: rgba(255, 255, 255, .05);
+  color: #ddd;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0
+}
+
+.popBtn.on {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .2);
+  color: #f0b429
+}
+
+.popBtn:disabled {
+  opacity: .35;
+  cursor: not-allowed
+}
+
+.popPreview {
+  height: 34px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .18)
+}
+
+.popOk {
+  height: 26px;
+  border-radius: 4px;
+  border: none;
+  background: #f0b429;
+  color: #191919;
+  font-weight: 800;
+  font-size: 11px;
+  cursor: pointer
+}
+
+.toolBtn {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  background: rgba(255, 255, 255, .04);
+  color: rgba(255, 255, 255, .85);
+  cursor: pointer
+}
+
+.toolBtn:hover {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .12)
+}
+
+.toolBtn:active {
+  transform: scale(.98)
+}
+
+.toolIcon {
+  width: 52px;
+  height: 44px;
+  border-radius: 4px;
+  display: grid;
+  place-items: center;
+  font-size: 24px;
+  color: #eee
+}
+
+.grassIcon {
+  background: repeating-linear-gradient(90deg, #2f7d3c 0 8px, #256a31 8px 16px);
+  border: 1px solid rgba(255, 255, 255, .25)
+}
+
+.subIcon {
+  background: rgba(255, 255, 255, .08);
+  border: 1px solid rgba(255, 255, 255, .2);
+  color: #f0b429
+}
+
+.toolLabel {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: .02em
+}
+
+.miniPitch {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: rgba(0, 0, 0, .14);
+  overflow: hidden
+}
+
+.miniHalf {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid rgba(255, 255, 255, .25);
+  z-index: 1;
+  pointer-events: none
+}
+
+.miniCircle {
+  position: absolute;
+  width: 34%;
+  aspect-ratio: 1;
+  max-width: 60px;
+  border: 1px solid rgba(255, 255, 255, .25);
+  border-radius: 50%;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1;
+  pointer-events: none
+}
+
+.miniPenalty {
+  position: absolute;
+  top: 18%;
+  bottom: 18%;
+  width: 14%;
+  border: 1px solid rgba(255, 255, 255, .25);
+  z-index: 1;
+  pointer-events: none
+}
+
+.miniPenalty.left {
+  left: 0;
+  border-left: none
+}
+
+.miniPenalty.right {
+  right: 0;
+  border-right: none
+}
+
+.miniGoal {
+  position: absolute;
+  top: 38%;
+  bottom: 38%;
+  width: 4%;
+  border: 1px solid rgba(255, 255, 255, .25);
+  z-index: 1;
+  pointer-events: none
+}
+
+.miniGoal.left {
+  left: 0;
+  border-left: none
+}
+
+.miniGoal.right {
+  right: 0;
+  border-right: none
+}
+
+.miniBox {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 50%;
+  cursor: pointer
+}
+
+.miniBox:hover {
+  background: rgba(255, 255, 255, .08)
+}
+
+.miniBox.active {
+  background: rgba(111, 159, 186, .22)
+}
+
+.leftBox {
+  left: 0
+}
+
+.rightBox {
+  right: 0
+}
+
+.playerPanel {}
+
+.tabs {
+  height: 30px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px
+}
+
+.tabs button {
+  padding: 0;
+  font: inherit;
+  display: grid;
+  place-items: center;
+  background: #f2f2f2;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .15);
+  color: #222;
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer
+}
+
+.tabs .off {
+  background: rgba(255, 255, 255, .04);
+  border-color: rgba(255, 255, 255, .1);
+  color: rgba(255, 255, 255, .5)
+}
+
+.tabs .off:hover {
+  background: rgba(255, 255, 255, .1);
+  color: rgba(255, 255, 255, .8)
+}
+
+.playerGrid {
+  flex: 1;
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  grid-template-rows: repeat(6, 1fr);
+  gap: 1px;
+  background: rgba(255, 255, 255, .06);
+  border-radius: 4px;
+  overflow: hidden
+}
+
+.player {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, .04);
+  background: rgba(255, 255, 255, .03);
+  overflow: hidden;
+  padding: 0;
+  cursor: default
+}
+
+.player.pickable {
+  cursor: grab
+}
+
+.player.pickable:active {
+  cursor: grabbing
+}
+
+.player.pickable:hover {
+  background: rgba(255, 255, 255, .08);
+  border-color: rgba(255, 255, 255, .15)
+}
+
+.player.used {
+  opacity: .3;
+  cursor: not-allowed
+}
+
+.player strong {
+  font-size: 19px;
+  line-height: 20px;
+  color: rgba(255, 255, 255, .85)
+}
+
+.player span {
+  max-width: 100%;
+  padding: 0 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: rgba(255, 255, 255, .45);
+  font-size: 8px
+}
+
+.player.gk strong {
+  color: rgba(255, 255, 255, .55)
+}
+
+.player.fw strong {
+  color: #5fb8c9
+}
+
+.player.mf strong {
+  color: #d98671
+}
+
+.player.df strong {
+  color: #93b56a
+}
+
+.player.empty {
+  min-height: 20px
+}
+
 /* 선수 교체 */
-.subTabs{grid-template-columns:1fr}
-.subTitle{cursor:default}
-.subHint{margin:8px 0 0;text-align:center;font-size:10px;color:rgba(255,255,255,.4)}
-.subTimeRow{height:28px;display:flex;align-items:center;justify-content:center;gap:6px;color:rgba(255,255,255,.55);font-size:10px}
-.subTimeRow strong{min-width:22px;text-align:center;color:#f0b429;font:700 14px ui-monospace,monospace}
-.subTimeRow b{color:#f0b429}
-.subTimeBtn{width:22px;height:22px;padding:0;border:1px solid rgba(255,255,255,.18);border-radius:4px;background:rgba(255,255,255,.05);color:#ddd;cursor:pointer}
-.subCols{flex:1.6;min-height:0;display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:8px 0}
-.subItem{cursor:grab}
-.subItem:active{cursor:grabbing}
-.subItem.dragging{opacity:.4}
-.subCol{min-width:0;min-height:0;display:flex;flex-direction:column;gap:6px}
-.subColHead{height:22px;display:grid;place-items:center;border-radius:4px;font-size:10px;font-weight:800;letter-spacing:.02em}
-.subColHead.out{background:rgba(217,134,113,.18);color:#d98671;border:1px solid rgba(217,134,113,.4)}
-.subColHead.in{background:rgba(147,181,106,.18);color:#93b56a;border:1px solid rgba(147,181,106,.4)}
+.subTabs {
+  grid-template-columns: 1fr
+}
+
+.subTitle {
+  cursor: default
+}
+
+.subTimeRow {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: rgba(255, 255, 255, .55);
+  font-size: 10px
+}
+
+.subTimeRow strong {
+  min-width: 22px;
+  text-align: center;
+  color: #f0b429;
+  font: 700 14px ui-monospace, monospace
+}
+
+.subTimeRow b {
+  color: #f0b429
+}
+
+.subTimeBtn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, .18);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .05);
+  color: #ddd;
+  cursor: pointer
+}
+
+.subCols {
+  flex: 1.6;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  padding: 8px 0
+}
+
+.subItem {
+  cursor: grab
+}
+
+.subItem:active {
+  cursor: grabbing
+}
+
+.subItem.dragging {
+  opacity: .4
+}
+
+.subCol {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px
+}
+
+.subColHead {
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .02em
+}
+
+.subColHead.out {
+  background: rgba(217, 134, 113, .18);
+  color: #d98671;
+  border: 1px solid rgba(217, 134, 113, .4)
+}
+
+.subColHead.in {
+  background: rgba(147, 181, 106, .18);
+  color: #93b56a;
+  border: 1px solid rgba(147, 181, 106, .4)
+}
+
 /* 카드는 DidInput.vue 의 교체 카드와 같은 느낌으로 — 폭이 좁아 2줄까지만 조금 더 크게 */
-.subList{flex:1;min-height:0;overflow:hidden;display:grid;grid-template-columns:1fr 1fr;grid-auto-rows:36px;gap:4px;align-content:start;padding-right:0}
-.subItem{min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;border-radius:6px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);cursor:pointer;padding:0 4px}
-.subItem strong{font-size:14px;font-weight:900;line-height:1}
-.subItem i{font-style:normal;font-size:10px}
-.subItem span{font-size:8px;color:rgba(255,255,255,.6);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
-.subItem.gk strong{color:#ddd}.subItem.fw strong{color:#5fb8c9}.subItem.mf strong{color:#d98671}.subItem.df strong{color:#93b56a}
-.subItem:hover{border-color:rgba(240,180,41,.6);background:rgba(240,180,41,.1)}
-.subItem.on{border-color:#f0b429;background:rgba(240,180,41,.24);box-shadow:0 0 0 1px #f0b429 inset}
-.subEmpty{grid-column:1/3;color:rgba(255,255,255,.35);font-size:10px;text-align:center;padding-top:14px}
+.subList {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-auto-rows: 36px;
+  gap: 4px;
+  align-content: start;
+  padding-right: 0
+}
+
+.subItem {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  background: rgba(255, 255, 255, .04);
+  cursor: pointer;
+  padding: 0 4px
+}
+
+.subItem strong {
+  font-size: 14px;
+  font-weight: 900;
+  line-height: 1
+}
+
+.subItem i {
+  font-style: normal;
+  font-size: 10px
+}
+
+.subItem span {
+  font-size: 8px;
+  color: rgba(255, 255, 255, .6);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%
+}
+
+.subItem.gk strong {
+  color: #ddd
+}
+
+.subItem.fw strong {
+  color: #5fb8c9
+}
+
+.subItem.mf strong {
+  color: #d98671
+}
+
+.subItem.df strong {
+  color: #93b56a
+}
+
+.subItem:hover {
+  border-color: rgba(240, 180, 41, .6);
+  background: rgba(240, 180, 41, .1)
+}
+
+.subItem.on {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .24);
+  box-shadow: 0 0 0 1px #f0b429 inset
+}
+
+.subEmpty {
+  grid-column: 1/3;
+  color: rgba(255, 255, 255, .35);
+  font-size: 10px;
+  text-align: center;
+  padding-top: 14px
+}
 
 /* 교체 이력 — DidInput.vue 의 subHistory 와 같은 형식(칸 폭만 이 패널 너비에 맞춤) */
-.subHistory{flex:1;min-height:56px;display:flex;flex-direction:column;border:1px solid rgba(255,255,255,.08);border-radius:6px;overflow:hidden;margin-bottom:8px}
-.subHistBody{flex:1;overflow-y:auto}
-.subHistHead,.subHistRow{display:grid;grid-template-columns:44px 40px 1fr 1fr 34px;align-items:center;gap:4px;padding:4px 6px;font-size:10px}
-.subHistHead{background:#1b2130;color:rgba(255,255,255,.45);font-weight:600}
-.subHistRow{border-top:1px solid rgba(255,255,255,.06);color:rgba(255,255,255,.8)}
-.subHistRow .hP{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.subHistRow .outP{color:#f87171}
-.subHistRow .inP{color:#f0b429}
-.subHistRow .hAct{display:flex;gap:4px;justify-content:flex-end}
-.subHistEmpty{padding:8px;text-align:center;color:rgba(255,255,255,.35);font-size:10px}
-.subUndo{border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:rgba(255,255,255,.6);font-size:9px;border-radius:4px;padding:1px 4px;cursor:pointer}
-.subUndo:hover{color:#fff;border-color:rgba(239,68,68,.5)}
+.subHistory {
+  flex: 0 0 auto;
+  max-height: 180px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(255, 255, 255, .08);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-bottom: 8px
+}
 
-.subActions{height:32px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.subCancel,.subSave{border-radius:4px;font-size:12px;font-weight:800;cursor:pointer;border:1px solid #f0b429;background:transparent;color:#f0b429}
-.subCancel:hover{background:rgba(240,180,41,.14)}
-.subSave{background:#f0b429;color:#191919}
-.subSave:disabled{background:transparent;border-color:rgba(255,255,255,.18);color:rgba(255,255,255,.35);cursor:not-allowed}
+.subHistBody {
+  flex: 1;
+  overflow-y: auto
+}
 
-.legend{height:19px;display:flex;align-items:end;justify-content:flex-end;gap:7px;font-size:9px}
-.legend span{padding:1px 8px;border-radius:3px;color:white;font-weight:700}
-.legend .gk{background:rgba(255,255,255,.25)}
-.legend .fw{background:#5fb8c9}
-.legend .mf{background:#d98671}
-.legend .df{background:#93b56a}
+.subHistHead,
+.subHistRow {
+  display: grid;
+  grid-template-columns: 44px 40px 1fr 1fr 34px;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 6px;
+  font-size: 11px
+}
+
+.subHistHead {
+  background: #1b2130;
+  color: rgba(255, 255, 255, .45);
+  font-weight: 600
+}
+
+.subHistRow {
+  border-top: 1px solid rgba(255, 255, 255, .06);
+  color: rgba(255, 255, 255, .8)
+}
+
+.subHistRow.pending {
+  background: rgba(240, 180, 41, .08);
+  border-left: 2px solid #f0b429
+}
+
+.subHistRow .hP {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis
+}
+
+.subHistRow .outP {
+  color: #f87171
+}
+
+.subHistRow .inP {
+  color: #f0b429
+}
+
+.subHistRow .hAct {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end
+}
+
+.subHistEmpty {
+  padding: 8px;
+  text-align: center;
+  color: rgba(255, 255, 255, .35);
+  font-size: 10px
+}
+
+.subUndo {
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: rgba(255, 255, 255, .05);
+  color: rgba(255, 255, 255, .6);
+  font-size: 9px;
+  border-radius: 4px;
+  padding: 1px 4px;
+  cursor: pointer
+}
+
+.subUndo:hover {
+  color: #fff;
+  border-color: rgba(239, 68, 68, .5)
+}
+
+.subActions {
+  height: 32px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px
+}
+
+.subCancel,
+.subSave {
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  border: 1px solid #f0b429;
+  background: transparent;
+  color: #f0b429
+}
+
+.subCancel:hover {
+  background: rgba(240, 180, 41, .14)
+}
+
+.subSave {
+  background: #f0b429;
+  color: #191919
+}
+
+.subSave:disabled {
+  background: transparent;
+  border-color: rgba(255, 255, 255, .18);
+  color: rgba(255, 255, 255, .35);
+  cursor: not-allowed
+}
+
+.legend {
+  height: 19px;
+  display: flex;
+  align-items: end;
+  justify-content: flex-end;
+  gap: 7px;
+  font-size: 9px
+}
+
+.legend span {
+  padding: 1px 8px;
+  border-radius: 3px;
+  color: white;
+  font-weight: 700
+}
+
+.legend .gk {
+  background: rgba(255, 255, 255, .25)
+}
+
+.legend .fw {
+  background: #5fb8c9
+}
+
+.legend .mf {
+  background: #d98671
+}
+
+.legend .df {
+  background: #93b56a
+}
 
 
-.modeToggle{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:8px}
-.modeBtn{height:22px;border-radius:4px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.03);color:rgba(255,255,255,.45);font-size:10px;font-weight:800;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:4px}
-.modeBtn small{font-size:8px;font-weight:600;color:rgba(255,255,255,.3)}
-.modeBtn.on{background:rgba(240,180,41,.18);border-color:#f0b429;color:#f0b429}
-.modeBtn.on small{color:rgba(240,180,41,.65)}
-.startPanel p{margin:0 0 10px;text-align:center;font-size:11px;line-height:1.4;color:rgba(255,255,255,.75)}
-.startPanel p b{color:rgba(241,180,0,.95)}
-.startBtn{height:43px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.04);color:rgba(255,255,255,.35);cursor:not-allowed}
-.startBtn:not(:disabled){background:#f0b429;border-color:#f0b429;color:#161200;font-weight:800;cursor:pointer}
-.startPanel small{position:absolute;right:8px;bottom:3px;color:rgba(255,255,255,.25);font-size:8px}
-.halfActions{display:grid;grid-template-columns:1fr 1.4fr;gap:8px}
-.halfActions3{grid-template-columns:1fr 1fr 1.3fr}
-.editBtn{height:43px;border-radius:4px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.04);color:#ddd;font-weight:800;cursor:pointer}
-.editBtn:hover{background:rgba(255,255,255,.1)}
-.editBtn:disabled{opacity:.35;cursor:not-allowed}
-.halfActions .startBtn{background:#f0b429;border-color:#f0b429;color:#161200;cursor:pointer}
-.refreshBtn{height:43px;border-radius:4px;border:1px solid rgba(240,180,41,.4);background:rgba(240,180,41,.08);color:#f0b429;font-weight:800;cursor:pointer;font-size:12px}
-.refreshBtn:hover:not(:disabled){background:rgba(240,180,41,.18)}
-.refreshBtn:disabled{opacity:.35;cursor:not-allowed;color:rgba(255,255,255,.35);border-color:rgba(255,255,255,.16);background:transparent}
-.lockNotice{margin:0 0 8px;font-size:11px;color:#f0b429;text-align:center}
-.draftNotice{margin:0 0 8px;font-size:11px;color:#f0b429;text-align:center}
-.lifecycleError{margin:8px 0 0;font-size:11px;color:#ff8b8b;text-align:center;line-height:1.4}
-.levelToggle{margin-top:6px;height:26px;border-radius:4px;border:1px dashed rgba(240,180,41,.5);background:rgba(240,180,41,.08);color:#f0b429;cursor:pointer;font-size:10px;font-weight:800;letter-spacing:.03em}
-.levelToggle.basic{background:rgba(99,192,162,.12);border-color:rgba(99,192,162,.5);color:#63c0a2}
+.modeToggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-bottom: 8px
+}
 
+.modeBtn {
+  height: 22px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  background: rgba(255, 255, 255, .03);
+  color: rgba(255, 255, 255, .45);
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px
+}
+
+.modeBtn small {
+  font-size: 8px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, .3)
+}
+
+.modeBtn.on {
+  background: rgba(240, 180, 41, .18);
+  border-color: #f0b429;
+  color: #f0b429
+}
+
+.modeBtn.on small {
+  color: rgba(240, 180, 41, .65)
+}
+
+.startPanel p {
+  margin: 0 0 10px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, .75)
+}
+
+.startPanel p b {
+  color: rgba(241, 180, 0, .95)
+}
+
+.startBtn {
+  height: 43px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .1);
+  background: rgba(255, 255, 255, .04);
+  color: rgba(255, 255, 255, .35);
+  cursor: not-allowed
+}
+
+.startBtn:not(:disabled) {
+  background: #f0b429;
+  border-color: #f0b429;
+  color: #161200;
+  font-weight: 800;
+  cursor: pointer
+}
+
+.startPanel small {
+  position: absolute;
+  right: 8px;
+  bottom: 3px;
+  color: rgba(255, 255, 255, .25);
+  font-size: 8px
+}
+
+.halfActions {
+  display: grid;
+  grid-template-columns: 1fr 1.4fr;
+  gap: 8px
+}
+
+.halfActions3 {
+  grid-template-columns: 1fr 1fr 1.3fr
+}
+
+.editBtn {
+  height: 43px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .16);
+  background: rgba(255, 255, 255, .04);
+  color: #ddd;
+  font-weight: 800;
+  cursor: pointer
+}
+
+.editBtn:hover {
+  background: rgba(255, 255, 255, .1)
+}
+
+.editBtn:disabled {
+  opacity: .35;
+  cursor: not-allowed
+}
+
+.halfActions .startBtn {
+  background: #f0b429;
+  border-color: #f0b429;
+  color: #161200;
+  cursor: pointer
+}
+
+.refreshBtn {
+  height: 43px;
+  border-radius: 4px;
+  border: 1px solid rgba(240, 180, 41, .4);
+  background: rgba(240, 180, 41, .08);
+  color: #f0b429;
+  font-weight: 800;
+  cursor: pointer;
+  font-size: 12px
+}
+
+.refreshBtn:hover:not(:disabled) {
+  background: rgba(240, 180, 41, .18)
+}
+
+.refreshBtn:disabled {
+  opacity: .35;
+  cursor: not-allowed;
+  color: rgba(255, 255, 255, .35);
+  border-color: rgba(255, 255, 255, .16);
+  background: transparent
+}
+
+.lockNotice {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: #f0b429;
+  text-align: center
+}
+
+.draftNotice {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: #f0b429;
+  text-align: center
+}
+
+.lifecycleError {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: #ff8b8b;
+  text-align: center;
+  line-height: 1.4
+}
+
+.levelToggle {
+  margin-top: 6px;
+  height: 26px;
+  border-radius: 4px;
+  border: 1px dashed rgba(240, 180, 41, .5);
+  background: rgba(240, 180, 41, .08);
+  color: #f0b429;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .03em
+}
+
+.levelToggle.basic {
+  background: rgba(99, 192, 162, .12);
+  border-color: rgba(99, 192, 162, .5);
+  color: #63c0a2
+}
 </style>

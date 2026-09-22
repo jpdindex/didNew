@@ -815,6 +815,10 @@ const cardSubSlots = computed(() =>
   byNo(benchSlots.value.filter(s => canPickForCard(game.value.assigned[s.id]!, cardByPlayer.value, cardHighlightPlayer.value)))
 )
 
+// 선수교체 패널의 OUT/IN 목록도 카드 목록과 마찬가지로 등번호 순으로 보여준다.
+const subOutSlots = computed(() => byNo(onFieldSlots.value))
+const subInSlots = computed(() => byNo(benchSlots.value))
+
 /** 한 번 빠진 선수는 다시 못 들어온다(축구 규칙) — 벤치에 있어도 고를 수 없게 막는다 */
 const subbedOutPlayers = computed(() => new Set(game.value.subs.map(s => s.outPlayer)))
 function isSubbedOut(slotId: string) {
@@ -823,6 +827,19 @@ function isSubbedOut(slotId: string) {
 }
 
 const canSubmitSub = computed(() => subOutSlot.value !== null && subInSlot.value !== null)
+// 교체 기록을 "수정" 중이면 그 인덱스를 들고 있는다 — null 이면 새 교체를 추가하는 중.
+// 수정 중에도 game.subs 에서 지우지 않아서 목록에 계속 보인다.
+const editingSubIndex = ref<number | null>(null)
+
+/** outPlayer·inPlayer 가 지금 있는 자리를 맞바꾼다. 같은 쌍으로 두 번 부르면 원래대로 돌아온다. */
+function swapPlayers(outPlayer: string, inPlayer: string) {
+  const entries = Object.entries(game.value.assigned)
+  const outSlot = entries.find(([, idx]) => idx === outPlayer)?.[0]
+  const inSlot = entries.find(([, idx]) => idx === inPlayer)?.[0]
+  if (outSlot && inSlot) {
+    game.value.assigned = { ...game.value.assigned, [outSlot]: inPlayer, [inSlot]: outPlayer }
+  }
+}
 
 function openSubPanel() {
   // 카드 패널이 열려 있었다면 강제로 닫는다 — Cancel 과 동일하게 미제출 큐도 버린다.
@@ -831,9 +848,17 @@ function openSubPanel() {
   subInSlot.value = null
   subMinute.value = Math.floor(seconds.value / 60)
   subSecond.value = seconds.value % 60
+  editingSubIndex.value = null
   subOpen.value = true
 }
+/** 수정 중이던 교체를 Submit 없이 그냥 닫으면, editSub 에서 되돌려 둔 배치를 원래대로 되돌린다. */
 function closeSubPanel() {
+  const index = editingSubIndex.value
+  if (index !== null) {
+    const original = game.value.subs[index]
+    if (original) swapPlayers(original.outPlayer, original.inPlayer)
+    editingSubIndex.value = null
+  }
   subOpen.value = false
 }
 
@@ -867,9 +892,16 @@ function submitSub() {
 
   // 자리를 맞바꾼다 — 들어온 선수가 나간 선수의 슬롯(포지션)을 그대로 이어받는다.
   game.value.assigned = { ...game.value.assigned, [outSlot]: inPlayer, [inSlot]: outPlayer }
-  game.value.subs = insertSubSorted(game.value.subs, {
-    half: halfCode.value, seconds: subTotalSeconds.value, outPlayer, inPlayer,
-  })
+  const record: SubRecord = { half: halfCode.value, seconds: subTotalSeconds.value, outPlayer, inPlayer }
+
+  const index = editingSubIndex.value
+  if (index !== null) {
+    // 수정 확정: 그 자리에 있던 기존 기록을 새 값으로 갈아 끼운다.
+    game.value.subs = insertSubSorted(game.value.subs.filter((_, i) => i !== index), record)
+    editingSubIndex.value = null
+  } else {
+    game.value.subs = insertSubSorted(game.value.subs, record)
+  }
   subOutSlot.value = null
   subInSlot.value = null
 }
@@ -878,13 +910,32 @@ function submitSub() {
 function undoSub(index: number) {
   const s = game.value.subs[index]
   if (!s) return
-  const entries = Object.entries(game.value.assigned)
-  const inSlot = entries.find(([, idx]) => idx === s.inPlayer)?.[0]
-  const outSlot = entries.find(([, idx]) => idx === s.outPlayer)?.[0]
-  if (inSlot && outSlot) {
-    game.value.assigned = { ...game.value.assigned, [inSlot]: s.outPlayer, [outSlot]: s.inPlayer }
-  }
+  swapPlayers(s.outPlayer, s.inPlayer)
   game.value.subs = game.value.subs.filter((_, i) => i !== index)
+}
+
+/**
+ * 이미 저장된 교체 한 건을 고친다 — OUT 도 IN 도 잘못 골랐을 수 있으므로(예: 손흥민이
+ * 아니라 황희찬이 나간 것이었다, 혹은 이강인이 아니라 다른 후보가 들어왔어야 했다),
+ * 배치를 되돌려서 둘 다 다시 고를 수 있게 열되 — 지금 값 그대로 이미 선택해 둔다.
+ * 그래서 아무것도 안 바꾸고 시각만 고쳐 Submit 해도 되고, 한쪽만 새로 골라도 된다.
+ * 목록에서는 지우지 않고 그대로 남겨 둬서, 수정 중에도 기록이 계속 보인다.
+ */
+function editSub(index: number) {
+  const s = game.value.subs[index]
+  if (!s) return
+  swapPlayers(s.outPlayer, s.inPlayer) // 되돌린다: outPlayer는 다시 필드로, inPlayer는 다시 벤치로
+  const entries = Object.entries(game.value.assigned)
+  const outSlot = entries.find(([, idx]) => idx === s.outPlayer)?.[0] // 되돌린 뒤 outPlayer 의 필드 슬롯
+  const inSlot = entries.find(([, idx]) => idx === s.inPlayer)?.[0] // 되돌린 뒤 inPlayer 의 벤치 슬롯
+  if (!outSlot || !inSlot) return
+  if (cardOpen.value) { cardOpen.value = false; resetCardDraft() }
+  subOpen.value = true
+  editingSubIndex.value = index
+  subOutSlot.value = outSlot
+  subInSlot.value = inSlot
+  subMinute.value = Math.floor(s.seconds / 60)
+  subSecond.value = s.seconds % 60
 }
 
 const subHalfLabel: Record<string, string> = { H1: '전반', H2: '후반', H3: '연장전반', H4: '연장후반' }
@@ -1623,9 +1674,9 @@ async function finishHalf() {
 
             <div class="subCols">
               <div class="subSection">
-                <div class="subColHead"><span>선수목록</span><span class="subColHint">나갈 선수</span></div>
+                <div class="subColHead"><span>선발</span></div>
                 <div class="subGrid">
-                  <button v-for="s in onFieldSlots" :key="s.id" class="subCard"
+                  <button v-for="s in subOutSlots" :key="s.id" class="subCard"
                     :class="[`pos${s.p!.pos}`, { out: subOutSlot === s.id }]" @click="pickSubOut(s.id)">
                     <span class="subNo">{{ s.p!.no }}</span>
                     <span class="subName">{{ s.p!.name }}</span>
@@ -1634,9 +1685,9 @@ async function finishHalf() {
               </div>
 
               <div class="subSection">
-                <div class="subColHead"><span>대기목록</span><span class="subColHint">들어올 선수</span></div>
+                <div class="subColHead"><span>후보</span></div>
                 <div class="subGrid">
-                  <button v-for="s in benchSlots" :key="s.id" class="subCard"
+                  <button v-for="s in subInSlots" :key="s.id" class="subCard"
                     :class="[`pos${s.p!.pos}`, { in: subInSlot === s.id, done: isSubbedOut(s.id) }]"
                     :disabled="isSubbedOut(s.id)" @click="pickSubIn(s.id)">
                     <span class="subNo">{{ s.p!.no }}</span>
@@ -1656,13 +1707,18 @@ async function finishHalf() {
                 <span class="hAct"></span>
               </div>
               <div v-if="!game.subs.length" class="subHistEmpty">교체 기록이 없습니다.</div>
-              <div v-for="(s, i) in game.subs" v-else :key="i" class="subHistRow">
+              <div v-for="(s, i) in game.subs" v-else :key="i" class="subHistRow" :class="{ editing: editingSubIndex === i }">
                 <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
                 <span class="hTime">{{ fmtTime(s.seconds) }}</span>
                 <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
                 <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
-                <span class="hAct"><button class="subUndo" @click="openSubPanel">수정</button><button class="subUndo"
-                    @click="undoSub(i)">취소</button></span>
+                <span class="hAct">
+                  <span v-if="editingSubIndex === i" class="subEditingTag">수정 중</span>
+                  <template v-else>
+                    <button class="subUndo" @click="editSub(i)">수정</button>
+                    <button class="subUndo" @click="undoSub(i)">취소</button>
+                  </template>
+                </span>
               </div>
             </div>
 
@@ -3473,6 +3529,11 @@ section.right h1 {
   min-width: 0
 }
 
+.subSection + .subSection {
+  border-left: 1px solid rgba(255, 255, 255, .1);
+  padding-left: 12px
+}
+
 .subColHead {
   display: flex;
   align-items: baseline;
@@ -3484,11 +3545,6 @@ section.right h1 {
   color: rgba(255, 255, 255, .85);
   font-weight: 700;
   font-size: 13px
-}
-
-.subColHint {
-  color: rgba(255, 255, 255, .4);
-  font-size: 10px
 }
 
 .subGrid {
@@ -3606,6 +3662,17 @@ section.right h1 {
 .subHistRow {
   border-top: 1px solid rgba(255, 255, 255, .06);
   color: rgba(255, 255, 255, .8)
+}
+
+.subHistRow.editing {
+  background: rgba(240, 180, 41, .1);
+  border-left: 2px solid #f0b429
+}
+
+.subEditingTag {
+  color: #f0b429;
+  font-size: 11px;
+  font-weight: 700
 }
 
 .subHistRow .hP {

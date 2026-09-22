@@ -111,7 +111,7 @@ function defaultMatchState(): MatchState {
     side: null,
     inputMode: '분석',
     grassPattern: 1,
-    grassLines: 10,
+    grassLines: 9,
     mirrored: false,
     halfStatus: 'ready',
     seconds: 0,
