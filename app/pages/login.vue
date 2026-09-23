@@ -6,6 +6,7 @@ import {
   setPersistence,
   signInWithEmailAndPassword
 } from 'firebase/auth'
+import { doc, getDoc, serverTimestamp, setDoc } from 'firebase/firestore'
 
 const SAVED_ID_KEY = 'did_saved_id'
 
@@ -16,7 +17,7 @@ const autoLogin = ref(false)
 const message = ref('')
 const loading = ref(false)
 
-const { $auth } = useNuxtApp()
+const { $auth, $db } = useNuxtApp()
 
 onMounted(() => {
   const saved = localStorage.getItem(SAVED_ID_KEY)
@@ -42,7 +43,22 @@ async function login() {
   try {
     // 자동로그인 체크: 브라우저를 닫아도 세션 유지. 해제 시: 탭 닫으면 로그아웃.
     await setPersistence($auth, autoLogin.value ? browserLocalPersistence : browserSessionPersistence)
-    await signInWithEmailAndPassword($auth, toInternalEmail(uId.value), uPw.value)
+    const credential = await signInWithEmailAndPassword($auth, toInternalEmail(uId.value), uPw.value)
+    // Firebase Authentication 계정과 입력 운영 프로필을 첫 로그인부터 연결한다.
+    // 주/부 분석관 역할은 계정 문서에 저장하지 않고, 등급만 기본값으로 만든다.
+    const profileRef = doc($db, 'recorders', credential.user.uid)
+    const existingProfile = await getDoc(profileRef)
+    await setDoc(profileRef, existingProfile.exists() ? {
+      name: uId.value.trim(),
+      updatedAt: serverTimestamp(),
+      updatedBy: 'login-bootstrap',
+    } : {
+      name: uId.value.trim(),
+      level: 'advanced',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      updatedBy: 'login-bootstrap',
+    }, { merge: true })
 
     if (saveId.value) {
       localStorage.setItem(SAVED_ID_KEY, uId.value)

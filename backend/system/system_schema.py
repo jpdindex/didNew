@@ -102,8 +102,10 @@ class RecordingDoc(SchemaModel):
     side: Side
     teamId: str
     opponentTeamId: str
-    recorders: dict[str, RecorderEntry]
-    recorderIds: list[str]
+    # RAW is the match-data source of truth. Analyst participation belongs to
+    # operational Draft/audit data, so new RAW documents do not carry it.
+    recorders: dict[str, RecorderEntry] = Field(default_factory=dict)
+    recorderIds: list[str] = Field(default_factory=list)
     status: HalfStatus
     inputMode: InputMode
     fieldSide: Literal["left", "right"]
@@ -143,7 +145,8 @@ class RecordDoc(SchemaModel):
     shootDspRange: bool | None = None
     isShot: bool | None = None
     playerId: str | None = None
-    createdBy: str
+    # New RAW intentionally does not retain the operator UID.
+    createdBy: str = ""
     playerIdBy: str | None = None
     source: DataSource
     playerIdSource: DataSource | None = None
@@ -161,7 +164,8 @@ class CardDoc(SchemaModel):
     half: Half
     halfSeconds: int
     card: Literal["Y", "R"]
-    createdBy: str
+    # New RAW intentionally does not retain the operator UID.
+    createdBy: str = ""
     createdAt: datetime
 
 

@@ -162,10 +162,10 @@ export interface RecordingDoc {
   side: Side
   teamId: string
   opponentTeamId: string
-  /** map. Firestore 는 map 의 키로 질의할 수 없어 recorderIds 를 따로 둔다 */
-  recorders: Record<string, RecorderEntry>
-  /** 질의용(array-contains). "내가 기록한 경기" 대시보드에 쓴다 */
-  recorderIds: string[]
+  /** Legacy RAW compatibility only. New RAW documents keep analyst history outside recordings. */
+  recorders?: Record<string, RecorderEntry>
+  /** Legacy RAW compatibility only. */
+  recorderIds?: string[]
   status: HalfStatus
   inputMode: InputMode
   /** 전반 기준 진영. 구역코드 반전에 쓰인다 */
@@ -242,9 +242,9 @@ export interface RecordDoc {
   isShot?: boolean
   /** 'OWN' = 자책골 */
   playerId?: string
-  /** 이 레코드(액트·위치)를 만든 사람의 uid */
-  createdBy: string
-  /** 선수를 넣은 사람의 uid. 2인 기록에서 createdBy 와 달라질 수 있다 (§6.3) */
+  /** Legacy RAW compatibility only. New RAW does not retain operator identity. */
+  createdBy?: string
+  /** Legacy RAW compatibility only. */
   playerIdBy?: string
   source: DataSource
   playerIdSource?: DataSource
@@ -272,8 +272,8 @@ export interface CardDoc {
   half: Half
   halfSeconds: number
   card: 'Y' | 'R'
-  /** 이 카드를 넣은 사람의 uid. RecordDoc.createdBy 와 같은 이유 — 정정 책임 추적용 */
-  createdBy: string
+  /** Legacy RAW compatibility only. New RAW does not retain operator identity. */
+  createdBy?: string
   createdAt: Timestamp
 }
 

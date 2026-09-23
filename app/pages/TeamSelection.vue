@@ -1,7 +1,17 @@
 <script setup lang="ts">
+import { doc, getDoc } from 'firebase/firestore'
 import { computeAttackPaths, computeBap } from '~/utils/didLogic'
-import type { HalfStatus, MatchSnapshot, MatchSquadPlayer, SubRecord } from '~/composables/useMatchState'
+import type { HalfStatus, MatchSnapshot, MatchSquadPlayer, MatchState, SubRecord } from '~/composables/useMatchState'
 import type { Half } from '~/types/schema'
+import type { InputPayload } from '~/composables/useMatchDraft'
+import {
+  BENCH_COUNT,
+  BENCH_IDS,
+  FORMATIONS,
+  GK_SLOT,
+  lineupAssignmentOrder as formationAssignmentOrder,
+  orderedOutfieldSlotIds,
+} from '~/utils/formationLayout'
 import {
   GRASS_LINE_OPTIONS,
   GRASS_PATTERNS,
@@ -18,6 +28,12 @@ const match = computed(() => ({
 }))
 const kpis = ['TAP', 'DAP', 'DTP', 'Shoot', 'Goal', 'SSR', 'BAP', 'ASR']
 const kpiHalf = ref<'all' | 'H1' | 'H2'>('all')
+type DashboardKpi = Record<(typeof kpis)[number], number>
+const emptyDashboardKpi = (): DashboardKpi => ({ TAP: 0, DAP: 0, DTP: 0, Shoot: 0, Goal: 0, SSR: 0, BAP: 0, ASR: 0 })
+const dashboardKpis = ref<{ H: Record<'all' | 'H1' | 'H2', DashboardKpi>; A: Record<'all' | 'H1' | 'H2', DashboardKpi> }>({
+  H: { all: emptyDashboardKpi(), H1: emptyDashboardKpi(), H2: emptyDashboardKpi() },
+  A: { all: emptyDashboardKpi(), H1: emptyDashboardKpi(), H2: emptyDashboardKpi() },
+})
 
 // ---- 공유 상태 ----
 // TeamSelection ↔ DidInput 이 함께 쓰는 임시 스토어(useState). 전반/후반 종료 후
@@ -25,9 +41,11 @@ const kpiHalf = ref<'all' | 'H1' | 'H2'>('all')
 // selectedTeam/formationKey/assigned/side/inputMode/잔디 설정을 전부 여기로 옮겼다.
 const game = useMatchState()
 const { request } = useBackendApi()
-const { saveLocal, save: saveDraft, promoteH1, finalizeAdvanced, restoreFinalRaw, recover: recoverDraft } = useMatchDraft()
+const { saveLocal, save: saveDraft, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover: recoverDraft, hydrate } = useMatchDraft()
+const { join: joinCollaboration, syncState } = useMatchCollaboration()
 const lifecycleBusy = ref(false)
 const lifecycleError = ref('')
+const bootstrapApplied = ref(false)
 
 // 전반 시작~종료 구간에는 전반 데이터를, 후반 시작~종료 구간에는 후반 데이터를 자동으로 보여준다.
 watch(() => game.value.halfStatus, (st) => {
@@ -35,6 +53,10 @@ watch(() => game.value.halfStatus, (st) => {
   else if (st === 'H2' || st === 'H2_done') kpiHalf.value = 'H2'
   else if (st === 'final') kpiHalf.value = 'all'
 }, { immediate: true })
+watch(kpiHalf, half => {
+  if (!bootstrapApplied.value) return
+  void loadDashboardKpis(half).catch(() => false)
+})
 
 // schedule 에서 다른 경기를 새로 선택해 들어온 경우(matchId 가 바뀐 경우)에는
 // 이전 경기의 라인업·기록이 남아있으면 안 되므로 초기화한다.
@@ -42,15 +64,72 @@ if (matchId.value && game.value.matchId !== matchId.value) {
   resetMatchState()
   game.value.matchId = matchId.value
 }
+// 일정 화면에서 선택한 팀은 새 세션마다 명시적으로 적용한다. 같은 경기의 반대 팀으로
+// 다시 들어오는 경우에도 useState에 남아 있던 이전 팀을 재사용하면 안 된다.
+game.value.team = route.query.team === 'away' ? 'away' : 'home'
+const requestedRole = route.query.role === 'assistant' ? 'assistant' : 'primary'
+game.value.participantRole = requestedRole
 
 const players = computed<MatchSquadPlayer[]>(() => (game.value.team === 'home' ? game.value.squads.home : game.value.squads.away))
 
 type FieldSide = 'left' | 'right'
-type InputSideStatus = { rawStatus: string | null; completed: boolean; fieldSide: FieldSide | null }
+type InputSideStatus = {
+  rawStatus: string | null
+  completed: boolean
+  fieldSide: FieldSide | null
+  lifecycleStatus?: HalfStatus
+}
 const inputStatus = ref<{ H: InputSideStatus; A: InputSideStatus }>({
   H: { rawStatus: null, completed: false, fieldSide: null },
   A: { rawStatus: null, completed: false, fieldSide: null },
 })
+
+type InputBootstrapSession = {
+  status: 'ok' | 'missing'
+  gmId: string
+  side: 'H' | 'A'
+  payload?: InputPayload
+  clientState?: MatchState
+}
+
+type InputBootstrap = {
+  H: MatchSquadPlayer[]
+  A: MatchSquadPlayer[]
+  matchSnapshot: MatchSnapshot
+  inputStatus: { H: InputSideStatus; A: InputSideStatus }
+  session: InputBootstrapSession
+  dashboardKpis: { H: Record<'all' | 'H1' | 'H2', DashboardKpi>; A: Record<'all' | 'H1' | 'H2', DashboardKpi> }
+}
+
+async function loadBootstrap() {
+  if (!matchId.value) return
+  const side = game.value.team === 'away' ? 'A' : 'H'
+  return await request<InputBootstrap>(
+    `/api/v1/match-input/matches/${encodeURIComponent(matchId.value)}/bootstrap?side=${side}`,
+  )
+}
+
+function applyBootstrap(payload: InputBootstrap) {
+  game.value.squads = { home: payload.H, away: payload.A }
+  game.value.matchSnapshot = payload.matchSnapshot
+  inputStatus.value = payload.inputStatus
+  dashboardKpis.value = payload.dashboardKpis
+
+  const selectedTeam = game.value.team
+  const selectedStatus = selectedTeam === 'home' ? payload.inputStatus.H : payload.inputStatus.A
+  if (payload.session.status === 'ok' && payload.session.payload) {
+    hydrate(game.value, payload.session.payload, payload.session.clientState)
+    return true
+  }
+  if (selectedStatus.lifecycleStatus === 'ready') {
+    resetForInputTeam(selectedTeam)
+    return false
+  }
+  if (selectedStatus.lifecycleStatus && selectedStatus.lifecycleStatus !== 'final') {
+    game.value.halfStatus = selectedStatus.lifecycleStatus
+  }
+  return false
+}
 
 async function loadSquads() {
   if (!matchId.value) return
@@ -65,6 +144,15 @@ async function loadSquads() {
   game.value.matchSnapshot = payload.matchSnapshot
   inputStatus.value = payload.inputStatus
   return { squads, snapshot: payload.matchSnapshot }
+}
+
+async function loadDashboardKpis(half: 'all' | 'H1' | 'H2' = kpiHalf.value) {
+  if (!matchId.value) return
+  const payload = await request<{ kpis: { H: DashboardKpi; A: DashboardKpi } }>(
+    `/api/v1/match-input/matches/${encodeURIComponent(matchId.value)}/dashboard-kpis?half=${half}`,
+  )
+  dashboardKpis.value.H[half] = payload.kpis.H
+  dashboardKpis.value.A[half] = payload.kpis.A
 }
 
 function oppositeFieldSide(side: FieldSide): FieldSide {
@@ -108,40 +196,9 @@ const sortedPlayers = computed(() => {
 })
 
 // ---- 포메이션 ----
-const formations: Record<string, { label: string; slots: { x: number; y: number }[] }> = {
-  '4-4-2': {
-    label: '4-4-2', slots: [
-      { x: 14, y: 72 }, { x: 38, y: 72 }, { x: 62, y: 72 }, { x: 86, y: 72 },
-      { x: 14, y: 46 }, { x: 38, y: 46 }, { x: 62, y: 46 }, { x: 86, y: 46 },
-      { x: 35, y: 18 }, { x: 65, y: 18 },
-    ]
-  },
-  '4-3-3': {
-    label: '4-3-3', slots: [
-      { x: 14, y: 72 }, { x: 38, y: 72 }, { x: 62, y: 72 }, { x: 86, y: 72 },
-      { x: 26, y: 48 }, { x: 50, y: 48 }, { x: 74, y: 48 },
-      { x: 20, y: 16 }, { x: 50, y: 16 }, { x: 80, y: 16 },
-    ]
-  },
-  '3-5-2': {
-    label: '3-5-2', slots: [
-      { x: 26, y: 75 }, { x: 50, y: 75 }, { x: 74, y: 75 },
-      { x: 10, y: 46 }, { x: 30, y: 46 }, { x: 50, y: 46 }, { x: 70, y: 46 }, { x: 90, y: 46 },
-      { x: 35, y: 16 }, { x: 65, y: 16 },
-    ]
-  },
-  '4-2-3-1': {
-    label: '4-2-3-1', slots: [
-      { x: 14, y: 75 }, { x: 38, y: 75 }, { x: 62, y: 75 }, { x: 86, y: 75 },
-      { x: 36, y: 54 }, { x: 64, y: 54 },
-      { x: 18, y: 32 }, { x: 50, y: 32 }, { x: 82, y: 32 },
-      { x: 50, y: 12 },
-    ]
-  },
-}
-const gkSlot = { x: 50, y: 94 }
-const BENCH_COUNT = 15
-const benchIds = Array.from({ length: BENCH_COUNT }, (_, i) => `b${i}`)
+const formations = FORMATIONS
+const gkSlot = GK_SLOT
+const benchIds = BENCH_IDS
 
 // 화면 전환/편집 중에만 의미있는 순수 UI 상태 — 공유할 필요 없어 로컬로 둔다.
 const menuOpen = ref(false)
@@ -157,11 +214,7 @@ const outfieldSlots = computed(() => (game.value.formationKey ? formations[game.
 // 라인업 입력 순서는 화면 좌표 기준이다: 좌상단 → 우측, 그 다음 아래 줄 → ... → GK → 벤치.
 // formation 배열의 원래 인덱스(o0...)는 수비부터 시작하므로 그대로 쓰면 좌하단이 첫 슬롯이 된다.
 const lineupAssignmentOrder = computed(() => {
-  const field = outfieldSlots.value
-    .map((slot, index) => ({ id: `o${index}`, x: slot.x, y: slot.y }))
-    .sort((a, b) => (a.y - b.y) || (a.x - b.x))
-    .map(item => item.id)
-  return [...field, 'gk', ...benchIds]
+  return formationAssignmentOrder(game.value.formationKey)
 })
 
 function firstEmptyLineupSlot() {
@@ -170,18 +223,60 @@ function firstEmptyLineupSlot() {
 
 function pickFormation(key: string) {
   if (!matchInfoEditable.value) return
+  const previous = { ...game.value.assigned }
+  const previousOutfield = lineupAssignmentOrder.value.filter(slot => slot.startsWith('o')).map(slot => previous[slot]).filter((id): id is string => Boolean(id))
+  const previousBench = benchIds.map(slot => previous[slot]).filter((id): id is string => Boolean(id))
   game.value.formationKey = key
   menuOpen.value = false
-  // 포메이션 바꾸면 배치 초기화
+  // Formation changes reflow people; they never discard an existing lineup.
   Object.keys(game.value.assigned).forEach(k => delete game.value.assigned[k])
+  if (previous.gk) game.value.assigned.gk = previous.gk
+  const newOutfieldSlots = orderedOutfieldSlotIds(key)
+  newOutfieldSlots.forEach((slot, index) => {
+    if (previousOutfield[index]) game.value.assigned[slot] = previousOutfield[index]
+  })
+  const used = new Set(Object.values(game.value.assigned))
+  const benchPool = [...previousOutfield.slice(newOutfieldSlots.length), ...previousBench].filter(id => !used.has(id))
+  benchIds.forEach((slot, index) => {
+    if (benchPool[index]) game.value.assigned[slot] = benchPool[index]
+  })
   activeSlot.value = firstEmptyLineupSlot()
+  void syncState(game.value).catch(() => false)
 }
 
-// 개발용 등급 토글. recorders/{uid}.level 연동 전까지 화면에서 직접 전환한다.
-function toggleRecorderLevel() {
-  game.value.recorderLevel = game.value.recorderLevel === 'basic' ? 'advanced' : 'basic'
-  // 실시간 모드는 advanced 전용. basic 으로 내려가면 분석으로 고정한다.
-  if (game.value.recorderLevel === 'basic') game.value.inputMode = '분석'
+async function recoverSelectedTeamState() {
+  const selectedTeam = game.value.team
+  const serverState = selectedTeam === 'home' ? inputStatus.value.H : inputStatus.value.A
+  const rawCompleted = serverState.rawStatus === 'final'
+
+  // 종료된 팀은 현장의 IndexedDB/Draft가 남아 있더라도 최종 RAW를 화면 정본으로
+  // 사용한다. 수정 버튼만 RAW를 Draft로 복제하는 쓰기 동작을 수행한다.
+  if (rawCompleted) return await recoverFinalRaw(game.value)
+
+  const draftRecovered = await recoverDraft(game.value)
+
+  // Online lifecycle state wins over device-local IndexedDB. A missing Draft
+  // means a genuinely new ready session, not an old half from this browser.
+  if (serverState.lifecycleStatus === 'ready') {
+    if (draftRecovered) resetForInputTeam(selectedTeam)
+    return false
+  }
+  if (serverState.lifecycleStatus && serverState.lifecycleStatus !== 'final') {
+    game.value.halfStatus = serverState.lifecycleStatus
+  }
+  return draftRecovered
+}
+
+async function loadRecorderProfile() {
+  const { $auth, $authReady, $db } = useNuxtApp()
+  await $authReady
+  const user = $auth.currentUser
+  if (!user) return
+  const snapshot = await getDoc(doc($db, 'recorders', user.uid))
+  if (!snapshot.exists()) return
+  const profile = snapshot.data()
+  if (profile.level === 'basic' || profile.level === 'advanced') game.value.recorderLevel = profile.level
+  game.value.participantName = String(profile.name || user.displayName || user.email || '')
 }
 
 // 테스트용: 포메이션/진영/전체 슬롯을 랜덤으로 한 번에 채움
@@ -203,7 +298,7 @@ function fillTestData() {
   const outfieldPool = pool.filter(player => player.pos !== 'GK')
   const gk = gkPool[0]
   if (gk) game.value.assigned.gk = gk.playerId
-  const outfieldIds = outfieldSlots.value.map((_, i) => `o${i}`)
+  const outfieldIds = orderedOutfieldSlotIds(key)
   outfieldIds.forEach((id, i) => {
     const player = outfieldPool[i]
     if (player) game.value.assigned[id] = player.playerId
@@ -219,7 +314,9 @@ function fillTestData() {
   game.value.side = Math.random() < 0.5 ? 'left' : 'right'
 }
 
-const canSwitchInputTeam = computed(() => game.value.halfStatus === 'ready' || game.value.halfStatus === 'final')
+// H1/H2 종료 뒤에도 반대 팀은 별도의 입력 세션으로 계속 시작할 수 있어야 한다.
+// pickTeam()이 현재 팀 상태를 먼저 Draft/IndexedDB에 보존하므로 전환 자체는 항상 허용한다.
+const canSwitchInputTeam = computed(() => true)
 
 function resetForInputTeam(team: 'home' | 'away') {
   // match/squad와 화면 공통 설정은 유지하되, 실제 입력 세션은 H/A별로 완전히 분리한다.
@@ -235,6 +332,8 @@ function resetForInputTeam(team: 'home' | 'away') {
     grassLines: game.value.grassLines,
     mirrored: game.value.mirrored,
     recorderLevel: game.value.recorderLevel,
+    participantRole: game.value.participantRole,
+    participantName: game.value.participantName,
   }
   Object.assign(game.value, {
     ...shared,
@@ -269,7 +368,7 @@ async function pickTeam(team: 'home' | 'away') {
     // H/A는 `${gmId}_H`, `${gmId}_A`로 분리되므로 팀을 왕복해도 KPI/라인업/기록이 섞이지 않는다.
     await saveLocal(game.value, game.value.halfStatus === 'final')
     resetForInputTeam(team)
-    const recovered = await recoverDraft(game.value)
+    const recovered = await recoverSelectedTeamState()
     if (snapshot) applyCurrentMatchSquads(squads, snapshot)
     if (!recovered) {
       // 처음 입력하는 반대 팀은 완전히 새 세션으로 시작한다.
@@ -433,6 +532,7 @@ function didInputQuery(resumeHalf?: '전반' | '후반', edit?: boolean, editRet
     team: game.value.team,
     grass: game.value.grassPattern,
     lines: game.value.grassLines,
+    role: game.value.participantRole,
     ...(resumeHalf ? { resumeHalf } : {}),
     ...(edit ? { edit: '1' } : {}),
     ...(editReturnStatus ? { editReturn: editReturnStatus } : {}),
@@ -440,13 +540,37 @@ function didInputQuery(resumeHalf?: '전반' | '후반', edit?: boolean, editRet
   }
 }
 
-function startFirstHalf() {
+async function startFirstHalf() {
   if (!canStart.value) return
   if (!confirm('전반전을 시작하시겠습니까?')) return
+  lifecycleBusy.value = true
+  try {
+    await joinCollaboration(game.value, requestedRole)
+  } catch (error) {
+    lifecycleError.value = error instanceof Error ? error.message : '협업 Draft 참여에 실패했습니다.'
+    return
+  } finally {
+    lifecycleBusy.value = false
+  }
   game.value.halfStatus = 'H1'
   game.value.seconds = 0 // 새 half 는 0초부터
   game.value.clockStartedAt = Date.now()
   navigateTo({ path: '/DidInput', query: didInputQuery() })
+}
+
+async function enterAsAssistant() {
+  lifecycleBusy.value = true
+  lifecycleError.value = ''
+  try {
+    await joinCollaboration(game.value, 'assistant')
+    // The shared Draft subscription in DidInput replaces this local shell with
+    // the primary analyst's current clock, lineup, and records.
+    navigateTo({ path: '/DidInput', query: didInputQuery() })
+  } catch (error) {
+    lifecycleError.value = error instanceof Error ? error.message : '주 분석관이 먼저 입력을 시작해야 합니다.'
+  } finally {
+    lifecycleBusy.value = false
+  }
 }
 
 // "대기방으로 나가기"로 빠져나온 상태(halfStatus 가 H1/H2 인데 이 화면에 있는 경우)에서
@@ -503,31 +627,65 @@ async function startSecondHalf() {
   if (!confirm('후반전을 시작하시겠습니까?')) return
   lifecycleBusy.value = true
   lifecycleError.value = ''
+  const previousStatus = game.value.halfStatus
+  const previousSeconds = game.value.seconds
+  const previousClockStartedAt = game.value.clockStartedAt
+  // The lifecycle checkpoint is H2 itself. Saving H1_done first and changing
+  // locally afterwards left the schedule temporarily reporting the old half.
+  game.value.halfStatus = 'H2'
+  game.value.seconds = 0
+  game.value.clockStartedAt = Date.now()
   try {
-    // Advanced only: H1 becomes raw at the instant H2 starts.
-    if (game.value.recorderLevel === 'advanced') await promoteH1(game.value)
-    else if (!await saveDraft(game.value)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 저장되었습니다.')
+    if (game.value.participantRole !== 'primary') throw new Error('주 분석관만 후반전을 시작할 수 있습니다.')
+    // H1 종료는 Draft 확인점일 뿐이며, 이 시점에 RAW를 만들지 않는다.
+    if (!await saveDraft(game.value)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 저장되었습니다.')
   } catch (error) {
+    game.value.halfStatus = previousStatus
+    game.value.seconds = previousSeconds
+    game.value.clockStartedAt = previousClockStartedAt
     lifecycleError.value = error instanceof Error ? error.message : '전반 Draft 처리에 실패했습니다.'
     return
   } finally {
     lifecycleBusy.value = false
   }
-  game.value.halfStatus = 'H2'
-  game.value.seconds = 0
-  game.value.clockStartedAt = Date.now()
   navigateTo({ path: '/DidInput', query: didInputQuery('후반') })
 }
 
 onMounted(async () => {
-  let loaded: { squads: { home: MatchSquadPlayer[]; away: MatchSquadPlayer[] }; snapshot: MatchSnapshot } | undefined
-  try {
-    loaded = await loadSquads()
-  } catch (error) {
-    lifecycleError.value = error instanceof Error ? error.message : '선수 명단을 불러오지 못했습니다.'
+  const [bootstrapResult] = await Promise.allSettled([loadBootstrap(), loadRecorderProfile()])
+  let recovered = false
+  if (bootstrapResult.status === 'fulfilled' && bootstrapResult.value) {
+    // Squads, selected RAW/Draft and every initially visible KPI state land in
+    // one reactive update. Nothing waits for a follow-up read before rendering.
+    recovered = applyBootstrap(bootstrapResult.value)
+  } else {
+    lifecycleError.value = bootstrapResult.status === 'rejected' && bootstrapResult.reason instanceof Error
+      ? bootstrapResult.reason.message
+      : '입력 대기 데이터를 불러오지 못했습니다.'
+    // Keep the former independent flow only as a resilience fallback.
+    const [squadResult] = await Promise.allSettled([loadSquads(), loadDashboardKpis('all')])
+    if (squadResult.status === 'fulfilled' && squadResult.value) {
+      const selectedState = game.value.team === 'home' ? inputStatus.value.H : inputStatus.value.A
+      if (selectedState.lifecycleStatus === 'ready' && game.value.halfStatus !== 'ready') resetForInputTeam(game.value.team)
+      recovered = await recoverSelectedTeamState()
+      applyCurrentMatchSquads(squadResult.value.squads, squadResult.value.snapshot)
+    } else {
+      lifecycleError.value = squadResult.status === 'rejected' && squadResult.reason instanceof Error
+        ? squadResult.reason.message
+        : '선수 명단을 불러오지 못했습니다.'
+    }
   }
-  const recovered = await recoverDraft(game.value)
-  if (loaded) applyCurrentMatchSquads(loaded.squads, loaded.snapshot)
+  bootstrapApplied.value = true
+
+  const selectedState = game.value.team === 'home' ? inputStatus.value.H : inputStatus.value.A
+  if (selectedState.rawStatus !== 'final') {
+    // Participation writes must not hold back the player list, formation or KPI paint.
+    void joinCollaboration(game.value, requestedRole).catch(error => {
+      lifecycleError.value = error instanceof Error
+        ? error.message
+        : `${requestedRole === 'primary' ? '주' : '부'} 분석관 참여 상태를 확인하지 못했습니다.`
+    })
+  }
   // 현재 팀에 저장된 세션이 없는 신규 입력이라면, 이미 RAW가 있는 상대 팀의
   // 진영을 기준으로 자동 반대 진영을 지정한다. 저장된 세션의 값은 절대 덮지 않는다.
   if (!recovered && game.value.halfStatus === 'ready') applyOpponentFieldSideDefault(game.value.team)
@@ -547,14 +705,17 @@ onUnmounted(() => {
 })
 
 async function finishMatch() {
-  if (!confirm('경기를 종료하시겠습니까?')) return
+  const isBasicPrimary = game.value.participantRole === 'primary' && game.value.recorderLevel === 'basic'
+  if (!confirm(isBasicPrimary ? '기록을 제출하시겠습니까? 관리자 승인 전까지 RAW로 반영되지 않습니다.' : '최종 갱신하시겠습니까?')) return
   lifecycleBusy.value = true
   lifecycleError.value = ''
   game.value.halfStatus = 'final'
   game.value.clockStartedAt = null
   try {
+    if (game.value.participantRole !== 'primary') throw new Error('주 분석관만 제출 또는 최종 갱신을 할 수 있습니다.')
+    if (!await saveDraft(game.value)) throw new Error('최종 Draft를 검증 API에 전달하지 못했습니다.')
+    // BASIC 주 분석관은 최종 Draft를 제출만 한다. RAW 승격은 관리자 승인 화면에서만 가능하다.
     if (game.value.recorderLevel === 'advanced') await finalizeAdvanced(game.value)
-    else if (!await saveDraft(game.value)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 저장되었습니다.')
   } catch (error) {
     game.value.halfStatus = 'H2_done'
     lifecycleError.value = error instanceof Error ? error.message : '최종 데이터 처리에 실패했습니다.'
@@ -565,6 +726,18 @@ async function finishMatch() {
 }
 
 async function editFinal() {
+  // 부 분석관은 최종 RAW를 직접 교체하지 않는다. 마지막 half의 Draft 편집으로
+  // 들어가면 입력 화면에서 전반/후반을 모두 선택해 수정할 수 있다.
+  if (game.value.participantRole === 'assistant') {
+    game.value.halfStatus = 'H2_done'
+    navigateTo({ path: '/DidInput', query: didInputQuery('후반', true, 'H2_done') })
+    return
+  }
+  if (game.value.recorderLevel === 'basic') {
+    game.value.halfStatus = 'H2_done'
+    navigateTo({ path: '/DidInput', query: didInputQuery('후반', true, 'H2_done') })
+    return
+  }
   lifecycleBusy.value = true
   lifecycleError.value = ''
   try {
@@ -635,6 +808,15 @@ const kpiValues = computed(() => {
     BAP: bap,
   }
 })
+const displayedKpis = computed(() => {
+  const selectedSide = game.value.team === 'home' ? 'H' : 'A'
+  const selectedIsFinal = inputStatus.value[selectedSide].completed
+  const selectedValues = selectedIsFinal ? dashboardKpis.value[selectedSide][kpiHalf.value] : kpiValues.value
+  return {
+    H: selectedSide === 'H' ? selectedValues : dashboardKpis.value.H[kpiHalf.value],
+    A: selectedSide === 'A' ? selectedValues : dashboardKpis.value.A[kpiHalf.value],
+  }
+})
 
 // ---- 입력 오류 감지 ----
 // E-Time: 같은 half 안에서 같은 초(seconds)에 두 번 이상 입력된 레코드.
@@ -643,8 +825,6 @@ function fmtErrTime(sec: number) {
   return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
 }
 const kpiErrors = computed(() => {
-  const { flags } = computeAttackPaths(kpiRecords.value, { closeTrailing: true })
-
   // DidInput 표의 No. 열과 같은 기준(그 half 레코드만 추린 순서)으로 번호를 매겨,
   // 오류 목록에 찍힌 No.가 수정 화면에서 보이는 행 번호와 그대로 일치하게 한다.
   const numberByHalf: Record<'H1' | 'H2', Map<string, number>> = { H1: new Map(), H2: new Map() }
@@ -654,29 +834,32 @@ const kpiErrors = computed(() => {
       .forEach((r, i) => numberByHalf[halfKey].set(r.id, i + 1))
   }
 
-  const timeGroups = new Map<string, { half: 'H1' | 'H2'; seconds: number; ids: string[] }>()
-  for (const r of kpiRecords.value) {
-    const halfKey = r.half ?? 'H1'
-    const key = `${halfKey}_${r.seconds}`
-    if (!timeGroups.has(key)) timeGroups.set(key, { half: halfKey, seconds: r.seconds, ids: [] })
-    timeGroups.get(key)!.ids.push(r.id)
-  }
-  const timeList = [...timeGroups.values()]
-    .filter(g => g.ids.length > 1)
-    .map(g => ({
-      half: g.half,
-      time: fmtErrTime(g.seconds),
-      nos: g.ids.map(id => numberByHalf[g.half].get(id) ?? 0).sort((a, b) => a - b),
-    }))
-    .sort((a, b) => (a.half === b.half ? 0 : a.half === 'H1' ? -1 : 1) || a.time.localeCompare(b.time))
-
-  const playerList = kpiRecords.value
-    .filter(r => flags.get(r.id)?.isDap && !r.playerId)
-    .map(r => {
-      const halfKey = r.half ?? 'H1'
-      return { half: halfKey, no: numberByHalf[halfKey].get(r.id) ?? 0, time: fmtErrTime(r.seconds) }
-    })
-    .sort((a, b) => (a.half === b.half ? 0 : a.half === 'H1' ? -1 : 1) || a.no - b.no)
+  const halves = kpiHalf.value === 'all' ? (['H1', 'H2'] as const) : [kpiHalf.value]
+  const timeList = halves.flatMap(halfKey => {
+    const timeGroups = new Map<number, string[]>()
+    const records = game.value.records.filter(record => (record.half ?? 'H1') === halfKey)
+    for (const record of records) {
+      const ids = timeGroups.get(record.seconds) ?? []
+      ids.push(record.id)
+      timeGroups.set(record.seconds, ids)
+    }
+    return [...timeGroups.entries()]
+      .filter(([, ids]) => ids.length > 1)
+      .map(([seconds, ids]) => ({
+        half: halfKey,
+        time: fmtErrTime(seconds),
+        nos: ids.map(id => numberByHalf[halfKey].get(id) ?? 0).sort((a, b) => a - b),
+      }))
+  })
+  const playerList = halves.flatMap(halfKey => {
+    const records = game.value.records.filter(record => (record.half ?? 'H1') === halfKey)
+    const { flags } = computeAttackPaths(records, { closeTrailing: true })
+    return records
+      .filter(record => flags.get(record.id)?.isDap && !record.playerId)
+      .map(record => ({ half: halfKey, no: numberByHalf[halfKey].get(record.id) ?? 0, time: fmtErrTime(record.seconds) }))
+  })
+  timeList.sort((a, b) => (a.half === b.half ? 0 : a.half === 'H1' ? -1 : 1) || a.time.localeCompare(b.time))
+  playerList.sort((a, b) => (a.half === b.half ? 0 : a.half === 'H1' ? -1 : 1) || a.no - b.no)
 
   return { eTime: timeList.length, ePlayer: playerList.length, timeList, playerList }
 })
@@ -923,8 +1106,7 @@ function undoSub(index: number) {
         </div>
         <div class="kpis">
           <div v-for="key in kpis" :key="key" class="kpiRow">
-            <span>{{ game.team === 'home' ? kpiValues[key] : 0 }}</span><b>{{ key }}</b><span>{{ game.team === 'away' ?
-              kpiValues[key] : 0 }}</span>
+            <span>{{ displayedKpis.H[key] }}</span><b>{{ key }}</b><span>{{ displayedKpis.A[key] }}</span>
           </div>
         </div>
         <div class="kpiErrors">
@@ -947,13 +1129,12 @@ function undoSub(index: number) {
             <span v-else class="errDetailEmpty">선수 미입력 없음</span>
           </div>
         </div>
-        <button class="testBtn" :disabled="!matchInfoEditable" @click="fillTestData">TEST</button>
-        <!-- 개발용 등급 토글. 실제로는 recorders/{uid}.level 을 읽어와야 하지만
-             그 연동 전까지 여기서 basic/advanced 화면을 바로 바꿔가며 확인한다. -->
-        <button class="levelToggle" :class="{ basic: game.recorderLevel === 'basic' }" @click="toggleRecorderLevel">
-          등급: {{ game.recorderLevel === 'basic' ? 'BASIC' : 'ADVANCED' }}
-        </button>
-        <button class="backBtn" @click="navigateTo('/schedule')">◀ 이전화면으로</button>
+        <div class="analystInfo analystLevel" :class="{ basic: game.recorderLevel === 'basic' }">
+          분석관 등급: {{ game.recorderLevel === 'basic' ? 'BASIC' : 'ADVANCED' }}
+        </div>
+        <div class="analystInfo analystRole" :class="{ assistant: game.participantRole === 'assistant' }">
+          분석 역할: {{ game.participantRole === 'primary' ? '주 분석관' : '부 분석관' }}
+        </div>
       </aside>
       <main class="content">
         <h1>Player List</h1>
@@ -1148,30 +1329,31 @@ function undoSub(index: number) {
             </section>
             <section class="startPanel">
               <template v-if="game.halfStatus === 'ready'">
-                <div v-if="game.recorderLevel === 'advanced'" class="modeToggle">
+                <div v-if="game.recorderLevel === 'advanced' && game.participantRole === 'primary'" class="modeToggle">
                   <button class="modeBtn" :class="{ on: game.inputMode === '분석' }"
                     @click="game.inputMode = '분석'">분석<small>정지 가능</small></button>
                   <button class="modeBtn" :class="{ on: game.inputMode === '실시간' }"
                     @click="game.inputMode = '실시간'">실시간<small>정지 불가</small></button>
                 </div>
                 <p>아래의 버튼을 터치하시면<br><b>경기데이터 입력이 시작됩니다.</b></p>
-                <button class="startBtn" :disabled="!canStart" @click="startFirstHalf">전반전 시작</button>
+                <button v-if="game.participantRole === 'primary'" class="startBtn" :disabled="!canStart" @click="startFirstHalf">전반전 시작</button>
+                <button v-else class="startBtn" :disabled="lifecycleBusy" @click="enterAsAssistant">부 분석관 참여</button>
               </template>
               <template v-else-if="game.halfStatus === 'H1_done'">
                 <p>전반 기록을 확인하세요<br><b>기록을 수정하거나 후반전을 시작할 수 있습니다.</b></p>
-                <p v-if="game.recorderLevel === 'basic'" class="draftNotice">BASIC 기록은 관리자 승인 전까지 Draft에만 저장됩니다.</p>
+                <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">BASIC 주 분석관 기록은 제출 후 관리자 승인 전까지 Draft에만 저장됩니다.</p>
                 <div class="halfActions">
                   <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
-                  <button class="startBtn" :disabled="lifecycleBusy" @click="startSecondHalf">후반전 시작</button>
+                  <button v-if="game.participantRole === 'primary'" class="startBtn" :disabled="lifecycleBusy" @click="startSecondHalf">후반전 시작</button>
                 </div>
               </template>
               <template v-else-if="game.halfStatus === 'H2_done'">
-                <p>후반 기록을 확인하세요<br><b>기록을 수정하거나 경기를 종료할 수 있습니다.</b></p>
-                <p v-if="game.recorderLevel === 'basic'" class="draftNotice">종료하면 관리자 승인 대기 Draft로 제출됩니다.</p>
+                <p>후반 기록을 확인하세요<br><b>{{ game.participantRole === 'primary' ? '기록을 수정하거나 처리할 수 있습니다.' : '전반 또는 후반 기록을 수정할 수 있습니다.' }}</b></p>
+                <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">제출하면 관리자 승인 대기 Draft로 유지됩니다.</p>
                 <div class="halfActions">
                   <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
-                  <button class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">{{ game.recorderLevel ===
-                    'basic' ? '승인 대기 제출 & 경기 종료' : '최종 데이터 갱신 & 경기 종료' }}</button>
+                  <button v-if="game.participantRole === 'primary'" class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">{{ game.recorderLevel ===
+                    'basic' ? '제출' : '최종 갱신' }}</button>
                 </div>
               </template>
               <template v-else-if="isPaused">
@@ -1185,9 +1367,9 @@ function undoSub(index: number) {
                 </div>
               </template>
               <template v-else>
-                <p>{{ game.recorderLevel === 'basic' ? '관리자 승인 대기' : statusLabel }}</p>
-                <p v-if="game.recorderLevel === 'basic'" class="draftNotice">관리자 페이지에서 RAW 승격 전까지 Draft만 유지됩니다.</p>
-                <button class="editBtn" :disabled="lifecycleBusy" @click="editFinal">수정</button>
+                <p>{{ game.participantRole === 'assistant' ? '분석 협업 종료' : (game.recorderLevel === 'basic' ? '관리자 승인 대기' : statusLabel) }}</p>
+                <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">관리자 페이지에서 RAW 승격 전까지 Draft만 유지됩니다.</p>
+                <button class="editBtn" :disabled="lifecycleBusy" @click="editFinal">{{ game.participantRole === 'assistant' ? '전반/후반 수정' : '수정' }}</button>
               </template>
               <p v-if="lifecycleError" class="lifecycleError">{{ lifecycleError }}</p>
               <small v-if="matchId">matchId: {{ matchId }}</small>
@@ -2723,22 +2905,35 @@ button {
   line-height: 1.4
 }
 
-.levelToggle {
+.analystInfo {
   margin-top: 6px;
   height: 26px;
   border-radius: 4px;
-  border: 1px dashed rgba(240, 180, 41, .5);
-  background: rgba(240, 180, 41, .08);
-  color: #f0b429;
-  cursor: pointer;
+  display: grid;
+  place-items: center;
   font-size: 10px;
   font-weight: 800;
   letter-spacing: .03em
 }
 
-.levelToggle.basic {
+.analystLevel {
+  border: 1px dashed rgba(240, 180, 41, .5);
+  background: rgba(240, 180, 41, .08);
+  color: #f0b429;
+}
+.analystLevel.basic {
   background: rgba(99, 192, 162, .12);
   border-color: rgba(99, 192, 162, .5);
   color: #63c0a2
+}
+.analystRole {
+  border: 1px dashed rgba(82, 184, 217, .55);
+  background: rgba(82, 184, 217, .08);
+  color: #71d5ee;
+}
+.analystRole.assistant {
+  border-color: rgba(185, 122, 232, .55);
+  background: rgba(185, 122, 232, .08);
+  color: #d4a4f4;
 }
 </style>

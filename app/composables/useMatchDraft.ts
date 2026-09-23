@@ -1,5 +1,6 @@
 import type { DidRecord } from '~/utils/didLogic'
 import type { FormationChange, MatchSnapshot, MatchState, MatchSquadPlayer } from '~/composables/useMatchState'
+import { assignmentsFromLineup, lineupOrderForSlot } from '~/utils/formationLayout'
 
 type Side = 'H' | 'A'
 
@@ -91,13 +92,13 @@ function cloneState(game: MatchState): MatchState {
 function assignedLineup(game: MatchState, squad: MatchSquadPlayer[]) {
   const playerById = new Map(squad.map(player => [player.playerId, player]))
   return Object.entries(game.assigned)
-    .map(([slot, playerId], order) => ({ slot, player: playerById.get(playerId), order }))
-    .filter((entry): entry is { slot: string; player: MatchSquadPlayer; order: number } => Boolean(entry.player))
-    .map(({ slot, player, order }) => {
+    .map(([slot, playerId]) => ({ slot, player: playerById.get(playerId) }))
+    .filter((entry): entry is { slot: string; player: MatchSquadPlayer } => Boolean(entry.player))
+    .map(({ slot, player }) => {
       const subOut = game.subs.find(sub => sub.outPlayer === player.playerId)
       const subIn = game.subs.find(sub => sub.inPlayer === player.playerId)
       return {
-        playerId: player.playerId, slot, order,
+        playerId: player.playerId, slot, order: lineupOrderForSlot(game.formationKey, slot),
         type: slot.startsWith('b') ? 'BENCH' : 'START', no: player.no, name: player.name, pos: player.pos,
         inHalf: subIn?.half ?? (slot.startsWith('b') ? null : 'H1'),
         inSeconds: subIn?.seconds ?? (slot.startsWith('b') ? null : 0),
@@ -139,6 +140,13 @@ function payloadFromState(game: MatchState): InputPayload {
 }
 
 function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState?: MatchState) {
+  // 역할과 계정 등급은 현재 로그인/일정 진입 세션의 값이다. 다른 기기나 이전
+  // 입력자가 남긴 Draft clientState를 복원하면서 이 권한 맥락을 덮으면 안 된다.
+  const sessionIdentity = {
+    participantRole: game.participantRole,
+    participantName: game.participantName,
+    recorderLevel: game.recorderLevel,
+  }
   if (clientState?.matchId) {
     // 이미 메모리에 살아 있는 명단/배치는 빈 Draft 값으로 덮어쓰지 않는다.
     // 진행 중 화면 → 대기방 이동에서 선수 목록이 사라지는 것을 막는다.
@@ -147,6 +155,7 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
     const sameMatch = game.matchId === clientState.matchId
 
     Object.assign(game, clientState)
+    Object.assign(game, sessionIdentity)
 
     if (sameMatch) {
       if (!game.squads.home.length && liveSquads.home.length) game.squads.home = liveSquads.home
@@ -172,6 +181,13 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
       const inPlayer = typeof sub.inPlayer === 'number' ? squad[sub.inPlayer]?.playerId : sub.inPlayer
       return outPlayer && inPlayer ? [{ ...sub, outPlayer, inPlayer }] : []
     })
+    // clientState used to preserve o0…o9, whose coordinate-array order starts
+    // at the defensive row. The durable lineup order is now the only authority
+    // when it is present, so old Drafts also reopen in screen reading order.
+    if (payload.formationKey && payload.lineup.length) {
+      game.formationKey = payload.formationKey
+      game.assigned = assignmentsFromLineup(payload.formationKey, payload.lineup)
+    }
     return
   }
   game.team = payload.side === 'A' ? 'away' : 'home'
@@ -185,6 +201,9 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
   game.h1Seconds = payload.halves.H1?.seconds ?? 0
   game.h2Seconds = payload.halves.H2?.seconds ?? 0
   game.seconds = game.h2Seconds
+  // Final RAW, especially SQL-migrated matches, has no browser clientState.
+  // Rebuild slots in visible formation order before the board renders.
+  game.assigned = assignmentsFromLineup(payload.formationKey, payload.lineup)
   game.records = payload.records.map(record => ({
     id: String(record.id), half: record.half as 'H1' | 'H2', seconds: Number(record.halfSeconds), seq: Number(record.seq),
     act: record.act as DidRecord['act'], res: record.res as DidRecord['res'], area: Number(record.area),
@@ -194,6 +213,7 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
     playerId: record.playerId as string | undefined,
   }))
   game.halfStatus = payload.status
+  Object.assign(game, sessionIdentity)
 }
 
 export function useMatchDraft() {
@@ -237,8 +257,8 @@ export function useMatchDraft() {
     if (!await save(game)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 안전하게 저장되었습니다.')
     const payload = payloadFromState(game)
     const result = await request(`/api/v1/match-input/drafts/${encodeURIComponent(payload.gmId)}/${payload.side}/finalize`, { method: 'POST' })
-    // Raw 승격 뒤에는 편집용 Draft는 Firestore에서 삭제한다. 다만 이 기기에는
-    // 종료 상태와 현장 KPI 미리보기를 보여줄 읽기 전용 최종 스냅샷을 남긴다.
+    // RAW 승격 뒤에도 Draft는 유지한다. 이후 수정은 이 Draft를 다시 편집해
+    // 같은 RAW를 교체하므로, 현장 화면도 종료 상태와 KPI 미리보기를 보존한다.
     await saveLocal(game, true)
     return result
   }
@@ -252,6 +272,22 @@ export function useMatchDraft() {
     await writeLocal({ key: keyFor(game), payload: response.payload, clientState: cloneState(game), updatedAt: Date.now() })
   }
 
+  async function recoverFinalRaw(game: MatchState) {
+    if (!game.matchId) return false
+    try {
+      const side = inputSide(game)
+      const response = await request<{ payload: InputPayload; clientState?: MatchState }>(
+        `/api/v1/match-input/matches/${encodeURIComponent(game.matchId)}/recordings/${side}/input-state`,
+      )
+      if (!response.payload) return false
+      hydrateFromPayload(game, response.payload, response.clientState)
+      await writeLocal({ key: keyFor(game), payload: response.payload, clientState: cloneState(game), updatedAt: Date.now(), finalized: true })
+      return true
+    } catch {
+      return false
+    }
+  }
+
   async function recoverLocal(game: MatchState) {
     const draft = await readLocal(keyFor(game))
     if (draft) hydrateFromPayload(game, draft.payload, draft.clientState)
@@ -259,7 +295,6 @@ export function useMatchDraft() {
   }
 
   async function recover(game: MatchState) {
-    if (await recoverLocal(game)) return true
     if (!game.matchId) return false
     try {
       const side = inputSide(game)
@@ -271,9 +306,11 @@ export function useMatchDraft() {
       await writeLocal({ key: keyFor(game), payload: response.payload, clientState: cloneState(game), updatedAt: Date.now() })
       return true
     } catch {
-      return false
+      // IndexedDB is an offline fallback only. When the shared Draft is
+      // reachable, its state must win over an older device-local snapshot.
+      return await recoverLocal(game)
     }
   }
 
-  return { saveLocal, save, promoteH1, finalizeAdvanced, restoreFinalRaw, recover }
+  return { saveLocal, save, promoteH1, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover, hydrate: hydrateFromPayload }
 }

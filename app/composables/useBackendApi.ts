@@ -43,13 +43,18 @@ export function useBackendApi() {
   async function request<T>(path: string, options: BackendRequestOptions = {}): Promise<T> {
     const { $auth, $authReady } = useNuxtApp()
     await $authReady
-    const token = await ($auth as Auth).currentUser?.getIdToken()
+    const user = ($auth as Auth).currentUser
+    const token = await user?.getIdToken()
     const response = await fetch(`${await resolveBackendUrl()}${path}`, {
       ...options,
       headers: {
         Accept: 'application/json',
         ...options.headers,
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        // Local uvicorn accepts this only from its configured loopback frontend
+        // origins. It keeps two locally signed-in analysts distinct even when
+        // Admin token verification is not configured on the development host.
+        ...(user?.uid ? { 'X-Did-Local-User': user.uid } : {}),
       },
     })
     if (!response.ok) {

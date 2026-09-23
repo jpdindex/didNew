@@ -96,6 +96,10 @@ export interface MatchState {
   formationChanges: FormationChange[]
   // ---- 갱신(=KPI 확정) 흐름. §11.2.1 참고 ----
   recorderLevel: RecorderLevel
+  // 입력 등급과 협업 역할은 다른 개념이다. 등급은 recorders/{uid}의 계정 속성이고,
+  // 역할은 일정 화면에서 매 입력 세션마다 선택한다. RAW 확정 권한은 둘을 함께 판별한다.
+  participantRole: 'primary' | 'assistant'
+  participantName: string
   // 전반전/후반전 갱신을 누르면 true. basic 등급에서만 의미가 있으며, true 인 동안은
   // 그 half 의 "수정"·"갱신" 버튼이 함께 잠긴다. 관리자 잠금 해제로만 다시 false 가 된다.
   h1Locked: boolean
@@ -127,6 +131,8 @@ function defaultMatchState(): MatchState {
     clockStartedAt: null,
     formationChanges: [],
     recorderLevel: 'advanced',
+    participantRole: 'primary',
+    participantName: '',
     h1Locked: false,
     h2Locked: false,
   }

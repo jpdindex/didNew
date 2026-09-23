@@ -38,6 +38,20 @@ def _string(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+
+
+def _normalize_position(value: Any) -> str:
+    raw = re.sub(r"[^A-Z]", "", _string(value).upper())
+    if raw in {"GK", "G", "GOALKEEPER", "KEEPER"}:
+        return "GK"
+    if raw in {"FW", "F", "ST", "CF", "SS", "LW", "RW", "LF", "RF", "FORWARD", "STRIKER"}:
+        return "FW"
+    if raw in {"MF", "M", "DM", "CDM", "CM", "CAM", "AM", "LM", "RM", "MIDFIELDER"}:
+        return "MF"
+    if raw in {"DF", "D", "CB", "LB", "RB", "LWB", "RWB", "SW", "DEFENDER"}:
+        return "DF"
+    return _string(value).upper()
+
 def _number(value: Any) -> int | float:
     try:
         return float(value) if "." in str(value) else int(value)
@@ -301,7 +315,17 @@ class BuildLegacyImport:
             candidates = contracts.get(f"{player_id}_{team_id}", [])
             date = matches[gm_id]["date"]
             contract = next((item for item in candidates if item["from"] <= date and (not item["to"] or date <= item["to"])), candidates[0] if candidates else {"no": "", "pos": ""})
-            lineups[f"{gm_id}:{side}"][player_id] = {"slot": player_id, "order": _integer(row.get("gp_order")), "type": "BENCH" if _string(row.get("gp_type")) == "ST" else "START", "no": contract["no"] or "", "name": player_names.get(player_id, ""), "pos": contract["pos"] or "", "inHalf": None if _string(row.get("gp_type")) == "ST" else "H1", "inSeconds": None if _string(row.get("gp_type")) == "ST" else 0, "outHalf": None, "outSeconds": None}
+            player_type = "BENCH" if _string(row.get("gp_type")) == "ST" else "START"
+            position = _normalize_position(contract["pos"])
+            lineups[f"{gm_id}:{side}"][player_id] = {
+                "slot": "gk" if player_type == "START" and position == "GK" else ("bench" if player_type == "BENCH" else "start"),
+                "order": 1 if player_type == "START" and position == "GK" else _integer(row.get("gp_order")),
+                "type": player_type,
+                "no": contract["no"] or "", "name": player_names.get(player_id, ""), "pos": position,
+                "inHalf": None if player_type == "BENCH" else "H1",
+                "inSeconds": None if player_type == "BENCH" else 0,
+                "outHalf": None, "outSeconds": None,
+            }
             append((f"matches/{gm_id}/recordings/{side}/playerStats/{player_id}", {"playerId": player_id, "TAP": _number(row.get("gp_tmp")), "DAP": _number(row.get("gp_tap")), "UTP": _number(row.get("gp_utp")), "DTP": _number(row.get("gp_ctp")), "TTP": _number(row.get("gp_ttp")), "SHOT": _number(row.get("gp_sht")), "AST": _number(row.get("gp_ast")), "GOAL": _number(row.get("gp_gol")), "DTB": _number(row.get("gp_ctb")), "DTM": _number(row.get("gp_ctm")), "DTA": _number(row.get("gp_cta")), "DTS": _number(row.get("gp_cts")), "GTB": _number(row.get("gp_gtb")), "GTM": _number(row.get("gp_gtm")), "ASR": _number(row.get("gp_asr")), "SSR": _number(row.get("gp_ssr")), "scoreRel": None, "scoreAbs": None, "score": None, "jmx": None, "apx": None, "apxGrade": None, "tpx": None, "tpxGrade": None, "fpx": None, "fpxGrade": None, "ratingBasedOn": None}, False))
         for row in _rows(tables.get("ff_game_player_log")):
             recording = recordings.get(_string(row.get("gi_id")))

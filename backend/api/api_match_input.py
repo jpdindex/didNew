@@ -143,6 +143,12 @@ class PromotionResponse(BaseModel):
     draftDeleted: bool
 
 
+class ParticipantJoinRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["primary", "assistant"]
+    displayName: str | None = Field(default=None, max_length=100)
+
+
 router = APIRouter(tags=["match-input"])
 
 
@@ -162,7 +168,6 @@ def _draft_response(document: dict[str, Any]) -> DraftResponse:
 
 def _raw_values(
     payload: MatchInputPayload,
-    user_id: str,
     *,
     status: str,
     halves: set[Half] | None = None,
@@ -191,11 +196,11 @@ def _raw_values(
         seen_ids.add(record_id)
         records.append((record_id, {
             **item.model_dump(exclude={"id"}, mode="python"),
-            "createdBy": user_id, "source": "did", "createdAt": now,
+            "source": "did", "createdAt": now,
         }))
     cards = [
         (f"{item.half}_{item.halfSeconds}_{item.playerId}_{index}", {
-            **item.model_dump(mode="python"), "createdBy": user_id, "createdAt": now,
+            **item.model_dump(mode="python"), "createdAt": now,
         })
         for index, item in enumerate(payload.cards)
         if item.half in selected_halves
@@ -206,8 +211,6 @@ def _raw_values(
     }
     recording = {
         "side": payload.side,
-        "recorders": {user_id: {"rank": "main", "joinedAt": now}},
-        "recorderIds": [user_id],
         "status": status,
         "inputMode": payload.inputMode,
         "fieldSide": payload.fieldSide,
@@ -245,7 +248,7 @@ def _promote(
         or snapshot.seasonId != match.seasonId
     ):
         raise BackendError("Draft match snapshot no longer matches the selected match", status_code=409, code="draft_match_mismatch")
-    recording, records, cards = _raw_values(payload, user_id, status=status, halves=halves)
+    recording, records, cards = _raw_values(payload, status=status, halves=halves)
     recording["teamId"], recording["opponentTeamId"] = (
         (match.homeTeamId, match.awayTeamId) if payload.side == "H" else (match.awayTeamId, match.homeTeamId)
     )
@@ -276,7 +279,9 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
     stadium_ids = {match.stadiumId for _, match in month_matches if match.stadiumId}
     teams = data.get_documents_by_ids("teams", team_ids)
     stadiums = data.get_documents_by_ids("stadiums", stadium_ids)
-    statuses_by_match = data.get_recording_statuses_many([gm_id for gm_id, _ in month_matches])
+    gm_ids = [gm_id for gm_id, _ in month_matches]
+    statuses_by_match = data.get_recording_statuses_many(gm_ids)
+    collaboration_by_match = data.get_input_draft_participants_many(gm_ids)
 
     matches = []
     for gm_id, match in month_matches:
@@ -284,18 +289,73 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
         away = teams.get(match.awayTeamId, {})
         stadium = stadiums.get(match.stadiumId, {})
         recording_status = statuses_by_match.get(gm_id, {"H": None, "A": None})
+        collaboration = collaboration_by_match.get(gm_id, {"H": {}, "A": {}})
+
+        # Imported/finalized fixtures keep their official score on matches.
+        # During live input, both team Drafts carry the same scoreboard; use a
+        # shared Draft score when present so the schedule does not lag behind.
+        live_score = next(
+            (summary.get("score") for summary in (collaboration["H"], collaboration["A"])
+            if isinstance(summary.get("score"), dict)),
+            None,
+        )
+        score = live_score or {"home": match.score.home, "away": match.score.away}
+
+        def _input_state(side: Side) -> dict[str, Any]:
+            raw_status = recording_status[side]
+            lifecycle = "final" if raw_status == "final" else collaboration[side].get("status") or "ready"
+            return {
+                "rawStatus": raw_status,
+                "completed": lifecycle == "final",
+                "lifecycleStatus": lifecycle,
+            }
         matches.append({
             "gmId": gm_id, "date": match.date, "kickoffTime": match.kickoffTime,
             "leagueId": match.leagueId, "seasonId": match.seasonId, "round": match.round,
             "stadiumId": match.stadiumId, "stadiumName": _display_name(stadium, match.stadiumId),
             "home": {"teamId": match.homeTeamId, "name": _display_name(home, match.homeTeamId)},
             "away": {"teamId": match.awayTeamId, "name": _display_name(away, match.awayTeamId)},
+            "score": score,
             "inputStatus": {
-                "H": {"rawStatus": recording_status["H"], "completed": recording_status["H"] == "final"},
-                "A": {"rawStatus": recording_status["A"], "completed": recording_status["A"] == "final"},
+                "H": _input_state("H"),
+                "A": _input_state("A"),
             },
+            "collaboration": collaboration,
         })
     return {"status": "ok", "matches": sorted(matches, key=lambda item: (item["date"], item["kickoffTime"] or "", item["gmId"]))}
+
+
+@router.get("/match-input/analyst-dashboard", summary="Read analyst operations dashboard")
+def read_analyst_dashboard(
+    date_from: str | None = Query(default=None, max_length=20),
+    date_to: str | None = Query(default=None, max_length=20),
+    level: Literal["basic", "advanced"] | None = Query(default=None),
+    lifecycle: Literal["ready", "H1", "H1_done", "H2", "H2_done", "final"] | None = Query(default=None),
+    _: RequiredUser = None,
+) -> dict:
+    return JpdDidData().build_analyst_dashboard(
+        date_from=date_from, date_to=date_to, level=level, lifecycle=lifecycle,
+    )
+
+
+@router.get("/match-input/matches/{gm_id}/bootstrap", summary="Read input lobby bootstrap")
+def read_match_input_bootstrap(
+    gm_id: str,
+    side: Side = Query(...),
+    _: RequiredUser = None,
+) -> dict:
+    """Load squads, selected session and all dashboard KPI views atomically for the lobby."""
+    return {"status": "ok", **JpdDidData().build_input_bootstrap(gm_id, side)}
+
+
+@router.get("/match-input/matches/{gm_id}/dashboard-kpis", summary="Read both teams' input dashboard KPI")
+def read_match_dashboard_kpis(
+    gm_id: str,
+    half: Literal["all", "H1", "H2"] = Query(default="all"),
+    _: RequiredUser = None,
+) -> dict:
+    JpdDidData().get_match(gm_id)
+    return {"status": "ok", "gmId": gm_id, "half": half, "kpis": JpdDidData().read_match_dashboard_kpis(gm_id, half=half)}
 
 
 @router.get("/match-input/matches/{gm_id}/squads", summary="Read match squads")
@@ -325,6 +385,15 @@ def refresh_match_squads(gm_id: str, _: RequiredUser = None) -> dict:
     return {"status": "ok", "gmId": gm_id, "H": squads["H"], "A": squads["A"], "cached": False}
 
 
+@router.post("/match-input/legacy-lineups/backfill", summary="Backfill imported match input snapshots")
+def backfill_legacy_lineups(
+    limit: int = Query(default=100, ge=1, le=500),
+    _: RequiredUser = None,
+) -> dict:
+    """Create lineup-aware input snapshots for a bounded set of imported finals."""
+    return {"status": "ok", **JpdDidData().backfill_legacy_input_squads(limit=limit)}
+
+
 @router.put("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse, summary="Save input draft")
 def save_draft(gm_id: str, side: Side, request: DraftWriteRequest, user: RequiredUser = None) -> DraftResponse:
     if request.payload.gmId != gm_id or request.payload.side != side:
@@ -338,13 +407,38 @@ def save_draft(gm_id: str, side: Side, request: DraftWriteRequest, user: Require
     return _draft_response(document)
 
 
+@router.post("/match-input/drafts/{gm_id}/{side}/participants", summary="Join a shared input draft")
+def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinRequest, user: RequiredUser = None) -> dict:
+    data = JpdDidData()
+    # The selected fixture must exist even before its first Draft is created.
+    data.get_match(gm_id)
+    document = data.join_input_draft_participant(
+        gm_id, side, user_id=user.uid, role=request.role, display_name=request.displayName,
+    )
+    return {
+        "status": "ok", "gmId": gm_id, "side": side,
+        "primaryUid": document.get("primaryUid"), "participants": document.get("participants", {}),
+    }
+
+
 @router.get("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse | DraftMissingResponse, summary="Read input draft")
 def get_draft(gm_id: str, side: Side, _: RequiredUser = None) -> DraftResponse | DraftMissingResponse:
     try:
-        return _draft_response(JpdDidData().get_input_draft(gm_id, side))
+        document = JpdDidData().get_input_draft(gm_id, side)
+        # A primary can be registered before its first lifecycle snapshot. That
+        # is a normal empty collaborative Draft, not a malformed API response.
+        if not document.get("payload"):
+            return DraftMissingResponse(status="missing", gmId=gm_id, side=side)
+        return _draft_response(document)
     except NotFoundError:
         # A side without a draft is the normal first-entry condition.
         return DraftMissingResponse(status="missing", gmId=gm_id, side=side)
+
+
+@router.get("/match-input/matches/{gm_id}/recordings/{side}/input-state", response_model=DraftResponse, summary="Read final raw for input display")
+def get_final_raw_input_state(gm_id: str, side: Side, _: RequiredUser = None) -> DraftResponse:
+    """Read a final RAW recording as an input-screen snapshot without creating a Draft."""
+    return _draft_response(JpdDidData().read_input_state_from_raw(gm_id, side))
 
 
 @router.delete("/match-input/drafts/{gm_id}/{side}", summary="Delete input draft")
@@ -358,22 +452,31 @@ def restore_raw_to_draft(gm_id: str, side: Side, user: RequiredUser = None) -> D
     return _draft_response(JpdDidData().restore_input_draft_from_raw(gm_id, side, user_id=user.uid))
 
 
-@router.post("/match-input/drafts/{gm_id}/{side}/promote-h1", response_model=PromotionResponse, summary="Promote advanced H1 draft to raw")
+@router.post("/match-input/drafts/{gm_id}/{side}/promote-h1", response_model=PromotionResponse, summary="Confirm H1 draft without RAW promotion")
 def promote_h1(gm_id: str, side: Side, user: RequiredUser = None) -> PromotionResponse:
     data = JpdDidData()
-    payload = MatchInputPayload.model_validate(data.get_input_draft(gm_id, side)["payload"])
+    draft = data.get_input_draft(gm_id, side)
+    if draft.get("primaryUid") and draft["primaryUid"] != user.uid:
+        raise BackendError("Only the primary analyst can confirm halftime", status_code=403, code="primary_required")
+    payload = MatchInputPayload.model_validate(draft["payload"])
     if payload.recorderLevel != "advanced":
-        raise BackendError("Only advanced input promotes raw at halftime", status_code=409, code="basic_approval_required")
-    return _promote(data, payload, user.uid, status="H1_done", halves={"H1"}, delete_draft=False)
+        raise BackendError("Only the primary analyst can confirm halftime", status_code=409, code="primary_required")
+    # H1 end is a Draft checkpoint, never a partial RAW write.
+    return PromotionResponse(status="ok", gmId=gm_id, side=side, recordsSaved=0, cardsSaved=0, draftDeleted=False)
 
 
 @router.post("/match-input/drafts/{gm_id}/{side}/finalize", response_model=PromotionResponse, summary="Finalize advanced draft as raw")
 def finalize_advanced(gm_id: str, side: Side, user: RequiredUser = None) -> PromotionResponse:
     data = JpdDidData()
-    payload = MatchInputPayload.model_validate(data.get_input_draft(gm_id, side)["payload"])
+    draft = data.get_input_draft(gm_id, side)
+    if draft.get("primaryUid") and draft["primaryUid"] != user.uid:
+        raise BackendError("Only the primary analyst can finalize RAW", status_code=403, code="primary_required")
+    payload = MatchInputPayload.model_validate(draft["payload"])
     if payload.recorderLevel != "advanced":
         raise BackendError("Basic input requires administrator approval", status_code=409, code="basic_approval_required")
-    return _promote(data, payload, user.uid, status="final", halves={"H1", "H2"}, delete_draft=True)
+    # Keep the final Draft as the editable source for later corrections. RAW is
+    # replaced atomically, but the Draft is retained and marked final.
+    return _promote(data, payload, user.uid, status="final", halves={"H1", "H2"}, delete_draft=False)
 
 
 @router.get("/match-input/approvals", summary="List basic drafts awaiting administrator approval")

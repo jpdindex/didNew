@@ -23,6 +23,25 @@ const isSingleDoc = ref(false)
 const roundFilter = ref('')
 const leagueFilter = ref('')
 const seasonFilter = ref('')
+const { request } = useBackendApi()
+const backfillBusy = ref(false)
+const backfillMessage = ref('')
+
+async function backfillLegacySnapshots() {
+  if (!confirm('이관 경기의 누락된 입력 Snapshot을 생성합니다. 최종 RAW는 변경하지 않습니다.')) return
+  backfillBusy.value = true
+  backfillMessage.value = ''
+  try {
+    const result = await request<{ scanned: number; created: number; unchanged: number; failed: number }>(
+      '/api/v1/match-input/legacy-lineups/backfill?limit=100', { method: 'POST' },
+    )
+    backfillMessage.value = `확인 ${result.scanned}경기 · 생성 ${result.created} · 유지 ${result.unchanged} · 실패 ${result.failed}`
+  } catch (error) {
+    backfillMessage.value = error instanceof Error ? error.message : 'Snapshot 백필에 실패했습니다.'
+  } finally {
+    backfillBusy.value = false
+  }
+}
 
 function formatValue(v: unknown): string {
   if (v === null || v === undefined) return ''
@@ -185,6 +204,14 @@ onMounted(start)
         <input v-model="roundFilter" class="filterValue" placeholder="라운드 (예: 17)" @keyup.enter="load">
         <button class="loadBtn" :disabled="busy" @click="load">{{ busy ? '조회 중...' : '조회' }}</button>
       </div>
+      <div v-if="depth === 1" class="snapshotBar">
+        <div>
+          <strong>이관 경기 라인업 Snapshot</strong>
+          <span>formationKey와 기존 lineup을 기준으로 입력 화면용 선수 배치를 보완합니다.</span>
+        </div>
+        <button class="loadBtn" :disabled="backfillBusy" @click="backfillLegacySnapshots">{{ backfillBusy ? '생성 중...' : '누락 Snapshot 생성' }}</button>
+      </div>
+      <p v-if="backfillMessage" class="snapshotMessage">{{ backfillMessage }}</p>
 
       <div v-if="depth === 2" class="quickRow">
         <button class="quickBtn" @click="enterSub('recordings')">팀 기록 보기 (H/A)</button>
@@ -259,6 +286,19 @@ onMounted(start)
   flex-direction: column;
   gap: 10px;
 }
+.snapshotBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 12px 14px;
+  border: 1px solid rgba(82, 210, 235, 0.3);
+  background: rgba(18, 47, 59, 0.35);
+}
+.snapshotBar div { display: grid; gap: 3px; }
+.snapshotBar strong { color: #dcf8ff; font-size: 14px; }
+.snapshotBar span, .snapshotMessage { color: #9db0bd; font-size: 12px; }
+.snapshotMessage { margin: 0; color: #6bd6ed; }
 .topBar { display: flex; align-items: center; justify-content: space-between; padding-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,0.06); }
 .title { color: rgba(255,255,255,0.85); font-weight: 700; letter-spacing: 0.02em; }
 .backBtn { color: rgba(255,255,255,0.55); font-size: 13px; text-decoration: none; }

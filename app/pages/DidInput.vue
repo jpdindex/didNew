@@ -26,6 +26,7 @@ import {
 } from '~/utils/goalCoordinates'
 import { canPickForCard, groupCardsByPlayer, isSentOff, type CardRecord } from '~/utils/card'
 import type { HalfStatus, MatchSquadPlayer, SubRecord } from '~/composables/useMatchState'
+import { FORMATIONS, GK_SLOT } from '~/utils/formationLayout'
 
 const route = useRoute()
 const home = computed(() => String(route.query.home ?? route.query.homeName ?? 'Vallecano').trim() || 'Vallecano')
@@ -37,7 +38,9 @@ const inputMode = computed(() => (route.query.mode === '실시간' ? '실시간'
 // TeamSelection 으로 돌아가며, "수정"/"후반전 시작"으로 다시 들어올 때 이어서 불러온다.
 const game = useMatchState()
 const { request } = useBackendApi()
-const { save: saveDraft, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
+const { saveLocal, save: saveDraft, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
+const { start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, removeRecord } = useMatchCollaboration()
+const isPrimary = computed(() => game.value.participantRole === 'primary')
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
 // "수정"으로 들어온 경우(이미 끝난 half를 고치러 옴)와 실시간으로 기록 중인 경우를
 // 구분한다. 수정 화면은 시계가 멈춰 있고, 우상단 버튼도 "{half} 종료"가 아니라
@@ -76,6 +79,7 @@ const clock = computed(() => {
 })
 // 시계 양옆 화살표로 시간을 수동 보정한다. ◀ 는 1초 줄이고 ▶ 는 1초 늘린다(0초 아래로는 안 내려간다).
 function stepSeconds(delta: number) {
+  if (!isPrimary.value) return
   seconds.value = Math.max(0, seconds.value + delta)
   // 실행 중인 타이머가 다음 tick에서 이전 기준값으로 되돌리지 않도록
   // 수동 보정값을 새 기준 시각으로 즉시 반영한다.
@@ -95,6 +99,7 @@ function selectHalf(target: '전반' | '후반') {
   seconds.value = target === '전반' ? game.value.h1Seconds : game.value.h2Seconds
 }
 let timer: ReturnType<typeof setInterval> | undefined
+let applyingRemoteDraft = false
 let tickStartedAt = 0
 let tickBaseSeconds = 0
 function startTicking() {
@@ -131,6 +136,9 @@ onMounted(async () => {
     if (!game.value.team) game.value.team = route.query.team === 'away' ? 'away' : 'home'
     game.value.inputMode = inputMode.value
     await recoverDraft(game.value).catch(() => false)
+    // records is a screen-local ref for rendering/editing. A direct URL entry
+    // restores game.records asynchronously, so mirror it after recovery.
+    records.value = [...game.value.records]
   }
 
   if (matchId && !game.value.squads.home.length && !game.value.squads.away.length) {
@@ -143,6 +151,34 @@ onMounted(async () => {
       // 개발·오프라인 입력은 기존 임시 명단으로도 화면을 열 수 있다.
     }
   }
+  game.value.seconds = seconds.value
+  void syncState(game.value).catch(() => false)
+
+  const restoredRecords = [...records.value]
+  await startCollaboration(game.value, {
+    applyState: (state) => {
+      applyingRemoteDraft = true
+      // Records are deliberately excluded from sharedState and arrive through
+      // their own subcollection, so an ACT correction never replaces the list.
+      Object.assign(game.value, state)
+      homeScore.value = game.value.homeScore
+      awayScore.value = game.value.awayScore
+      nextTick(() => { applyingRemoteDraft = false })
+    },
+    applyRecords: (remoteRecords) => {
+      // RAW restoration reaches payload.records first. An empty live records
+      // snapshot is only the unseeded Draft, never an instruction to erase it.
+      if (!remoteRecords.length && records.value.length) return
+      applyingRemoteDraft = true
+      records.value = remoteRecords
+      game.value.records = remoteRecords
+      nextTick(() => { applyingRemoteDraft = false })
+    },
+  }).catch(() => false)
+
+  // Put restored RAW records into the same InputDraft subcollection used by
+  // primary/assistant live collaboration. Repeated writes are idempotent.
+  if (restoredRecords.length) void syncRecords(game.value, restoredRecords).catch(() => false)
 
   if (!isEditMode && game.value.clockStartedAt) {
     seconds.value = Math.max(seconds.value, Math.floor((Date.now() - game.value.clockStartedAt) / 1000))
@@ -165,9 +201,11 @@ onUnmounted(() => {
   if (timer) clearInterval(timer)
   if (flashTimer) clearTimeout(flashTimer)
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
+  stopCollaboration()
 })
 
 function togglePause() {
+  if (!isPrimary.value) return
   if (inputMode.value === '실시간') return // 실시간 모드는 정지 불가
   paused.value = !paused.value
   if (paused.value) {
@@ -175,6 +213,9 @@ function togglePause() {
   } else {
     startTicking()
   }
+  game.value.seconds = seconds.value
+  game.value.clockStartedAt = paused.value ? null : game.value.clockStartedAt
+  void syncState(game.value).catch(() => false)
 }
 
 // 대기방으로 나가기.
@@ -209,16 +250,22 @@ const records = ref<DidRecord[]>(resumeHalf ? [...game.value.records] : [])
 let draftSaveTimer: ReturnType<typeof setTimeout> | undefined
 
 function queueDraftSave() {
+  if (applyingRemoteDraft) return
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
   draftSaveTimer = setTimeout(() => {
     saveToStore()
-    void saveDraft(game.value).catch(() => {
-      // IndexedDB remains the retry source when metadata/network is unavailable.
-    })
+    void saveLocal(game.value).catch(() => false)
+    // Live work uses direct Firestore writes inside the existing Draft. REST is
+    // reserved for H1/H2 confirmation and final RAW validation.
+    void Promise.all([syncState(game.value), syncRecords(game.value, records.value)]).catch(() => false)
   }, 500)
 }
 
 async function completeFinalCorrection() {
+  if (!isPrimary.value || game.value.recorderLevel !== 'advanced') {
+    alert('ADVANCED 주 분석관만 최종 RAW를 갱신할 수 있습니다.')
+    return
+  }
   if (!confirm('수정한 내용을 최종 RAW에 반영하시겠습니까?')) return
   saveToStore()
   game.value.halfStatus = 'final'
@@ -229,6 +276,13 @@ async function completeFinalCorrection() {
     game.value.halfStatus = 'H2_done'
     alert(error instanceof Error ? error.message : '최종 RAW 갱신에 실패했습니다.')
   }
+}
+
+function exitFinalCorrection() {
+  if (!confirm('수정한 내용은 저장하지 않고 나가시겠습니까?')) return
+  game.value.halfStatus = 'final'
+  game.value.clockStartedAt = null
+  goTeamSelection()
 }
 
 watch([records, homeScore, awayScore, () => game.value.cards, () => game.value.subs], queueDraftSave, { deep: true })
@@ -518,8 +572,10 @@ function applyEdit() {
 function deleteEdit() {
   if (!editingId.value) return
   if (!confirm('이 기록을 삭제하시겠습니까?')) return
-  records.value = records.value.filter(r => r.id !== editingId.value)
+  const deletedId = editingId.value
+  records.value = records.value.filter(r => r.id !== deletedId)
   game.value.records = records.value
+  void removeRecord(game.value, deletedId).catch(() => false)
   editingId.value = null
 }
 function cancelEdit() {
@@ -580,30 +636,10 @@ const pickedPlayerId = ref<string | null>(null)
 
 // 선수 선택창도 TeamSelection에서 확정한 포메이션 좌표를 그대로 쓴다.
 // 예전 고정 LINEUP_SLOTS를 쓰면 4-3-3으로 세팅해도 별도 모양으로 다시 배치되는 문제가 있었다.
-const FORMATION_LINEUP_SLOTS: Record<string, { x: number; y: number }[]> = {
-  '4-4-2': [
-    { x: 14, y: 72 }, { x: 38, y: 72 }, { x: 62, y: 72 }, { x: 86, y: 72 },
-    { x: 14, y: 46 }, { x: 38, y: 46 }, { x: 62, y: 46 }, { x: 86, y: 46 },
-    { x: 35, y: 18 }, { x: 65, y: 18 },
-  ],
-  '4-3-3': [
-    { x: 14, y: 72 }, { x: 38, y: 72 }, { x: 62, y: 72 }, { x: 86, y: 72 },
-    { x: 26, y: 48 }, { x: 50, y: 48 }, { x: 74, y: 48 },
-    { x: 20, y: 16 }, { x: 50, y: 16 }, { x: 80, y: 16 },
-  ],
-  '3-5-2': [
-    { x: 26, y: 75 }, { x: 50, y: 75 }, { x: 74, y: 75 },
-    { x: 10, y: 46 }, { x: 30, y: 46 }, { x: 50, y: 46 }, { x: 70, y: 46 }, { x: 90, y: 46 },
-    { x: 35, y: 16 }, { x: 65, y: 16 },
-  ],
-  '4-2-3-1': [
-    { x: 14, y: 75 }, { x: 38, y: 75 }, { x: 62, y: 75 }, { x: 86, y: 75 },
-    { x: 36, y: 54 }, { x: 64, y: 54 },
-    { x: 18, y: 32 }, { x: 50, y: 32 }, { x: 82, y: 32 },
-    { x: 50, y: 12 },
-  ],
-}
-const GK_LINEUP_SLOT = { x: 50, y: 94 }
+const FORMATION_LINEUP_SLOTS: Record<string, { x: number; y: number }[]> = Object.fromEntries(
+  Object.entries(FORMATIONS).map(([key, formation]) => [key, formation.slots]),
+)
+const GK_LINEUP_SLOT = GK_SLOT
 const FALLBACK_LINEUP_SLOTS = [
   { x: 50, y: 8 },
   { x: 20, y: 26 }, { x: 50, y: 26 }, { x: 80, y: 26 },
@@ -1382,11 +1418,16 @@ function goTeamSelection() {
       side: route.query.side ?? game.value.side,
       grass: route.query.grass,
       lines: route.query.lines,
+      role: game.value.participantRole,
     },
   })
 }
 
 async function finishHalf() {
+  if (!isPrimary.value) {
+    alert('주 분석관만 전반/후반을 종료할 수 있습니다.')
+    return
+  }
   if (halfFinishBusy.value) return
   if (!confirm(`${half.value}을 종료하시겠습니까?`)) return
 
@@ -1430,11 +1471,11 @@ async function finishHalf() {
         <section class="left" :style="{ paddingBottom: (tableExpanded ? 380 : 250) + 'px' }">
           <div class="statBar">
             <button class="cardIcon" :class="{ on: cardOpen }" title="카드 입력" @click="openCardPanel">🟨🟥</button>
-            <button class="stat" @click="stepSeconds(-3)">-3</button>
-            <button class="stat" @click="stepSeconds(-1)">-1</button>
+            <button class="stat" :disabled="!isPrimary" @click="stepSeconds(-3)">-3</button>
+            <button class="stat" :disabled="!isPrimary" @click="stepSeconds(-1)">-1</button>
             <div class="spacer" />
-            <button class="stat" @click="stepSeconds(1)">+1</button>
-            <button class="stat" @click="stepSeconds(3)">+3</button>
+            <button class="stat" :disabled="!isPrimary" @click="stepSeconds(1)">+1</button>
+            <button class="stat" :disabled="!isPrimary" @click="stepSeconds(3)">+3</button>
             <div class="grassWrap">
               <button class="grassIcon" :class="{ on: grassOpen }" title="잔디 패턴" @click="grassOpen = !grassOpen"><span
                   class="grassSwatch" /></button>
@@ -1458,7 +1499,7 @@ async function finishHalf() {
               </div>
             </div>
             <button class="swapIcon" :class="{ on: subOpen }" title="선수 교체" @click="openSubPanel">🔄</button>
-            <button v-if="inputMode === '분석'" class="pauseBtn" :class="{ paused }" @click="togglePause">{{ paused ? '▶'
+            <button v-if="inputMode === '분석'" class="pauseBtn" :disabled="!isPrimary" :class="{ paused }" @click="togglePause">{{ paused ? '▶'
               : '❚❚' }}</button>
             <div v-else class="modeTag">실시간</div>
           </div>
@@ -1468,13 +1509,13 @@ async function finishHalf() {
             <div class="score">{{ homeScore }}</div>
             <div class="halfBox">
               <div class="clockRow">
-                <button class="timeStep" @click="stepSeconds(-1)">◀</button>
+                <button class="timeStep" :disabled="!isPrimary" @click="stepSeconds(-1)">◀</button>
                 <div class="halfLabel" :class="{ on: half === '전반', clickable: isEditMode }" @click="selectHalf('전반')">
                   전반</div>
                 <div class="clock" :class="{ paused }">{{ displayClock }}</div>
                 <div class="halfLabel" :class="{ on: half === '후반', clickable: isEditMode }" @click="selectHalf('후반')">
                   후반</div>
-                <button class="timeStep" @click="stepSeconds(1)">▶</button>
+                <button class="timeStep" :disabled="!isPrimary" @click="stepSeconds(1)">▶</button>
               </div>
             </div>
             <div class="score">{{ awayScore }}</div>
@@ -1565,12 +1606,15 @@ async function finishHalf() {
           <!-- 종료/복귀 액션. 일반 입력에서는 일시정지 여부와 관계없이 두 버튼을 항상 유지한다. -->
           <div v-if="!editingId" class="finishControls">
             <!-- 최종 RAW 수정은 같은 자리에서 바로 반영하고 final 상태로 되돌린다. -->
-            <button v-if="isFinalCorrection" class="finishBtn" @click="completeFinalCorrection">수정 완료</button>
+            <template v-if="isFinalCorrection">
+              <button class="lobbyExitBtn" @click="exitFinalCorrection">퇴장하기</button>
+              <button class="finishBtn" @click="completeFinalCorrection">수정 완료</button>
+            </template>
             <!-- 기존 half 수정 화면에서는 종료 상태를 바꾸지 않고 대기방으로만 복귀한다. -->
             <button v-else-if="isEditMode" class="finishBtn" @click="exitToLobby">대기방으로 나가기</button>
             <template v-else>
               <button class="lobbyExitBtn" @click="exitToLobby">대기방으로 나가기</button>
-              <button class="finishBtn" :disabled="halfFinishBusy" @click="finishHalf">{{ halfFinishBusy ? '저장 중...' : `${half} 종료` }}</button>
+              <button class="finishBtn" :disabled="halfFinishBusy || !isPrimary" @click="finishHalf">{{ halfFinishBusy ? '저장 중...' : `${half} 종료` }}</button>
             </template>
           </div>
 

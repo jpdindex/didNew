@@ -6,7 +6,7 @@
 //
 // TODO: 지금은 진행 중인 경기 하나(useMatchState)만 보여준다. Firestore 연동 후에는
 // recordings 컬렉션 전체에서 h1Locked/h2Locked = true 인 세션을 모아 보여줘야 한다.
-// TODO: 이 화면 자체도 recorders/{uid}.role === 'admin' 인 사람만 들어올 수 있어야 한다
+// TODO: 관리 화면 권한 정책이 확정되면 이 화면에도 별도 관리자 접근 제어를 둔다.
 // (지금은 로그인만 하면 /manage 전체에 접근 가능 — 권한 분리 전이다).
 
 const game = useMatchState()
