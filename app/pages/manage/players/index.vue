@@ -404,13 +404,11 @@ async function submitAddPlayer() {
       </div>
 
       <div class="playerTable">
-        <div class="playerHead"><span>선수명</span><span>영문명</span><span>정식 영문명</span><span>포지션</span><span>등번호</span><span>소속팀</span><span>국적</span><span>생년월일</span></div>
+        <div class="playerHead"><span>선수명</span><span>포지션</span><span>등번호</span><span>소속팀</span><span>국적</span><span>생년월일</span></div>
         <div v-if="!loading && !searching && !filteredRows.length" class="playerEmpty">조건에 맞는 선수가 없습니다.</div>
         <template v-for="r in filteredRows" :key="r.player.id">
           <div class="playerRow" :class="{ open: selectedPlayerId === r.player.id }" @click="toggleDetail(r)">
             <span class="nameCell">{{ r.player.name }}</span>
-            <span>{{ r.player.nameEn || '-' }}</span>
-            <span>{{ r.player.nameFull || '-' }}</span>
             <span>{{ contractForFilter(r)?.pos || '-' }}</span>
             <span>{{ contractForFilter(r)?.no || '-' }}</span>
             <span>{{ teamLabel(contractForFilter(r)?.teamId ?? '') }}</span>
@@ -540,7 +538,7 @@ async function submitAddPlayer() {
 .searchLabel{display:flex;align-items:center;gap:10px;color:#f0b429;font-weight:800;font-size:13px}
 .nameSearchInput{flex:1;background:#11161d;color:#fff;border:1px solid rgba(240,180,41,.5);padding:9px 12px;border-radius:4px;width:100%;max-width:420px;box-sizing:border-box;font-size:13px}
 .playerTable{border:1px solid #303a48;border-radius:5px;overflow:hidden}
-.playerHead,.playerRow{display:grid;grid-template-columns:1.1fr 1fr 1.3fr .5fr .4fr 1.1fr .5fr .8fr;align-items:center;gap:14px;padding:10px 14px}
+.playerHead,.playerRow{display:grid;grid-template-columns:1.4fr .8fr .6fr 1.2fr .9fr 1fr;align-items:center;gap:16px;padding:10px 14px}
 .playerHead{background:#202731;color:#8f9baa;font-size:12px;font-weight:800}
 .playerRow{border-top:1px solid #2a3340;background:#171d25;color:#eee;font-size:14px;cursor:pointer}
 .playerRow:hover{background:#242d38}
