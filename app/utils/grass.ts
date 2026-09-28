@@ -31,15 +31,49 @@ export const GRASS_PATTERNS: { value: GrassPattern; label: string }[] = [
 ]
 export const GRASS_LINE_OPTIONS: GrassLines[] = [9, 10, 11]
 
+/** 페널티 박스 폭(%) — DidInput.vue 의 .boxL/.boxR width 와 같아야 한다 */
+export const PENALTY_BOX_WIDTH = 15.5
+
+function stripeLayout(lines: GrassLines) {
+  const total = lines * 2
+  const box = PENALTY_BOX_WIDTH
+  const mid = 100 - box * 2
+
+  // 박스 안 띠 개수: 박스 쪽 폭과 가운데 쪽 폭이 가장 비슷해지는 값
+  let k = 1
+  for (let n = 1; n < total / 2; n++) {
+    const diff = Math.abs(box / n - mid / (total - n * 2))
+    if (diff < Math.abs(box / k - mid / (total - k * 2))) k = n
+  }
+  const midCount = total - k * 2
+  return { box, mid, k, midCount, midStripe: mid / midCount }
+}
+
+/** 박스 바깥(가운데 구간) 띠 하나의 폭(%) — 페널티 아크 반지름 상한으로 쓴다 */
+export function grassMidStripeWidth(lines: GrassLines): number {
+  return stripeLayout(lines).midStripe
+}
+
 /**
  * 경기장 배경 CSS 값을 만든다.
- * 원본은 비트맵이지만 띠 폭이 일정하므로 그라디언트로 동일하게 재현된다.
+ * 띠 경계가 페널티 박스 라인에 정확히 걸리도록, 박스 구간과 가운데 구간을 따로 균등 분할한다.
+ * 전체 띠 개수(줄수×2)와 하프라인 위치의 경계는 그대로 유지된다.
  */
 export function grassBackground(pattern: GrassPattern, lines: GrassLines): string {
   if (pattern === 0) return GRASS_DARK
 
-  const w = 100 / (lines * 2) // 띠 하나의 폭(%)
-  const [first, second] = pattern === 1 ? [GRASS_LIGHT, GRASS_DARK] : [GRASS_DARK, GRASS_LIGHT]
+  const { box, mid, k, midCount } = stripeLayout(lines)
 
-  return `repeating-linear-gradient(90deg, ${first} 0 ${w}%, ${second} ${w}% ${w * 2}%)`
+  const edges: number[] = [0]
+  for (let i = 1; i <= k; i++) edges.push((box / k) * i)
+  for (let i = 1; i <= midCount; i++) edges.push(box + (mid / midCount) * i)
+  for (let i = 1; i <= k; i++) edges.push(100 - box + (box / k) * i)
+
+  const [first, second] = pattern === 1 ? [GRASS_LIGHT, GRASS_DARK] : [GRASS_DARK, GRASS_LIGHT]
+  const stops = edges.slice(1).map((end, i) => {
+    const start = +edges[i]!.toFixed(4)
+    return `${i % 2 === 0 ? first : second} ${start}% ${+end.toFixed(4)}%`
+  })
+
+  return `linear-gradient(90deg, ${stops.join(', ')})`
 }

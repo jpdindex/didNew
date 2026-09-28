@@ -2,6 +2,7 @@
 // APK 원본 좌표계(1280×800)는 유지하고, 실제 태블릿 뷰포트에 맞춰서만 축소한다.
 // 화면 내부 클릭은 각 요소의 실제 표시 영역을 기준으로 좌표를 환산하므로 기록 좌표는 변하지 않는다.
 const canvasScale = ref(1)
+const canvasOffsetY = ref(0)
 
 function fitCanvas() {
   // PWA/browser chrome can make innerHeight larger than the actually visible
@@ -10,6 +11,8 @@ function fitCanvas() {
   const width = viewport?.width ?? window.innerWidth
   const height = viewport?.height ?? window.innerHeight
   canvasScale.value = Math.min(width / 1280, height / 800)
+  // 상단 기준으로 배치하고, 실제 보이는 높이 기준으로만 세로 여백을 준다.
+  canvasOffsetY.value = Math.max(0, (height - 800 * canvasScale.value) / 2)
 }
 
 onMounted(() => {
@@ -24,7 +27,7 @@ onUnmounted(() => window.visualViewport?.removeEventListener('resize', fitCanvas
 
 <template>
   <main class="canvasHost">
-    <div class="apkCanvas" :style="{ '--canvas-scale': String(canvasScale) }">
+    <div class="apkCanvas" :style="{ '--canvas-scale': String(canvasScale), marginTop: `${canvasOffsetY}px` }">
       <NuxtPage />
     </div>
   </main>
@@ -46,7 +49,8 @@ body {
   width: 100vw;
   height: 100dvh;
   display: grid;
-  place-items: center;
+  justify-items: center;
+  align-items: start;
   overflow: hidden;
 }
 
@@ -55,6 +59,6 @@ body {
   height: 800px;
   flex: 0 0 auto;
   transform: scale(var(--canvas-scale));
-  transform-origin: center center;
+  transform-origin: top center;
 }
 </style>

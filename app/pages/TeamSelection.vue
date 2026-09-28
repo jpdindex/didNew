@@ -799,7 +799,7 @@ const kpiValues = computed(() => {
     if (f.isSht) sht++
     if (f.isGol) gol++
   }
-  const dtp = paths.filter(p => p.ptype === 'DTP' || p.ptype === 'STP').length
+  const dtp = paths.filter(p => p.ptype === 'DTP').length
   const bap = computeBap(kpiRecords.value).length
   return {
     TAP: tap, DAP: dap, DTP: dtp, Shoot: sht, Goal: gol,

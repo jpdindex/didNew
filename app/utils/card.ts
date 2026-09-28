@@ -39,6 +39,27 @@ export function isSentOff(cards: CardRecord[]): boolean {
 }
 
 /**
+ * 경고 누적 퇴장이 된 "두 번째 경고" 카드들. 카드 종류는 Y 그대로 두고 표시에만 쓴다.
+ * 입력 순서가 아니라 시간순(half → seconds)으로 센다 — 수정으로 시각을 바꾸면 순서가 달라질 수 있어서다.
+ */
+const HALF_ORDER: Record<string, number> = { H1: 1, H2: 2, H3: 3, H4: 4 }
+export function secondYellowCards(cards: CardRecord[]): Set<CardRecord> {
+  const key = (c: CardRecord) => (HALF_ORDER[c.half] ?? 0) * 100000 + c.seconds
+  const sorted = cards
+    .map((c, i) => ({ c, i }))
+    .filter(({ c }) => c.card === 'Y')
+    .sort((a, b) => key(a.c) - key(b.c) || a.i - b.i)
+  const count = new Map<string, number>()
+  const result = new Set<CardRecord>()
+  for (const { c } of sorted) {
+    const n = (count.get(c.player) ?? 0) + 1
+    count.set(c.player, n)
+    if (n === 2) result.add(c)
+  }
+  return result
+}
+
+/**
  * 카드 패널의 선수 목록에서 이 선수를 새로 선택할 수 있는지.
  * 이미 퇴장 처리된 선수는 더 카드를 줄 수 없어 막아야 하지만, 지금 그 선수의 카드를
  * "수정" 중이라면(editingPlayer === playerIdx) 예외로 열어준다 — 그래야 그 선수의

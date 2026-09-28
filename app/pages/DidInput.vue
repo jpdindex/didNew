@@ -13,6 +13,7 @@ import {
   GRASS_LINE_OPTIONS,
   GRASS_PATTERNS,
   grassBackground,
+  grassMidStripeWidth,
   type GrassLines,
   type GrassPattern,
 } from '~/utils/grass'
@@ -24,7 +25,7 @@ import {
   isWithinGoalOneMeter,
   type GoalZoneResult,
 } from '~/utils/goalCoordinates'
-import { canPickForCard, groupCardsByPlayer, isSentOff, type CardRecord } from '~/utils/card'
+import { canPickForCard, groupCardsByPlayer, isSentOff, secondYellowCards, type CardRecord } from '~/utils/card'
 import type { HalfStatus, MatchSquadPlayer, SubRecord } from '~/composables/useMatchState'
 import { FORMATIONS, GK_SLOT } from '~/utils/formationLayout'
 
@@ -163,12 +164,15 @@ onMounted(async () => {
       Object.assign(game.value, state)
       homeScore.value = game.value.homeScore
       awayScore.value = game.value.awayScore
+      // 공유 상태의 스코어가 늦게 도착해도 입력 팀 점수는 레코드 기준을 유지한다.
+      if (records.value.length) syncOwnScore()
       nextTick(() => { applyingRemoteDraft = false })
     },
     applyRecords: (remoteRecords) => {
       // RAW restoration reaches payload.records first. An empty live records
       // snapshot is only the unseeded Draft, never an instruction to erase it.
       if (!remoteRecords.length && records.value.length) return
+      if (draftSavePending) return
       applyingRemoteDraft = true
       records.value = remoteRecords
       game.value.records = remoteRecords
@@ -201,6 +205,7 @@ onUnmounted(() => {
   if (timer) clearInterval(timer)
   if (flashTimer) clearTimeout(flashTimer)
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
+  for (const t of editedTimers.values()) clearTimeout(t)
   stopCollaboration()
 })
 
@@ -249,10 +254,18 @@ async function exitToLobby() {
 const records = ref<DidRecord[]>(resumeHalf ? [...game.value.records] : [])
 let draftSaveTimer: ReturnType<typeof setTimeout> | undefined
 
+// 로컬 변경이 아직 서버로 저장되기 전(0.5초 대기 중)인지. 이 사이에 서버 스냅샷이 오면
+// (예: 직전 저장의 서버 확정 — updatedAt 이 채워지며 스냅샷이 다시 온다) 옛 값으로
+// 방금 입력을 덮어쓰게 되므로(H 누르고 곧바로 HX → HX 가 O 로 되돌아감), 그동안은 받지 않는다.
+// 대기 중인 저장이 끝나면 그 결과가 다시 스냅샷으로 들어온다.
+let draftSavePending = false
+
 function queueDraftSave() {
   if (applyingRemoteDraft) return
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
+  draftSavePending = true
   draftSaveTimer = setTimeout(() => {
+    draftSavePending = false
     saveToStore()
     void saveLocal(game.value).catch(() => false)
     // Live work uses direct Firestore writes inside the existing Draft. REST is
@@ -289,6 +302,14 @@ watch([records, homeScore, awayScore, () => game.value.cards, () => game.value.s
 
 // 입력 중인 팀. TeamSelection 에서 team 쿼리로 넘어온다.
 const team = computed(() => (route.query.team === 'away' ? 'away' : 'home'))
+// 입력 중인 팀의 스코어는 GOAL 결과 레코드 수에서 다시 계산한다. 골을 넣을 때 ++ 만
+// 하면 기록을 삭제하거나 결과를 B/X/선방 등으로 고쳤을 때 점수가 내려가지 않는다.
+function syncOwnScore() {
+  const goals = records.value.filter(r => r.res === 'GOAL').length
+  if (team.value === 'away') awayScore.value = goals
+  else homeScore.value = goals
+}
+watch(records, syncOwnScore, { deep: true })
 const squad = computed<MatchSquadPlayer[]>(() => {
   return team.value === 'away' ? game.value.squads.away : game.value.squads.home
 })
@@ -303,6 +324,14 @@ const visibleRecords = computed(() => records.value.filter(r => (r.half ?? 'H1')
 // 그 루트가 UTP 로 확정되어 진입 레코드 + 직전 2개에 선수 입력 버튼이 바로 뜬다.
 // (DAP 존에 못 들어갔고 슛도 없으면 여전히 UPP 라 뜨지 않는다)
 const analysis = computed(() => computeAttackPaths(visibleRecords.value, { closeTrailing: true }))
+
+// 가안 행 시간: 기본은 위치를 찍은 순간에 멈춘다. '흐르는 초' 버튼을 켜면 경기 시계를 그대로 따라간다.
+// 확정되는 레코드의 시간도 가안 행에 보이던 값과 같게 draftSeconds 를 쓴다.
+const liveDraftTime = ref(false)
+const pendingSeconds = ref<number | null>(null)
+const draftSeconds = computed(() =>
+  liveDraftTime.value || pendingSeconds.value === null ? seconds.value : pendingSeconds.value
+)
 
 function fmtTime(sec: number) {
   return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
@@ -336,7 +365,7 @@ const rows = computed(() => {
   // 이미 표시된다 — C/P/K/F 가 결과를 기다리는 동안 그대로 보이는 것과 같다.
   if (!editingId.value && pendingPos.value) {
     list.push({
-      id: '__draft__', no: list.length + 1, time: fmtTime(seconds.value),
+      id: '__draft__', no: list.length + 1, time: fmtTime(draftSeconds.value),
       act: '', result: '', area: areaFromPos(pendingPos.value),
       isDap: false, playerName: '', draft: true,
     })
@@ -374,13 +403,28 @@ function tapRangeRow(id: string) {
   if (!rangeStartId.value || rangeEndId.value) { rangeStartId.value = id; rangeEndId.value = null }
   else rangeEndId.value = id
 }
+// 수정된 기록은 10초 동안만 초록색으로 표시하고 다시 기본색으로 돌린다.
+// 저장되는 edited 플래그와 별개로 이 화면에서만 쓰는 표시 상태라, 다시 불러온 기록은 초록색이 아니다.
+const EDITED_HIGHLIGHT_MS = 10_000
+const editedTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const recentlyEditedIds = reactive(new Set<string>())
+function markEdited(rec: { id: string; edited?: boolean }) {
+  rec.edited = true
+  recentlyEditedIds.add(rec.id)
+  const prev = editedTimers.get(rec.id)
+  if (prev) clearTimeout(prev)
+  editedTimers.set(rec.id, setTimeout(() => {
+    editedTimers.delete(rec.id)
+    recentlyEditedIds.delete(rec.id)
+  }, EDITED_HIGHLIGHT_MS))
+}
 function openRangeEdit() { if (rangeIndices.value) { rangeDelta.value = 0; rangeEditingOpen.value = true } }
 function stepRangeDelta(delta: number) { rangeDelta.value += delta }
 function cancelRangeEdit() { rangeEditingOpen.value = false }
 function applyRangeEdit() {
   const ids = rangeSelectedIds.value
   if (ids.size && rangeDelta.value) {
-    for (const rec of records.value) if (ids.has(rec.id)) { rec.seconds = Math.max(0, rec.seconds + rangeDelta.value); rec.edited = true }
+    for (const rec of records.value) if (ids.has(rec.id)) { rec.seconds = Math.max(0, rec.seconds + rangeDelta.value); markEdited(rec) }
     records.value.sort((a, b) => (a.seconds - b.seconds) || ((a.seq ?? 0) - (b.seq ?? 0)))
     game.value.records = records.value
   }
@@ -396,9 +440,18 @@ const editSeconds = ref(0)
 // 수정 모드에서는 경기장 클릭·액트 클릭·결과 클릭이 새 레코드를 만들지 않고 이 값만 바꾼다.
 const editAct = ref<ActCode>('')
 const editPos = ref<{ x: number; y: number } | null>(null)
-// 원래 결과가 X/B 였던 레코드만 결과를 고칠 수 있다 — 그 외(진행중/슛 결과 등)는 null 로 두어
-// Kick 패널의 X/B 버튼을 눌러도 아무 효과가 없게 막는다.
+// 원래 결과가 X/B 였던 레코드는 X↔B 로 고칠 수 있다. 결과가 X/B 가 아닌 액트 레코드
+// (C/P/K/F/S/H/R)는 editResConvertible 로 표시해, X/B 를 누르면 액트를 X/B 단독 레코드
+// (act='')로 바꿀 수 있게 한다 — 액트 버튼을 누르면 그 액트로 바뀌는 것과 같은 방식이다.
 const editRes = ref<'X' | 'B' | null>(null)
+const editResConvertible = ref(false)
+// 반대로 액트 없는 X/B 단독 레코드는 C/P/K/F/S/H/R 을 누르면 그 액트 레코드(res 'O')로 바꾼다.
+// X/B 를 다시 누르면 액트 없는 X/B 레코드로 되돌린다. 적용을 눌러야 반영된다.
+const editActConvertible = ref(false)
+// 액트가 있는 X/B 레코드(예: P|B)는 선택된 X/B 를 한 번 더 누르면 결과를 지워 'O'(진행중)로 되돌린다.
+const editResClearable = ref(false)
+// X/B 로 바꿨다가 같은 버튼을 다시 눌러 되돌릴 때 복원할 원래 액트.
+const editOrigAct = ref<ActCode>('')
 // applyResult() 는 X/B 를 누른 비-슛 액트에 대해 "액트 레코드(res 도 채움) + 그 결과만
 // 나타내는 act='' 레코드"를 항상 짝으로 만든다. 둘은 늘 같은 res 값을 가져야 하므로,
 // 한쪽을 수정하면 짝도 같이 바꿔준다. (예: 17번 P|B 와 18번 (빈 act)|B)
@@ -511,10 +564,17 @@ function openEdit(id: string) {
   editAct.value = rec.act
   editPos.value = rec.posX !== undefined && rec.posY !== undefined ? { x: rec.posX, y: rec.posY } : null
   editRes.value = rec.res === 'X' || rec.res === 'B' ? rec.res : null
+  editResConvertible.value = !!rec.act && rec.res !== 'X' && rec.res !== 'B'
+  editActConvertible.value = !rec.act && (rec.res === 'X' || rec.res === 'B')
+  editResClearable.value = !!rec.act && (rec.res === 'X' || rec.res === 'B')
+  editOrigAct.value = rec.act
   editPairedId.value = editRes.value ? findPairedResultRecordId(rec) : null
-  if (GOAL_ZONE_RESULTS.has(rec.res) && rec.shootPosX !== undefined && rec.shootPosY !== undefined) {
+  // 골대 좌표가 없는 옛 기록도 결과(GB/GOAL/GX 등)만으로 골대 수정을 켠다.
+  if (GOAL_ZONE_RESULTS.has(rec.res)) {
     editShootZone.value = rec.res as GoalZoneResult
-    editShootPos.value = { x: rec.shootPosX, y: rec.shootPosY }
+    editShootPos.value = rec.shootPosX !== undefined && rec.shootPosY !== undefined
+      ? { x: rec.shootPosX, y: rec.shootPosY }
+      : null
     editShootDspRange.value = rec.shootDspRange
   } else {
     editShootZone.value = null
@@ -538,19 +598,40 @@ function applyEdit() {
   if (rec) {
     rec.seconds = editSeconds.value
     rec.act = editAct.value
-    rec.edited = true
+    markEdited(rec)
     if (editPos.value) {
       rec.posX = editPos.value.x
       rec.posY = editPos.value.y
       rec.area = Number(areaFromPos(editPos.value))
     }
-    if (editRes.value && (rec.res === 'X' || rec.res === 'B')) {
+    // P|B 처럼 액트가 있는 X/B 레코드의 결과를 지웠으면 'O' 로 되돌린다.
+    // 그 결과만 나타내던 짝 레코드(act 없음)는 건드리지 않는다 — 필요하면 직접 보고 삭제한다.
+    if (editResClearable.value && !editRes.value && (rec.res === 'X' || rec.res === 'B')) {
+      rec.res = 'O'
+    } else if (editRes.value && (rec.res === 'X' || rec.res === 'B')) {
       rec.res = editRes.value
       const paired = records.value.find(r => r.id === editPairedId.value)
       if (paired) {
         paired.res = editRes.value
-        paired.edited = true
+        markEdited(paired)
       }
+    }
+    // 액트 없는 X/B 레코드에 액트를 골랐으면 그 액트의 진행중(res 'O') 레코드로 바꾼다.
+    // 슛으로 바꾸고 골대 결과(GOAL/GB/L 등)까지 이미 찍었다면 그 결과를 유지한다.
+    if (editActConvertible.value && editAct.value && !editRes.value) {
+      if (rec.res === 'X' || rec.res === 'B') rec.res = 'O'
+      rec.isShot = editAct.value === 'S' || editAct.value === 'H' || editAct.value === 'R'
+    }
+    // 액트 레코드를 X/B 로 바꾸면 짝 레코드를 만들지 않고, 이 레코드 자체를 액트 없는
+    // X/B 단독 레코드로 바꾼다. 슛이었다면 골대 좌표·슛 표시도 같이 지운다.
+    if (editResConvertible.value && editRes.value) {
+      rec.act = ''
+      rec.res = editRes.value
+      rec.isShot = false
+      rec.shootPosX = undefined
+      rec.shootPosY = undefined
+      rec.shootDspRange = undefined
+      if (pendingShot.value?.id === rec.id) pendingShot.value = null
     }
     if (!editPlayerEligible.value) {
       rec.playerId = undefined
@@ -571,7 +652,6 @@ function applyEdit() {
 }
 function deleteEdit() {
   if (!editingId.value) return
-  if (!confirm('이 기록을 삭제하시겠습니까?')) return
   const deletedId = editingId.value
   records.value = records.value.filter(r => r.id !== deletedId)
   game.value.records = records.value
@@ -594,7 +674,19 @@ const grassLines = ref<GrassLines>(
   [9, 10, 11].includes(queryLines) ? (queryLines as GrassLines) : 10
 )
 const grassOpen = ref(false)
+// 잔디 팝업은 확인 버튼 말고 바깥 아무 곳을 눌러도 닫힌다(잔디 아이콘 자체는 토글이라 제외).
+const grassWrapRef = ref<HTMLElement | null>(null)
+function closeGrassOnOutside(e: PointerEvent) {
+  if (grassOpen.value && grassWrapRef.value && !grassWrapRef.value.contains(e.target as Node)) grassOpen.value = false
+}
+onMounted(() => document.addEventListener('pointerdown', closeGrassOnOutside))
+onUnmounted(() => document.removeEventListener('pointerdown', closeGrassOnOutside))
 const grassBg = computed(() => grassBackground(grassPattern.value, grassLines.value))
+// 페널티 아크가 박스 밖 잔디 1칸 안에 들어오도록 반지름을 띠 폭의 85%로 둔다(띠 경계에 닿지 않게).
+const pitchStyle = computed(() => ({
+  background: grassBg.value,
+  '--arc-r': `${grassMidStripeWidth(grassLines.value) * 0.85}%`,
+}))
 
 // 좌우 반전: 경기장·기록표(left)와 액트 입력판(right)의 화면 위치를 통째로 바꾼다.
 // 팝업에서 고른 값은 "확인"을 눌러야 실제로 적용된다.
@@ -632,6 +724,19 @@ watch(() => rows.value.length, async () => {
 })
 
 const playerPickFor = ref<string | null>(null) // 선수 입력창을 띄운 레코드
+// DAP 가 아닌 레코드에는 선수를 남기지 않는다. 기록을 끼워 넣거나 시간을 옮겨서
+// DAP 가 풀린 경우(예: P 30:44 → P|B 30:46 사이에 30:45 X/B 삽입)는 물론, 이미 저장돼 있던
+// 비DAP 레코드의 선수도 화면을 여는 순간 지운다. 지운 결과는 자동 저장(queueDraftSave)된다.
+watch(analysis, now => {
+  if (applyingRemoteDraft) return
+  for (const rec of visibleRecords.value) {
+    if (!rec.playerId || rec.playerId === 'OWN') continue
+    if (!now.flags.get(rec.id)?.isDap) {
+      rec.playerId = undefined
+      if (playerPickFor.value === rec.id) playerPickFor.value = null
+    }
+  }
+}, { immediate: true })
 const pickedPlayerId = ref<string | null>(null)
 
 // 선수 선택창도 TeamSelection에서 확정한 포메이션 좌표를 그대로 쓴다.
@@ -674,6 +779,24 @@ const lineup = computed(() => {
   return gk ? [...fallback, { ...gk, slot: GK_LINEUP_SLOT }] : fallback
 })
 
+// 선수 선택: 경기장 위 11명 외에 교체 기록에 나오는 선수(들어온/나간)도 고를 수 있어야 한다.
+// 교체 전 시점의 기록엔 나간 선수를, 배치에 아직 반영 안 된 교체면 들어온 선수를 골라야 하기 때문.
+const subPickPlayers = computed(() => {
+  const onField = new Set(lineup.value.map(p => p.playerId))
+  const tags = new Map<string, 'IN' | 'OUT'>()
+  for (const s of game.value.subs) {
+    if (!onField.has(s.inPlayer)) tags.set(s.inPlayer, 'IN')
+    if (!onField.has(s.outPlayer)) tags.set(s.outPlayer, 'OUT')
+  }
+  return [...tags]
+    .map(([playerId, tag]) => {
+      const player = squad.value.find(p => p.playerId === playerId)
+      return player ? { ...player, tag } : null
+    })
+    .filter((p): p is MatchSquadPlayer & { tag: 'IN' | 'OUT' } => Boolean(p))
+    .sort((a, b) => Number(a.no) - Number(b.no))
+})
+
 // ---------------------------------------------------------------------------
 // 선수 교체 — 상단 ⇄ 아이콘으로 연다.
 // TeamSelection 의 교체 화면과 같은 일을 하지만, 이쪽은 시계가 도는 중이라
@@ -691,6 +814,8 @@ const cardType = ref<'Y' | 'R'>('Y')
 // 퇴장 처리 때문에 선수가 그라운드/벤치 목록에서 사라진 채로 남는다.
 const cardQueue = ref<CardRecord[]>([])
 const cardByPlayer = computed(() => groupCardsByPlayer(game.value.cards, cardQueue.value))
+// 히스토리에서 "경고 · 퇴장"으로 같이 보여줄 두 번째 경고 카드들
+const secondYellows = computed(() => secondYellowCards([...game.value.cards, ...cardQueue.value]))
 /** 카드 패널을 완전히 새로 여는 경우에만 쓰는 초기화. 편집 중이던 큐는 버린다. */
 function resetCardDraft() {
   cardPlayer.value = null
@@ -798,10 +923,23 @@ const subInSlot = ref<string | null>(null)
 const subMinute = ref(0)
 const subSecond = ref(0)
 const subTotalSeconds = computed(() => subMinute.value * 60 + subSecond.value)
+// 새 교체를 입력하는 동안에는 교체 시각이 상단 경기 시계를 그대로 따라간다.
+// -/+ 로 직접 고치거나 기존 교체를 수정 중일 때만 멈춘다.
+const subTimeFollowsClock = ref(true)
+function syncSubTimeToClock() {
+  subTimeFollowsClock.value = true
+  subMinute.value = Math.floor(seconds.value / 60)
+  subSecond.value = seconds.value % 60
+}
+watch(seconds, () => {
+  if (subOpen.value && subTimeFollowsClock.value && editingSubIndex.value === null) syncSubTimeToClock()
+})
 function bumpSubMinute(delta: number) {
+  subTimeFollowsClock.value = false
   subMinute.value = Math.max(0, subMinute.value + delta)
 }
 function bumpSubSecond(delta: number) {
+  subTimeFollowsClock.value = false
   let s = subSecond.value + delta
   let m = subMinute.value
   if (s < 0) { s += 60; m = Math.max(0, m - 1) }
@@ -856,7 +994,14 @@ const subOutSlots = computed(() => byNo(onFieldSlots.value))
 const subInSlots = computed(() => byNo(benchSlots.value))
 
 /** 한 번 빠진 선수는 다시 못 들어온다(축구 규칙) — 벤치에 있어도 고를 수 없게 막는다 */
-const subbedOutPlayers = computed(() => new Set(game.value.subs.map(s => s.outPlayer)))
+// 교체를 "수정" 중이면 배치가 그 교체 직전 시점으로 되돌려져 있으므로, 표시도 그 시점 기준이다 —
+// 그때까지(앞 교체) 빠진 선수만 "교체됨"이고, 뒤에서 교체되는 선수는 아직 평범한 선발/후보로 보인다.
+// 뒤 교체와 겹치는 선택은 적용할 때(submitSub) 막는다.
+const subbedOutPlayers = computed(() => {
+  const index = editingSubIndex.value
+  const list = index === null ? game.value.subs : game.value.subs.slice(0, index)
+  return new Set(list.map(s => s.outPlayer))
+})
 function isSubbedOut(slotId: string) {
   const playerId = game.value.assigned[slotId]
   return playerId !== undefined && subbedOutPlayers.value.has(playerId)
@@ -877,25 +1022,55 @@ function swapPlayers(outPlayer: string, inPlayer: string) {
   }
 }
 
+// 교체는 앞 교체 위에 쌓인다(예: 화이트→모스케라 뒤에 모스케라→살리바). 중간 교체 하나만 swap 해서
+// 되돌리면 배치가 꼬이므로, 뒤에서부터 from 번째까지 차례로 되돌리고(revert) 앞에서부터 다시 적용한다(apply).
+function revertSubsFrom(list: SubRecord[], from: number) {
+  list.slice(from).reverse().forEach(s => swapPlayers(s.outPlayer, s.inPlayer))
+}
+function applySubsFrom(list: SubRecord[], from: number) {
+  list.slice(from).forEach(s => swapPlayers(s.outPlayer, s.inPlayer))
+}
+
+
 function openSubPanel() {
   // 카드 패널이 열려 있었다면 강제로 닫는다 — Cancel 과 동일하게 미제출 큐도 버린다.
   if (cardOpen.value) { cardOpen.value = false; resetCardDraft() }
   subOutSlot.value = null
   subInSlot.value = null
-  subMinute.value = Math.floor(seconds.value / 60)
-  subSecond.value = seconds.value % 60
+  syncSubTimeToClock()
   editingSubIndex.value = null
+  subAddedInPanel.value = false
   subOpen.value = true
 }
 /** 수정 중이던 교체를 Submit 없이 그냥 닫으면, editSub 에서 되돌려 둔 배치를 원래대로 되돌린다. */
 function closeSubPanel() {
   const index = editingSubIndex.value
   if (index !== null) {
-    const original = game.value.subs[index]
-    if (original) swapPlayers(original.outPlayer, original.inPlayer)
+    applySubsFrom(game.value.subs, index)
     editingSubIndex.value = null
   }
   subOpen.value = false
+}
+
+/** 교체 수정만 그만둔다 — 되돌려 둔 배치를 원래대로 돌리고, 패널은 열어 둔 채 새 교체 입력 상태로 돌아간다. */
+function cancelEditSub() {
+  const index = editingSubIndex.value
+  if (index === null) return
+  applySubsFrom(game.value.subs, index)
+  editingSubIndex.value = null
+  subOutSlot.value = null
+  subInSlot.value = null
+  syncSubTimeToClock()
+}
+
+// 한 교체를 수정하는 중에 히스토리의 다른 교체 줄(버튼 포함)을 누르면 수정만 취소한다.
+// 곧바로 다른 교체를 수정/삭제하면 되돌려 둔 배치가 꼬이므로, 한 번 더 눌러야 실행된다.
+function onSubHistRowClick(index: number) {
+  if (editingSubIndex.value !== null && editingSubIndex.value !== index) cancelEditSub()
+}
+function onSubHistAction(action: () => void) {
+  if (editingSubIndex.value !== null) { cancelEditSub(); return }
+  action()
 }
 
 function pickSubOut(slotId: string) {
@@ -926,28 +1101,76 @@ function submitSub() {
   const inPlayer = game.value.assigned[inSlot]
   if (outPlayer === undefined || inPlayer === undefined) return
 
-  // 자리를 맞바꾼다 — 들어온 선수가 나간 선수의 슬롯(포지션)을 그대로 이어받는다.
-  game.value.assigned = { ...game.value.assigned, [outSlot]: inPlayer, [inSlot]: outPlayer }
-  const record: SubRecord = { half: halfCode.value, seconds: subTotalSeconds.value, outPlayer, inPlayer }
-
   const index = editingSubIndex.value
+  // 수정할 때는 원래 교체가 있던 half 를 유지한다(지금 보고 있는 half 로 바뀌면 안 된다).
+  const recordHalf = index !== null ? (game.value.subs[index]?.half ?? halfCode.value) : halfCode.value
+  const record: SubRecord = { half: recordHalf, seconds: subTotalSeconds.value, outPlayer, inPlayer }
+
   if (index !== null) {
-    // 수정 확정: 그 자리에 있던 기존 기록을 새 값으로 갈아 끼운다.
-    game.value.subs = insertSubSorted(game.value.subs.filter((_, i) => i !== index), record)
+    // 수정 확정. 지금 배치는 index 번째 교체 직전 상태다.
+    const original = game.value.subs[index]!
+    // IN 선수를 바꿨다면, 원래 IN 선수가 뒤에서 다시 빠지던 재교체(모스케라→살리바)는
+    // 그 자리를 이어받은 새 IN 선수가 빠지는 것으로 따라 바꾼다.
+    const rest = game.value.subs
+      .filter((_, i) => i !== index)
+      .map((s, i) => (i >= index && s.outPlayer === original.inPlayer ? { ...s, outPlayer: inPlayer } : s))
+    // 한 선수는 한 번만 나가고 한 번만 들어온다 — 다른 교체 기록과 겹치면 뒤 교체를 다시 적용할 때 꼬인다.
+    if (rest.some(s => s.outPlayer === outPlayer)) {
+      alert(`${playerLabel(outPlayer)} 선수는 다른 교체 기록에서 이미 OUT 됩니다.`)
+      return
+    }
+    if (rest.some(s => s.inPlayer === inPlayer)) {
+      alert(`${playerLabel(inPlayer)} 선수는 다른 교체 기록에서 이미 IN 됩니다.`)
+      return
+    }
+    // 시각을 고쳐 순서가 앞뒤로 옮겨질 수 있으므로, 앞 교체까지 모두 되돌려 처음 배치로 만든 뒤
+    // 새 목록을 처음부터 다시 적용한다.
+    revertSubsFrom(game.value.subs.slice(0, index), 0)
+    const next = insertSubSorted(rest, record)
+    applySubsFrom(next, 0)
+    game.value.subs = next
     editingSubIndex.value = null
   } else {
+    // 자리를 맞바꾼다 — 들어온 선수가 나간 선수의 슬롯(포지션)을 그대로 이어받는다.
+    game.value.assigned = { ...game.value.assigned, [outSlot]: inPlayer, [inSlot]: outPlayer }
     game.value.subs = insertSubSorted(game.value.subs, record)
   }
   subOutSlot.value = null
   subInSlot.value = null
+  subAddedInPanel.value = true
+  syncSubTimeToClock() // 다음 교체는 다시 현재 시계부터
+}
+
+// 카드 입력창과 같은 흐름: "목록추가"(submitSub)는 교체를 넣고 패널을 열어 둔 채 다음 교체를 받고,
+// "Submit"은 지금 고른 교체가 있으면 넣은 뒤 패널을 닫는다.
+// 목록추가로 이미 넣은 교체가 있으면 선수를 안 골라도 Submit 으로 닫을 수 있다.
+const subAddedInPanel = ref(false)
+function submitSubAndClose() {
+  if (canSubmitSub.value) {
+    submitSub()
+    if (editingSubIndex.value !== null) return // 수정이 겹침 경고로 막혔으면 패널을 닫지 않는다
+  }
+  subOpen.value = false
 }
 
 /** 잘못 넣은 교체 되돌리기 — 자리도 원래대로 돌려놓는다 */
 function undoSub(index: number) {
-  const s = game.value.subs[index]
-  if (!s) return
-  swapPlayers(s.outPlayer, s.inPlayer)
+  if (!game.value.subs[index]) return
+  revertSubsFrom(game.value.subs, index)
   game.value.subs = game.value.subs.filter((_, i) => i !== index)
+  applySubsFrom(game.value.subs, index)
+}
+
+/** 수정 중인 교체를 지운다 — editSub 에서 이미 그 교체 직전 배치로 되돌려 뒀으므로, 빼고 뒤 교체만 다시 적용한다. */
+function deleteEditingSub() {
+  const index = editingSubIndex.value
+  if (index === null) return
+  game.value.subs = game.value.subs.filter((_, i) => i !== index)
+  applySubsFrom(game.value.subs, index)
+  editingSubIndex.value = null
+  subOutSlot.value = null
+  subInSlot.value = null
+  syncSubTimeToClock()
 }
 
 /**
@@ -960,11 +1183,12 @@ function undoSub(index: number) {
 function editSub(index: number) {
   const s = game.value.subs[index]
   if (!s) return
-  swapPlayers(s.outPlayer, s.inPlayer) // 되돌린다: outPlayer는 다시 필드로, inPlayer는 다시 벤치로
+  // 되돌린다: 뒤 교체들까지 역순으로 풀어 이 교체 직전 배치로 — outPlayer는 다시 필드로, inPlayer는 다시 벤치로
+  revertSubsFrom(game.value.subs, index)
   const entries = Object.entries(game.value.assigned)
   const outSlot = entries.find(([, idx]) => idx === s.outPlayer)?.[0] // 되돌린 뒤 outPlayer 의 필드 슬롯
   const inSlot = entries.find(([, idx]) => idx === s.inPlayer)?.[0] // 되돌린 뒤 inPlayer 의 벤치 슬롯
-  if (!outSlot || !inSlot) return
+  if (!outSlot || !inSlot) { applySubsFrom(game.value.subs, index); return }
   if (cardOpen.value) { cardOpen.value = false; resetCardDraft() }
   subOpen.value = true
   editingSubIndex.value = index
@@ -975,8 +1199,11 @@ function editSub(index: number) {
 }
 
 const subHalfLabel: Record<string, string> = { H1: '전반', H2: '후반', H3: '연장전반', H4: '연장후반' }
+function findPlayer(playerId: string | null) {
+  return squad.value.find(player => player.playerId === playerId)
+}
 function playerLabel(playerId: string | null) {
-  const p = squad.value.find(player => player.playerId === playerId)
+  const p = findPlayer(playerId)
   return p ? `${p.no} ${p.name}` : '-'
 }
 
@@ -1036,10 +1263,10 @@ const peekRecord = computed(() => records.value.find(r => r.id === peekId.value)
 const editingRecord = computed(() => records.value.find(r => r.id === editingId.value) ?? null)
 const infoRecord = computed(() => editingRecord.value ?? peekRecord.value)
 
-// 수정 화면에서 기록표를 눌러 보고 있는(peek/edit) 레코드가 있으면, 위쪽 시계는 진행 시각
-// 대신 그 레코드의 시간을 보여준다. seconds.value(전/후반 종료 시각, 나가기 시 저장되는 값)는
-// 그대로 유지되므로 대기방으로 나가도 시간이 틀어지지 않는다 — 화면 표시만 바뀐다.
-const displayClock = computed(() => (infoRecord.value ? fmtTime(infoRecord.value.seconds) : clock.value))
+// 길게 눌러 수정 중인 레코드가 있으면, 위쪽 시계는 진행 시각 대신 그 레코드의 시간을
+// 보여준다. 짧게 눌러 보기(peek)만 할 때는 진행 시각을 그대로 둔다. seconds.value(전/후반
+// 종료 시각, 나가기 시 저장되는 값)는 그대로 유지되므로 화면 표시만 바뀐다.
+const displayClock = computed(() => (editingRecord.value ? fmtTime(editingRecord.value.seconds) : clock.value))
 
 // Kick/Shooting 패널에 "채워서" 보여줄 레코드. 레코드를 클릭/롱프레스해서 보고 있는
 // 중이면 그 레코드를 그대로 보여준다. 아무것도 안 보고 있을 때는 마지막 레코드가
@@ -1095,16 +1322,21 @@ const infoCellRect = computed(() => {
 const GOAL_ZONE_RESULTS = new Set<string>(['GOAL', 'GB', 'GX', 'H', 'HX', 'L', 'LX', 'R', 'RX'])
 // 수정(long-press) 중인 슛 레코드만 골대를 다시 찍을 수 있다 — 그냥 보기(peek, 짧게 클릭)만
 // 하는 중엔 editShootZone 이 비어 있으므로 .goal 이 활성화되지 않는다.
-const isEditingShoot = computed(() => editingId.value !== null && editShootZone.value !== null)
+// 골대 결과가 이미 있는 슛은 물론, 결과 없이 'O' 로 남은 슛(S/H/R)을 수정할 때도 골대를 켠다.
+const isEditingShoot = computed(() => editingId.value !== null && (
+  editShootZone.value !== null || editAct.value === 'S' || editAct.value === 'H' || editAct.value === 'R'
+))
 const infoGoalPos = computed(() => {
   if (editingId.value) {
     if (!editShootZone.value || !editShootPos.value) return null
+    if (editShootZone.value === 'LX' || editShootZone.value === 'HX' || editShootZone.value === 'RX') return null
     const frac = goalPointToScreenFraction(editShootZone.value, editShootPos.value)
     return { left: frac.left * 100 + '%', top: frac.top * 100 + '%' }
   }
   const r = infoRecord.value
   if (!r || r.shootPosX === undefined || r.shootPosY === undefined) return null
   if (!GOAL_ZONE_RESULTS.has(r.res)) return null
+  if (r.res === 'LX' || r.res === 'HX' || r.res === 'RX') return null
   const frac = goalPointToScreenFraction(r.res as GoalZoneResult, { x: r.shootPosX, y: r.shootPosY })
   return { left: frac.left * 100 + '%', top: frac.top * 100 + '%' }
 })
@@ -1153,6 +1385,7 @@ function clickPitch(e: MouseEvent) {
 
   const nextCell = cellFromPos({ x, y })
   pendingPos.value = { x, y }
+  pendingSeconds.value = seconds.value
   pendingCell.value = nextCell
   flashCell.value = nextCell
   if (flashTimer) clearTimeout(flashTimer)
@@ -1190,12 +1423,14 @@ function clickAct(actKey: string, isShot: boolean) {
   // 수정 중이면 새 레코드를 만들지 않고, 지금 수정 중인 레코드의 액트만 바꾼다.
   if (editingId.value) {
     editAct.value = actKey as Exclude<ActCode, ''>
+    // X/B 로 바꾸려던 중에 액트를 다시 고르면 X/B 변환은 취소한다.
+    if (editResConvertible.value || editActConvertible.value) editRes.value = null
     return
   }
   if (!pendingPos.value) return
   const rec = createActRecord(
     actKey as Exclude<ActCode, ''>,
-    seconds.value,
+    draftSeconds.value,
     Number(areaFromPos(pendingPos.value)),
     { posX: pendingPos.value.x, posY: pendingPos.value.y, half: halfCode.value }
   )
@@ -1219,17 +1454,32 @@ function clickAct(actKey: string, isShot: boolean) {
 // 직전 액트 레코드에 결과를 기록하고, 그 위치를 area 로 하는 결과 레코드를 하나 더 남긴다.
 function clickResult(res: 'X' | 'B') {
   // 수정 중이면 새 레코드를 만들지 않고, 지금 수정 중인 레코드의 결과만 바꾼다.
-  // 원래 결과가 X/B 였던 레코드(editRes 가 null 이 아닌 경우)만 바꿀 수 있다 —
-  // 그 외는 짝 레코드가 없어 함께 갱신할 대상이 불분명하므로 막는다.
+  // 원래 결과가 X/B 였던 레코드는 X↔B 로 바꾸고, 액트 레코드는 X/B 단독 레코드로
+  // 바꾼다(같은 버튼을 다시 누르면 원래 액트로 되돌림). 적용을 눌러야 반영된다.
   if (editingId.value) {
-    if (editRes.value !== null) editRes.value = res
+    if (editResConvertible.value) {
+      if (editRes.value === res) {
+        editRes.value = null
+        editAct.value = editOrigAct.value
+      } else {
+        editRes.value = res
+        editAct.value = ''
+        // 더 이상 슛이 아니므로 골대 UI 로 결과를 즉시 덮어쓰지 못하게 막는다.
+        editShootZone.value = null
+      }
+    } else if (editActConvertible.value) {
+      editRes.value = res
+      editAct.value = ''
+    } else if (editResClearable.value) {
+      editRes.value = editRes.value === res ? null : res
+    } else if (editRes.value !== null) editRes.value = res
     return
   }
   if (!pendingPos.value) return
   const last = records.value[records.value.length - 1]
   if (last && last.res === 'O') {
     applyResult(records.value, last.id, res, {
-      seconds: seconds.value,
+      seconds: draftSeconds.value,
       area: Number(areaFromPos(pendingPos.value)),
       pos: { x: pendingPos.value.x, y: pendingPos.value.y },
     })
@@ -1240,7 +1490,7 @@ function clickResult(res: 'X' | 'B') {
     // 진행중(res:'O')인 액트가 없을 때는 액트 없이 X/B 만 단독으로 입력한다
     // (예: 특정 액트 없이 벌어진 실책/블락). 나중에 이 레코드의 시간을 고쳐 어떤
     // 액트 바로 뒤로 옮기면 그 액트도 자동으로 마감된다 — closePrecedingOpenAct 참고.
-    const rec = createResultRecord(res, seconds.value, Number(areaFromPos(pendingPos.value)), {
+    const rec = createResultRecord(res, draftSeconds.value, Number(areaFromPos(pendingPos.value)), {
       posX: pendingPos.value.x, posY: pendingPos.value.y, half: halfCode.value,
     })
     records.value.push(rec)
@@ -1265,11 +1515,16 @@ function recordGoalResult(zone: Exclude<ResCode, 'O' | ''>, point?: { x: number;
     const rec = records.value.find(r => r.id === editingId.value)
     if (rec) {
       rec.res = zone
-      rec.edited = true
+      markEdited(rec)
       if (point) {
         rec.shootPosX = point.x
         rec.shootPosY = point.y
         rec.shootDspRange = isWithinGoalOneMeter(point)
+      } else if (zone === 'LX' || zone === 'HX' || zone === 'RX') {
+        // 좌표 없이 기록하는 바깥 존은 예전 좌표가 남지 않게 지운다.
+        rec.shootPosX = undefined
+        rec.shootPosY = undefined
+        rec.shootDspRange = undefined
       }
     }
     return
@@ -1279,10 +1534,6 @@ function recordGoalResult(zone: Exclude<ResCode, 'O' | ''>, point?: { x: number;
     shootPos: point,
     shootDspRange: point ? isWithinGoalOneMeter(point) : undefined,
   })
-  if (zone === 'GOAL') {
-    if (team.value === 'away') awayScore.value++
-    else homeScore.value++
-  }
   pendingShot.value = null
 }
 
@@ -1330,13 +1581,17 @@ function confirmGoalFrame(result: 'B' | 'GOAL' | 'X') {
   if (pendingFramePos.value) {
     recordGoalResult(zone, goalFramePoint(pendingFramePos.value.x, pendingFramePos.value.y))
     pendingFramePos.value = null
+    // 수정 중이면 B/GOAL/X 를 누르는 것으로 수정을 끝낸다 — 적용 버튼을 따로 누르지 않아도 된다.
+    if (editingId.value) applyEdit()
     return
   }
-  // 수정 중이고 이미 프레임 안에 위치가 있으면(새로 찍지 않았어도) 그 자리 그대로 결과만
-  // 바꾼다 — 위치는 안 건드리고 B/GB/X 분류만 고치고 싶을 때 새로 다시 찍을 필요가 없게 한다.
-  if (editingId.value && editShootPos.value &&
+  // 수정 중이고 결과가 이미 B/GOAL/X(GB/GOAL/GX)인 슛이면, 새로 찍지 않아도 그 자리 그대로
+  // 결과만 바꾸고 바로 적용한다 — 위치는 안 건드리고 B/GB/X 분류만 고치고 싶을 때 새로
+  // 다시 찍거나 적용을 누를 필요가 없게 한다.
+  if (editingId.value &&
     (editShootZone.value === 'GOAL' || editShootZone.value === 'GB' || editShootZone.value === 'GX')) {
-    recordGoalResult(zone, editShootPos.value)
+    recordGoalResult(zone, editShootPos.value ?? undefined)
+    applyEdit()
   }
 }
 
@@ -1356,6 +1611,12 @@ function clickOuterZone(e: MouseEvent, zone: 'H' | 'HX' | 'L' | 'LX' | 'R' | 'RX
   // 안 눌러 확정 안 된) 임시 위치가 남아 있었다면 여기서 버린다 — 안 지우면 나중에
   // B/GOAL/X 를 눌렀을 때 방금 고른 바깥 존 위치 대신 그 옛 프레임 좌표가 되살아난다.
   pendingFramePos.value = null
+
+  // LX/HX/RX(골대 바깥 빗나감)는 위치가 필요 없다 — 터치하면 결과만 기록하고 좌표는 남기지 않는다.
+  if (zone === 'LX' || zone === 'HX' || zone === 'RX') {
+    recordGoalResult(zone)
+    return
+  }
 
   if (zone === 'H' || zone === 'HX') {
     recordGoalResult(zone, goalOuterPoint('HX', x, y / FRAME_TOP))
@@ -1476,7 +1737,7 @@ async function finishHalf() {
             <div class="spacer" />
             <button class="stat" :disabled="!isPrimary" @click="stepSeconds(1)">+1</button>
             <button class="stat" :disabled="!isPrimary" @click="stepSeconds(3)">+3</button>
-            <div class="grassWrap">
+            <div ref="grassWrapRef" class="grassWrap">
               <button class="grassIcon" :class="{ on: grassOpen }" title="잔디 패턴" @click="grassOpen = !grassOpen"><span
                   class="grassSwatch" /></button>
               <div v-if="grassOpen" class="grassPop">
@@ -1499,9 +1760,13 @@ async function finishHalf() {
               </div>
             </div>
             <button class="swapIcon" :class="{ on: subOpen }" title="선수 교체" @click="openSubPanel">🔄</button>
-            <button v-if="inputMode === '분석'" class="pauseBtn" :disabled="!isPrimary" :class="{ paused }" @click="togglePause">{{ paused ? '▶'
-              : '❚❚' }}</button>
-            <div v-else class="modeTag">실시간</div>
+            <div class="clockCtrl">
+              <button v-if="inputMode === '분석'" class="pauseBtn" :disabled="!isPrimary" :class="{ paused }"
+                @click="togglePause">{{ paused ? '▶' : '❚❚' }}</button>
+              <button class="liveTimeBtn" :class="{ on: liveDraftTime }" title="가안 행 시간을 경기 시계에 맞춰 흐르게 한다"
+                @click="liveDraftTime = !liveDraftTime">흐르는 초</button>
+            </div>
+            <div v-if="inputMode !== '분석'" class="modeTag">실시간</div>
           </div>
 
           <div class="scoreBar">
@@ -1522,15 +1787,17 @@ async function finishHalf() {
             <div class="team right">{{ away }}</div>
           </div>
 
-          <div class="pitch" :style="{ background: grassBg }" @pointerdown="clickPitch">
+          <div class="pitch" :style="pitchStyle" @pointerdown="clickPitch">
             <div class="lineHalf" />
             <div class="lineCircle" />
             <div class="boxL" />
             <div class="arcL" />
             <div class="goalNetL" />
+            <div class="pkSpot pkSpotL" />
             <div class="boxR" />
             <div class="arcR" />
             <div class="goalNetR" />
+            <div class="pkSpot pkSpotR" />
             <div class="corner cornerTL" />
             <div class="corner cornerBL" />
             <div class="corner cornerTR" />
@@ -1560,7 +1827,7 @@ async function finishHalf() {
             </div>
             <div class="tbody">
               <div v-for="r in rows" :key="r.id" class="trow"
-                :class="{ pending: r.isDap, editing: editingId === r.id, peeking: peekId === r.id, edited: records.find(x => x.id === r.id)?.edited, rangeSel: rangeMode && rangeSelectedIds.has(r.id), rangeAnchor: rangeMode && r.id === rangeStartId && !rangeEndId, draft: r.draft }"
+                :class="{ pending: r.isDap, editing: editingId === r.id, peeking: peekId === r.id, edited: recentlyEditedIds.has(r.id), rangeSel: rangeMode && rangeSelectedIds.has(r.id), rangeAnchor: rangeMode && r.id === rangeStartId && !rangeEndId, draft: r.draft }"
                 @mousedown="!r.draft && startPress(r.id)" @mouseup="!r.draft && endPress(r.id)"
                 @mouseleave="cancelPress" @touchstart="!r.draft && startPress(r.id, true)" @touchmove="handleTouchMove"
                 @touchend="!r.draft && endPress(r.id, true)" @contextmenu.prevent>
@@ -1578,6 +1845,8 @@ async function finishHalf() {
                         @click.stop="applyEdit">적용</button>
                       <button class="editDelete editDeleteInline" @mousedown.stop @touchstart.stop
                         @click.stop="deleteEdit">삭제</button>
+                      <button class="editCancel editCancelInline" @mousedown.stop @touchstart.stop
+                        @click.stop="cancelEdit">취소</button>
                     </div>
                     <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn" @mousedown.stop @touchstart.stop
                       @click.stop="openPlayerPick(r.id)">{{ r.playerName || '선수 선택' }}</button>
@@ -1587,7 +1856,7 @@ async function finishHalf() {
                   <span>{{ r.no }}</span><span>{{ r.time }}</span><span>{{ r.act }}</span><span>{{ r.result
                   }}</span><span>{{ r.area }}</span>
                   <span>
-                    <button v-if="r.isDap || r.playerName" class="playerBtn" :class="{ assigned: !!r.playerName }"
+                    <button v-if="r.isDap" class="playerBtn" :class="{ assigned: !!r.playerName }"
                       @mousedown.stop @touchstart.stop @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select'
                       }}</button>
                   </span>
@@ -1672,20 +1941,15 @@ async function finishHalf() {
                 </div>
               </template>
             </div>
-            <div v-if="!cardPlayerEditTarget" class="cardSelected">{{ cardPlayer === null ? '선수를 선택하세요' :
-              playerLabel(cardPlayer) }} · {{
-                cardType ===
-                  'Y' ? '🟨 경고' : '🟥 퇴장' }} <button v-if="cardPlayer !== null" class="queueBtn" @click="queueCard">목록에
-                추가</button>
-            </div>
             <div class="cardHistory">
               <div class="cardHistHead">
                 <span>Half</span><span>Time</span><span>Player</span><span>Card</span><span></span>
               </div>
               <div v-for="(c, i) in [...game.cards, ...cardQueue]" :key="i" class="cardHistRow">
-                <span>{{ subHalfLabel[c.half] }}</span><span>{{ fmtTime(c.seconds) }}</span><span>{{
-                  playerLabel(c.player)
-                }}</span><span>{{ c.card === 'Y' ? '🟨 경고' : '🟥 퇴장' }}</span>
+                <span>{{ subHalfLabel[c.half] }}</span><span>{{ fmtTime(c.seconds) }}</span><span class="histPlayer"><b
+                  v-if="findPlayer(c.player)" class="histNo" :class="`pos${findPlayer(c.player)!.pos}`">{{ findPlayer(c.player)!.no }}</b>{{
+                  findPlayer(c.player)?.name ?? '-' }}</span><span class="cardKind">{{ c.card === 'Y' ? '🟨 경고' : '🟥 퇴장' }}<template
+                    v-if="secondYellows.has(c)"> · 🟥 퇴장</template></span>
                 <span class="cardRowActions">
                   <button class="cardRowEdit"
                     @click="openCardPlayerEdit(i >= game.cards.length, i >= game.cards.length ? i - game.cards.length : i)">수정</button>
@@ -1694,25 +1958,29 @@ async function finishHalf() {
                 </span>
               </div>
             </div>
-            <div class="cardActions"><button @click="cancelCards">Cancel</button><button
+            <div class="cardActions"><button @click="cancelCards">Cancel</button><button v-if="!cardPlayerEditTarget"
+                :disabled="cardPlayer === null" @click="queueCard">목록추가</button><button
                 :disabled="cardPlayer === null && !cardQueue.length" @click="submitCards">Submit</button></div>
           </div>
 
           <!-- 선수교체: 선수선택과 마찬가지로 액트 입력창 자리에서 UI 를 전환한다.
              경기장·기록표(왼쪽)는 그대로 보여야 하므로 화면을 덮지 않는다. -->
           <div v-if="subOpen" class="group subGroup">
-            <div class="subTimeRow">
-              <span class="subTimeLabel">{{ half }} 교체 시각</span>
-              <div class="subTimeStepper">
-                <button class="subTimeBtn" @click="bumpSubMinute(-1)">－</button>
-                <span class="subTimeNum">{{ String(subMinute).padStart(2, '0') }}</span>
-                <button class="subTimeBtn" @click="bumpSubMinute(1)">＋</button>
+            <!-- 교체 시각은 히스토리에서 '수정'을 눌렀을 때만 고친다. 새 교체는 상단 경기 시계 시각으로 들어간다. -->
+            <div v-if="editingSubIndex !== null" class="cardEditBar">
+              <div class="cardEditTime">
+                <button class="timeBtn" @click="bumpSubMinute(-1)">−</button>
+                <strong>{{ String(subMinute).padStart(2, '0') }}</strong>
+                <button class="timeBtn" @click="bumpSubMinute(1)">＋</button>
+                <b class="timeColon">:</b>
+                <button class="timeBtn" @click="bumpSubSecond(-1)">−</button>
+                <strong>{{ String(subSecond).padStart(2, '0') }}</strong>
+                <button class="timeBtn" @click="bumpSubSecond(1)">＋</button>
               </div>
-              <span class="subTimeColon">:</span>
-              <div class="subTimeStepper">
-                <button class="subTimeBtn" @click="bumpSubSecond(-1)">－</button>
-                <span class="subTimeNum">{{ String(subSecond).padStart(2, '0') }}</span>
-                <button class="subTimeBtn" @click="bumpSubSecond(1)">＋</button>
+              <div class="cardEditBtns">
+                <button class="cardEditBtn cardEditBtnApply" :disabled="!canSubmitSub" @click="submitSub">적용</button>
+                <button class="cardEditBtn cardEditBtnDelete" @click="deleteEditingSub">삭제</button>
+                <button class="cardEditBtn cardEditBtnCancel" @click="cancelEditSub">취소</button>
               </div>
             </div>
 
@@ -1751,16 +2019,19 @@ async function finishHalf() {
                 <span class="hAct"></span>
               </div>
               <div v-if="!game.subs.length" class="subHistEmpty">교체 기록이 없습니다.</div>
-              <div v-for="(s, i) in game.subs" v-else :key="i" class="subHistRow" :class="{ editing: editingSubIndex === i }">
+              <div v-for="(s, i) in game.subs" v-else :key="i" class="subHistRow" :class="{ editing: editingSubIndex === i }"
+                @click="onSubHistRowClick(i)">
                 <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
                 <span class="hTime">{{ fmtTime(s.seconds) }}</span>
-                <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
-                <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
+                <span class="hP outP histPlayer"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
+                  findPlayer(s.outPlayer)!.no }}</b>{{ findPlayer(s.outPlayer)?.name ?? '-' }}</span>
+                <span class="hP inP histPlayer"><b v-if="findPlayer(s.inPlayer)" class="histNo">{{
+                  findPlayer(s.inPlayer)!.no }}</b>{{ findPlayer(s.inPlayer)?.name ?? '-' }}</span>
                 <span class="hAct">
-                  <span v-if="editingSubIndex === i" class="subEditingTag">수정 중</span>
+                  <button v-if="editingSubIndex === i" class="subUndo subEditCancel" @click.stop="cancelEditSub">취소</button>
                   <template v-else>
-                    <button class="subUndo" @click="editSub(i)">수정</button>
-                    <button class="subUndo" @click="undoSub(i)">취소</button>
+                    <button class="cardRowEdit" @click.stop="onSubHistAction(() => editSub(i))">수정</button>
+                    <button class="cardRowCancel" @click.stop="onSubHistAction(() => undoSub(i))">삭제</button>
                   </template>
                 </span>
               </div>
@@ -1768,7 +2039,9 @@ async function finishHalf() {
 
             <div class="subActions">
               <button class="subCancel" @click="closeSubPanel">Close</button>
-              <button class="subSubmit" :disabled="!canSubmitSub" @click="submitSub">Submit</button>
+              <button v-if="editingSubIndex === null" class="subQueue" :disabled="!canSubmitSub"
+                @click="submitSub">목록추가</button>
+              <button class="subSubmit" :disabled="!canSubmitSub && !subAddedInPanel" @click="submitSubAndClose">Submit</button>
             </div>
           </div>
 
@@ -1814,7 +2087,7 @@ async function finishHalf() {
                 <div v-if="infoGoalPos && !pendingFramePos" class="marker editMarker" :style="infoGoalPos" />
                 <div v-if="pendingFrameScreenPos" class="marker editMarker" :style="pendingFrameScreenPos" />
               </div>
-              <div class="goalResultButtons">
+              <div class="goalResultButtons" :class="{ active: pendingShot !== null || isEditingShoot }">
                 <button class="goalResultBtn resB" @click="confirmGoalFrame('B')">B</button>
                 <button class="goalResultBtn resGoal" @click="confirmGoalFrame('GOAL')">GOAL</button>
                 <button class="goalResultBtn resX" @click="confirmGoalFrame('X')">X</button>
@@ -1828,6 +2101,14 @@ async function finishHalf() {
             <div class="pickField">
               <button v-for="p in lineup" :key="p.playerId" class="jersey" :class="{ on: pickedPlayerId === p.playerId }"
                 :style="{ left: p.slot.x + '%', top: p.slot.y + '%' }" @click="pickedPlayerId = p.playerId">
+                <span class="shirt">{{ p.no }}</span>
+                <span class="jname">{{ p.name }}</span>
+              </button>
+            </div>
+            <div v-if="subPickPlayers.length" class="pickSubs">
+              <span class="pickSubsLabel">교체<br>OUT</span>
+              <button v-for="p in subPickPlayers" :key="p.playerId" class="jersey subJersey"
+                :class="{ on: pickedPlayerId === p.playerId }" @click="pickedPlayerId = p.playerId">
                 <span class="shirt">{{ p.no }}</span>
                 <span class="jname">{{ p.name }}</span>
               </button>
@@ -1947,11 +2228,24 @@ button {
 .cardHistHead,
 .cardHistRow {
   display: grid;
-  grid-template-columns: 44px 44px 1fr 78px 80px;
+  /* Player 칸이 남는 폭을 다 먹으면 Half/Time/Player 가 왼쪽에 몰려 보이므로 Card 칸과 나눠 갖는다. */
+  grid-template-columns: 48px 54px minmax(0, 1.4fr) minmax(max-content, 1fr) 88px;
   align-items: center;
-  gap: 4px;
-  padding: 6px 7px;
+  gap: 8px;
+  padding: 6px 10px;
   font-size: 13px
+}
+
+/* "🟨 경고 · 🟥 퇴장"이 두 줄로 꺾이지 않게 한다. */
+.cardKind {
+  white-space: nowrap
+}
+
+/* 긴 선수 이름은 칸을 넘치지 않고 한 줄에서 말줄임(…)으로 자른다. */
+.cardHistRow .histPlayer {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis
 }
 
 .cardHistHead {
@@ -2072,8 +2366,8 @@ button {
   display: flex;
   align-items: center;
   justify-content: center;
-  align-self: center;
-  gap: 2px;
+  align-self: stretch; /* 패널 너비만큼 넓혀서 −/＋ 를 누르기 쉽게 한다 */
+  gap: 16px;
   padding: 5px 10px;
   background: rgba(255, 255, 255, .04);
   border: 1px solid rgba(255, 255, 255, .12);
@@ -2081,14 +2375,15 @@ button {
 }
 
 .timeBtn {
-  width: 22px;
-  height: 22px;
+  flex: 1;
+  max-width: 52px;
+  height: 28px;
   padding: 0;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: rgba(255, 255, 255, .45);
-  font-size: 14px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .06);
+  color: rgba(255, 255, 255, .7);
+  font-size: 16px;
   line-height: 1;
   cursor: pointer
 }
@@ -2099,10 +2394,10 @@ button {
 }
 
 .cardEditTime strong {
-  min-width: 22px;
+  min-width: 28px;
   text-align: center;
   font-family: ui-monospace, monospace;
-  font-size: 15px;
+  font-size: 16px;
   font-weight: 700;
   color: #f0b429
 }
@@ -2169,29 +2464,6 @@ button {
   background: rgba(240, 180, 41, .15)
 }
 
-.cardSelected {
-  text-align: center;
-  color: rgba(255, 255, 255, .7);
-  font-size: 12px
-}
-
-.queueBtn {
-  margin-left: 6px;
-  padding: 6px 14px;
-  font-size: 12px;
-  font-weight: 800;
-  border-radius: 6px;
-  border: 1px solid #f0b429;
-  background: rgba(240, 180, 41, .15);
-  color: #f0b429;
-  cursor: pointer
-}
-
-.queueBtn:active {
-  background: #f0b429;
-  color: #191919
-}
-
 .cardHistory {
   flex: 1;
   min-height: 150px;
@@ -2204,13 +2476,14 @@ button {
   line-height: 1.7
 }
 
+/* Cancel · 목록에 추가 · Submit — 수정 중엔 "목록에 추가"가 빠지므로 개수에 맞춰 나눠 갖는다. */
 .cardActions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
   gap: 8px
 }
 
 .cardActions button {
+  flex: 1;
   padding: 11px;
   border: 1px solid #f0b429;
   border-radius: 4px;
@@ -2450,12 +2723,17 @@ button {
   color: rgba(255, 255, 255, .4)
 }
 
-.pauseBtn {
+.clockCtrl {
   position: absolute;
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
-  width: 180px;
+  display: flex;
+  gap: 6px
+}
+
+.pauseBtn {
+  width: 110px;
   height: 34px;
   border-radius: 4px;
   border: 1px solid rgba(255, 255, 255, .15);
@@ -2471,6 +2749,25 @@ button {
 .pauseBtn.paused {
   background: rgba(240, 180, 41, .2);
   border-color: #f0b429
+}
+
+.liveTimeBtn {
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: rgba(255, 255, 255, .06);
+  color: rgba(255, 255, 255, .5);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer
+}
+
+.liveTimeBtn.on {
+  background: rgba(240, 180, 41, .2);
+  border-color: #f0b429;
+  color: #f0b429
 }
 
 .modeTag {
@@ -2514,18 +2811,17 @@ button {
   left: 0;
   top: 19%;
   bottom: 19%;
-  width: 15.5%;
+  width: 15.5%; /* 잔디 띠 경계와 맞춤 — utils/grass.ts PENALTY_BOX_WIDTH */
   border: 2px solid rgba(255, 255, 255, .78);
   border-left: none
 }
 
 .arcL {
   position: absolute;
-  left: 8.5%;
-  top: 50%;
-  width: 14%;
-  aspect-ratio: 1;
-  transform: translateY(-50%);
+  left: calc(15.5% - var(--arc-r, 7%));
+  top: 38.5%;
+  bottom: 38.5%;
+  width: calc(var(--arc-r, 7%) * 2);
   border: 2px solid rgba(255, 255, 255, .78);
   border-radius: 50%;
   clip-path: inset(0 0 0 50%)
@@ -2543,14 +2839,33 @@ button {
 
 .arcR {
   position: absolute;
-  right: 8.5%;
-  top: 50%;
-  width: 14%;
-  aspect-ratio: 1;
-  transform: translateY(-50%);
+  right: calc(15.5% - var(--arc-r, 7%));
+  top: 38.5%;
+  bottom: 38.5%;
+  width: calc(var(--arc-r, 7%) * 2);
   border: 2px solid rgba(255, 255, 255, .78);
   border-radius: 50%;
   clip-path: inset(0 50% 0 0)
+}
+
+.pkSpot {
+  position: absolute;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  margin: -3px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .78);
+  pointer-events: none
+}
+
+/* 실제 규격 비율: 골라인에서 11m / 박스 깊이 16.5m → 박스 폭(15.5%)의 2/3 */
+.pkSpotL {
+  left: calc(15.5% * 2 / 3)
+}
+
+.pkSpotR {
+  right: calc(15.5% * 2 / 3)
 }
 
 .goalNetL,
@@ -2761,9 +3076,9 @@ button {
 
 .playerBtn.assigned {
   border-style: solid;
-  border-color: #c2a04a;
-  background: #c2a04a;
-  color: #080808;
+  border-color: #9aa0a6;
+  background: #9aa0a6;
+  color: #111;
   font-style: italic
 }
 
@@ -2836,7 +3151,8 @@ button {
 }
 
 .editApplyInline,
-.editDeleteInline {
+.editDeleteInline,
+.editCancelInline {
   height: 24px;
   padding: 0 12px;
   border-radius: 4px;
@@ -2850,7 +3166,8 @@ button {
   margin-left: 28px
 }
 
-.editDeleteInline {
+.editDeleteInline,
+.editCancelInline {
   margin-left: 10px
 }
 
@@ -2885,7 +3202,8 @@ button {
   flex-direction: column;
   align-items: center;
   gap: 3px;
-  padding: 4px 6px;
+  min-width: 96px;
+  padding: 14px 18px;
   border: 1px solid transparent;
   border-radius: 4px;
   background: transparent;
@@ -2922,6 +3240,45 @@ button {
   color: #ddd;
   font-size: 10px;
   white-space: nowrap
+}
+
+.pickSubs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 6px;
+  border: 1px solid rgba(255, 255, 255, .1);
+  background: rgba(255, 255, 255, .02)
+}
+
+.pickSubsLabel {
+  color: rgba(255, 255, 255, .45);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.2;
+  text-align: center;
+  margin-right: 6px
+}
+
+.jersey.subJersey {
+  position: static;
+  transform: none;
+  min-width: 84px;
+  padding: 10px 14px
+}
+
+/* 경기장 위 선수는 카드 범위와 유니폼을 크게 — 교체OUT 줄은 기본 크기 유지 */
+.pickField .jersey {
+  min-width: 108px;
+  padding: 16px 22px
+}
+
+.pickField .shirt {
+  width: 50px;
+  height: 44px;
+  font-size: 18px
 }
 
 .pickActions {
@@ -3467,7 +3824,16 @@ section.right h1 {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
   gap: 8px;
-  margin-top: 8px
+  margin-top: 8px;
+  /* 골대(.goal)와 같이, 슛 액트를 눌러 결과를 기다릴 때만 활성화한다. */
+  opacity: .5;
+  pointer-events: none;
+  transition: opacity .2s
+}
+
+.goalResultButtons.active {
+  opacity: 1;
+  pointer-events: auto
 }
 
 .goalResultBtn {
@@ -3510,59 +3876,6 @@ section.right h1 {
   min-height: 0
 }
 
-.subTimeRow {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px
-}
-
-.subTimeLabel {
-  color: rgba(255, 255, 255, .6);
-  font-size: 13px;
-  margin-right: 4px
-}
-
-.subTimeColon {
-  color: #f0b429;
-  font-weight: 700;
-  font-size: 16px
-}
-
-.subTimeStepper {
-  display: flex;
-  align-items: center;
-  gap: 4px
-}
-
-.subTimeBtn {
-  width: 26px;
-  height: 26px;
-  border-radius: 5px;
-  border: 1px solid rgba(255, 255, 255, .18);
-  background: rgba(255, 255, 255, .06);
-  color: #ddd;
-  font-size: 14px;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0
-}
-
-.subTimeBtn:hover {
-  border-color: rgba(240, 180, 41, .6);
-  color: #f0b429
-}
-
-.subTimeNum {
-  display: inline-block;
-  min-width: 34px;
-  text-align: center;
-  color: #f0b429;
-  font-family: ui-monospace, monospace;
-  font-size: 16px;
-  font-weight: 700
-}
-
 .subCols {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -3594,7 +3907,7 @@ section.right h1 {
 .subGrid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 10px
+  gap: 8px
 }
 
 .subCard {
@@ -3603,16 +3916,16 @@ section.right h1 {
   flex-direction: column;
   align-items: center;
   gap: 4px;
-  padding: 18px 4px;
+  padding: 17px 4px;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, .12);
+  border: 1px solid transparent; /* 기본은 테두리 없음 — 선택(out/in) 때만 색 테두리가 보인다 */
   background: rgba(255, 255, 255, .04);
   cursor: pointer;
   overflow: hidden
 }
 
 .subCard:hover {
-  border-color: rgba(255, 255, 255, .35)
+  background: rgba(255, 255, 255, .08)
 }
 
 .subNo {
@@ -3649,11 +3962,7 @@ section.right h1 {
   color: #93b56a
 }
 
-.subCard.out {
-  border-color: #ef4444;
-  background: rgba(239, 68, 68, .16)
-}
-
+.subCard.out,
 .subCard.in {
   border-color: #f0b429;
   background: rgba(240, 180, 41, .18)
@@ -3665,7 +3974,7 @@ section.right h1 {
 }
 
 .subCard.done:hover {
-  border-color: rgba(255, 255, 255, .12)
+  background: rgba(255, 255, 255, .04)
 }
 
 .subDoneTag {
@@ -3683,20 +3992,32 @@ section.right h1 {
   border: 1px solid rgba(255, 255, 255, .08);
   border-radius: 6px;
   display: flex;
-  flex-direction: column
+  flex-direction: column;
+  /* 교체가 많아져도 잘리지 않게 남는 높이 안에서 스크롤한다(헤더는 고정) */
+  flex: 0 1 auto;
+  min-height: 232px;
+  overflow-y: auto
 }
 
 .subHistHead,
 .subHistRow {
   display: grid;
-  grid-template-columns: 60px 64px 1fr 1fr 60px;
+  grid-template-columns: 60px 64px 1fr 1fr 108px;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
-  font-size: 13px
+  padding: 4px 10px;
+  font-size: 12px
+}
+
+.subHistRow {
+  padding-top: 8px;
+  padding-bottom: 8px
 }
 
 .subHistHead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   background: #1b2130;
   color: rgba(255, 255, 255, .45);
   font-weight: 600;
@@ -3708,15 +4029,44 @@ section.right h1 {
   color: rgba(255, 255, 255, .8)
 }
 
+.subHistRow .hAct {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  white-space: nowrap
+}
+
 .subHistRow.editing {
   background: rgba(240, 180, 41, .1);
   border-left: 2px solid #f0b429
 }
 
-.subEditingTag {
-  color: #f0b429;
-  font-size: 11px;
-  font-weight: 700
+/* 히스토리의 등번호는 이름과 붙어 보이지 않게 고정폭·굵게 구분한다.
+   교체 히스토리는 행(Out/In) 색을 따르고, 카드 히스토리는 포지션 색을 쓴다. */
+.histNo {
+  display: inline-block;
+  width: 2.4ch; /* 두 자리 번호까지 같은 폭 — 번호는 헤더 왼쪽에, 이름은 한 줄로 맞춘다 */
+  margin-right: 6px;
+  font-family: ui-monospace, monospace;
+  font-weight: 700;
+  text-align: left
+}
+
+.histNo.posGK {
+  color: rgba(255, 255, 255, .55)
+}
+
+.histNo.posFW {
+  color: #5fb8c9
+}
+
+.histNo.posMF {
+  color: #d98671
+}
+
+.histNo.posDF {
+  color: #93b56a
 }
 
 .subHistRow .hP {
@@ -3730,7 +4080,7 @@ section.right h1 {
 }
 
 .subHistRow .inP {
-  color: #f0b429
+  color: #4ade80
 }
 
 .subHistEmpty {
@@ -3740,13 +4090,18 @@ section.right h1 {
   font-size: 12px
 }
 
+.subUndo.subEditCancel {
+  font-size: 12px;
+  padding: 5px 18px
+}
+
 .subUndo {
   border: 1px solid rgba(255, 255, 255, .15);
   background: rgba(255, 255, 255, .05);
   color: rgba(255, 255, 255, .6);
-  font-size: 11px;
+  font-size: 12px;
   border-radius: 4px;
-  padding: 3px 8px;
+  padding: 4px 10px;
   cursor: pointer
 }
 
@@ -3758,12 +4113,16 @@ section.right h1 {
 .subActions {
   display: flex;
   justify-content: center;
-  gap: 16px
+  gap: 16px;
+  margin-top: auto; /* 남는 공간이 있으면 패널 맨 아래로 */
+  padding-top: 8px
 }
 
 .subCancel,
+.subQueue,
 .subSubmit {
-  min-width: 140px;
+  flex: 1;
+  min-width: 0;
   padding: 14px 20px;
   border-radius: 8px;
   font-size: 15px;
@@ -3780,6 +4139,21 @@ section.right h1 {
 .subCancel:hover {
   color: #fff;
   border-color: rgba(255, 255, 255, .4)
+}
+
+.subQueue {
+  border: 1px solid rgba(240, 180, 41, .6);
+  background: transparent;
+  color: #f0b429
+}
+
+.subQueue:hover:not(:disabled) {
+  background: rgba(240, 180, 41, .12)
+}
+
+.subQueue:disabled {
+  opacity: .35;
+  cursor: not-allowed
 }
 
 .subSubmit {
@@ -3815,16 +4189,6 @@ section.right h1 {
 </style>
 
 <style scoped>
-/* 수정된 기록은 배경을 바꾸지 않고 초록색으로만 구분한다. */
+/* 수정된 기록은 배경을 바꾸지 않고 잠시 초록색으로만 구분한다. */
 .trow.edited { color: #78c58a; }
-.trow.edited button { color: #78c58a; border-color: #78c58a; }
-.trow.pending.edited { color: #78c58a; }
-.trow.edited .playerBtn.assigned { color: #191919; }
-</style>
-<style scoped>
-/* 아직 결과가 확정되지 않은 DAP/진행 기록은 기존처럼 노란색으로 표시한다. */
-.trow.pending { color: #f0b429; }
-.trow.pending span { color: #f0b429; }
-.trow.pending.edited,
-.trow.pending.edited span { color: #78c58a; }
 </style>

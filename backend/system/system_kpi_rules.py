@@ -154,6 +154,8 @@ def _classify_chain(chain: list[KpiRecord], path_id: str) -> tuple[AttackPath, d
     dsp = False
     act_count = 0
     utp_begin_id: str | None = None
+    seen_connect = False  # a C/P/K/F appeared before the shot
+    linked_shot = False  # a shot followed a C/P/K/F within the same path
 
     for record in chain:
         own_goal = _is_goal(record.res) and record.player_id == "OWN"
@@ -162,15 +164,19 @@ def _classify_chain(chain: list[KpiRecord], path_id: str) -> tuple[AttackPath, d
             act_count += 1
         if act and _is_shot_act(act):
             path_type = "DTP"
+            # Only a shot linked (<= 4s, same path) from a C/P/K/F counts as DTP.
+            linked_shot = linked_shot or seen_connect
             is_goal_chain = is_goal_chain or _is_goal(record.res)
             has_position = bool((record.shoot_pos_x or 0) > 0 or (record.shoot_pos_y or 0) > 0)
             if record.res in {"GOAL", "R", "L", "H", "GB"} or (record.res == "B" and has_position) or record.shoot_dsp_range:
                 dsp = True
-        elif record.area < 7 and path_type == "UPP":
+        elif act:
+            seen_connect = True
+        if not (act and _is_shot_act(act)) and record.area < 7 and path_type == "UPP":
             path_type = "UTP"
             utp_begin_id = record.id
 
-    if path_type == "DTP" and act_count < 2:
+    if path_type == "DTP" and not linked_shot:
         path_type = "STP"
     if path_type == "UTP" and act_count < 2 and chain[0].act not in {"K", "F"}:
         path_type = "UPP"

@@ -178,11 +178,6 @@ function orderedParticipants(summary: CollaborationSummary) {
   return [...(summary.participants || [])].sort((a, b) => (a.role === 'primary' ? -1 : 1) - (b.role === 'primary' ? -1 : 1))
 }
 
-function shortAnalystName(name: string | undefined) {
-  const value = Array.from(name || '')
-  return value.length > 5 ? `${value.slice(0, 5).join('')}...` : value.join('')
-}
-
 const selectedTeamHasOtherPrimary = computed(() => {
   if (!selectedMatch.value || !selectedTeam.value) return false
   const summary = teamCollaboration(selectedMatch.value, selectedTeam.value)
@@ -378,7 +373,7 @@ function onCancel() {
               <div class="vs">
                 <div class="analystStack analystStackHome" aria-label="홈팀 분석관">
                   <div v-for="participant in orderedParticipants(teamCollaboration(m, 'home'))" :key="participant.uid" class="analyst">
-                    {{ participant.role === 'primary' ? 'Main' : 'Sub' }}: {{ shortAnalystName(participant.name || participant.uid) }}
+                    {{ participant.role === 'primary' ? 'Main' : 'Sub' }}: {{ (participant.name || participant.uid).split('@')[0] }}
                   </div>
                 </div>
                 <button
@@ -410,7 +405,7 @@ function onCancel() {
                 </button>
                 <div class="analystStack analystStackAway" aria-label="원정팀 분석관">
                   <div v-for="participant in orderedParticipants(teamCollaboration(m, 'away'))" :key="participant.uid" class="analyst">
-                    {{ participant.role === 'primary' ? 'Main' : 'Sub' }}: {{ shortAnalystName(participant.name || participant.uid) }}
+                    {{ participant.role === 'primary' ? 'Main' : 'Sub' }}: {{ (participant.name || participant.uid).split('@')[0] }}
                   </div>
                 </div>
               </div>
@@ -569,7 +564,7 @@ function onCancel() {
 .rightTitle { color: rgba(255,255,255,0.85); font-weight: 800; font-size: 18px; text-align: center; }
 
 .hint { color: rgba(255,255,255,0.45); display: grid; place-items: center; font-size: 14px; }
-.analyst { color: #f4b928; font-size: 11px; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.analyst { color: #f4b928; font-size: 11px; line-height: 16px; white-space: nowrap; }
 .analystStack { min-width: 0; min-height: 34px; display: flex; flex-direction: column; justify-content: center; }
 .analystStackHome { align-items: flex-end; text-align: right; }
 .analystStackAway { align-items: flex-start; text-align: left; }

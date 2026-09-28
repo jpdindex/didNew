@@ -221,7 +221,7 @@ export function createResultRecord(
 /**
  * 액트 없는 결과 전용 레코드(act='')를 새로 만들었거나 그 시간을 옮겼을 때 쓴다.
  * 그 시점 바로 앞(같은 half 안에서 시간순)에 아직 res:'O' 로 진행중인 액트 레코드가 있으면,
- * 그 액트도 이 결과로 마감한다 — "위치만 찍고 액트 없이 X/B" 로 넣었더라도, 시간을 고쳐서
+ * 그 액트도 이 결과로 마감한다. 골대 결과로 끝난 슛이면 그 결과를 X/B 로 정정한다 — "위치만 찍고 액트 없이 X/B" 로 넣었더라도, 시간을 고쳐서
  * 어떤 액트 바로 뒤에 놓이게 되면 그 액트의 결과도 자동으로 채워지도록 하기 위함이다.
  */
 export function closePrecedingOpenAct(records: DidRecord[], resultRecordId: string): void {
@@ -240,8 +240,23 @@ export function closePrecedingOpenAct(records: DidRecord[], resultRecordId: stri
   }
   if (prev && prev.res === 'O') {
     prev.res = resultRec.res
+    return
+  }
+  // 골대 결과(GB/GX/L/H/R/LX/HX/RX)로 끝난 슛 바로 뒤(4초 이내)에 X/B 를 넣으면, 알고 보니
+  // 수비 블락·실책이었다는 정정으로 보고 슛 결과를 X/B 로 바꾼다 (예: S|GB → S|B + B).
+  // 골대 좌표·DSP 범위도 지워 유효슈팅으로 잡히지 않게 한다. 득점(GOAL)은 점수가 걸려 있어 건드리지 않는다.
+  if (
+    prev && (prev.isShot || isShotAct(prev.act)) && SHOT_ZONE_RESULTS.has(prev.res) &&
+    resultRec.seconds - prev.seconds <= 4
+  ) {
+    prev.res = resultRec.res
+    prev.shootPosX = undefined
+    prev.shootPosY = undefined
+    prev.shootDspRange = undefined
   }
 }
+
+const SHOT_ZONE_RESULTS = new Set<ResCode>(['GB', 'GX', 'L', 'H', 'R', 'LX', 'HX', 'RX'])
 
 // =============================================================================
 // 1. 공격루트(Path) 그룹핑 + DAP 판정
@@ -368,6 +383,8 @@ function classifyChain(chain: DidRecord[]): { path: AttackPath; flags: Map<strin
   let dsp = false //         레거시 stype == "CSP"
   let count = 0 //           실제 공격 카운트 (act 없는 레코드는 제외)
   let utpBeginId: string | null = null
+  let seenConnect = false //  슛 이전에 C/P/K/F 가 나왔는지
+  let linkedShot = false //   C/P/K/F 뒤에 이어진 슛이 있는지 → DTP
 
   // ---- 1차 패스: 루트 전체를 보고 ptype / dsp / UTP 진입지점 판정 ----
   for (const r of chain) {
@@ -378,8 +395,10 @@ function classifyChain(chain: DidRecord[]): { path: AttackPath; flags: Map<strin
     if (act) count++
 
     if (r.isShot || (act && isShotAct(act))) {
-      // 슛이 있으면 전/후방 무관하게 DTP
+      // 슛이 있으면 전/후방 무관하게 슛 루트. 같은 루트 안(4초 이하로 연결)에서
+      // C/P/K/F 뒤에 나온 슛만 DTP 이고, 앞선 연결 액트가 없으면 단독슛(STP)이다.
       ptype = 'DTP'
+      if (seenConnect && !isOwnGoal) linkedShot = true
       if (isGoal(r.res)) isGoalChain = true
 
       // DSP: 유효슈팅(득점 / 유효방향 L·H·R / 좌표가 찍힌 블락 / 골키퍼 선방)을 포함하는지.
@@ -390,15 +409,18 @@ function classifyChain(chain: DidRecord[]): { path: AttackPath; flags: Map<strin
         (r.res === 'B' && hasShootPos) || r.shootDspRange) {
         dsp = true
       }
-    } else if (r.area < 7 && ptype === 'UPP') {
+    } else if (act) {
+      seenConnect = true
+    }
+    if (!(r.isShot || (act && isShotAct(act))) && r.area < 7 && ptype === 'UPP') {
       // 공격영역(구역 1~6) 진입 → UTP 로 승격하고 진입지점을 기록
       ptype = 'UTP'
       utpBeginId = r.id
     }
   }
 
-  // 단독슛(빌드업 없이 바로 슛)이면 STP 로 재분류
-  if (ptype === 'DTP' && count < 2) ptype = 'STP'
+  // C/P/K/F 에서 이어지지 않은 슛(단독슛, 슛→슛 등)은 STP 로 재분류
+  if (ptype === 'DTP' && !linkedShot) ptype = 'STP'
 
   // UTP 는 포인트 최소 2개 이상만 인정.
   // 예외: 레코드가 1개여도 K(코너킥)/F(프리킥)이면 인정 (레거시 2021.12.13 추가)

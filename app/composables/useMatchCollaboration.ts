@@ -1,4 +1,4 @@
-import { collection, doc, onSnapshot, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore'
+import { collection, deleteField, doc, onSnapshot, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore'
 import type { DidRecord } from '~/utils/didLogic'
 import type { MatchState } from '~/composables/useMatchState'
 
@@ -15,6 +15,13 @@ function draftId(game: MatchState) {
 function plain<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
 }
+
+// 레코드에서 비워질 수 있는 선택 필드. merge 저장은 undefined 필드를 무시하므로,
+// 로컬에서 지운 값(예: DAP 가 풀려 지운 playerId)이 서버에 남아 있다가 스냅샷으로 되살아난다.
+// 로컬에 없는 필드는 deleteField() 로 서버에서도 지운다.
+const OPTIONAL_RECORD_FIELDS = [
+  'playerId', 'posX', 'posY', 'shootPosX', 'shootPosY', 'shootDspRange', 'isShot', 'edited',
+] as const
 
 /**
  * Firestore is the shared Draft transport. Every event record has its own document
@@ -70,7 +77,7 @@ export function useMatchCollaboration() {
         .map(item => item.data())
         .filter(item => !item.deleted)
         .map(item => plain(item) as DidRecord)
-        .sort((a, b) => ((a.half || 'H1').localeCompare(b.half || 'H1')) || a.seconds - b.seconds || a.no - b.no)
+        .sort((a, b) => ((a.half || 'H1').localeCompare(b.half || 'H1')) || a.seconds - b.seconds || (a.seq ?? 0) - (b.seq ?? 0))
       handlers.applyRecords(records)
     })
     return true
@@ -99,8 +106,11 @@ export function useMatchCollaboration() {
     const batch = writeBatch($db)
     const root = doc($db, 'inputDrafts', draftId(game))
     for (const record of records) {
+      const data = plain(record) as Record<string, unknown>
+      const cleared = Object.fromEntries(OPTIONAL_RECORD_FIELDS.filter(key => data[key] === undefined).map(key => [key, deleteField()]))
       batch.set(doc(root, 'records', record.id), {
-        ...plain(record),
+        ...cleared,
+        ...data,
         half: record.half || 'H1',
         updatedAt: serverTimestamp(),
         updatedBy: $auth.currentUser.uid,
@@ -113,9 +123,12 @@ export function useMatchCollaboration() {
   async function removeRecord(game: MatchState, recordId: string) {
     const { $db, $auth } = useNuxtApp()
     if (!$auth.currentUser || !game.matchId) return false
+    // 삭제한 기록의 내용(시간·액트·선수 등)은 서버에 남기지 않는다. 문서 자체는 지우지 않고
+    // deleted 표시만 남긴다 — 이 표시가 있어야 백엔드가 체크포인트(payload.records)에 남은
+    // 옛 사본을 걸러내고, 다른 분석관의 동기화가 이 기록을 되살리지 않는다.
     await setDoc(doc($db, 'inputDrafts', draftId(game), 'records', recordId), {
-      deleted: true, updatedAt: serverTimestamp(), updatedBy: $auth.currentUser.uid,
-    }, { merge: true })
+      id: recordId, deleted: true, updatedAt: serverTimestamp(), updatedBy: $auth.currentUser.uid,
+    })
     return true
   }
 
