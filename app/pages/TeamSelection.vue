@@ -1128,31 +1128,33 @@ function undoSub(index: number) {
     <button type="button" class="topBack" @click="navigateTo('/schedule')">← 경기 선택</button>
     <div class="frame">
       <aside class="sidebar">
-        <div class="matchDate">{{ match.date.replaceAll('-', '.') }}</div>
-        <div class="teamPick">입력할 팀 선택</div>
-        <div class="teams">
-          <button class="club" :class="{ active: game.team === 'home' }"
-            :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('home')">
-            <div class="crest homeCrest">V</div><span>{{ match.home }}</span>
-          </button>
-          <span class="versus">VS</span>
-          <button class="club" :class="{ active: game.team === 'away' }"
-            :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('away')">
-            <div class="crest awayCrest">RM</div><span>{{ match.away }}</span>
-          </button>
-        </div>
-        <div class="score">{{ game.homeScore }} : {{ game.awayScore }}</div>
-        <div class="status">{{ statusLabel }}</div>
-        <div class="matchMeta">{{ match.time }} | {{ match.league }} | {{ match.round }}</div>
-        <div class="stadium">{{ match.stadium }}</div>
-        <div class="kpiHalfToggle">
-          <button :class="{ active: kpiHalf === 'all' }" @click="kpiHalf = 'all'">전체</button>
-          <button :class="{ active: kpiHalf === 'H1' }" @click="kpiHalf = 'H1'">전반</button>
-          <button :class="{ active: kpiHalf === 'H2' }" @click="kpiHalf = 'H2'">후반</button>
-        </div>
-        <div class="kpis">
-          <div v-for="key in kpis" :key="key" class="kpiRow">
-            <span>{{ displayedKpis.H[key] }}</span><b>{{ key }}</b><span>{{ displayedKpis.A[key] }}</span>
+        <div class="sidebarFixed">
+          <div class="matchDate">{{ match.date.replaceAll('-', '.') }}</div>
+          <div class="teamPick">입력할 팀 선택</div>
+          <div class="teams">
+            <button class="club" :class="{ active: game.team === 'home' }"
+              :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('home')">
+              <div class="crest homeCrest">V</div><span>{{ match.home }}</span>
+            </button>
+            <span class="versus">VS</span>
+            <button class="club" :class="{ active: game.team === 'away' }"
+              :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('away')">
+              <div class="crest awayCrest">RM</div><span>{{ match.away }}</span>
+            </button>
+          </div>
+          <div class="score">{{ game.homeScore }} : {{ game.awayScore }}</div>
+          <div class="status">{{ statusLabel }}</div>
+          <div class="matchMeta">{{ match.time }} | {{ match.league }} | {{ match.round }}</div>
+          <div class="stadium">{{ match.stadium }}</div>
+          <div class="kpiHalfToggle">
+            <button :class="{ active: kpiHalf === 'all' }" @click="kpiHalf = 'all'">전체</button>
+            <button :class="{ active: kpiHalf === 'H1' }" @click="kpiHalf = 'H1'">전반</button>
+            <button :class="{ active: kpiHalf === 'H2' }" @click="kpiHalf = 'H2'">후반</button>
+          </div>
+          <div class="kpis">
+            <div v-for="key in kpis" :key="key" class="kpiRow">
+              <span>{{ displayedKpis.H[key] }}</span><b>{{ key }}</b><span>{{ displayedKpis.A[key] }}</span>
+            </div>
           </div>
         </div>
         <div class="kpiErrors">
@@ -1175,11 +1177,13 @@ function undoSub(index: number) {
             <span v-else class="errDetailEmpty">선수 미입력 없음</span>
           </div>
         </div>
-        <div class="analystInfo analystLevel" :class="{ basic: game.recorderLevel === 'basic' }">
-          분석관 등급: {{ game.recorderLevel === 'basic' ? 'BASIC' : 'ADVANCED' }}
-        </div>
-        <div class="analystInfo analystRole" :class="{ assistant: game.participantRole === 'assistant' }">
-          분석 역할: {{ game.participantRole === 'primary' ? '주 분석관' : '부 분석관' }}
+        <div class="sidebarFooter">
+          <div class="analystInfo analystLevel" :class="{ basic: game.recorderLevel === 'basic' }">
+            분석관 등급: {{ game.recorderLevel === 'basic' ? 'BASIC' : 'ADVANCED' }}
+          </div>
+          <div class="analystInfo analystRole" :class="{ assistant: game.participantRole === 'assistant' }">
+            분석 역할: {{ game.participantRole === 'primary' ? '주 분석관' : '부 분석관' }}
+          </div>
         </div>
       </aside>
       <main class="content">
@@ -1493,12 +1497,18 @@ button {
 }
 
 .sidebar {
-  padding: 12px 12px 10px;
+  padding: 12px 12px 18px;
   border-right: 1px solid rgba(255, 255, 255, .06);
   display: flex;
   flex-direction: column;
   min-height: 0;
   overflow: hidden
+}
+
+.sidebarFixed,
+.sidebarFooter {
+  flex: 0 0 auto;
+  min-height: 0
 }
 
 .matchDate {
@@ -1665,11 +1675,16 @@ button {
 
 .kpiErrors {
   margin-top: 6px;
-  display: grid;
-  gap: 4px
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  gap: 4px;
+  overflow: hidden
 }
 
 .errRow {
+  flex: 0 0 26px;
   height: 26px;
   display: flex;
   align-items: center;
@@ -1704,6 +1719,8 @@ button {
 }
 
 .errDetail {
+  flex: 0 1 auto;
+  min-height: 0;
   margin: -2px 0 2px;
   padding: 4px 8px;
   max-height: 118px;
@@ -2981,7 +2998,6 @@ button {
 
 .analystInfo {
   margin-top: 6px;
-  flex: 0 0 26px;
   height: 26px;
   border-radius: 4px;
   display: grid;
