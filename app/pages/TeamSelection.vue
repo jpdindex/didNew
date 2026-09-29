@@ -501,6 +501,52 @@ function onDrop(slotId: string) {
 }
 
 const benchFilledCount = computed(() => benchIds.filter(id => game.value.assigned[id] !== undefined).length)
+function scrollBenchHorizontally(e: WheelEvent) {
+  const bench = e.currentTarget as HTMLElement
+  bench.scrollLeft += Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY
+}
+const benchDragging = ref(false)
+let benchDragPointerId: number | null = null
+let benchDragStartX = 0
+let benchDragStartScrollLeft = 0
+let benchDragMoved = false
+let suppressBenchClickUntil = 0
+
+function startBenchDrag(e: PointerEvent) {
+  // 터치는 브라우저의 기본 좌우 스와이프를 그대로 사용하고, 마우스만 직접 처리한다.
+  if (e.pointerType !== 'mouse' || e.button !== 0) return
+  const bench = e.currentTarget as HTMLElement
+  benchDragPointerId = e.pointerId
+  benchDragStartX = e.clientX
+  benchDragStartScrollLeft = bench.scrollLeft
+  benchDragMoved = false
+  bench.setPointerCapture(e.pointerId)
+}
+
+function moveBenchDrag(e: PointerEvent) {
+  if (benchDragPointerId !== e.pointerId) return
+  const dx = e.clientX - benchDragStartX
+  if (!benchDragMoved && Math.abs(dx) < 4) return
+  benchDragMoved = true
+  benchDragging.value = true
+  ;(e.currentTarget as HTMLElement).scrollLeft = benchDragStartScrollLeft - dx
+  e.preventDefault()
+}
+
+function endBenchDrag(e: PointerEvent) {
+  if (benchDragPointerId !== e.pointerId) return
+  const bench = e.currentTarget as HTMLElement
+  if (benchDragMoved) suppressBenchClickUntil = Date.now() + 300
+  benchDragging.value = false
+  benchDragPointerId = null
+  if (bench.hasPointerCapture(e.pointerId)) bench.releasePointerCapture(e.pointerId)
+}
+
+function suppressBenchClickAfterDrag(e: MouseEvent) {
+  if (Date.now() >= suppressBenchClickUntil) return
+  e.preventDefault()
+  e.stopPropagation()
+}
 const starterCount = computed(() => outfieldSlots.value.filter((_, index) => game.value.assigned[`o${index}`]).length + (game.value.assigned.gk ? 1 : 0))
 // 후보는 선택 사항이다. 포메이션의 필드 10명과 GK만 확정되면 시작할 수 있다.
 const canStart = computed(() => !!game.value.formationKey && !!game.value.side && starterCount.value === outfieldSlots.value.length + 1)
@@ -1177,7 +1223,9 @@ function undoSub(index: number) {
               <div v-if="game.formationKey" class="benchHeader">
                 <span>후보</span><b>{{ benchFilledCount }} / {{ BENCH_COUNT }}</b>
               </div>
-              <div v-if="game.formationKey" class="bench">
+              <div v-if="game.formationKey" class="bench" :class="{ dragging: benchDragging }"
+                @wheel.prevent="scrollBenchHorizontally" @pointerdown="startBenchDrag" @pointermove="moveBenchDrag"
+                @pointerup="endBenchDrag" @pointercancel="endBenchDrag" @click.capture="suppressBenchClickAfterDrag">
                 <button v-for="id in benchIds" :key="id" class="slot benchSlot"
                   :class="[{ active: activeSlot === id, filled: game.assigned[id] !== undefined }, playerAt(id)?.pos?.toLowerCase()]"
                   :disabled="!matchInfoEditable" @click="clickSlot(id)" @dblclick.prevent="removeFromSlot(id)"
@@ -1448,7 +1496,9 @@ button {
   padding: 12px 12px 10px;
   border-right: 1px solid rgba(255, 255, 255, .06);
   display: flex;
-  flex-direction: column
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden
 }
 
 .matchDate {
@@ -1656,9 +1706,21 @@ button {
 .errDetail {
   margin: -2px 0 2px;
   padding: 4px 8px;
+  max-height: 118px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background: rgba(0, 0, 0, .2);
   border: 1px solid rgba(255, 255, 255, .07);
   border-radius: 4px
+}
+
+.errDetail::-webkit-scrollbar {
+  width: 5px
+}
+
+.errDetail::-webkit-scrollbar-thumb {
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .24)
 }
 
 .errDetailGrid {
@@ -1970,7 +2032,19 @@ button {
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
-  -ms-overflow-style: none
+  -ms-overflow-style: none;
+  touch-action: pan-x;
+  cursor: grab;
+  user-select: none
+}
+
+.bench.dragging {
+  cursor: grabbing
+}
+
+/* 비활성 후보 버튼 위에서도 컨테이너가 마우스 드래그를 받을 수 있게 한다. */
+.bench .benchSlot:disabled {
+  pointer-events: none
 }
 
 .bench::-webkit-scrollbar {
@@ -2907,6 +2981,7 @@ button {
 
 .analystInfo {
   margin-top: 6px;
+  flex: 0 0 26px;
   height: 26px;
   border-radius: 4px;
   display: grid;

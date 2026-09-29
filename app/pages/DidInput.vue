@@ -13,7 +13,6 @@ import {
   GRASS_LINE_OPTIONS,
   GRASS_PATTERNS,
   grassBackground,
-  grassMidStripeWidth,
   type GrassLines,
   type GrassPattern,
 } from '~/utils/grass'
@@ -430,6 +429,25 @@ function applyRangeEdit() {
   }
   toggleRangeMode()
 }
+function deleteRangeRecords() {
+  const ids = new Set(rangeSelectedIds.value)
+  if (!ids.size) return
+  if (!confirm(`선택한 기록 ${ids.size}개를 삭제하시겠습니까?`)) return
+
+  records.value = records.value.filter(rec => !ids.has(rec.id))
+  game.value.records = records.value
+  for (const id of ids) {
+    const timer = editedTimers.get(id)
+    if (timer) clearTimeout(timer)
+    editedTimers.delete(id)
+    recentlyEditedIds.delete(id)
+  }
+  if (peekId.value && ids.has(peekId.value)) peekId.value = null
+  if (playerPickFor.value && ids.has(playerPickFor.value)) playerPickFor.value = null
+  if (pendingShot.value && ids.has(pendingShot.value.id)) pendingShot.value = null
+  void Promise.all([...ids].map(id => removeRecord(game.value, id))).catch(() => false)
+  toggleRangeMode()
+}
 
 // ---- 기록 보기(짧은 클릭) / 수정(길게 눌러서 진입) ----
 // PPT 슬라이드 26-27: 수정할 데이터를 길게 클릭 → 시간 수정 → 적용/삭제/취소.
@@ -542,6 +560,7 @@ function clearPendingEntry() {
   // 지운다 — 안 지우면 다른 레코드를 보러 갔다가 그 레코드의 B/GOAL/X를 눌렀을 때 지금
   // 레코드와 무관한 옛 좌표가 엉뚱하게 다시 적용된다.
   pendingFramePos.value = null
+  pendingOuterScreenPos.value = null
 }
 function clickRecord(id: string) {
   if (rangeMode.value) { tapRangeRow(id); return }
@@ -682,10 +701,9 @@ function closeGrassOnOutside(e: PointerEvent) {
 onMounted(() => document.addEventListener('pointerdown', closeGrassOnOutside))
 onUnmounted(() => document.removeEventListener('pointerdown', closeGrassOnOutside))
 const grassBg = computed(() => grassBackground(grassPattern.value, grassLines.value))
-// 페널티 아크가 박스 밖 잔디 1칸 안에 들어오도록 반지름을 띠 폭의 85%로 둔다(띠 경계에 닿지 않게).
+// 잔디 설정은 배경 무늬만 바꾼다. 경기장 라인은 아래 CSS의 고정 규격을 유지한다.
 const pitchStyle = computed(() => ({
   background: grassBg.value,
-  '--arc-r': `${grassMidStripeWidth(grassLines.value) * 0.85}%`,
 }))
 
 // 좌우 반전: 경기장·기록표(left)와 액트 입력판(right)의 화면 위치를 통째로 바꾼다.
@@ -693,6 +711,10 @@ const pitchStyle = computed(() => ({
 const mirrorOpen = ref(false)
 const pendingMirrored = ref(game.value.mirrored)
 function openMirrorPopup() {
+  if (mirrorOpen.value) {
+    mirrorOpen.value = false
+    return
+  }
   pendingMirrored.value = game.value.mirrored
   mirrorOpen.value = true
 }
@@ -1033,6 +1055,12 @@ function applySubsFrom(list: SubRecord[], from: number) {
 
 
 function openSubPanel() {
+  // 이미 열려 있으면 아이콘을 다시 누른 것을 Close 와 동일하게 처리한다.
+  // 수정 중이라면 closeSubPanel 이 되돌려 둔 배치를 원래 상태로 복원한다.
+  if (subOpen.value) {
+    closeSubPanel()
+    return
+  }
   // 카드 패널이 열려 있었다면 강제로 닫는다 — Cancel 과 동일하게 미제출 큐도 버린다.
   if (cardOpen.value) { cardOpen.value = false; resetCardDraft() }
   subOutSlot.value = null
@@ -1382,6 +1410,8 @@ function clickPitch(e: MouseEvent) {
   peekId.value = null
   // 결과를 고르지 않은 채 새 위치를 찍으면 대기 중이던 슛 초안은 버려진다(레코드로 남지 않았으므로).
   pendingShot.value = null
+  pendingFramePos.value = null
+  pendingOuterScreenPos.value = null
 
   const nextCell = cellFromPos({ x, y })
   pendingPos.value = { x, y }
@@ -1552,8 +1582,12 @@ const GUIDE_TOP = FRAME_TOP - (FRAME_HEIGHT_FRAC / GOAL_TARGET.meters.height) //
 // 골문 프레임 안쪽 클릭: 바로 기록하지 않고 위치 마커만 세부 조정한다.
 // 확정은 아래 B/GOAL/X 버튼을 눌러야 이루어진다.
 const pendingFramePos = ref<{ x: number; y: number } | null>(null)
+// H/L/R은 결과 코드와 함께 실제로 누른 골대 주변 좌표도 저장한다.
+// 결과가 즉시 확정된 뒤에도 골문 안을 찍었을 때처럼 방금 누른 위치를 화면에 보여준다.
+const pendingOuterScreenPos = ref<{ left: string; top: string } | null>(null)
 function clickGoalFrame(e: MouseEvent) {
   const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  pendingOuterScreenPos.value = null
   pendingFramePos.value = {
     x: (e.clientX - rect.left) / rect.width,
     y: (e.clientY - rect.top) / rect.height,
@@ -1598,11 +1632,9 @@ function confirmGoalFrame(result: 'B' | 'GOAL' | 'X') {
 // 중앙 정렬된 골대 주변 영역(프레임 바깥)은 클릭 즉시 기록한다 — 버튼 필요 없음.
 // footballX의 전체 628×300 좌표로 남긴다.
 //
-// H/HX, L/LX, R/RX 는 예전엔 하나의 큰 영역 안에서 1m 경계선을 기준으로 좌표 계산으로
-// 구분했다 — 터치로는 그 얇은 경계선 정확히 어느 쪽인지 맞추기 어려워서, 지금은 여섯 칸을
-// 아예 서로 다른 요소(.goalZone)로 나눠서 어디를 눌렀는지 자체로 구분한다(경계선 좌표
-// 계산 자체는 그대로 재사용 — 저장되는 좌표값의 정확도는 그대로 유지된다).
-function clickOuterZone(e: MouseEvent, zone: 'H' | 'HX' | 'L' | 'LX' | 'R' | 'RX') {
+// H/L/R은 골문 주변 1m 영역을 누른 정확한 좌표를 저장한다.
+// 좌표가 필요 없는 LX/HX/RX는 selectOuterMiss의 독립 버튼으로 분리한다.
+function clickOuterZone(e: MouseEvent, zone: 'H' | 'L' | 'R') {
   const rect = (e.currentTarget as HTMLElement).closest('.goal')!.getBoundingClientRect()
   const x = (e.clientX - rect.left) / rect.width
   const y = (e.clientY - rect.top) / rect.height
@@ -1612,19 +1644,24 @@ function clickOuterZone(e: MouseEvent, zone: 'H' | 'HX' | 'L' | 'LX' | 'R' | 'RX
   // B/GOAL/X 를 눌렀을 때 방금 고른 바깥 존 위치 대신 그 옛 프레임 좌표가 되살아난다.
   pendingFramePos.value = null
 
-  // LX/HX/RX(골대 바깥 빗나감)는 위치가 필요 없다 — 터치하면 결과만 기록하고 좌표는 남기지 않는다.
-  if (zone === 'LX' || zone === 'HX' || zone === 'RX') {
-    recordGoalResult(zone)
-    return
-  }
+  // L/H/R은 영역 이름만 고르는 버튼이 아니라 실제 위치 입력 영역이다.
+  pendingOuterScreenPos.value = { left: `${x * 100}%`, top: `${y * 100}%` }
 
-  if (zone === 'H' || zone === 'HX') {
+  if (zone === 'H') {
     recordGoalResult(zone, goalOuterPoint('HX', x, y / FRAME_TOP))
-  } else if (zone === 'L' || zone === 'LX') {
+  } else if (zone === 'L') {
     recordGoalResult(zone, goalOuterPoint('LX', x / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP)))
   } else {
     recordGoalResult(zone, goalOuterPoint('RX', (x - (1 - FRAME_SIDE)) / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP)))
   }
+}
+
+// LX/HX/RX는 좌표가 없는 결과 버튼이다. 골대 주변의 좁은 실측 영역에 버튼을 끼워 넣지 않고
+// 같은 크기의 독립 버튼으로 선택한다.
+function selectOuterMiss(zone: 'LX' | 'HX' | 'RX') {
+  pendingFramePos.value = null
+  pendingOuterScreenPos.value = null
+  recordGoalResult(zone)
 }
 
 // DAP 레코드의 선수 입력
@@ -1812,12 +1849,12 @@ async function finishHalf() {
             <button class="tableToggle" @click="tableExpanded = !tableExpanded">{{ tableToggleLabel }}</button>
             <button class="rangeToggle" :class="{ on: rangeMode }" @click="toggleRangeMode">구간 수정</button>
           </div>
-          <div v-if="rangeMode" class="rangeHint">{{ rangeEditingOpen ? '델타를 조절하고 적용을 누르세요' : (!rangeStartId ? '구간 시작 레코드를 탭하세요' : (!rangeEndId ? '구간 끝 레코드를 탭하세요' : '길게 눌러 이 구간을 수정하세요')) }}</div>
+          <div v-if="rangeMode" class="rangeHint">{{ rangeEditingOpen ? '델타를 조절하거나 선택 구간을 삭제하세요' : (!rangeStartId ? '구간 시작 레코드를 탭하세요' : (!rangeEndId ? '구간 끝 레코드를 탭하세요' : '길게 눌러 이 구간을 수정하세요')) }}</div>
           <div v-if="rangeEditingOpen" class="rangeEditBar" @mousedown.stop @touchstart.stop>
             <span class="rangeEditLabel">{{ rangeDelta > 0 ? '+' : '' }}{{ rangeDelta }}초</span>
             <button @click="stepRangeDelta(-10)">−10</button><button @click="stepRangeDelta(-1)">−1</button>
             <button @click="stepRangeDelta(1)">+1</button><button @click="stepRangeDelta(10)">+10</button>
-            <button class="rangeApply" @click="applyRangeEdit">적용</button><button class="rangeCancel" @click="cancelRangeEdit">취소</button>
+            <button class="rangeApply" @click="applyRangeEdit">적용</button><button class="rangeDelete" @click="deleteRangeRecords">삭제</button><button class="rangeCancel" @click="cancelRangeEdit">취소</button>
           </div>
           <div ref="tableEl" class="table" :class="{ expanded: tableExpanded }"
             @mousedown.capture="closeOverlayPanelsOnOutsideTouch"
@@ -1965,7 +2002,7 @@ async function finishHalf() {
 
           <!-- 선수교체: 선수선택과 마찬가지로 액트 입력창 자리에서 UI 를 전환한다.
              경기장·기록표(왼쪽)는 그대로 보여야 하므로 화면을 덮지 않는다. -->
-          <div v-if="subOpen" class="group subGroup">
+          <div v-if="subOpen" class="group subGroup" :class="{ editingSub: editingSubIndex !== null }">
             <!-- 교체 시각은 히스토리에서 '수정'을 눌렀을 때만 고친다. 새 교체는 상단 경기 시계 시각으로 들어간다. -->
             <div v-if="editingSubIndex !== null" class="cardEditBar">
               <div class="cardEditTime">
@@ -2073,18 +2110,19 @@ async function finishHalf() {
               </div>
 
               <div class="goal" :class="{ active: pendingShot !== null || isEditingShoot }">
-                <div class="goalZone hx" @click="clickOuterZone($event, 'HX')">HX</div>
-                <div class="goalZone h" @click="clickOuterZone($event, 'H')">H</div>
-                <div class="goalZone lx" @click="clickOuterZone($event, 'LX')">LX</div>
-                <div class="goalZone l" @click="clickOuterZone($event, 'L')">L</div>
-                <div class="goalZone rx" @click="clickOuterZone($event, 'RX')">RX</div>
-                <div class="goalZone r" @click="clickOuterZone($event, 'R')">R</div>
+                <button type="button" class="goalZone goalMissButton hx" @click="selectOuterMiss('HX')">HX</button>
+                <div class="goalZone goalAimZone h" @click="clickOuterZone($event, 'H')">H</div>
+                <button type="button" class="goalZone goalMissButton lx" @click="selectOuterMiss('LX')">LX</button>
+                <div class="goalZone goalAimZone l" @click="clickOuterZone($event, 'L')">L</div>
+                <button type="button" class="goalZone goalMissButton rx" @click="selectOuterMiss('RX')">RX</button>
+                <div class="goalZone goalAimZone r" @click="clickOuterZone($event, 'R')">R</div>
                 <div class="hxDivider" aria-hidden="true" />
                 <div class="meterGuide" aria-hidden="true" />
                 <div class="goalFrame" @click="clickGoalFrame">
                   <div class="goalZone goalCenter" aria-hidden="true" />
                 </div>
-                <div v-if="infoGoalPos && !pendingFramePos" class="marker editMarker" :style="infoGoalPos" />
+                <div v-if="infoGoalPos && !pendingFramePos && !pendingOuterScreenPos" class="marker editMarker" :style="infoGoalPos" />
+                <div v-if="pendingOuterScreenPos" class="marker editMarker" :style="pendingOuterScreenPos" />
                 <div v-if="pendingFrameScreenPos" class="marker editMarker" :style="pendingFrameScreenPos" />
               </div>
               <div class="goalResultButtons" :class="{ active: pendingShot !== null || isEditingShoot }">
@@ -2818,13 +2856,16 @@ button {
 
 .arcL {
   position: absolute;
-  left: calc(15.5% - var(--arc-r, 7%));
-  top: 38.5%;
-  bottom: 38.5%;
-  width: calc(var(--arc-r, 7%) * 2);
+  /* 실제 페널티 아크: 페널티 스폿(11m)을 중심으로 한 반지름 9.15m 원에서
+     페널티 박스(16.5m) 밖으로 나온 부분만 보인다. */
+  left: calc(15.5% * 2 / 3);
+  top: 50%;
+  width: 17.19%;
+  aspect-ratio: 1;
+  transform: translate(-50%, -50%);
   border: 2px solid rgba(255, 255, 255, .78);
   border-radius: 50%;
-  clip-path: inset(0 0 0 50%)
+  clip-path: inset(0 0 0 80%)
 }
 
 .boxR {
@@ -2839,13 +2880,14 @@ button {
 
 .arcR {
   position: absolute;
-  right: calc(15.5% - var(--arc-r, 7%));
-  top: 38.5%;
-  bottom: 38.5%;
-  width: calc(var(--arc-r, 7%) * 2);
+  right: calc(15.5% * 2 / 3);
+  top: 50%;
+  width: 17.19%;
+  aspect-ratio: 1;
+  transform: translate(50%, -50%);
   border: 2px solid rgba(255, 255, 255, .78);
   border-radius: 50%;
-  clip-path: inset(0 50% 0 0)
+  clip-path: inset(0 80% 0 0)
 }
 
 .pkSpot {
@@ -3740,14 +3782,26 @@ section.right h1 {
   place-items: center
 }
 
+.goalMissButton {
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, .24);
+  background: rgba(35, 38, 43, .92);
+  color: rgba(255, 255, 255, .72)
+}
+
+.goalMissButton:hover {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .2);
+  color: #f0b429
+}
+
+/* 좌표 없는 바깥 결과 버튼은 각 실측 가이드라인 바깥 영역을 정확히 채운다. */
 .hx {
   position: absolute;
   left: 0;
   right: 0;
   top: 0;
   height: 18.23%;
-  text-align: center;
-  color: rgba(255, 255, 255, .6);
   font-size: 10px;
   letter-spacing: .08em
 }
@@ -3755,28 +3809,24 @@ section.right h1 {
 .lx {
   position: absolute;
   left: 0;
-  top: 42%;
+  top: 18.23%;
   bottom: 0;
-  width: 5.44%;
-  color: rgba(255, 255, 255, .68)
+  width: 5.44%
 }
 
 .rx {
   position: absolute;
   right: 0;
-  top: 42%;
+  top: 18.23%;
   bottom: 0;
-  width: 5.44%;
-  color: rgba(255, 255, 255, .68)
+  width: 5.44%
 }
 
-/* H/L/R — HX/LX/RX 와 나란히 있는 "1m 이내(근접 미스)" 칸. 예전엔 이 경계선(hxDivider/
-   meterGuide) 안쪽인지 바깥쪽인지를 클릭 좌표 계산으로 구분했는데, 터치로는 경계선
-   정확히 어느 쪽을 짚었는지 맞추기 어려워서 아예 각각 별도로 누를 수 있는 칸으로 나눴다. */
+/* H/L/R — 위치를 저장하는 포스트·크로스바 바깥 1m 이내(근접 미스) 영역. */
 .h {
   position: absolute;
-  left: 0;
-  right: 0;
+  left: 5.44%;
+  right: 5.44%;
   top: 18.23%;
   height: 23.77%;
   text-align: center;
@@ -3811,12 +3861,7 @@ section.right h1 {
   pointer-events: none
 }
 
-.goal:hover .hx,
-.goal:hover .h,
-.goal:hover .lx,
-.goal:hover .l,
-.goal:hover .rx,
-.goal:hover .r {
+.goalAimZone:hover {
   background: rgba(240, 180, 41, .08)
 }
 
@@ -3997,6 +4042,13 @@ section.right h1 {
   flex: 0 1 auto;
   min-height: 232px;
   overflow-y: auto
+}
+
+/* 수정 바가 생기면 고정 높이를 고집하지 않고 이력 영역이 남은 높이에 맞춰 줄어든다.
+   우측 패널은 overflow:hidden 이므로, 이 처리가 없으면 맨 아래 액션 버튼이 화면 밖으로 잘린다. */
+.subGroup.editingSub .subHistory {
+  flex: 1 1 96px;
+  min-height: 96px
 }
 
 .subHistHead,
@@ -4183,6 +4235,7 @@ section.right h1 {
 .rangeEditBar button { border:1px solid #b88712; background:#24272d; color:#f0b429; border-radius:3px; padding:3px 7px; font-size:10px; font-weight:800; }
 .rangeEditLabel { min-width:42px; text-align:center; color:#f0b429; font-weight:800; font-size:11px; }
 .rangeEditBar .rangeApply { background:#f0b429; color:#161a20; }
+.rangeEditBar .rangeDelete { color:#ff8585; border-color:#a64545; background:#3a2024; }
 .rangeEditBar .rangeCancel { color:#e38b8b; border-color:#8d4c4c; }
 .trow.rangeSel { background:rgba(240,180,41,.16); box-shadow:inset 3px 0 #f0b429; }
 .trow.rangeAnchor { outline:1px solid rgba(120,197,138,.8); outline-offset:-1px; }
