@@ -402,15 +402,6 @@ def list_approvals(_: RequiredUser = None) -> dict:
     return {"status": "ok", "drafts": [{"gmId": item["gmId"], "side": item["side"], "updatedAt": item.get("updatedAt"), "payload": item["payload"]} for item in drafts]}
 
 
-@router.post("/match-input/legacy-lineups/backfill", include_in_schema=False)
-def backfill_legacy_lineups(
-    limit: int = Query(default=100, ge=1, le=500),
-    _: RequiredUser = None,
-) -> dict:
-    """Create lineup-aware input snapshots for a bounded set of imported finals."""
-    return {"status": "ok", **JpdDidData().backfill_legacy_input_squads(limit=limit)}
-
-
 @router.post("/match-input/drafts/{gm_id}/{side}/participants", include_in_schema=False)
 def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinRequest, user: RequiredUser = None) -> dict:
     data = JpdDidData()

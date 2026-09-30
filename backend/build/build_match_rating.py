@@ -40,12 +40,6 @@ class BuildMatchRating:
                 status_code=409,
                 code="rating_kpi_missing",
             )
-        if source.recording.kpiSourceFingerprint != source.fingerprint:
-            raise BackendError(
-                message=f"KPI must be rebuilt from current raw before rating: {gm_id}/{side}",
-                status_code=409,
-                code="rating_kpi_stale",
-            )
         if (
             not force
             and source.recording.ratingBasedOn == source.recording.kpiVersion

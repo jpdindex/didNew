@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import re
 from threading import Event, Lock, Thread
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal
 
 import firebase_admin
 from fastapi import Depends, Request, Security
@@ -891,25 +891,89 @@ class JpdDidData:
         side_snapshot = legacy.get(side) if isinstance(legacy.get(side), dict) else {}
         return side_snapshot.get("lineup") if isinstance(side_snapshot.get("lineup"), list) else None
 
-    def backfill_legacy_input_squads(self, *, limit: int = 100) -> dict[str, int]:
-        """Create v3 imported-match snapshots without mutating RAW recordings."""
-        counts = {"scanned": 0, "created": 0, "unchanged": 0, "failed": 0}
-        for gm_id, match in self.list_matches(limit=limit):
+    def _legacy_snapshot_matches(
+        self,
+        *,
+        season_id: str,
+        from_gm_id: str | None = None,
+        to_gm_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[tuple[str, MatchDoc]]:
+        if from_gm_id and to_gm_id and from_gm_id > to_gm_id:
+            raise BackendError("from_gm_id must not be greater than to_gm_id", status_code=422, code="snapshot_range_invalid")
+        matches = [
+            item for item in self.list_matches(season_id=season_id, limit=10_000)
+            if (from_gm_id is None or item[0] >= from_gm_id)
+            and (to_gm_id is None or item[0] <= to_gm_id)
+        ]
+        matches.sort(key=lambda item: item[0])
+        return matches[:limit] if limit is not None else matches
+
+    def get_legacy_input_snapshot_status(
+        self,
+        *,
+        season_id: str,
+        from_gm_id: str | None = None,
+        to_gm_id: str | None = None,
+    ) -> dict[str, int]:
+        """Count usable imported-match snapshots for an explicit legacy scope."""
+        counts = {"matched": 0, "legacy": 0, "ready": 0, "missing": 0}
+        for gm_id, match in self._legacy_snapshot_matches(
+            season_id=season_id, from_gm_id=from_gm_id, to_gm_id=to_gm_id,
+        ):
+            counts["matched"] += 1
             recordings = self._legacy_recordings(gm_id)
             if not recordings:
                 continue
-            counts["scanned"] += 1
+            counts["legacy"] += 1
+            snapshot = self._input_squads_reference(gm_id).get(retry=None, timeout=10).to_dict() or {}
+            lineups = snapshot.get("legacyLineup") if isinstance(snapshot.get("legacyLineup"), dict) else {}
+            ready = (
+                snapshot.get("schemaVersion") == 3
+                and snapshot.get("source") == self._input_squad_source(match)
+                and all(
+                    isinstance(lineups.get(side), dict)
+                    and lineups[side].get("fingerprint") == self._legacy_lineup_fingerprint(recording)
+                    and isinstance(lineups[side].get("lineup"), list)
+                    for side, recording in recordings.items()
+                )
+            )
+            counts["ready" if ready else "missing"] += 1
+        return counts
+
+    def backfill_legacy_input_squads(
+        self,
+        *,
+        season_id: str,
+        from_gm_id: str | None = None,
+        to_gm_id: str | None = None,
+        limit: int | None = None,
+        on_progress: Callable[[dict[str, int]], None] | None = None,
+    ) -> dict[str, int]:
+        """Create v3 imported-match snapshots without mutating RAW recordings."""
+        matches = self._legacy_snapshot_matches(
+            season_id=season_id, from_gm_id=from_gm_id, to_gm_id=to_gm_id, limit=limit,
+        )
+        counts = {"matched": len(matches), "processed": 0, "scanned": 0, "created": 0, "unchanged": 0, "failed": 0}
+        for gm_id, match in matches:
             try:
-                reference = self._input_squads_reference(gm_id)
-                current = reference.get(retry=None, timeout=10).to_dict() or {}
-                if current.get("schemaVersion") == 3 and current.get("source") == self._input_squad_source(match):
-                    counts["unchanged"] += 1
-                    continue
-                self.refresh_input_squads(gm_id, match, legacy_recordings=recordings)
-                counts["created"] += 1
+                recordings = self._legacy_recordings(gm_id)
+                if recordings:
+                    counts["scanned"] += 1
+                    reference = self._input_squads_reference(gm_id)
+                    current = reference.get(retry=None, timeout=10).to_dict() or {}
+                    if current.get("schemaVersion") == 3 and current.get("source") == self._input_squad_source(match):
+                        counts["unchanged"] += 1
+                    else:
+                        self.refresh_input_squads(gm_id, match, legacy_recordings=recordings)
+                        counts["created"] += 1
             except Exception:
                 logger.exception("Legacy input snapshot backfill failed for %s", gm_id)
                 counts["failed"] += 1
+            finally:
+                counts["processed"] += 1
+                if on_progress is not None:
+                    on_progress(dict(counts))
         return counts
 
     @staticmethod

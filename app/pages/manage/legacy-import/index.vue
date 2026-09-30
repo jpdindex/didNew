@@ -1,7 +1,7 @@
 <script setup lang="ts">
 type BackendState = 'idle' | 'checking' | 'ready' | 'unavailable'
-type ImportJobState = 'queued' | 'preparing' | 'replacing' | 'writing' | 'complete' | 'failed'
-interface ImportJob { status: ImportJobState; jobId: string; matchesTotal: number; matchesProcessed: number; documentsTotal: number; documentsWritten: number; recordsWritten: number; percent: number; error?: string | null }
+type ImportJobState = 'idle' | 'queued' | 'preparing' | 'replacing' | 'writing' | 'complete' | 'failed'
+interface ImportJob { status: ImportJobState; matchesTotal: number; matchesProcessed: number; documentsTotal: number; documentsWritten: number; recordsWritten: number; percent: number; error?: string | null }
 
 const selectedFile = ref<File | null>(null)
 const backendUrl = ref('')
@@ -44,21 +44,21 @@ function selectFile(event: Event) {
   importJob.value = null; errorMessage.value = ''
 }
 function progressText(job: ImportJob) { return `경기 ${job.matchesProcessed} / ${job.matchesTotal} · 문서 ${job.documentsWritten} / ${job.documentsTotal}` }
-async function readJob(jobId: string) {
-  const response = await fetch(`${backendUrl.value}/api/v1/legacy-import/jobs/${jobId}`, { headers: { 'X-Swagger-Key': localApiKey.value } })
+async function readStatus() {
+  const response = await fetch(`${backendUrl.value}/api/v1/legacy-import/status`, { headers: { 'X-Swagger-Key': localApiKey.value } })
   if (!response.ok) throw new Error(await response.text())
   return await response.json() as ImportJob
 }
-async function pollJob(jobId: string) {
+async function pollStatus() {
   try {
-    const job = await readJob(jobId); importJob.value = job
+    const job = await readStatus(); importJob.value = job
     if (job.status === 'complete') {
       busy.value = false
       statusMessage.value = `완료: 경기 ${job.matchesProcessed}건 교체, 문서 ${job.documentsWritten}건, raw ${job.recordsWritten}건 저장`
       return
     }
     if (job.status === 'failed') { busy.value = false; errorMessage.value = job.error || '이관 작업이 실패했습니다.'; return }
-    pollTimer = setTimeout(() => void pollJob(jobId), 1200)
+    pollTimer = setTimeout(() => void pollStatus(), 1200)
   } catch (error) { busy.value = false; errorMessage.value = error instanceof Error ? error.message : '진행 상태를 읽지 못했습니다.' }
 }
 async function startImport() {
@@ -70,7 +70,8 @@ async function startImport() {
   try {
     const response = await fetch(`${backendUrl.value}/api/v1/legacy-import`, { method: 'POST', headers: { 'X-Swagger-Key': localApiKey.value }, body: form })
     if (!response.ok) throw new Error(await response.text())
-    await pollJob((await response.json() as { jobId: string }).jobId)
+    await response.json()
+    await pollStatus()
   } catch (error) { busy.value = false; errorMessage.value = error instanceof Error ? error.message : '이관 요청을 시작하지 못했습니다.' }
 }
 onMounted(() => void checkBackend())

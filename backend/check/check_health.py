@@ -38,7 +38,9 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
         "/api/v1/match-ratings/build",
         "/api/v1/match-ratings/read",
         "/api/v1/legacy-import",
-        "/api/v1/legacy-import/jobs/{job_id}",
+        "/api/v1/legacy-import/status",
+        "/api/v1/legacy-import/snapshot-status/{season}",
+        "/api/v1/legacy-import/snapshot-backfill",
     }
     assert not any(path.startswith("/api/v1/match-input/") for path in schema["paths"])
     assert schema["components"]["securitySchemes"]["SwaggerKey"]["name"] == "X-Swagger-Key"
@@ -58,6 +60,10 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
     import_operation = schema["paths"]["/api/v1/legacy-import"]["post"]
     assert import_operation["security"] == [{"SwaggerKey": []}]
     assert "multipart/form-data" in import_operation["requestBody"]["content"]
+    snapshot_operation = schema["paths"]["/api/v1/legacy-import/snapshot-backfill"]["post"]
+    snapshot_schema = snapshot_operation["requestBody"]["content"]["application/x-www-form-urlencoded"]["schema"]
+    snapshot_properties = schema["components"]["schemas"][snapshot_schema["$ref"].split("/")[-1]]["properties"]
+    assert {"season", "from_gm_id", "to_gm_id", "limit"} <= set(snapshot_properties)
 
 
 def test_kpi_build_rejects_missing_swagger_key() -> None:
