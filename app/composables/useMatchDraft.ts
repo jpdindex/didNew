@@ -139,6 +139,26 @@ function payloadFromState(game: MatchState): InputPayload {
   }
 }
 
+const HALF_ORDER: Record<string, number> = { H1: 1, H2: 2, H3: 3, H4: 4 }
+
+/**
+ * 서버 라인업은 선발 기준으로 돌아올 수 있어(레거시 스냅샷 등) 교체가 배치에 반영돼 있지 않을 수 있다.
+ * 교체를 시간순으로 다시 적용하되, OUT 선수가 필드에·IN 선수가 벤치에 있을 때만 맞바꾼다 —
+ * 이미 교체가 반영된 배치라면 조건이 맞지 않아 그대로 두므로 두 번 적용되지 않는다.
+ */
+function applySubsToAssigned(game: MatchState) {
+  const subs = [...game.subs].sort(
+    (a, b) => (HALF_ORDER[a.half] ?? 0) * 100000 + a.seconds - ((HALF_ORDER[b.half] ?? 0) * 100000 + b.seconds),
+  )
+  for (const sub of subs) {
+    const entries = Object.entries(game.assigned)
+    const outSlot = entries.find(([, playerId]) => playerId === sub.outPlayer)?.[0]
+    const inSlot = entries.find(([, playerId]) => playerId === sub.inPlayer)?.[0]
+    if (!outSlot || !inSlot || outSlot.startsWith('b') || !inSlot.startsWith('b')) continue
+    game.assigned = { ...game.assigned, [outSlot]: sub.inPlayer, [inSlot]: sub.outPlayer }
+  }
+}
+
 function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState?: MatchState) {
   // 역할과 계정 등급은 현재 로그인/일정 진입 세션의 값이다. 다른 기기나 이전
   // 입력자가 남긴 Draft clientState를 복원하면서 이 권한 맥락을 덮으면 안 된다.
@@ -188,6 +208,7 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
       game.formationKey = payload.formationKey
       game.assigned = assignmentsFromLineup(payload.formationKey, payload.lineup)
     }
+    applySubsToAssigned(game)
     return
   }
   game.team = payload.side === 'A' ? 'away' : 'home'

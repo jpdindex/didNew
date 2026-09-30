@@ -222,6 +222,18 @@ function togglePause() {
   void syncState(game.value).catch(() => false)
 }
 
+// 브라우저 confirm 대신 쓰는 화면 안 확인 팝업. 확인=true, 취소·바깥 터치=false 로 끝난다.
+const confirmDialog = ref<{ title: string; message: string; okLabel: string; resolve: (ok: boolean) => void } | null>(null)
+function askConfirm(title: string, message = '', okLabel = '확인') {
+  confirmDialog.value?.resolve(false)
+  return new Promise<boolean>(resolve => { confirmDialog.value = { title, message, okLabel, resolve } })
+}
+function closeConfirm(ok: boolean) {
+  const dialog = confirmDialog.value
+  confirmDialog.value = null
+  dialog?.resolve(ok)
+}
+
 // 대기방으로 나가기.
 // 지금까지의 기록·스코어·경과초를 공유 상태에 저장한 뒤 TeamSelection 으로 나간다.
 // 돌아갈 상태는 editReturnStatus 가 있으면 그걸 그대로 쓰고(수정 화면 — 원래 있던
@@ -230,7 +242,7 @@ async function exitToLobby() {
   const clockMessage = paused.value
     ? `${clock.value}에 일시정지된 상태로 대기방으로 나갑니다.`
     : '대기방으로 나가도 경기 시간은 계속 흐릅니다.'
-  if (!confirm(`대기방으로 나가시겠습니까?\n${clockMessage}`)) return
+  if (!await askConfirm('대기방으로 나가시겠습니까?', clockMessage, '나가기')) return
 
   if (timer) clearInterval(timer)
   saveToStore()
@@ -850,6 +862,28 @@ const subPickPlayers = computed(() => {
     .filter((p): p is MatchSquadPlayer & { tag: 'IN' | 'OUT' } => Boolean(p))
     .sort((a, b) => Number(a.no) - Number(b.no))
 })
+// 선수 선택창 표시용: 교체로 들어온 선수(In)와 카드(경고/퇴장). 퇴장은 레드 1장 또는 경고 2장.
+const pickSubbedIn = computed(() => new Set(game.value.subs.map(s => s.inPlayer)))
+const pickCardsByPlayer = computed(() => groupCardsByPlayer(game.value.cards))
+function pickCardMark(playerId: string): 'r' | 'y' | null {
+  const cards = pickCardsByPlayer.value.get(playerId)
+  if (!cards?.length) return null
+  return isSentOff(cards) ? 'r' : 'y'
+}
+// 기록 시각보다 먼저 교체로 나간 선수는 그 기록의 주인이 될 수 없다 — 목록엔 보이되 회색·비활성.
+// 교체 전 시각의 기록을 넣거나 고칠 때는 아직 뛰던 중이므로 그대로 고를 수 있다.
+const pickRecordKey = computed(() => {
+  const rec = records.value.find(r => r.id === playerPickFor.value)
+  return rec ? (HALF_ORDER[rec.half ?? 'H1'] ?? 0) * 100000 + rec.seconds : null
+})
+const pickOutKeyByPlayer = computed(() =>
+  new Map(game.value.subs.map(s => [s.outPlayer, (HALF_ORDER[s.half] ?? 0) * 100000 + s.seconds]))
+)
+function isPickGone(playerId: string) {
+  const recordKey = pickRecordKey.value
+  const outKey = pickOutKeyByPlayer.value.get(playerId)
+  return recordKey !== null && outKey !== undefined && recordKey > outKey
+}
 
 // ---------------------------------------------------------------------------
 // 선수 교체 — 상단 ⇄ 아이콘으로 연다.
@@ -1070,6 +1104,16 @@ const subbedOutPlayers = computed(() => {
 function isSubbedOut(slotId: string) {
   const playerId = game.value.assigned[slotId]
   return playerId !== undefined && subbedOutPlayers.value.has(playerId)
+}
+/** 후보에서 교체로 들어온 선수 — "In" 표시만 하고, 다시 교체(OUT)될 수 있으므로 막지 않는다. 기준 시점은 subbedOutPlayers 와 같다. */
+const subbedInPlayers = computed(() => {
+  const index = editingSubIndex.value
+  const list = index === null ? game.value.subs : game.value.subs.slice(0, index)
+  return new Set(list.map(s => s.inPlayer))
+})
+function isSubbedIn(slotId: string) {
+  const playerId = game.value.assigned[slotId]
+  return playerId !== undefined && subbedInPlayers.value.has(playerId)
 }
 
 const canSubmitSub = computed(() => subOutSlot.value !== null && subInSlot.value !== null)
@@ -1822,7 +1866,8 @@ async function finishHalf() {
     return
   }
   if (halfFinishBusy.value) return
-  if (!confirm(`${half.value}을 종료하시겠습니까?`)) return
+  if (!await askConfirm(`${half.value}을 종료하시겠습니까?`, '', `${half.value} 종료`)) return
+  if (halfFinishBusy.value) return
 
   const wasPaused = paused.value
   const runningStatus = half.value === '전반' ? 'H1' : 'H2'
@@ -1874,14 +1919,14 @@ async function finishHalf() {
                   class="grassSwatch" /></button>
               <div v-if="grassOpen" class="grassPop">
                 <div class="popRow">
-                  <span class="popLabel">잔디 패턴</span>
+                  <span class="popLabel">잔디 패턴(중계화면 왼쪽에서부터)</span>
                   <div class="popOpts">
                     <button v-for="g in GRASS_PATTERNS" :key="g.value" class="popBtn"
                       :class="{ on: grassPattern === g.value }" @click="grassPattern = g.value">{{ g.label }}</button>
                   </div>
                 </div>
                 <div class="popRow">
-                  <span class="popLabel">잔디 라인</span>
+                  <span class="popLabel">잔디 라인(하프기준)</span>
                   <div class="popOpts">
                     <button v-for="n in GRASS_LINE_OPTIONS" :key="n" class="popBtn" :class="{ on: grassLines === n }"
                       :disabled="grassPattern === 0" @click="grassLines = n">{{ n }}줄</button>
@@ -1906,13 +1951,13 @@ async function finishHalf() {
             <div class="score">{{ homeScore }}</div>
             <div class="halfBox">
               <div class="clockRow">
-                <button class="timeStep" :disabled="!isPrimary" @click="stepSeconds(-1)">◀</button>
+                <button class="timeStep" :disabled="!isPrimary" @click="stepSeconds(-1)">−</button>
                 <div class="halfLabel" :class="{ on: half === '전반', clickable: isEditMode }" @click="selectHalf('전반')">
                   전반</div>
                 <div class="clock" :class="{ paused }">{{ displayClock }}</div>
                 <div class="halfLabel" :class="{ on: half === '후반', clickable: isEditMode }" @click="selectHalf('후반')">
                   후반</div>
-                <button class="timeStep" :disabled="!isPrimary" @click="stepSeconds(1)">▶</button>
+                <button class="timeStep" :disabled="!isPrimary" @click="stepSeconds(1)">+</button>
               </div>
             </div>
             <div class="score">{{ awayScore }}</div>
@@ -1949,7 +1994,8 @@ async function finishHalf() {
             <span class="rangeEditLabel">{{ rangeDelta > 0 ? '+' : '' }}{{ rangeDelta }}초</span>
             <button @click="stepRangeDelta(-10)">−10</button><button @click="stepRangeDelta(-1)">−1</button>
             <button @click="stepRangeDelta(1)">+1</button><button @click="stepRangeDelta(10)">+10</button>
-            <button class="rangeApply" @click="applyRangeEdit">적용</button><button class="rangeDelete" @click="deleteRangeRecords">삭제</button><button class="rangeCancel" @click="cancelRangeEdit">취소</button>
+            <button class="rangeApply" @click="applyRangeEdit">적용</button><button class="rangeDelete"
+              @click="deleteRangeRecords">삭제</button><button class="rangeCancel" @click="cancelRangeEdit">취소</button>
           </div>
           <div ref="tableEl" class="table" :class="{ expanded: tableExpanded }"
             @mousedown.capture="closeOverlayPanelsOnOutsideTouch"
@@ -1980,16 +2026,17 @@ async function finishHalf() {
                       <button class="editCancel editCancelInline" @mousedown.stop @touchstart.stop
                         @click.stop="cancelEdit">취소</button>
                     </div>
-                    <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn" :class="{ assigned: !!r.playerName }"
-                      @mousedown.stop @touchstart.stop @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select' }}</button>
+                    <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn"
+                      :class="{ assigned: !!r.playerName }" @mousedown.stop @touchstart.stop
+                      @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select' }}</button>
                   </div>
                 </template>
                 <template v-else>
                   <span>{{ r.no }}</span><span>{{ r.time }}</span><span>{{ r.act }}</span><span>{{ r.result
                   }}</span><span>{{ r.area }}</span>
                   <span>
-                    <button v-if="r.isDap" class="playerBtn" :class="{ assigned: !!r.playerName }"
-                      @mousedown.stop @touchstart.stop @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select'
+                    <button v-if="r.isDap" class="playerBtn" :class="{ assigned: !!r.playerName }" @mousedown.stop
+                      @touchstart.stop @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select'
                       }}</button>
                   </span>
                 </template>
@@ -1998,14 +2045,26 @@ async function finishHalf() {
           </div>
         </section>
 
-        <section class="right" :class="{ editing: !!editingId }">
+        <section class="right" :class="{ editing: !!editingId || !!cardPlayerEditTarget || editingSubIndex !== null }">
           <div v-if="editingId" class="editActions">
             <button class="editApply" @click="applyEdit">적용</button>
             <button class="editDelete" @click="deleteEdit">삭제</button>
             <button class="editCancel" @click="cancelEdit">취소</button>
           </div>
+          <!-- 카드 수정도 기록표 수정과 같은 자리(상단)에 적용·삭제·취소를 띄운다 -->
+          <div v-else-if="cardPlayerEditTarget" class="editActions">
+            <button class="editApply" @click="applyCardPlayerEdit">적용</button>
+            <button class="editDelete" @click="deleteCardPlayerEdit">삭제</button>
+            <button class="editCancel" @click="cancelCardPlayerEdit">취소</button>
+          </div>
+          <!-- 교체 수정도 같은 자리(상단)에 적용·삭제·취소를 띄운다 -->
+          <div v-else-if="editingSubIndex !== null" class="editActions">
+            <button class="editApply" :disabled="!canSubmitSub" @click="submitSub">적용</button>
+            <button class="editDelete" @click="deleteEditingSub">삭제</button>
+            <button class="editCancel" @click="cancelEditSub">취소</button>
+          </div>
           <!-- 종료/복귀 액션. 일반 입력에서는 일시정지 여부와 관계없이 두 버튼을 항상 유지한다. -->
-          <div v-if="!editingId" class="finishControls">
+          <div v-if="!editingId && !cardPlayerEditTarget && editingSubIndex === null" class="finishControls">
             <!-- 최종 RAW 수정은 같은 자리에서 바로 반영하고 final 상태로 되돌린다. -->
             <template v-if="isFinalCorrection">
               <button class="lobbyExitBtn" @click="exitFinalCorrection">퇴장하기</button>
@@ -2015,11 +2074,13 @@ async function finishHalf() {
             <button v-else-if="isEditMode" class="finishBtn" @click="exitToLobby">대기방으로 나가기</button>
             <template v-else>
               <button class="lobbyExitBtn" @click="exitToLobby">대기방으로 나가기</button>
-              <button class="finishBtn" :disabled="halfFinishBusy || !isPrimary" @click="finishHalf">{{ halfFinishBusy ? '저장 중...' : `${half} 종료` }}</button>
+              <button class="finishBtn" :disabled="halfFinishBusy || !isPrimary" @click="finishHalf">{{ halfFinishBusy ?
+                '저장 중...' : `${half} 종료` }}</button>
             </template>
           </div>
 
-          <div v-if="!editingId" ref="mirrorWrapRef" class="mirrorWrap">
+          <div v-if="!editingId && !cardPlayerEditTarget && editingSubIndex === null" ref="mirrorWrapRef"
+            class="mirrorWrap">
             <button class="mirrorIcon" :class="{ on: mirrorOpen }" @click="openMirrorPopup">⇄</button>
             <div v-if="mirrorOpen" class="mirrorPop">
               <div class="popRow">
@@ -2033,13 +2094,13 @@ async function finishHalf() {
             </div>
           </div>
 
-          <h1 :class="{ editTitle: !!editingId }">{{ cardOpen ? '카드 입력' : subOpen ? '선수교체' : playerPickFor ? '선수선택' :
-            'DID-INPUT' }}</h1>
+          <!-- 카드 입력·선수교체 제목은 각 입력창 안(.cardPanelTitle)에 둔다. 상단 버튼 줄과 겹치지 않도록
+               h1 은 보이지 않게(editTitle) 자리만 잡아, 수정 전/후 입력창 크기가 같게 한다. -->
+          <h1 :class="{ editTitle: !!editingId || cardOpen || subOpen }">{{
+            subOpen ? '선수교체' : playerPickFor ? '선수선택' : 'DID-INPUT' }}</h1>
 
           <div v-if="cardOpen" class="cardPanel">
-            <div class="cardTypes"><button :class="{ selected: cardTypeDisplay === 'Y' }" @click="setCardType('Y')">🟨
-                경고</button><button :class="{ selected: cardTypeDisplay === 'R' }" @click="setCardType('R')">🟥 퇴장</button>
-            </div>
+            <div class="cardPanelTitle">카드 입력</div>
             <div v-if="cardPlayerEditTarget" class="cardEditBar">
               <div class="cardEditTime">
                 <button class="timeBtn" @click="bumpCardMinute(-1)">−</button>
@@ -2050,18 +2111,17 @@ async function finishHalf() {
                 <strong>{{ String(cardSecond).padStart(2, '0') }}</strong>
                 <button class="timeBtn" @click="bumpCardSecond(1)">＋</button>
               </div>
-              <div class="cardEditBtns">
-                <button class="cardEditBtn cardEditBtnApply" @click="applyCardPlayerEdit">적용</button>
-                <button class="cardEditBtn cardEditBtnDelete" @click="deleteCardPlayerEdit">삭제</button>
-                <button class="cardEditBtn cardEditBtnCancel" @click="cancelCardPlayerEdit">취소</button>
-              </div>
+            </div>
+            <div class="cardTypes"><button :class="{ selected: cardTypeDisplay === 'Y' }" @click="setCardType('Y')">🟨
+                경고</button><button :class="{ selected: cardTypeDisplay === 'R' }" @click="setCardType('R')">🟥
+                퇴장</button>
             </div>
             <div class="cardPlayerGroups">
               <div class="cardPlayers">
                 <button v-for="p in cardStarterSlots" :key="p.id"
                   :class="[p.p!.pos?.toLowerCase(), { selected: cardHighlightPlayer === game.assigned[p.id] }]"
                   @click="selectCardPlayer(game.assigned[p.id]!)"><strong>{{ p.p!.no }}</strong><span>{{ p.p!.name
-                  }}</span></button>
+                  }}</span><span v-if="isSubbedIn(p.id)" class="subDoneTag">In</span><span v-else-if="isSubbedOut(p.id)" class="subDoneTag">Out</span></button>
               </div>
               <template v-if="cardSubSlots.length">
                 <div class="cardGroupLabel">후보</div>
@@ -2069,7 +2129,7 @@ async function finishHalf() {
                   <button v-for="p in cardSubSlots" :key="p.id"
                     :class="[p.p!.pos?.toLowerCase(), { selected: cardHighlightPlayer === game.assigned[p.id] }]"
                     @click="selectCardPlayer(game.assigned[p.id]!)"><strong>{{ p.p!.no }}</strong><span>{{ p.p!.name
-                    }}</span></button>
+                    }}</span><span v-if="isSubbedIn(p.id)" class="subDoneTag">In</span><span v-else-if="isSubbedOut(p.id)" class="subDoneTag">Out</span></button>
                 </div>
               </template>
             </div>
@@ -2079,25 +2139,29 @@ async function finishHalf() {
               </div>
               <div v-for="{ c, queue, index } in cardHistory" :key="`${queue ? 'q' : 'c'}${index}`" class="cardHistRow">
                 <span>{{ subHalfLabel[c.half] }}</span><span>{{ fmtTime(c.seconds) }}</span><span class="histPlayer"><b
-                  v-if="findPlayer(c.player)" class="histNo" :class="`pos${findPlayer(c.player)!.pos}`">{{ findPlayer(c.player)!.no }}</b>{{
-                  findPlayer(c.player)?.name ?? '-' }}</span><span class="cardKind">{{ c.card === 'Y' ? '🟨 경고' : '🟥 퇴장' }}<template
-                    v-if="secondYellows.has(c)"> · 🟥 퇴장</template></span>
+                    v-if="findPlayer(c.player)" class="histNo" :class="`pos${findPlayer(c.player)!.pos}`">{{
+                      findPlayer(c.player)!.no }}</b>{{
+                      findPlayer(c.player)?.name ?? '-' }}</span><span class="cardKind">{{ c.card === 'Y' ? '🟨 경고' : '🟥 퇴장' }}<template v-if="secondYellows.has(c)"> · 🟥 퇴장</template></span>
                 <span class="cardRowActions">
-                  <button class="cardRowEdit"
-                    @click="openCardPlayerEdit(queue, index)">수정</button>
-                  <button class="cardRowCancel"
-                    @click="queue ? removeQueuedCard(index) : removeCard(index)">삭제</button>
+                  <button class="cardRowEdit" @click="openCardPlayerEdit(queue, index)">수정</button>
+                  <button class="cardRowCancel" @click="queue ? removeQueuedCard(index) : removeCard(index)">삭제</button>
                 </span>
               </div>
             </div>
-            <div class="cardActions"><button @click="cancelCards">Cancel</button><button v-if="!cardPlayerEditTarget"
-                :disabled="cardPlayer === null" @click="queueCard">목록추가</button><button
-                :disabled="cardPlayer === null && !cardQueue.length" @click="submitCards">Submit</button></div>
+            <!-- 선수교체 패널과 같은 하단 버튼(Close · 목록추가 · Submit) — 패널 맨 아래에 붙는다 -->
+            <div class="subActions">
+              <button class="subCancel" @click="cancelCards">Close</button>
+              <button v-if="!cardPlayerEditTarget" class="subQueue" :disabled="cardPlayer === null"
+                @click="queueCard">목록추가</button>
+              <button class="subSubmit" :disabled="cardPlayer === null && !cardQueue.length"
+                @click="submitCards">Submit</button>
+            </div>
           </div>
 
           <!-- 선수교체: 선수선택과 마찬가지로 액트 입력창 자리에서 UI 를 전환한다.
              경기장·기록표(왼쪽)는 그대로 보여야 하므로 화면을 덮지 않는다. -->
           <div v-if="subOpen" class="group subGroup" :class="{ editingSub: editingSubIndex !== null }">
+            <div class="cardPanelTitle">선수교체</div>
             <!-- 교체 시각은 히스토리에서 '수정'을 눌렀을 때만 고친다. 새 교체는 상단 경기 시계 시각으로 들어간다. -->
             <div v-if="editingSubIndex !== null" class="cardEditBar">
               <div class="cardEditTime">
@@ -2109,34 +2173,30 @@ async function finishHalf() {
                 <strong>{{ String(subSecond).padStart(2, '0') }}</strong>
                 <button class="timeBtn" @click="bumpSubSecond(1)">＋</button>
               </div>
-              <div class="cardEditBtns">
-                <button class="cardEditBtn cardEditBtnApply" :disabled="!canSubmitSub" @click="submitSub">적용</button>
-                <button class="cardEditBtn cardEditBtnDelete" @click="deleteEditingSub">삭제</button>
-                <button class="cardEditBtn cardEditBtnCancel" @click="cancelEditSub">취소</button>
-              </div>
             </div>
 
             <div class="subCols">
               <div class="subSection">
-                <div class="subColHead"><span>선발</span></div>
+                <div class="subColHead" :class="{ selected: subOutSlot !== null }"><span>선발</span></div>
                 <div class="subGrid">
                   <button v-for="s in subOutSlots" :key="s.id" class="subCard"
                     :class="[`pos${s.p!.pos}`, { out: subOutSlot === s.id }]" @click="pickSubOut(s.id)">
                     <span class="subNo">{{ s.p!.no }}</span>
                     <span class="subName">{{ s.p!.name }}</span>
+                    <span v-if="isSubbedIn(s.id)" class="subDoneTag">In</span>
                   </button>
                 </div>
               </div>
 
               <div class="subSection">
-                <div class="subColHead"><span>후보</span></div>
+                <div class="subColHead" :class="{ selected: subInSlot !== null }"><span>후보</span></div>
                 <div class="subGrid">
                   <button v-for="s in subInSlots" :key="s.id" class="subCard"
                     :class="[`pos${s.p!.pos}`, { in: subInSlot === s.id, done: isSubbedOut(s.id) }]"
                     :disabled="isSubbedOut(s.id)" @click="pickSubIn(s.id)">
                     <span class="subNo">{{ s.p!.no }}</span>
                     <span class="subName">{{ s.p!.name }}</span>
-                    <span v-if="isSubbedOut(s.id)" class="subDoneTag">교체됨</span>
+                    <span v-if="isSubbedOut(s.id)" class="subDoneTag">Out</span>
                   </button>
                 </div>
               </div>
@@ -2151,8 +2211,8 @@ async function finishHalf() {
                 <span class="hAct"></span>
               </div>
               <div v-if="!game.subs.length" class="subHistEmpty">교체 기록이 없습니다.</div>
-              <div v-for="(s, i) in game.subs" v-else :key="i" class="subHistRow" :class="{ editing: editingSubIndex === i }"
-                @click="onSubHistRowClick(i)">
+              <div v-for="(s, i) in game.subs" v-else :key="i" class="subHistRow"
+                :class="{ editing: editingSubIndex === i }" @click="onSubHistRowClick(i)">
                 <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
                 <span class="hTime">{{ fmtTime(s.seconds) }}</span>
                 <span class="hP outP histPlayer"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
@@ -2160,7 +2220,8 @@ async function finishHalf() {
                 <span class="hP inP histPlayer"><b v-if="findPlayer(s.inPlayer)" class="histNo">{{
                   findPlayer(s.inPlayer)!.no }}</b>{{ findPlayer(s.inPlayer)?.name ?? '-' }}</span>
                 <span class="hAct">
-                  <button v-if="editingSubIndex === i" class="subUndo subEditCancel" @click.stop="cancelEditSub">취소</button>
+                  <button v-if="editingSubIndex === i" class="subUndo subEditCancel"
+                    @click.stop="cancelEditSub">취소</button>
                   <template v-else>
                     <button class="cardRowEdit" @click.stop="onSubHistAction(() => editSub(i))">수정</button>
                     <button class="cardRowCancel" @click.stop="onSubHistAction(() => undoSub(i))">삭제</button>
@@ -2173,7 +2234,8 @@ async function finishHalf() {
               <button class="subCancel" @click="closeSubPanel">Close</button>
               <button v-if="editingSubIndex === null" class="subQueue" :disabled="!canSubmitSub"
                 @click="submitSub">목록추가</button>
-              <button class="subSubmit" :disabled="!canSubmitSub && !subAddedInPanel" @click="submitSubAndClose">Submit</button>
+              <button class="subSubmit" :disabled="!canSubmitSub && !subAddedInPanel"
+                @click="submitSubAndClose">Submit</button>
             </div>
           </div>
 
@@ -2216,7 +2278,8 @@ async function finishHalf() {
                 <div class="goalFrame" @click="clickGoalFrame">
                   <div class="goalZone goalCenter" aria-hidden="true" />
                 </div>
-                <div v-if="infoGoalPos && !pendingFramePos && !pendingOuterScreenPos" class="marker editMarker" :style="infoGoalPos" />
+                <div v-if="infoGoalPos && !pendingFramePos && !pendingOuterScreenPos" class="marker editMarker"
+                  :style="infoGoalPos" />
                 <div v-if="pendingOuterScreenPos" class="marker editMarker" :style="pendingOuterScreenPos" />
                 <div v-if="pendingFrameScreenPos" class="marker editMarker" :style="pendingFrameScreenPos" />
               </div>
@@ -2238,17 +2301,23 @@ async function finishHalf() {
                 :style="{ top: GK_LINEUP_SLOT.y + '%' }" @click="togglePickSubmit">
                 Submit<br>{{ pickSubmitOn ? 'ON' : 'OFF' }}
               </button>
-              <button v-for="p in lineup" :key="p.playerId" class="jersey" :class="{ on: pickedPlayerId === p.playerId }"
-                :style="{ left: p.slot.x + '%', top: p.slot.y + '%' }" @click="pickPlayer(p.playerId)">
-                <span class="shirt">{{ p.no }}</span>
+              <button v-for="p in lineup" :key="p.playerId" class="jersey"
+                :class="{ on: pickedPlayerId === p.playerId }" :style="{ left: p.slot.x + '%', top: p.slot.y + '%' }"
+                :disabled="isPickGone(p.playerId)" @click="pickPlayer(p.playerId)">
+                <span class="shirtWrap"><span class="shirt">{{ p.no }}</span><span v-if="pickSubbedIn.has(p.playerId)"
+                    class="shirtTag">In</span><i v-if="pickCardMark(p.playerId)" class="cardMark"
+                    :class="pickCardMark(p.playerId)!" /></span>
                 <span class="jname">{{ p.name }}</span>
               </button>
             </div>
             <div v-if="subPickPlayers.length" class="pickSubs">
               <span class="pickSubsLabel">교체<br>OUT</span>
               <button v-for="p in subPickPlayers" :key="p.playerId" class="jersey subJersey"
-                :class="{ on: pickedPlayerId === p.playerId }" @click="pickPlayer(p.playerId)">
-                <span class="shirt">{{ p.no }}</span>
+                :class="{ on: pickedPlayerId === p.playerId }" :disabled="isPickGone(p.playerId)"
+                @click="pickPlayer(p.playerId)">
+                <span class="shirtWrap"><span class="shirt">{{ p.no }}</span><span v-if="p.tag === 'IN'"
+                    class="shirtTag">In</span><i v-if="pickCardMark(p.playerId)" class="cardMark"
+                    :class="pickCardMark(p.playerId)!" /></span>
                 <span class="jname">{{ p.name }}</span>
               </button>
             </div>
@@ -2261,12 +2330,94 @@ async function finishHalf() {
 
       </div>
     </div>
+
+    <div v-if="confirmDialog" class="confirmOverlay" @pointerdown.self="closeConfirm(false)">
+      <div class="confirmBox" role="dialog" aria-modal="true">
+        <div class="confirmTitle">{{ confirmDialog.title }}</div>
+        <div v-if="confirmDialog.message" class="confirmMessage">{{ confirmDialog.message }}</div>
+        <div class="confirmBtns">
+          <button class="confirmCancel" @click="closeConfirm(false)">취소</button>
+          <button class="confirmOk" @click="closeConfirm(true)">{{ confirmDialog.okLabel }}</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <style scoped>
 * {
   box-sizing: border-box
+}
+
+/* 확인 팝업 — 태블릿 터치 기준: hover 없이 :active 로 눌림 표시, 버튼은 크게 */
+.confirmOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, .6)
+}
+
+.confirmBox {
+  width: 580px;
+  max-width: calc(100vw - 32px);
+  padding: 40px 36px 30px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 10px;
+  background: #1b1f24;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, .5)
+}
+
+.confirmTitle {
+  color: #fff;
+  font-size: 24px;
+  font-weight: 800;
+  text-align: center
+}
+
+.confirmMessage {
+  margin-top: 14px;
+  color: rgba(255, 255, 255, .65);
+  font-size: 18px;
+  line-height: 1.5;
+  text-align: center;
+  white-space: pre-line
+}
+
+.confirmBtns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 32px
+}
+
+.confirmBtns button {
+  height: 64px;
+  border-radius: 8px;
+  font-size: 19px;
+  font-weight: 800;
+  cursor: pointer
+}
+
+.confirmCancel {
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: #23262b;
+  color: #ddd
+}
+
+.confirmOk {
+  border: 1px solid #f0b429;
+  background: #f0b429;
+  color: #191919
+}
+
+.confirmCancel:active {
+  background: #2e3238
+}
+
+.confirmOk:active {
+  background: #d99e1c
 }
 
 button {
@@ -2331,44 +2482,44 @@ button {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 14px;
   padding: 8px 10px;
   border-bottom: 1px solid rgba(255, 255, 255, .08)
 }
 
 .cardIcon {
-  font-size: 14px
+  font-size: 18px
 }
 
 .cardRowActions {
   display: flex;
-  gap: 4px;
+  gap: 8px;
   justify-content: flex-end
 }
 
 .cardRowCancel {
-  padding: 3px 6px;
+  padding: 5px 8px;
   border: 1px solid rgba(255, 255, 255, .2);
-  border-radius: 3px;
+  border-radius: 4px;
   background: rgba(255, 255, 255, .06);
   color: rgba(255, 255, 255, .7);
-  font-size: 11px
+  font-size: 12px
 }
 
 .cardRowEdit {
-  padding: 3px 6px;
+  padding: 5px 8px;
   border: 1px solid rgba(240, 180, 41, .5);
-  border-radius: 3px;
+  border-radius: 4px;
   background: rgba(240, 180, 41, .1);
   color: #f0b429;
-  font-size: 11px
+  font-size: 12px
 }
 
 .cardHistHead,
 .cardHistRow {
   display: grid;
   /* Player 칸이 남는 폭을 다 먹으면 Half/Time/Player 가 왼쪽에 몰려 보이므로 Card 칸과 나눠 갖는다. */
-  grid-template-columns: 48px 54px minmax(0, 1.4fr) minmax(max-content, 1fr) 88px;
+  grid-template-columns: 48px 54px minmax(0, 1.4fr) minmax(max-content, 1fr) 100px;
   align-items: center;
   gap: 8px;
   padding: 6px 10px;
@@ -2413,7 +2564,9 @@ button {
   color: #fff;
   border-radius: 4px;
   cursor: pointer;
-  padding: 5px 8px
+  height: 26px;
+  line-height: 1;
+  padding: 0 12px
 }
 
 .cardIcon.on {
@@ -2422,6 +2575,7 @@ button {
 }
 
 .cardPlayers button {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2432,7 +2586,7 @@ button {
 }
 
 .cardPlayers button strong {
-  font-size: 16px;
+  font-size: 18px;
   line-height: 1;
   font-weight: 900
 }
@@ -2476,6 +2630,13 @@ button {
   border-radius: 6px
 }
 
+.cardPanelTitle {
+  text-align: center;
+  color: #fff;
+  font-size: 16px;
+  font-weight: 800
+}
+
 .cardTypes {
   display: flex;
   gap: 8px
@@ -2505,7 +2666,8 @@ button {
   display: flex;
   align-items: center;
   justify-content: center;
-  align-self: stretch; /* 패널 너비만큼 넓혀서 −/＋ 를 누르기 쉽게 한다 */
+  align-self: stretch;
+  /* 패널 너비만큼 넓혀서 −/＋ 를 누르기 쉽게 한다 */
   gap: 16px;
   padding: 5px 10px;
   background: rgba(255, 255, 255, .04);
@@ -2547,34 +2709,6 @@ button {
   font-weight: 400
 }
 
-.cardEditBtns {
-  display: flex;
-  gap: 8px
-}
-
-.cardEditBtn {
-  flex: 1;
-  padding: 6px 0;
-  font-size: 14px;
-  font-weight: 800;
-  border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, .15);
-  background: #23262b;
-  color: #fff
-}
-
-.cardEditBtnApply {
-  border-color: #f0b429;
-  background: #f0b429;
-  color: #191919
-}
-
-.cardEditBtnDelete {
-  border-color: rgba(217, 76, 76, .45);
-  background: #3a2126;
-  color: #e08a8a
-}
-
 .cardPlayerGroups {
   flex: 0 0 auto;
   display: flex;
@@ -2585,8 +2719,8 @@ button {
 .cardPlayers {
   display: grid;
   grid-template-columns: repeat(6, 1fr);
-  grid-auto-rows: 46px;
-  gap: 5px
+  grid-auto-rows: 54px;
+  gap: 6px
 }
 
 .cardPlayers button {
@@ -2595,7 +2729,7 @@ button {
   background: rgba(255, 255, 255, .04);
   color: #ddd;
   border-radius: 4px;
-  font-size: 11px
+  font-size: 12px
 }
 
 .cardPlayers button.selected {
@@ -2615,31 +2749,6 @@ button {
   line-height: 1.7
 }
 
-/* Cancel · 목록에 추가 · Submit — 수정 중엔 "목록에 추가"가 빠지므로 개수에 맞춰 나눠 갖는다. */
-.cardActions {
-  display: flex;
-  gap: 8px
-}
-
-.cardActions button {
-  flex: 1;
-  padding: 11px;
-  border: 1px solid #f0b429;
-  border-radius: 4px;
-  background: transparent;
-  color: #f0b429;
-  font-weight: 700
-}
-
-.cardActions button:last-child {
-  background: #f0b429;
-  color: #191919
-}
-
-.cardActions button:disabled {
-  opacity: .4
-}
-
 .stat {
   height: 26px;
   padding: 0 10px;
@@ -2657,7 +2766,7 @@ button {
 
 .grassIcon,
 .swapIcon {
-  width: 26px;
+  width: 44px;
   height: 26px;
   display: grid;
   place-items: center;
@@ -2665,7 +2774,8 @@ button {
   border: 1px solid rgba(255, 255, 255, .15);
   background: rgba(255, 255, 255, .06);
   color: #ddd;
-  font-size: 13px;
+  font-size: 19px;
+  line-height: 1;
   padding: 0;
   cursor: pointer
 }
@@ -2677,8 +2787,8 @@ button {
 }
 
 .grassSwatch {
-  width: 16px;
-  height: 16px;
+  width: 28px;
+  height: 18px;
   border-radius: 3px;
   background: repeating-linear-gradient(90deg, #9ccc65 0 4px, #4caf50 4px 8px)
 }
@@ -2802,23 +2912,25 @@ button {
   background: #111417;
   border: 1px solid rgba(255, 255, 255, .1);
   border-radius: 6px;
-  padding: 6px 10px
+  padding: 6px 20px
 }
 
 .clockRow {
   display: flex;
   align-items: center;
-  gap: 8px
+  gap: 18px
 }
 
 .timeStep {
-  width: 18px;
-  height: 18px;
+  width: 24px;
+  height: 20px;
   border-radius: 3px;
-  border: 1px solid rgba(255, 255, 255, .15);
-  background: rgba(255, 255, 255, .05);
-  color: rgba(255, 255, 255, .5);
-  font-size: 9px;
+  border: 1px solid rgba(255, 255, 255, .3);
+  background: rgba(255, 255, 255, .1);
+  color: rgba(255, 255, 255, .6);
+  font-size: 16px;
+  font-weight: 900;
+  line-height: 1;
   cursor: pointer;
   display: grid;
   place-items: center;
@@ -2950,7 +3062,8 @@ button {
   left: 0;
   top: 19%;
   bottom: 19%;
-  width: 15.5%; /* 잔디 띠 경계와 맞춤 — utils/grass.ts PENALTY_BOX_WIDTH */
+  width: 15.5%;
+  /* 잔디 띠 경계와 맞춤 — utils/grass.ts PENALTY_BOX_WIDTH */
   border: 2px solid rgba(255, 255, 255, .78);
   border-left: none
 }
@@ -3383,6 +3496,14 @@ button {
   background: rgba(240, 180, 41, .2)
 }
 
+/* 기록 시각 전에 교체로 나간 선수 — 보이되 고를 수 없다 */
+.jersey:disabled {
+  opacity: .3;
+  filter: grayscale(1);
+  cursor: default;
+  pointer-events: none
+}
+
 .shirt {
   width: 34px;
   height: 30px;
@@ -3460,6 +3581,44 @@ button {
   line-height: 1.2;
   text-align: center;
   margin-right: 6px
+}
+
+/* 선수 선택창 표시 — 유니폼(.shirt) 바로 옆에 붙인다: In 은 왼쪽 위, 카드(경고/퇴장)는 오른쪽 위.
+   .shirt 는 clip-path 로 잘리므로 감싸는 .shirtWrap 을 기준으로 배치한다. */
+.shirtWrap {
+  position: relative;
+  display: grid
+}
+
+.shirtTag {
+  position: absolute;
+  top: -5px;
+  right: calc(100% + 3px);
+  font-size: 9px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, .5);
+  border: 1px solid rgba(255, 255, 255, .2);
+  border-radius: 3px;
+  padding: 0 3px;
+  pointer-events: none
+}
+
+.jersey .cardMark {
+  position: absolute;
+  top: -5px;
+  left: calc(100% + 3px);
+  width: 8px;
+  height: 11px;
+  border-radius: 1px;
+  pointer-events: none
+}
+
+.jersey .cardMark.y {
+  background: #f5c518
+}
+
+.jersey .cardMark.r {
+  background: #e5484d
 }
 
 .jersey.subJersey {
@@ -3640,6 +3799,12 @@ button {
 
 .editApply:hover {
   background: #ffc84a
+}
+
+.editApply:disabled {
+  opacity: .4;
+  cursor: default;
+  pointer-events: none
 }
 
 .editDelete {
@@ -4089,20 +4254,31 @@ section.right h1 {
   min-width: 0
 }
 
-.subSection + .subSection {
+.subSection+.subSection {
   border-left: 1px solid rgba(255, 255, 255, .1);
   padding-left: 12px
 }
 
+/* 카드 입력창의 경고/퇴장 버튼(.cardTypes)과 같은 박스 — 그 열에서 선수를 고르면 노란 테두리 */
 .subColHead {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  justify-content: center;
   gap: 8px;
-  margin-bottom: 8px
+  margin-bottom: 8px;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, .2);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .06)
+}
+
+.subColHead.selected {
+  border-color: #f0b429;
+  background: rgba(240, 180, 41, .2)
 }
 
 .subColHead span:first-child {
-  color: rgba(255, 255, 255, .85);
+  color: #fff;
   font-weight: 700;
   font-size: 13px
 }
@@ -4121,7 +4297,8 @@ section.right h1 {
   gap: 4px;
   padding: 17px 4px;
   border-radius: 8px;
-  border: 1px solid transparent; /* 기본은 테두리 없음 — 선택(out/in) 때만 색 테두리가 보인다 */
+  border: 1px solid transparent;
+  /* 기본은 테두리 없음 — 선택(out/in) 때만 색 테두리가 보인다 */
   background: rgba(255, 255, 255, .04);
   cursor: pointer;
   overflow: hidden
@@ -4180,10 +4357,11 @@ section.right h1 {
   background: rgba(255, 255, 255, .04)
 }
 
+/* In/Out 태그 — 왼쪽 상단. TeamSelection.vue 교체 화면과 같은 위치 */
 .subDoneTag {
   position: absolute;
   top: 1px;
-  right: 1px;
+  left: 1px;
   font-size: 7px;
   color: rgba(255, 255, 255, .5);
   border: 1px solid rgba(255, 255, 255, .2);
@@ -4243,7 +4421,7 @@ section.right h1 {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  gap: 8px;
   white-space: nowrap
 }
 
@@ -4256,7 +4434,8 @@ section.right h1 {
    교체 히스토리는 행(Out/In) 색을 따르고, 카드 히스토리는 포지션 색을 쓴다. */
 .histNo {
   display: inline-block;
-  width: 2.4ch; /* 두 자리 번호까지 같은 폭 — 번호는 헤더 왼쪽에, 이름은 한 줄로 맞춘다 */
+  width: 2.4ch;
+  /* 두 자리 번호까지 같은 폭 — 번호는 헤더 왼쪽에, 이름은 한 줄로 맞춘다 */
   margin-right: 6px;
   font-family: ui-monospace, monospace;
   font-weight: 700;
@@ -4324,7 +4503,8 @@ section.right h1 {
   display: flex;
   justify-content: center;
   gap: 16px;
-  margin-top: auto; /* 남는 공간이 있으면 패널 맨 아래로 */
+  margin-top: auto;
+  /* 남는 공간이 있으면 패널 맨 아래로 */
   padding-top: 8px
 }
 
@@ -4384,22 +4564,97 @@ section.right h1 {
 </style>
 
 <style scoped>
-.tableBar { display:flex; gap:4px; flex:0 0 auto; }
-.tableBar .tableToggle { flex:1; }
-.rangeToggle { height:20px; padding:0 10px; border:1px solid rgba(240,180,41,.45); background:#20242b; color:#f0b429; font-size:10px; font-weight:800; cursor:pointer; }
-.rangeToggle.on { background:rgba(240,180,41,.2); }
-.rangeHint { flex:0 0 auto; text-align:center; padding:4px; color:#9da4af; background:#1b1f25; font-size:10px; }
-.rangeEditBar { display:flex; align-items:center; justify-content:center; gap:5px; padding:6px; background:#302b20; }
-.rangeEditBar button { border:1px solid #b88712; background:#24272d; color:#f0b429; border-radius:3px; padding:3px 7px; font-size:10px; font-weight:800; }
-.rangeEditLabel { min-width:42px; text-align:center; color:#f0b429; font-weight:800; font-size:11px; }
-.rangeEditBar .rangeApply { background:#f0b429; color:#161a20; }
-.rangeEditBar .rangeDelete { color:#ff8585; border-color:#a64545; background:#3a2024; }
-.rangeEditBar .rangeCancel { color:#e38b8b; border-color:#8d4c4c; }
-.trow.rangeSel { background:rgba(240,180,41,.16); box-shadow:inset 3px 0 #f0b429; }
-.trow.rangeAnchor { outline:1px solid rgba(120,197,138,.8); outline-offset:-1px; }
+.tableBar {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.tableBar .tableToggle {
+  flex: 1;
+}
+
+.rangeToggle {
+  height: 20px;
+  padding: 0 10px;
+  border: 1px solid rgba(240, 180, 41, .45);
+  background: #20242b;
+  color: #f0b429;
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.rangeToggle.on {
+  background: rgba(240, 180, 41, .2);
+}
+
+.rangeHint {
+  flex: 0 0 auto;
+  text-align: center;
+  padding: 4px;
+  color: #9da4af;
+  background: #1b1f25;
+  font-size: 10px;
+}
+
+.rangeEditBar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 6px;
+  background: #302b20;
+}
+
+.rangeEditBar button {
+  border: 1px solid #b88712;
+  background: #24272d;
+  color: #f0b429;
+  border-radius: 3px;
+  padding: 3px 7px;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.rangeEditLabel {
+  min-width: 42px;
+  text-align: center;
+  color: #f0b429;
+  font-weight: 800;
+  font-size: 11px;
+}
+
+.rangeEditBar .rangeApply {
+  background: #f0b429;
+  color: #161a20;
+}
+
+.rangeEditBar .rangeDelete {
+  color: #ff8585;
+  border-color: #a64545;
+  background: #3a2024;
+}
+
+.rangeEditBar .rangeCancel {
+  color: #e38b8b;
+  border-color: #8d4c4c;
+}
+
+.trow.rangeSel {
+  background: rgba(240, 180, 41, .16);
+  box-shadow: inset 3px 0 #f0b429;
+}
+
+.trow.rangeAnchor {
+  outline: 1px solid rgba(120, 197, 138, .8);
+  outline-offset: -1px;
+}
 </style>
 
 <style scoped>
 /* 수정된 기록은 배경을 바꾸지 않고 잠시 초록색으로만 구분한다. */
-.trow.edited { color: #78c58a; }
+.trow.edited {
+  color: #78c58a;
+}
 </style>

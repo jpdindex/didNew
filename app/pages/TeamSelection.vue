@@ -941,7 +941,7 @@ onMounted(() => document.addEventListener('pointerdown', handleOutsideClick))
 onUnmounted(() => document.removeEventListener('pointerdown', handleOutsideClick))
 
 // ---- 선수교체 ----
-// PPT 슬라이드 37: 좌측 = 교체 아웃 선수, 우측 = 교체 투입 선수, 선택 후 저장.
+// PPT 슬라이드 37: 좌측 = 교체 아웃 선수, 우측 = 교체 투입 선수, 선택 → 목록추가 → Submit.
 // Player List 자리에서 화면을 전환한다.
 const subOpen = ref(false)
 const cardForPlayer = (playerId: string) => game.value.cards.filter(c => c.player === playerId)
@@ -974,9 +974,11 @@ const benchSlots = computed(() =>
     .sort(byNo)
 )
 
-// 교체는 고르는 즉시 반영해서 왼쪽 포메이션에 바로 보이게 한다.
+// 목록추가한 교체는 바로 반영해서 왼쪽 포메이션에 보이게 한다.
 // 취소를 누르면 열었을 때 상태로 되돌리기 위해 스냅샷을 떠둔다.
 let subSnapshot: Record<string, string> | null = null
+// 저장된 교체 목록에서 "취소"한 것도 Submit 전까지는 확정이 아니므로, Close 시 되돌릴 원본을 둔다.
+let subsSnapshot: SubRecord[] | null = null
 const subDragId = ref<string | null>(null)
 /**
  * 저장 전, 지금 화면에서 진행 중인 교체를 일어난 순서 그대로 쌓아둔다. 스냅샷과의
@@ -987,6 +989,26 @@ const pendingSubs = ref<SubRecord[]>([])
 
 const isBenchSlot = (id: string) => id.startsWith('b')
 
+/** 한 번 빠진 선수는 다시 못 들어온다(축구 규칙) — 확정된 교체와 목록추가한 교체 모두 기준. DidInput.vue 와 동일 표시. */
+const subbedOutPlayers = computed(() => new Set([...game.value.subs, ...pendingSubs.value].map(s => s.outPlayer)))
+function isSubbedOut(slotId: string) {
+  const playerId = game.value.assigned[slotId]
+  return playerId !== undefined && subbedOutPlayers.value.has(playerId)
+}
+/** 후보에서 교체로 들어온 선수 — 표시만 하고 다시 교체(OUT)될 수 있으므로 막지 않는다. */
+const subbedInPlayers = computed(() => new Set([...game.value.subs, ...pendingSubs.value].map(s => s.inPlayer)))
+function isSubbedIn(slotId: string) {
+  const playerId = game.value.assigned[slotId]
+  return playerId !== undefined && subbedInPlayers.value.has(playerId)
+}
+
+// 목록추가한 교체는 목록 맨 아래에 붙으므로, 추가될 때마다 끝까지 내려 방금 넣은 항목이 보이게 한다.
+const subHistBody = ref<HTMLElement | null>(null)
+watch(() => pendingSubs.value.length, (next, prev) => {
+  if (next <= prev) return
+  nextTick(() => subHistBody.value?.scrollTo({ top: subHistBody.value.scrollHeight, behavior: 'smooth' }))
+})
+
 function openSub() {
   if (subOpen.value) { closeSub(); return }
   // 다른 팝업/슬롯 선택 상태를 닫고 교체 패널을 최상위 입력 상태로 연다.
@@ -994,6 +1016,7 @@ function openSub() {
   menuOpen.value = false
   activeSlot.value = null
   subSnapshot = { ...game.value.assigned }
+  subsSnapshot = [...game.value.subs]
   subOpen.value = true
   subOut.value = null
   subIn.value = null
@@ -1005,6 +1028,7 @@ function openSub() {
 function closeSub() {
   subOpen.value = false
   subSnapshot = null
+  subsSnapshot = null
   subOut.value = null
   subIn.value = null
   subDragId.value = null
@@ -1028,13 +1052,17 @@ function swapSlots(a: string, b: string) {
   const moment = subMoment()
   if (moment) pendingSubs.value = [...pendingSubs.value, { half: moment.half, seconds: subTimeTotal.value, outPlayer, inPlayer }]
 }
+// 고르기만 하고, 실제 교체는 "목록추가"/"Submit" 에서 한다. 같은 선수를 다시 누르면 선택 해제.
 function pickOut(id: string) {
-  subOut.value = id
-  if (subIn.value) swapSlots(id, subIn.value)
+  subOut.value = subOut.value === id ? null : id
 }
 function pickIn(id: string) {
-  subIn.value = id
-  if (subOut.value) swapSlots(subOut.value, id)
+  subIn.value = subIn.value === id ? null : id
+}
+const canAddSub = computed(() => subOut.value !== null && subIn.value !== null)
+/** 목록추가: 고른 OUT/IN 을 맞바꾸고 미리보기 목록에 올린 뒤, 패널은 열어 둔 채 다음 교체를 받는다. */
+function addSub() {
+  if (subOut.value && subIn.value) swapSlots(subOut.value, subIn.value)
 }
 function onSubDragStart(id: string) {
   subDragId.value = id
@@ -1045,7 +1073,10 @@ function onSubDrop(targetId: string) {
   if (!src || src === targetId) return
   // 선발끼리, 후보끼리는 교체가 아니므로 무시한다
   if (isBenchSlot(src) === isBenchSlot(targetId)) return
-  swapSlots(src, targetId)
+  if (isSubbedOut(src) || isSubbedOut(targetId)) return
+  // 드래그도 탭과 같이 짝만 골라 두고, 교체 확정은 목록추가/Submit 으로 한다.
+  subOut.value = isBenchSlot(src) ? targetId : src
+  subIn.value = isBenchSlot(src) ? src : targetId
 }
 /**
  * 이 화면에서 교체를 "언제" 한 것으로 볼지.
@@ -1067,13 +1098,16 @@ function subMoment(): { half: Half; seconds: number } | null {
   return { half: st, seconds: game.value.seconds }
 }
 
-/** 저장: 미리보기로 떠 있던 교체를 실제 기록(game.subs)으로 확정하고 닫는다. */
+/** Submit: 지금 고른 교체가 있으면 목록에 넣고, 미리보기로 떠 있던 교체를 실제 기록(game.subs)으로 확정하고 닫는다. */
 function saveSub() {
+  addSub()
   if (pendingSubs.value.length) {
     game.value.subs = [...game.value.subs, ...pendingSubs.value].sort(
       (a, b) => HALF_ORDER[a.half]! * 100000 + a.seconds - (HALF_ORDER[b.half]! * 100000 + b.seconds)
     )
   }
+  // 추가/취소한 교체는 Submit 에서만 저장한다. 팀 전환 후 돌아올 때는 서버 Draft가 정본이므로 서버에도 올린다.
+  if (pendingSubs.value.length || game.value.subs.length !== subsSnapshot?.length) void saveDraft(game.value)
   closeSub()
 }
 /** 아직 저장 전인 교체 미리보기 한 건을 되돌린다 — 배치만 원래대로, game.subs 는 손대지 않는다. */
@@ -1088,12 +1122,13 @@ function cancelPendingSub(index: number) {
   }
   pendingSubs.value = pendingSubs.value.filter((_, i) => i !== index)
 }
-/** 취소: 열었을 때 상태로 되돌린다. */
+/** Close: 저장하지 않고, 열었을 때 상태(배치·교체 목록)로 되돌린 뒤 닫는다. */
 function cancelSub() {
   if (subSnapshot) {
     Object.keys(game.value.assigned).forEach(k => delete game.value.assigned[k])
     Object.assign(game.value.assigned, subSnapshot)
   }
+  if (subsSnapshot) game.value.subs = subsSnapshot
   closeSub()
 }
 function playerAt(id: string) {
@@ -1107,11 +1142,8 @@ const subHalfLabel: Record<string, string> = { H1: '전반', H2: '후반', H3: '
 function fmtTime(sec: number) {
   return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
 }
-function playerLabel(playerId: string) {
-  const player = players.value.find(item => item.playerId === playerId)
-  return player ? `${player.no} ${player.name}` : '-'
-}
-/** 잘못 저장된 교체 되돌리기 — 자리도 원래대로 돌려놓는다(DidInput.vue 의 undoSub 와 동일 로직) */
+const findPlayer = (playerId: string) => players.value.find(item => item.playerId === playerId)
+/** 잘못 저장된 교체 되돌리기 — 자리도 원래대로 돌려놓는다(DidInput.vue 의 undoSub 와 동일 로직). 확정은 Submit 에서. */
 function undoSub(index: number) {
   const s = game.value.subs[index]
   if (!s) return
@@ -1239,7 +1271,7 @@ function undoSub(index: number) {
                   @dragover.prevent @drop="onDrop(id)">{{ playerAt(id)?.no ?? '' }}</button>
               </div>
             </section>
-            <section class="playerPanel" ref="playerPanelRef">
+            <section class="playerPanel" :class="{ subMode: subOpen }" ref="playerPanelRef">
               <template v-if="!subOpen">
                 <div class="tabs">
                   <button :class="{ off: sortKey !== 'position' }" @click="sortKey = 'position'">Position</button>
@@ -1261,7 +1293,8 @@ function undoSub(index: number) {
               <!-- 선수 교체: 좌 = OUT(선발), 우 = IN(후보) -->
               <template v-else>
                 <div class="tabs subTabs">
-                  <button class="subTitle">선수 교체</button>
+                  <h2 class="subTitle"><span class="subTitleIcon">⇄</span>선수 교체</h2>
+                  <button type="button" class="subClose" aria-label="닫기" @click="cancelSub">✕</button>
                 </div>
                 <div class="subTimeRow">
                   <span>교체 시각</span>
@@ -1275,25 +1308,26 @@ function undoSub(index: number) {
                 </div>
                 <div class="subCols">
                   <div class="subCol">
-                    <div class="subColHead out">교체 OUT · 선발</div>
+                    <div class="subColHead out">선발</div>
                     <div class="subList" @dragover.prevent>
                       <button v-for="s in starterSlots" :key="s.id" class="subItem"
                         :class="[s.p?.pos?.toLowerCase(), { on: subOut === s.id, dragging: subDragId === s.id }]"
                         draggable="true" @click="pickOut(s.id)" @dragstart="onSubDragStart(s.id)"
-                        @dragend="subDragId = null" @dragover.prevent @drop="onSubDrop(s.id)"><strong>{{ s.p?.no }} <i
-                            v-if="cardForPlayer(game.assigned[s.id]!).some(c => c.card === 'R')">🟥</i><i
-                            v-else-if="cardForPlayer(game.assigned[s.id]!).length">🟨</i></strong><span>{{ s.p?.name
-                            }}</span></button>
+                        @dragend="subDragId = null" @dragover.prevent @drop="onSubDrop(s.id)"><strong>{{ s.p?.no
+                        }}</strong><span>{{ s.p?.name }}</span><span v-if="isSubbedIn(s.id)" class="subTag in">In</span><i
+                          v-if="cardForPlayer(game.assigned[s.id]!).some(c => c.card === 'R')" class="cardMark r" /><i
+                          v-else-if="cardForPlayer(game.assigned[s.id]!).length" class="cardMark y" /></button>
                     </div>
                   </div>
                   <div class="subCol">
-                    <div class="subColHead in">교체 IN · 후보</div>
+                    <div class="subColHead in">후보</div>
                     <div class="subList" @dragover.prevent>
                       <button v-for="s in benchSlots" :key="s.id" class="subItem"
-                        :class="[s.p?.pos?.toLowerCase(), { on: subIn === s.id, dragging: subDragId === s.id }]"
-                        draggable="true" @click="pickIn(s.id)" @dragstart="onSubDragStart(s.id)"
-                        @dragend="subDragId = null" @dragover.prevent @drop="onSubDrop(s.id)"><strong>{{ s.p?.no
-                        }}</strong><span>{{ s.p?.name }}</span></button>
+                        :class="[s.p?.pos?.toLowerCase(), { on: subIn === s.id, dragging: subDragId === s.id, done: isSubbedOut(s.id) }]"
+                        :disabled="isSubbedOut(s.id)" :draggable="!isSubbedOut(s.id)" @click="pickIn(s.id)"
+                        @dragstart="onSubDragStart(s.id)" @dragend="subDragId = null" @dragover.prevent
+                        @drop="onSubDrop(s.id)"><strong>{{ s.p?.no }}</strong><span>{{ s.p?.name }}</span><span
+                          v-if="isSubbedOut(s.id)" class="subTag out">Out</span></button>
                       <div v-if="!benchSlots.length" class="subEmpty">후보 선수가 없습니다</div>
                     </div>
                   </div>
@@ -1307,28 +1341,33 @@ function undoSub(index: number) {
                     <span class="hP">In</span>
                     <span class="hAct"></span>
                   </div>
-                  <div class="subHistBody">
+                  <div ref="subHistBody" class="subHistBody">
                     <div v-if="!game.subs.length && !pendingSubs.length" class="subHistEmpty">교체 기록이 없습니다.</div>
                     <div v-for="(s, i) in game.subs" :key="`saved${i}`" class="subHistRow">
                       <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
                       <span class="hTime">{{ fmtTime(s.seconds) }}</span>
-                      <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
-                      <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
+                      <span class="hP outP"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
+                        findPlayer(s.outPlayer)!.no }}</b>{{ findPlayer(s.outPlayer)?.name ?? '-' }}</span>
+                      <span class="hP inP"><b v-if="findPlayer(s.inPlayer)" class="histNo">{{
+                        findPlayer(s.inPlayer)!.no }}</b>{{ findPlayer(s.inPlayer)?.name ?? '-' }}</span>
                       <span class="hAct"><button class="subUndo" @click="undoSub(i)">취소</button></span>
                     </div>
                     <div v-for="(s, i) in pendingSubs" :key="`pending${i}`" class="subHistRow pending">
                       <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
                       <span class="hTime">{{ fmtTime(s.seconds) }}</span>
-                      <span class="hP outP">{{ playerLabel(s.outPlayer) }}</span>
-                      <span class="hP inP">{{ playerLabel(s.inPlayer) }}</span>
+                      <span class="hP outP"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
+                        findPlayer(s.outPlayer)!.no }}</b>{{ findPlayer(s.outPlayer)?.name ?? '-' }}</span>
+                      <span class="hP inP"><b v-if="findPlayer(s.inPlayer)" class="histNo">{{
+                        findPlayer(s.inPlayer)!.no }}</b>{{ findPlayer(s.inPlayer)?.name ?? '-' }}</span>
                       <span class="hAct"><button class="subUndo" @click="cancelPendingSub(i)">취소</button></span>
                     </div>
                   </div>
                 </div>
 
                 <div class="subActions">
-                  <button class="subCancel" @click="cancelSub">취소</button>
-                  <button class="subSave" @click="saveSub">저장</button>
+                  <button class="subCancel" @click="cancelSub">Close</button>
+                  <button class="subQueue" :disabled="!canAddSub" @click="addSub">목록추가</button>
+                  <button class="subSave" @click="saveSub">Submit</button>
                 </div>
               </template>
             </section>
@@ -1812,6 +1851,7 @@ button {
 }
 
 .topRow {
+  position: relative;
   flex: 2.2;
   min-height: 0;
   display: grid;
@@ -2517,30 +2557,80 @@ button {
   min-height: 20px
 }
 
-/* 선수 교체 */
-.subTabs {
-  grid-template-columns: 1fr
+/* 선수 교체 — 세로 공간을 더 쓰도록 아래 행(진영선택·도구·시작)까지 덮어 늘린다.
+   아래 행을 다 덮지는 않고 170px 만 아래로 확장. */
+.playerPanel.subMode {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 5;
+  width: calc(50% - 5px);
+  height: calc(100% + 170px);
+  background: #151a24;
+  border-color: rgba(255, 255, 255, .14);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .45)
 }
 
+.subTabs {
+  height: 38px;
+  grid-template-columns: 1fr 32px;
+  align-items: center;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, .08)
+}
+
+.tabs .subClose {
+  height: 32px;
+  border-color: rgba(255, 255, 255, .18);
+  background: transparent;
+  color: rgba(255, 255, 255, .75);
+  font-size: 16px;
+  line-height: 1
+}
+
+.tabs .subClose:active {
+  background: rgba(255, 255, 255, .14);
+  color: #fff
+}
+
+/* 제목은 버튼처럼 보이지 않게 — 좌측 정렬 텍스트 + 아래 구분선 */
 .subTitle {
-  cursor: default
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 14px;
+  font-weight: 800;
+  color: rgba(255, 255, 255, .9)
+}
+
+.subTitleIcon {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  background: rgba(240, 180, 41, .16);
+  color: #f0b429;
+  font-size: 12px
 }
 
 .subTimeRow {
-  height: 28px;
+  height: 38px;
+  margin-top: 4px;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  gap: 8px;
   color: rgba(255, 255, 255, .55);
-  font-size: 10px
+  font-size: 12px
 }
 
 .subTimeRow strong {
-  min-width: 22px;
+  min-width: 28px;
   text-align: center;
   color: #f0b429;
-  font: 700 14px ui-monospace, monospace
+  font: 700 18px ui-monospace, monospace
 }
 
 .subTimeRow b {
@@ -2548,8 +2638,9 @@ button {
 }
 
 .subTimeBtn {
-  width: 22px;
-  height: 22px;
+  width: 32px;
+  height: 32px;
+  font-size: 16px;
   padding: 0;
   border: 1px solid rgba(255, 255, 255, .18);
   border-radius: 4px;
@@ -2588,11 +2679,11 @@ button {
 }
 
 .subColHead {
-  height: 22px;
+  height: 28px;
   display: grid;
   place-items: center;
   border-radius: 4px;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 800;
   letter-spacing: .02em
 }
@@ -2613,13 +2704,17 @@ button {
 .subList {
   flex: 1;
   min-height: 0;
-  overflow: hidden;
   display: grid;
   grid-template-columns: 1fr 1fr;
-  grid-auto-rows: 36px;
-  gap: 4px;
+  grid-auto-rows: 46px;
+  gap: 6px;
   align-content: start;
-  padding-right: 0
+  padding-right: 0;
+  /* 교체 목록이 커져 자리가 줄면 마지막 줄이 잘리지 않고 스크롤되게 */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .2) transparent
 }
 
 .subItem {
@@ -2637,18 +2732,36 @@ button {
 }
 
 .subItem strong {
-  font-size: 14px;
+  font-size: 18px;
   font-weight: 900;
   line-height: 1
 }
 
-.subItem i {
-  font-style: normal;
-  font-size: 10px
+/* 경고/퇴장 표시 — 흐름 밖(absolute)에 두어 번호·이름 위치가 카드 없는 선수와 동일하게 유지 */
+.subItem {
+  position: relative
+}
+
+.subItem .cardMark {
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  width: 8px;
+  height: 11px;
+  border-radius: 1px;
+  pointer-events: none
+}
+
+.cardMark.y {
+  background: #f5c518
+}
+
+.cardMark.r {
+  background: #e5484d
 }
 
 .subItem span {
-  font-size: 8px;
+  font-size: 10px;
   color: rgba(255, 255, 255, .6);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2672,9 +2785,9 @@ button {
   color: #93b56a
 }
 
-.subItem:hover {
-  border-color: rgba(240, 180, 41, .6);
-  background: rgba(240, 180, 41, .1)
+/* 태블릿은 탭 후 :hover 가 남아 선택(.on)처럼 보이므로 hover 대신 누르는 동안만 반응한다 */
+.subItem:active:not(.on) {
+  background: rgba(255, 255, 255, .1)
 }
 
 .subItem.on {
@@ -2683,10 +2796,30 @@ button {
   box-shadow: 0 0 0 1px #f0b429 inset
 }
 
+.subItem.done {
+  opacity: .4;
+  cursor: not-allowed
+}
+
+/* In/Out 태그 — 흐름 밖(absolute) 왼쪽 상단에 두어 번호·이름 위치는 다른 선수와 동일하게 유지.
+   오른쪽 상단은 경고/퇴장 표시(.cardMark) 자리. 눈에 띄지 않게 DidInput 의 교체됨 태그처럼 회색으로. */
+.subItem .subTag {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  max-width: none;
+  font-size: 8px;
+  color: rgba(255, 255, 255, .45);
+  border: 1px solid rgba(255, 255, 255, .18);
+  border-radius: 3px;
+  padding: 0 3px;
+  line-height: 1.4
+}
+
 .subEmpty {
   grid-column: 1/3;
   color: rgba(255, 255, 255, .35);
-  font-size: 10px;
+  font-size: 12px;
   text-align: center;
   padding-top: 14px
 }
@@ -2694,7 +2827,7 @@ button {
 /* 교체 이력 — DidInput.vue 의 subHistory 와 같은 형식(칸 폭만 이 패널 너비에 맞춤) */
 .subHistory {
   flex: 0 0 auto;
-  max-height: 180px;
+  max-height: 210px;
   display: flex;
   flex-direction: column;
   border: 1px solid rgba(255, 255, 255, .08);
@@ -2705,17 +2838,20 @@ button {
 
 .subHistBody {
   flex: 1;
-  overflow-y: auto
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .2) transparent
 }
 
 .subHistHead,
 .subHistRow {
   display: grid;
-  grid-template-columns: 44px 40px 1fr 1fr 34px;
+  grid-template-columns: 56px 48px 1fr 1fr 44px;
   align-items: center;
-  gap: 4px;
-  padding: 8px 6px;
-  font-size: 11px
+  gap: 6px;
+  padding: 9px 8px;
+  font-size: 13px
 }
 
 .subHistHead {
@@ -2745,7 +2881,17 @@ button {
 }
 
 .subHistRow .inP {
-  color: #f0b429
+  color: #4ade80
+}
+
+/* 등번호는 이름과 붙어 보이지 않게 고정폭·굵게 구분한다 — DidInput.vue 교체 히스토리와 동일 */
+.histNo {
+  display: inline-block;
+  width: 2.4ch;
+  margin-right: 6px;
+  font-family: ui-monospace, monospace;
+  font-weight: 700;
+  text-align: left
 }
 
 .subHistRow .hAct {
@@ -2758,35 +2904,36 @@ button {
   padding: 8px;
   text-align: center;
   color: rgba(255, 255, 255, .35);
-  font-size: 10px
+  font-size: 12px
 }
 
 .subUndo {
   border: 1px solid rgba(255, 255, 255, .15);
   background: rgba(255, 255, 255, .05);
   color: rgba(255, 255, 255, .6);
-  font-size: 9px;
+  font-size: 11px;
   border-radius: 4px;
-  padding: 1px 4px;
+  padding: 4px 7px;
   cursor: pointer
 }
 
-.subUndo:hover {
+.subUndo:active {
   color: #fff;
   border-color: rgba(239, 68, 68, .5)
 }
 
 .subActions {
-  height: 32px;
+  height: 40px;
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr;
   gap: 8px
 }
 
 .subCancel,
+.subQueue,
 .subSave {
-  border-radius: 4px;
-  font-size: 12px;
+  border-radius: 6px;
+  font-size: 14px;
   font-weight: 800;
   cursor: pointer;
   border: 1px solid #f0b429;
@@ -2794,8 +2941,18 @@ button {
   color: #f0b429
 }
 
-.subCancel:hover {
+.subCancel:active {
   background: rgba(240, 180, 41, .14)
+}
+
+.subQueue:active:not(:disabled) {
+  background: rgba(240, 180, 41, .14)
+}
+
+.subQueue:disabled {
+  border-color: rgba(255, 255, 255, .18);
+  color: rgba(255, 255, 255, .35);
+  cursor: not-allowed
 }
 
 .subSave {
