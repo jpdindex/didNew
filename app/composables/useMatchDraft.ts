@@ -85,7 +85,7 @@ async function removeLocal(key: string): Promise<void> {
   }).finally(() => db.close())
 }
 
-function cloneState(game: MatchState): MatchState {
+export function cloneState(game: MatchState): MatchState {
   return toPlain(game)
 }
 
@@ -107,7 +107,7 @@ function assignedLineup(game: MatchState, squad: MatchSquadPlayer[]) {
     })
 }
 
-function payloadFromState(game: MatchState): InputPayload {
+export function payloadFromState(game: MatchState): InputPayload {
   const squad = game.team === 'away' ? game.squads.away : game.squads.home
   // matchSnapshot은 화면 복원용 보조 스냅샷이다. gmId가 있는 입력/Draft 저장 자체를
   // 이 값의 유무로 막지 않는다. 새로고침·직접 URL 진입처럼 메모리 상태가 비어도
@@ -163,6 +163,9 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
   // 역할과 계정 등급은 현재 로그인/일정 진입 세션의 값이다. 다른 기기나 이전
   // 입력자가 남긴 Draft clientState를 복원하면서 이 권한 맥락을 덮으면 안 된다.
   const sessionIdentity = {
+    // Team choice belongs to this URL/session. The other analyst's stored
+    // clientState must not move an away analyst onto the home-side workspace.
+    team: game.team,
     participantRole: game.participantRole,
     participantName: game.participantName,
     recorderLevel: game.recorderLevel,
@@ -209,9 +212,27 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
       game.assigned = assignmentsFromLineup(payload.formationKey, payload.lineup)
     }
     applySubsToAssigned(game)
+    // clientState is only a UI recovery shell. Records and match lifecycle are
+    // server-merged payload data, otherwise another analyst's old checkpoint
+    // can make recently assigned players disappear after refresh/re-entry.
+    game.homeScore = payload.homeScore
+    game.awayScore = payload.awayScore
+    game.h1Seconds = payload.halves.H1?.seconds ?? game.h1Seconds
+    game.h2Seconds = payload.halves.H2?.seconds ?? game.h2Seconds
+    game.halfStatus = payload.status
+    game.records = payload.records.map(record => ({
+      id: String(record.id), half: record.half as 'H1' | 'H2', seconds: Number(record.halfSeconds), seq: Number(record.seq),
+      act: record.act as DidRecord['act'], res: record.res as DidRecord['res'], area: Number(record.area),
+      posX: record.posX as number | undefined, posY: record.posY as number | undefined,
+      shootPosX: record.shootPosX as number | undefined, shootPosY: record.shootPosY as number | undefined,
+      shootDspRange: record.shootDspRange as boolean | undefined, isShot: record.isShot as boolean | undefined,
+      playerId: record.playerId as string | undefined,
+    }))
     return
   }
-  game.team = payload.side === 'A' ? 'away' : 'home'
+  // Direct entries also set the requested team before hydration. Preserve it
+  // instead of inferring it from a Draft/RAW payload made by another analyst.
+  game.team = sessionIdentity.team || (payload.side === 'A' ? 'away' : 'home')
   game.inputMode = payload.inputMode
   game.side = payload.fieldSide
   game.formationKey = payload.formationKey
@@ -268,6 +289,22 @@ export function useMatchDraft() {
     }
   }
 
+  /** Persist only durable lobby setup after a formation/lineup action.
+   * It must never be used for records, timer ticks or lifecycle changes. */
+  async function saveSetup(game: MatchState): Promise<boolean> {
+    if (!game.matchId) return false
+    const payload = payloadFromState(game)
+    try {
+      await request(`/api/v1/match-input/drafts/${encodeURIComponent(payload.gmId)}/${payload.side}/setup`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ payload, clientState: cloneState(game) }),
+      })
+      return true
+    } catch {
+      return false
+    }
+  }
+
   async function promoteH1(game: MatchState) {
     if (!await save(game)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 안전하게 저장되었습니다.')
     const payload = payloadFromState(game)
@@ -278,8 +315,8 @@ export function useMatchDraft() {
     if (!await save(game)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 안전하게 저장되었습니다.')
     const payload = payloadFromState(game)
     const result = await request(`/api/v1/match-input/drafts/${encodeURIComponent(payload.gmId)}/${payload.side}/finalize`, { method: 'POST' })
-    // RAW 승격 뒤에도 Draft는 유지한다. 이후 수정은 이 Draft를 다시 편집해
-    // 같은 RAW를 교체하므로, 현장 화면도 종료 상태와 KPI 미리보기를 보존한다.
+    // Final promotion clears its server Draft. A later explicit edit recreates
+    // a short-lived Draft from RAW, so final RAW remains the only source.
     await saveLocal(game, true)
     return result
   }
@@ -317,21 +354,41 @@ export function useMatchDraft() {
 
   async function recover(game: MatchState) {
     if (!game.matchId) return false
+    const local = await readLocal(keyFor(game))
     try {
       const side = inputSide(game)
-      const response = await request<{ status?: string; payload?: InputPayload; clientState?: MatchState }>(
+      const response = await request<{ status?: string; payload?: InputPayload; clientState?: MatchState; updatedAt?: string }>(
         `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${side}`,
       )
-      if (response.status === 'missing' || !response.payload) return false
+      if (response.status === 'missing' || !response.payload) {
+        if (local) {
+          hydrateFromPayload(game, local.payload, local.clientState)
+          // The page can reload before the debounced shared-Draft write has
+          // completed. Restore the local checkpoint and immediately put it
+          // back on the server so other analysts/re-entries see the same state.
+          void save(game)
+          return true
+        }
+        return false
+      }
+      const serverUpdatedAt = response.updatedAt ? Date.parse(response.updatedAt) : 0
+      // A page reload can happen inside the network debounce window. In that
+      // case this device's immediately-written IndexedDB snapshot is newer than
+      // the server Draft and must be restored + retried, never discarded.
+      if (local && local.updatedAt > serverUpdatedAt) {
+        hydrateFromPayload(game, local.payload, local.clientState)
+        void save(game)
+        return true
+      }
       hydrateFromPayload(game, response.payload, response.clientState)
       await writeLocal({ key: keyFor(game), payload: response.payload, clientState: cloneState(game), updatedAt: Date.now() })
       return true
     } catch {
       // IndexedDB is an offline fallback only. When the shared Draft is
       // reachable, its state must win over an older device-local snapshot.
-      return await recoverLocal(game)
+      return local ? (hydrateFromPayload(game, local.payload, local.clientState), true) : false
     }
   }
 
-  return { saveLocal, save, promoteH1, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover, hydrate: hydrateFromPayload }
+  return { saveLocal, save, saveSetup, promoteH1, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover, hydrate: hydrateFromPayload }
 }

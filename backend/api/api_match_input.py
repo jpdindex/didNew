@@ -7,6 +7,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from backend.system.system_firestore import BackendError, JpdDidData, NotFoundError, RequiredUser, utc_now
+from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
 from backend.system.system_schema import Half, InputMode, Side
 
 
@@ -117,6 +118,18 @@ class DraftWriteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     payload: MatchInputPayload
     clientState: dict[str, Any]
+    # One endpoint serves durable checkpoints and the two lightweight live-sync
+    # mutations.  These endpoints are intentionally internal to the frontend.
+    syncScope: Literal["checkpoint", "state", "records"] = "checkpoint"
+    deletedRecordIds: list[str] = Field(default_factory=list)
+
+
+class InputSetupWriteRequest(BaseModel):
+    """Durable lobby configuration. It deliberately cannot mutate live Draft state."""
+
+    model_config = ConfigDict(extra="forbid")
+    payload: MatchInputPayload
+    clientState: dict[str, Any]
 
 
 class DraftResponse(BaseModel):
@@ -125,7 +138,10 @@ class DraftResponse(BaseModel):
     side: Side
     payload: MatchInputPayload
     clientState: dict[str, Any]
+    sharedState: dict[str, Any] = Field(default_factory=dict)
+    revision: int = 0
     updatedAt: str | None = None
+    inputSetup: dict[str, Any] | None = None
 
 
 class DraftMissingResponse(BaseModel):
@@ -149,6 +165,19 @@ class ParticipantJoinRequest(BaseModel):
     displayName: str | None = Field(default=None, max_length=100)
 
 
+class RecorderProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, max_length=100)
+
+
+class InputPreviewRequest(BaseModel):
+    """Ephemeral input-screen calculation. Nothing is persisted by this route."""
+
+    model_config = ConfigDict(extra="forbid")
+    records: list[InputRecord]
+    half: Half | None = None
+
+
 router = APIRouter(tags=["match-input"])
 
 
@@ -156,13 +185,16 @@ def _display_name(document: dict, fallback: str) -> str:
     return str(document.get("nameKr") or document.get("name") or document.get("nameShort") or fallback)
 
 
-def _draft_response(document: dict[str, Any]) -> DraftResponse:
+def _draft_response(document: dict[str, Any], input_setup: dict[str, Any] | None = None) -> DraftResponse:
     updated_at = document.get("updatedAt")
     return DraftResponse(
         status="ok", gmId=document["gmId"], side=document["side"],
         payload=MatchInputPayload.model_validate(document["payload"]),
         clientState=document.get("clientState") or {},
+        sharedState=document.get("sharedState") or {},
+        revision=int(document.get("revision") or 0),
         updatedAt=updated_at.isoformat() if updated_at else None,
+        inputSetup=input_setup,
     )
 
 
@@ -354,8 +386,16 @@ def read_match_dashboard_kpis(
     half: Literal["all", "H1", "H2"] = Query(default="all"),
     _: RequiredUser = None,
 ) -> dict:
-    JpdDidData().get_match(gm_id)
-    return {"status": "ok", "gmId": gm_id, "half": half, "kpis": JpdDidData().read_match_dashboard_kpis(gm_id, half=half)}
+    data = JpdDidData()
+    data.get_match(gm_id)
+    return {
+        "status": "ok", "gmId": gm_id, "half": half,
+        "kpis": data.read_match_dashboard_kpis(gm_id, half=half),
+        # The lobby already polls this lightweight response for live KPI. Keep
+        # the durable setup in the same response so it never falls back to a
+        # transient Draft just to paint formation or player placement.
+        "inputSetup": data.get_input_setup(gm_id),
+    }
 
 
 @router.get("/match-input/matches/{gm_id}/squads", include_in_schema=False)
@@ -368,6 +408,7 @@ def read_match_squads(gm_id: str, _: RequiredUser = None) -> dict:
         "H": result["H"], "A": result["A"],
         "cached": cached,
         "inputStatus": data.get_recording_input_states(gm_id),
+        "inputSetup": data.get_input_setup(gm_id),
         "matchSnapshot": {
             "leagueId": match.leagueId, "seasonId": match.seasonId, "round": match.round,
             "date": match.date, "kickoffTime": match.kickoffTime, "stadiumId": match.stadiumId,
@@ -379,12 +420,13 @@ def read_match_squads(gm_id: str, _: RequiredUser = None) -> dict:
 @router.get("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse | DraftMissingResponse, include_in_schema=False)
 def get_draft(gm_id: str, side: Side, _: RequiredUser = None) -> DraftResponse | DraftMissingResponse:
     try:
-        document = JpdDidData().get_input_draft(gm_id, side)
+        data = JpdDidData()
+        document = data.get_input_draft(gm_id, side)
         # A primary can be registered before its first lifecycle snapshot. That
         # is a normal empty collaborative Draft, not a malformed API response.
         if not document.get("payload"):
             return DraftMissingResponse(status="missing", gmId=gm_id, side=side)
-        return _draft_response(document)
+        return _draft_response(document, data.get_input_setup(gm_id).get(side))
     except NotFoundError:
         # A side without a draft is the normal first-entry condition.
         return DraftMissingResponse(status="missing", gmId=gm_id, side=side)
@@ -402,6 +444,49 @@ def list_approvals(_: RequiredUser = None) -> dict:
     return {"status": "ok", "drafts": [{"gmId": item["gmId"], "side": item["side"], "updatedAt": item.get("updatedAt"), "payload": item["payload"]} for item in drafts]}
 
 
+@router.post("/match-input/preview", include_in_schema=False)
+def calculate_input_preview(request: InputPreviewRequest, _: RequiredUser = None) -> dict:
+    """Calculate preview KPI and per-record eligibility without Firestore I/O."""
+    source = [
+        KpiRecord(
+            id=item.id or f"record-{index}", half=item.half, seconds=item.halfSeconds, seq=item.seq,
+            act=item.act, res=item.res, area=item.area, player_id=item.playerId,
+            shoot_pos_x=item.shootPosX, shoot_pos_y=item.shootPosY,
+            shoot_dsp_range=item.shootDspRange, is_shot=item.isShot,
+        )
+        for index, item in enumerate(request.records)
+        if request.half is None or item.half == request.half
+    ]
+    result = calculate_kpis(source)
+    return {
+        "status": "ok",
+        "kpis": result.team_kpi,
+        "flags": {
+            record_id: {
+                "isTap": flag.is_tap, "isDap": flag.is_dap, "isDapSuccess": flag.is_dap_success,
+                "isShot": flag.is_shot, "isGoal": flag.is_goal,
+            }
+            for record_id, flag in result.flags.items()
+        },
+        "paths": [
+            {"id": path.id, "recordIds": list(path.record_ids), "type": path.path_type, "ttp": path.ttp}
+            for path in result.paths
+        ],
+    }
+
+
+@router.get("/match-input/recorder-profile", include_in_schema=False)
+def get_recorder_profile(user: RequiredUser = None) -> dict:
+    profile = JpdDidData().get_recorder_profile(user.uid)
+    return {"status": "ok", "name": profile.get("name") or user.uid, "level": profile.get("level", "advanced")}
+
+
+@router.post("/match-input/recorder-profile", include_in_schema=False)
+def ensure_recorder_profile(request: RecorderProfileRequest, user: RequiredUser = None) -> dict:
+    profile = JpdDidData().ensure_recorder_profile(user.uid, name=request.name)
+    return {"status": "ok", "name": profile.get("name") or user.uid, "level": profile.get("level", "advanced")}
+
+
 @router.post("/match-input/drafts/{gm_id}/{side}/participants", include_in_schema=False)
 def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinRequest, user: RequiredUser = None) -> dict:
     data = JpdDidData()
@@ -413,6 +498,7 @@ def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinReque
     return {
         "status": "ok", "gmId": gm_id, "side": side,
         "primaryUid": document.get("primaryUid"), "participants": document.get("participants", {}),
+        "role": (document.get("participants", {}).get(user.uid) or {}).get("role"),
     }
 
 
@@ -445,7 +531,9 @@ def finalize_advanced(gm_id: str, side: Side, user: RequiredUser = None) -> Prom
         raise BackendError("Basic input requires administrator approval", status_code=409, code="basic_approval_required")
     # Keep the final Draft as the editable source for later corrections. RAW is
     # replaced atomically, but the Draft is retained and marked final.
-    return _promote(data, payload, user.uid, status="final", halves={"H1", "H2"}, delete_draft=False)
+    # RAW is the only durable final source. A later edit explicitly recreates a
+    # short-lived Draft from RAW, so stale collaboration records cannot reopen.
+    return _promote(data, payload, user.uid, status="final", halves={"H1", "H2"}, delete_draft=True)
 
 
 @router.post("/match-input/approvals/{gm_id}/{side}/promote", response_model=PromotionResponse, include_in_schema=False)
@@ -466,5 +554,36 @@ def save_draft(gm_id: str, side: Side, request: DraftWriteRequest, user: Require
     snapshot = request.payload.matchSnapshot
     if snapshot and (snapshot.homeTeamId != match.homeTeamId or snapshot.awayTeamId != match.awayTeamId):
         raise BackendError("Draft match snapshot does not match this fixture", status_code=422, code="draft_match_mismatch")
-    document = data.save_input_draft(gm_id, side, payload=request.payload.model_dump(mode="python"), client_state=request.clientState, user_id=user.uid)
-    return _draft_response(document)
+    document = data.save_input_draft(
+        gm_id,
+        side,
+        payload=request.payload.model_dump(mode="python"),
+        client_state=request.clientState,
+        user_id=user.uid,
+        sync_scope=request.syncScope,
+        deleted_record_ids=request.deletedRecordIds,
+    )
+    return _draft_response(document, data.get_input_setup(gm_id).get(side))
+
+
+@router.put("/match-input/drafts/{gm_id}/{side}/setup", include_in_schema=False)
+def save_draft_setup(gm_id: str, side: Side, request: InputSetupWriteRequest, user: RequiredUser = None) -> dict:
+    """Write formation/lineup only after a real configuration action.
+
+    This is intentionally hidden from Swagger: it is a browser collaboration
+    transport, not an operator action. Records, timer and lifecycle are never
+    touched here.
+    """
+    if request.payload.gmId != gm_id or request.payload.side != side:
+        raise BackendError("Draft path and payload must identify the same match side", status_code=422, code="draft_target_mismatch")
+    data = JpdDidData()
+    draft = data.get_input_draft(gm_id, side)
+    primary_uid = str(draft.get("primaryUid") or "")
+    if primary_uid and primary_uid != user.uid:
+        raise BackendError("Only the primary analyst can change the shared lineup", status_code=403, code="primary_required")
+    setup = data.save_input_setup(
+        gm_id, side,
+        payload=request.payload.model_dump(mode="python"),
+        client_state=request.clientState,
+    )
+    return {"status": "ok", "gmId": gm_id, "side": side, "inputSetup": setup}

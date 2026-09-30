@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { doc, getDoc } from 'firebase/firestore'
 import { computeAttackPaths, computeBap } from '~/utils/didLogic'
 import type { HalfStatus, MatchSnapshot, MatchSquadPlayer, MatchState, SubRecord } from '~/composables/useMatchState'
 import type { Half } from '~/types/schema'
@@ -9,6 +8,7 @@ import {
   BENCH_IDS,
   FORMATIONS,
   GK_SLOT,
+  assignmentsFromLineup,
   lineupAssignmentOrder as formationAssignmentOrder,
   orderedOutfieldSlotIds,
 } from '~/utils/formationLayout'
@@ -34,6 +34,9 @@ const dashboardKpis = ref<{ H: Record<'all' | 'H1' | 'H2', DashboardKpi>; A: Rec
   H: { all: emptyDashboardKpi(), H1: emptyDashboardKpi(), H2: emptyDashboardKpi() },
   A: { all: emptyDashboardKpi(), H1: emptyDashboardKpi(), H2: emptyDashboardKpi() },
 })
+let dashboardKpiTimer: ReturnType<typeof setInterval> | undefined
+let dashboardKpiLoading = false
+let appliedSetupFingerprint = ''
 
 // ---- 공유 상태 ----
 // TeamSelection ↔ DidInput 이 함께 쓰는 임시 스토어(useState). 전반/후반 종료 후
@@ -41,8 +44,8 @@ const dashboardKpis = ref<{ H: Record<'all' | 'H1' | 'H2', DashboardKpi>; A: Rec
 // selectedTeam/formationKey/assigned/side/inputMode/잔디 설정을 전부 여기로 옮겼다.
 const game = useMatchState()
 const { request } = useBackendApi()
-const { saveLocal, save: saveDraft, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover: recoverDraft, hydrate } = useMatchDraft()
-const { join: joinCollaboration, syncState } = useMatchCollaboration()
+const { saveLocal, save: saveDraft, saveSetup, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover: recoverDraft, hydrate } = useMatchDraft()
+const { join: joinCollaboration } = useMatchCollaboration()
 const lifecycleBusy = ref(false)
 const lifecycleError = ref('')
 const bootstrapApplied = ref(false)
@@ -92,13 +95,60 @@ type InputBootstrapSession = {
   clientState?: MatchState
 }
 
+type InputSetup = {
+  formationKey: string
+  fieldSide: FieldSide | null
+  lineup: Array<Record<string, unknown>>
+  inputMode: '분석' | '실시간'
+}
+
 type InputBootstrap = {
   H: MatchSquadPlayer[]
   A: MatchSquadPlayer[]
   matchSnapshot: MatchSnapshot
   inputStatus: { H: InputSideStatus; A: InputSideStatus }
+  inputSetup: { H: InputSetup | null; A: InputSetup | null }
   session: InputBootstrapSession
   dashboardKpis: { H: Record<'all' | 'H1' | 'H2', DashboardKpi>; A: Record<'all' | 'H1' | 'H2', DashboardKpi> }
+}
+
+function applyInputSetup(setup: InputSetup | null | undefined) {
+  if (!setup || !FORMATIONS[setup.formationKey]) return
+  appliedSetupFingerprint = setupFingerprint(setup)
+  game.value.formationKey = setup.formationKey
+  if (setup.fieldSide === 'left' || setup.fieldSide === 'right') game.value.side = setup.fieldSide
+  game.value.assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
+  game.value.inputMode = setup.inputMode
+}
+
+function setupFingerprint(setup: Pick<InputSetup, 'formationKey' | 'fieldSide' | 'lineup' | 'inputMode'>) {
+  return JSON.stringify({
+    formationKey: setup.formationKey,
+    fieldSide: setup.fieldSide,
+    inputMode: setup.inputMode,
+    lineup: [...setup.lineup].map(item => ({
+      playerId: item.playerId, slot: item.slot, order: item.order, type: item.type,
+      inHalf: item.inHalf ?? null, inSeconds: item.inSeconds ?? null,
+      outHalf: item.outHalf ?? null, outSeconds: item.outSeconds ?? null,
+    })).sort((a, b) => String(a.slot).localeCompare(String(b.slot))),
+  })
+}
+
+function currentSetupFingerprint() {
+  const squad = game.value.team === 'away' ? game.value.squads.away : game.value.squads.home
+  const lineup = Object.entries(game.value.assigned).map(([slot, playerId]) => {
+    const player = squad.find(candidate => candidate.playerId === playerId)
+    const subOut = game.value.subs.find(sub => sub.outPlayer === playerId)
+    const subIn = game.value.subs.find(sub => sub.inPlayer === playerId)
+    return {
+      playerId, slot, order: slot === 'gk' ? 1 : Number(slot.slice(1)) || 0,
+      type: slot.startsWith('b') ? 'BENCH' : 'START', no: player?.no, name: player?.name, pos: player?.pos,
+      inHalf: subIn?.half ?? (slot.startsWith('b') ? null : 'H1'),
+      inSeconds: subIn?.seconds ?? (slot.startsWith('b') ? null : 0),
+      outHalf: subOut?.half ?? null, outSeconds: subOut?.seconds ?? null,
+    }
+  })
+  return setupFingerprint({ formationKey: game.value.formationKey, fieldSide: game.value.side, lineup, inputMode: game.value.inputMode })
 }
 
 async function loadBootstrap() {
@@ -117,18 +167,19 @@ function applyBootstrap(payload: InputBootstrap) {
 
   const selectedTeam = game.value.team
   const selectedStatus = selectedTeam === 'home' ? payload.inputStatus.H : payload.inputStatus.A
+  const setups = payload.inputSetup ?? { H: null, A: null }
+  const selectedSetup = selectedTeam === 'home' ? setups.H : setups.A
   if (payload.session.status === 'ok' && payload.session.payload) {
     hydrate(game.value, payload.session.payload, payload.session.clientState)
-    return true
-  }
-  if (selectedStatus.lifecycleStatus === 'ready') {
+  } else if (selectedStatus.lifecycleStatus === 'ready') {
     resetForInputTeam(selectedTeam)
-    return false
-  }
-  if (selectedStatus.lifecycleStatus && selectedStatus.lifecycleStatus !== 'final') {
+  } else if (selectedStatus.lifecycleStatus && selectedStatus.lifecycleStatus !== 'final') {
     game.value.halfStatus = selectedStatus.lifecycleStatus
   }
-  return false
+  // Drafts are transient collaboration state. The snapshot is the lobby
+  // authority for formation, field side and player placement.
+  applyInputSetup(selectedSetup)
+  return payload.session.status === 'ok' && Boolean(payload.session.payload)
 }
 
 async function loadSquads() {
@@ -138,21 +189,29 @@ async function loadSquads() {
     A: MatchSquadPlayer[]
     matchSnapshot: MatchSnapshot
     inputStatus: { H: InputSideStatus; A: InputSideStatus }
+    inputSetup: { H: InputSetup | null; A: InputSetup | null }
   }>(`/api/v1/match-input/matches/${encodeURIComponent(matchId.value)}/squads`)
   const squads = { home: payload.H, away: payload.A }
   game.value.squads = squads
   game.value.matchSnapshot = payload.matchSnapshot
   inputStatus.value = payload.inputStatus
-  return { squads, snapshot: payload.matchSnapshot }
+  return { squads, snapshot: payload.matchSnapshot, inputSetup: payload.inputSetup }
 }
 
 async function loadDashboardKpis(half: 'all' | 'H1' | 'H2' = kpiHalf.value) {
-  if (!matchId.value) return
-  const payload = await request<{ kpis: { H: DashboardKpi; A: DashboardKpi } }>(
+  if (!matchId.value || dashboardKpiLoading) return
+  dashboardKpiLoading = true
+  try {
+  const payload = await request<{ kpis: { H: DashboardKpi; A: DashboardKpi }; inputSetup?: { H: InputSetup | null; A: InputSetup | null } }>(
     `/api/v1/match-input/matches/${encodeURIComponent(matchId.value)}/dashboard-kpis?half=${half}`,
   )
   dashboardKpis.value.H[half] = payload.kpis.H
   dashboardKpis.value.A[half] = payload.kpis.A
+  const setup = game.value.team === 'away' ? payload.inputSetup?.A : payload.inputSetup?.H
+  if (setup) applyInputSetup(setup)
+  } finally {
+    dashboardKpiLoading = false
+  }
 }
 
 function oppositeFieldSide(side: FieldSide): FieldSide {
@@ -241,7 +300,6 @@ function pickFormation(key: string) {
     if (benchPool[index]) game.value.assigned[slot] = benchPool[index]
   })
   activeSlot.value = firstEmptyLineupSlot()
-  void syncState(game.value).catch(() => false)
 }
 
 async function recoverSelectedTeamState() {
@@ -268,13 +326,11 @@ async function recoverSelectedTeamState() {
 }
 
 async function loadRecorderProfile() {
-  const { $auth, $authReady, $db } = useNuxtApp()
+  const { $auth, $authReady } = useNuxtApp()
   await $authReady
   const user = $auth.currentUser
   if (!user) return
-  const snapshot = await getDoc(doc($db, 'recorders', user.uid))
-  if (!snapshot.exists()) return
-  const profile = snapshot.data()
+  const profile = await request<{ name?: string; level?: 'basic' | 'advanced' }>('/api/v1/match-input/recorder-profile')
   if (profile.level === 'basic' || profile.level === 'advanced') game.value.recorderLevel = profile.level
   game.value.participantName = String(profile.name || user.displayName || user.email || '')
 }
@@ -363,6 +419,7 @@ async function pickTeam(team: 'home' | 'away') {
   const snapshot = game.value.matchSnapshot
   const previousTeam = game.value.team
   const previousFieldSide = game.value.side as FieldSide | null
+  let selectedSetup: InputSetup | null = null
   try {
     // 서버 lifecycle과 별개로, 현재 팀의 프론트 상태를 IndexedDB에 먼저 보존한다.
     // H/A는 `${gmId}_H`, `${gmId}_A`로 분리되므로 팀을 왕복해도 KPI/라인업/기록이 섞이지 않는다.
@@ -370,7 +427,14 @@ async function pickTeam(team: 'home' | 'away') {
     resetForInputTeam(team)
     const recovered = await recoverSelectedTeamState()
     if (snapshot) applyCurrentMatchSquads(squads, snapshot)
-    if (!recovered) {
+    const refreshed = await loadSquads()
+    if (refreshed) {
+      applyCurrentMatchSquads(refreshed.squads, refreshed.snapshot)
+      const setups = refreshed.inputSetup ?? { H: null, A: null }
+      selectedSetup = team === 'home' ? setups.H : setups.A
+      applyInputSetup(selectedSetup)
+    }
+    if (!recovered && !selectedSetup) {
       // 처음 입력하는 반대 팀은 완전히 새 세션으로 시작한다.
       // 먼저 입력하던 팀의 진영을 알고 있으면 즉시 반대로 잡고,
       // 새로고침/다른 기기처럼 로컬 상태가 없으면 RAW recording의 fieldSide를 사용한다.
@@ -476,23 +540,31 @@ function onDragStart(playerId: string) {
 }
 
 function recordFormationChange() {
-  if (game.value.halfStatus !== 'H1' && game.value.halfStatus !== 'H2') return
-  if (!game.value.matchSnapshot) return
+  if (!game.value.matchId) return
   if (formationSaveTimer) clearTimeout(formationSaveTimer)
   formationSaveTimer = setTimeout(() => {
+    // A ready lobby is not shared input yet. Its first durable setup write is
+    // the primary's explicit "전반전 시작" action below.
+    if (game.value.halfStatus === 'ready') return
+    const fingerprint = currentSetupFingerprint()
+    if (!game.value.formationKey || fingerprint === appliedSetupFingerprint) return
     const half = game.value.halfStatus
-    if (half !== 'H1' && half !== 'H2') return
-    game.value.formationChanges.push({
-      half,
-      seconds: game.value.seconds,
-      formationKey: game.value.formationKey,
-      assigned: { ...game.value.assigned },
-    })
-    void saveDraft(game.value)
+    if ((half === 'H1' || half === 'H2') && game.value.matchSnapshot) {
+      game.value.formationChanges.push({
+        half,
+        seconds: game.value.seconds,
+        formationKey: game.value.formationKey,
+        assigned: { ...game.value.assigned },
+      })
+    }
+    // Setup only changes when a formation/lineup action happens. Timer and
+    // record autosaves must not rewrite this durable lobby snapshot.
+    appliedSetupFingerprint = fingerprint
+    void saveSetup(game.value).catch(() => { appliedSetupFingerprint = '' })
   }, 300)
 }
 
-watch([() => game.value.formationKey, () => game.value.assigned], recordFormationChange, { deep: true })
+watch([() => game.value.formationKey, () => game.value.assigned, () => game.value.side], recordFormationChange, { deep: true })
 function onDrop(slotId: string) {
   if (!matchInfoEditable.value || dragPlayerId.value === null) return
   if (slotId !== 'gk' && !slotId.startsWith('b') && !game.value.formationKey) return
@@ -593,17 +665,30 @@ async function startFirstHalf() {
   if (!canStart.value) return
   if (!confirm('전반전을 시작하시겠습니까?')) return
   lifecycleBusy.value = true
+  const previousStatus = game.value.halfStatus
+  const previousSeconds = game.value.seconds
+  const previousClockStartedAt = game.value.clockStartedAt
   try {
     await joinCollaboration(game.value, requestedRole)
+    if (game.value.participantRole !== 'primary') throw new Error('주 분석관만 전반전을 시작할 수 있습니다.')
+    // Create the durable setup before the first live Draft checkpoint. An
+    // assistant can therefore render formation and lineup on its first poll.
+    if (!await saveSetup(game.value)) throw new Error('포메이션과 명단 스냅샷을 저장하지 못했습니다.')
+    // This checkpoint is the single source of the running-clock timestamp.
+    // Do not navigate until the Draft contains formation, lineup and H1 time.
+    game.value.halfStatus = 'H1'
+    game.value.seconds = 0
+    game.value.clockStartedAt = Date.now()
+    if (!await saveDraft(game.value)) throw new Error('전반 시작 상태를 Firestore Draft에 저장하지 못했습니다.')
   } catch (error) {
     lifecycleError.value = error instanceof Error ? error.message : '협업 Draft 참여에 실패했습니다.'
+    game.value.halfStatus = previousStatus
+    game.value.seconds = previousSeconds
+    game.value.clockStartedAt = previousClockStartedAt
     return
   } finally {
     lifecycleBusy.value = false
   }
-  game.value.halfStatus = 'H1'
-  game.value.seconds = 0 // 새 half 는 0초부터
-  game.value.clockStartedAt = Date.now()
   navigateTo({ path: '/DidInput', query: didInputQuery() })
 }
 
@@ -611,6 +696,7 @@ async function enterAsAssistant() {
   lifecycleBusy.value = true
   lifecycleError.value = ''
   try {
+    game.value.participantRole = 'assistant'
     await joinCollaboration(game.value, 'assistant')
     // The shared Draft subscription in DidInput replaces this local shell with
     // the primary analyst's current clock, lineup, and records.
@@ -647,7 +733,7 @@ async function toggleMatchInfoEdit() {
 
   lifecycleBusy.value = true
   try {
-    if (!await saveDraft(game.value)) throw new Error('경기 정보 변경 내용을 Firestore Draft에 저장하지 못했습니다.')
+    if (!await saveSetup(game.value)) throw new Error('경기 정보 변경 내용을 저장하지 못했습니다.')
     matchInfoEditMode.value = false
     activeSlot.value = null
     menuOpen.value = false
@@ -718,6 +804,8 @@ onMounted(async () => {
       if (selectedState.lifecycleStatus === 'ready' && game.value.halfStatus !== 'ready') resetForInputTeam(game.value.team)
       recovered = await recoverSelectedTeamState()
       applyCurrentMatchSquads(squadResult.value.squads, squadResult.value.snapshot)
+      const setups = squadResult.value.inputSetup ?? { H: null, A: null }
+      applyInputSetup(game.value.team === 'home' ? setups.H : setups.A)
     } else {
       lifecycleError.value = squadResult.status === 'rejected' && squadResult.reason instanceof Error
         ? squadResult.reason.message
@@ -746,11 +834,18 @@ onMounted(async () => {
       game.value.seconds = Math.max(game.value.seconds, Math.floor((Date.now() - game.value.clockStartedAt) / 1000))
     }
   }, 250)
+  // The selected team is calculated locally for instant feedback. Refresh the
+  // server's two-sided view while either side is live so the opposite team's
+  // KPI does not remain at the value from lobby entry.
+  dashboardKpiTimer = setInterval(() => {
+    void loadDashboardKpis(kpiHalf.value).catch(() => false)
+  }, 1200)
 })
 
 onUnmounted(() => {
   if (formationSaveTimer) clearTimeout(formationSaveTimer)
   if (lobbyClockTimer) clearInterval(lobbyClockTimer)
+  if (dashboardKpiTimer) clearInterval(dashboardKpiTimer)
 })
 
 async function finishMatch() {

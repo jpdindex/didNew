@@ -627,6 +627,83 @@ class JpdDidData:
     def _input_squads_reference(self, gm_id: str):
         return self.db.collection("matches").document(gm_id).collection("inputSnapshots").document("squads")
 
+    def _input_setup_reference(self, gm_id: str, side: Side):
+        """Return the temporary, team-specific Draft document holding setup.
+
+        `matches` is reserved for final RAW. Setup must therefore live beside
+        the collaboration Draft until promotion, rather than creating a
+        partially populated match document when the first half begins.
+        """
+        return self.db.collection("inputDrafts").document(f"{gm_id}_{side}")
+
+    @staticmethod
+    def _normalise_input_setup(values: Any) -> dict[str, Any] | None:
+        if not isinstance(values, dict):
+            return None
+        formation_key = values.get("formationKey")
+        lineup = values.get("lineup")
+        field_side = values.get("fieldSide")
+        if not isinstance(formation_key, str) or not formation_key or not isinstance(lineup, list):
+            return None
+        return {
+            "formationKey": formation_key,
+            "fieldSide": field_side if field_side in {"left", "right"} else None,
+            "lineup": [item for item in lineup if isinstance(item, dict)],
+            "inputMode": values.get("inputMode") if values.get("inputMode") in {"분석", "실시간"} else "분석",
+            "revision": int(values.get("revision") or 0),
+        }
+
+    def get_input_setup(self, gm_id: str) -> dict[Side, dict[str, Any] | None]:
+        result: dict[Side, dict[str, Any] | None] = {"H": None, "A": None}
+        for side in ("H", "A"):
+            document = self._input_setup_reference(gm_id, side).get(retry=None, timeout=10)
+            if document.exists:
+                result[side] = self._normalise_input_setup((document.to_dict() or {}).get("setup"))
+        return result
+
+    def save_input_setup(
+        self,
+        gm_id: str,
+        side: Side,
+        *,
+        payload: dict[str, Any],
+        client_state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Checkpoint Draft setup without allowing blank state writes to erase it."""
+        reference = self._input_setup_reference(gm_id, side)
+        current = reference.get(retry=None, timeout=10).to_dict() or {}
+        previous = self._normalise_input_setup(current.get("setup")) or {}
+        formation_key = payload.get("formationKey")
+        lineup = payload.get("lineup")
+        selected_field_side = client_state.get("side")
+        if selected_field_side not in {"left", "right"}:
+            selected_field_side = payload.get("fieldSide")
+
+        # A Draft may be created by a join/recovery before its UI has hydrated.
+        # Such an empty payload must never destroy a completed lobby setup.
+        if not isinstance(formation_key, str) or not formation_key or not isinstance(lineup, list):
+            if previous:
+                return previous
+            return None
+
+        next_comparable = {
+            "formationKey": formation_key,
+            "fieldSide": selected_field_side if selected_field_side in {"left", "right"} else previous.get("fieldSide"),
+            "lineup": [item for item in lineup if isinstance(item, dict)],
+            "inputMode": payload.get("inputMode") if payload.get("inputMode") in {"분석", "실시간"} else previous.get("inputMode", "분석"),
+        }
+        previous_comparable = {key: previous.get(key) for key in next_comparable}
+        if previous and previous_comparable == next_comparable:
+            return previous
+
+        next_setup = {
+            **next_comparable,
+            "revision": int(previous.get("revision") or 0) + 1,
+            "updatedAt": utc_now(),
+        }
+        reference.set({"setup": next_setup}, merge=True)
+        return self._normalise_input_setup(next_setup)
+
     @staticmethod
     def _legacy_lineup_fingerprint(recording: RecordingDoc) -> str:
         """Fingerprint only the durable fields that define an imported lineup."""
@@ -985,7 +1062,41 @@ class JpdDidData:
         snapshot = reference.get(retry=None, timeout=10)
         if not snapshot.exists:
             raise NotFoundError(f"Input draft not found: {gm_id}/{side}")
-        return snapshot.to_dict() or {}
+        document = snapshot.to_dict() or {}
+        return self._with_draft_records(reference, document)
+
+    @staticmethod
+    def _normalise_draft_record(record_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
+        """Accept both the old browser record shape and the API payload shape."""
+        if values.get("deleted"):
+            return None
+        record = {key: value for key, value in values.items() if key not in {"deleted", "updatedAt", "updatedBy", "edited"}}
+        record["id"] = str(record.get("id") or record_id)
+        if "halfSeconds" not in record and "seconds" in record:
+            record["halfSeconds"] = record.pop("seconds")
+        record.setdefault("half", "H1")
+        return record
+
+    def _with_draft_records(self, reference: Any, document: dict[str, Any]) -> dict[str, Any]:
+        """Hydrate a Draft payload from server-owned per-record documents.
+
+        Root payloads remain useful for first open/offline recovery.  Once a
+        records subcollection exists, it is the merge authority so independent
+        analysts cannot overwrite each other's latest event edits.
+        """
+        payload = document.get("payload")
+        if not isinstance(payload, dict):
+            return document
+        record_documents = list(reference.collection("records").stream(retry=None, timeout=20))
+        if not record_documents:
+            return document
+        records = [
+            normalised for item in record_documents
+            if isinstance((values := item.to_dict()), dict)
+            if (normalised := self._normalise_draft_record(item.id, values)) is not None
+        ]
+        records.sort(key=lambda item: (str(item.get("half", "H1")), int(item.get("halfSeconds", 0)), int(item.get("seq", 0))))
+        return {**document, "payload": {**payload, "records": records}}
 
     def save_input_draft(
         self,
@@ -995,32 +1106,88 @@ class JpdDidData:
         payload: dict[str, Any],
         client_state: dict[str, Any],
         user_id: str,
+        sync_scope: Literal["checkpoint", "state", "records"] = "checkpoint",
+        deleted_record_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
         now = utc_now()
         current = reference.get(retry=None, timeout=10)
         previous = current.to_dict() or {}
         previous_shared = previous.get("sharedState") if isinstance(previous.get("sharedState"), dict) else {}
-        # Direct Firestore sync owns normal live edits. A REST lifecycle save is
-        # an explicit checkpoint, so it must advance the same shared status too;
-        # otherwise schedule reads can keep showing the old H1/H2 value.
-        shared_state = {
-            **previous_shared,
-            "halfStatus": payload.get("status", "ready"),
-            "seconds": client_state.get("seconds", previous_shared.get("seconds", 0)),
-            "h1Seconds": client_state.get("h1Seconds", payload.get("halves", {}).get("H1", {}).get("seconds", 0)),
-            "h2Seconds": client_state.get("h2Seconds", payload.get("halves", {}).get("H2", {}).get("seconds", 0)),
-            "clockStartedAt": client_state.get("clockStartedAt"),
-        }
+        previous_client = previous.get("clientState") if isinstance(previous.get("clientState"), dict) else {}
+        previous_payload = previous.get("payload") if isinstance(previous.get("payload"), dict) else {}
+        # Only the primary analyst can advance shared match lifecycle/clock.
+        # An assistant's record sync must never pause, restart or reopen a half.
+        primary_uid = str(previous.get("primaryUid") or "")
+        can_write_live_state = not primary_uid or primary_uid == user_id
+        if sync_scope == "records" or not can_write_live_state:
+            shared_state = previous_shared
+        else:
+            shared_state = {
+                **previous_shared,
+                "halfStatus": payload.get("status", "ready"),
+                "seconds": client_state.get("seconds", previous_shared.get("seconds", 0)),
+                "h1Seconds": client_state.get("h1Seconds", payload.get("halves", {}).get("H1", {}).get("seconds", 0)),
+                "h2Seconds": client_state.get("h2Seconds", payload.get("halves", {}).get("H2", {}).get("seconds", 0)),
+                "clockStartedAt": client_state.get("clockStartedAt"),
+                "homeScore": payload.get("homeScore", previous_shared.get("homeScore", 0)),
+                "awayScore": payload.get("awayScore", previous_shared.get("awayScore", 0)),
+            }
+        root_payload = payload if sync_scope == "checkpoint" or not previous_payload else previous_payload
+        if sync_scope == "checkpoint":
+            root_payload = {**payload, "records": previous_payload.get("records", [])}
+        elif sync_scope == "state" and can_write_live_state:
+            root_payload = {
+                **previous_payload,
+                "status": payload.get("status", previous_payload.get("status", "ready")),
+                "homeScore": payload.get("homeScore", previous_payload.get("homeScore", 0)),
+                "awayScore": payload.get("awayScore", previous_payload.get("awayScore", 0)),
+                "halves": payload.get("halves", previous_payload.get("halves", {})),
+            }
+        if sync_scope == "checkpoint" and not can_write_live_state and previous_payload:
+            root_payload = previous_payload
+
+        records_reference = reference.collection("records")
+        if sync_scope in {"checkpoint", "records"}:
+            batch = self.db.batch()
+            for index, record in enumerate(payload.get("records", [])):
+                if not isinstance(record, dict):
+                    continue
+                record_id = str(record.get("id") or uuid4())
+                batch.set(records_reference.document(record_id), {
+                    **record, "id": record_id, "half": record.get("half") or "H1",
+                    "deleted": False, "updatedAt": now, "updatedBy": user_id,
+                }, merge=True)
+            for record_id in deleted_record_ids or []:
+                if record_id:
+                    batch.set(records_reference.document(str(record_id)), {
+                        "id": str(record_id), "deleted": True, "updatedAt": now, "updatedBy": user_id,
+                    }, merge=True)
+            batch.commit(retry=None, timeout=20)
+
+        # Persist recovery-safe clock data without allowing a record-only sync
+        # to replace the rest of another analyst's client snapshot.
+        if sync_scope == "state" and can_write_live_state:
+            next_client_state = {
+                **previous_client,
+                **{key: client_state[key] for key in ("seconds", "h1Seconds", "h2Seconds", "clockStartedAt", "halfStatus", "homeScore", "awayScore") if key in client_state},
+            }
+        elif sync_scope == "records":
+            next_client_state = previous_client or client_state
+        elif sync_scope == "checkpoint" and not can_write_live_state:
+            next_client_state = previous_client
+        else:
+            next_client_state = client_state
         document = {
             "gmId": gm_id,
             "side": side,
-            "payload": payload,
-            "clientState": client_state,
-            "recorderLevel": payload.get("recorderLevel", "advanced"),
-            "status": payload.get("status", "ready"),
+            "payload": root_payload,
+            "clientState": next_client_state,
+            "recorderLevel": root_payload.get("recorderLevel", "advanced"),
+            "status": root_payload.get("status", "ready"),
             "updatedBy": user_id,
             "updatedAt": now,
+            "revision": int(previous.get("revision") or 0) + 1,
             "createdAt": previous.get("createdAt", now) if current.exists else now,
             # Collaboration metadata is deliberately retained when lifecycle saves
             # replace the validated payload snapshot.
@@ -1028,9 +1195,12 @@ class JpdDidData:
             "primaryUid": previous.get("primaryUid"),
             "collaboration": previous.get("collaboration", {}),
             "sharedState": shared_state,
+            # setup is a separate Draft state. Record, timer and lifecycle
+            # checkpoints replace this document, so explicitly retain it.
+            "setup": previous.get("setup"),
         }
         reference.set(document, retry=None, timeout=20)
-        return document
+        return self._with_draft_records(reference, document)
 
     def join_input_draft_participant(
         self,
@@ -1058,8 +1228,11 @@ class JpdDidData:
         participants = current.get("participants") if isinstance(current.get("participants"), dict) else {}
         existing_participant = participants.get(user_id) if isinstance(participants.get(user_id), dict) else {}
         existing_role = existing_participant.get("role")
-        if existing_role in {"primary", "assistant"} and existing_role != role:
-            raise BackendError("An analyst cannot hold both primary and assistant roles for one team session", status_code=409, code="participant_role_conflict")
+        # Re-entry never changes a role. The schedule can carry an old/default
+        # role query after a refresh, so return the role already assigned to
+        # this UID instead of treating its own re-entry as a conflict.
+        if existing_role in {"primary", "assistant"}:
+            role = existing_role
         if role == "primary":
             if primary_uid and primary_uid != user_id:
                 legacy_primary = participants.get(primary_uid) if isinstance(participants.get(primary_uid), dict) else {}
@@ -1093,6 +1266,29 @@ class JpdDidData:
         }
         reference.set(document, retry=None, timeout=20)
         return document
+
+    def ensure_recorder_profile(self, user_id: str, *, name: str | None = None) -> dict[str, Any]:
+        """Create/update the minimal operational profile after Firebase Auth login."""
+        reference = self.db.collection("recorders").document(user_id)
+        snapshot = reference.get(retry=None, timeout=10)
+        current = snapshot.to_dict() or {}
+        now = utc_now()
+        document = {
+            **current,
+            "name": name or current.get("name") or user_id,
+            "level": current.get("level") if current.get("level") in {"basic", "advanced"} else "advanced",
+            "updatedAt": now,
+            "updatedBy": "backend-login-bootstrap",
+            "createdAt": current.get("createdAt", now),
+        }
+        reference.set(document, retry=None, timeout=20)
+        return document
+
+    def get_recorder_profile(self, user_id: str) -> dict[str, Any]:
+        snapshot = self.db.collection("recorders").document(user_id).get(retry=None, timeout=10)
+        if not snapshot.exists:
+            return self.ensure_recorder_profile(user_id)
+        return snapshot.to_dict() or {}
 
     def get_input_draft_participants_many(self, gm_ids: list[str]) -> dict[str, dict[Side, dict[str, Any]]]:
         """Schedule-friendly collaboration summary without streaming all Drafts."""
@@ -1132,7 +1328,18 @@ class JpdDidData:
         return result
 
     def delete_input_draft(self, gm_id: str, side: Side) -> None:
-        self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side)).delete(retry=None, timeout=20)
+        reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
+        # A document delete does not delete subcollections in Firestore. Drafts
+        # currently own record documents, so delete them first before removing
+        # the root; this prevents an old collaboration record surviving a RAW
+        # promotion and reappearing when a later edit creates a fresh Draft.
+        records = list(reference.collection("records").stream(retry=None, timeout=20))
+        for start in range(0, len(records), 400):
+            batch = self.db.batch()
+            for snapshot in records[start:start + 400]:
+                batch.delete(snapshot.reference)
+            batch.commit(retry=None, timeout=20)
+        reference.delete(retry=None, timeout=20)
 
     def list_input_drafts(self, *, recorder_level: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
         # Drafts are operationally small. Filtering locally avoids requiring a composite index.
@@ -1440,11 +1647,39 @@ class JpdDidData:
             ]
             return display(calculate_kpis(source).team_kpi)
 
+        def calculated_draft(side: Side) -> dict[str, int | float] | None:
+            """Use the shared Draft for an in-progress side with no final RAW."""
+            try:
+                payload = self.get_input_draft(gm_id, side).get("payload")
+            except NotFoundError:
+                return None
+            if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+                return None
+            source = []
+            for index, item in enumerate(payload["records"]):
+                if not isinstance(item, dict):
+                    continue
+                record_half = str(item.get("half") or "H1")
+                if half != "all" and record_half != half:
+                    continue
+                source.append(KpiRecord(
+                    id=str(item.get("id") or f"draft-{index}"), half=record_half,
+                    seconds=int(item.get("halfSeconds") or 0), seq=int(item.get("seq") or index),
+                    act=str(item.get("act") or ""), res=str(item.get("res") or ""), area=int(item.get("area") or 1),
+                    player_id=str(item["playerId"]) if item.get("playerId") else None,
+                    shoot_pos_x=item.get("shootPosX"), shoot_pos_y=item.get("shootPosY"),
+                    shoot_dsp_range=item.get("shootDspRange"), is_shot=item.get("isShot"),
+                ))
+            return display(calculate_kpis(source).team_kpi)
+
         result: dict[Side, dict[str, int | float]] = {"H": display({}), "A": display({})}
         for side in ("H", "A"):
             try:
                 recording = self.get_recording(gm_id, side)
             except NotFoundError:
+                draft_kpis = calculated_draft(side)
+                if draft_kpis is not None:
+                    result[side] = draft_kpis
                 continue
             # Imported/finalized all-match KPI is already stored on the small
             # recording document. Avoid streaming thousands of raw rows until a
@@ -1478,13 +1713,15 @@ class JpdDidData:
     def build_input_bootstrap(self, gm_id: str, side: Side) -> dict[str, Any]:
         """Return the lobby-critical data in one response with parallel independent reads."""
         match = self.get_match(gm_id)
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="input-bootstrap") as executor:
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="input-bootstrap") as executor:
             squads_future = executor.submit(self.get_or_create_input_squads, gm_id, match)
             status_future = executor.submit(self.get_recording_input_states, gm_id)
             kpi_future = executor.submit(self.read_match_dashboard_kpis_bootstrap, gm_id)
+            setup_future = executor.submit(self.get_input_setup, gm_id)
             squads, cached = squads_future.result()
             input_status = status_future.result()
             dashboard_kpis = kpi_future.result()
+            input_setup = setup_future.result()
 
         selected_status = input_status[side]
         if selected_status["rawStatus"] == "final":
@@ -1515,6 +1752,16 @@ class JpdDidData:
                     "clientState": draft.get("clientState") or {},
                     "updatedAt": draft.get("updatedAt"),
                 } if draft.get("payload") else {"status": "missing", "gmId": gm_id, "side": side}
+        # Existing active Drafts predate the dedicated setup field. Copy their
+        # completed configuration once; later record/timer writes never touch it.
+        if input_setup[side] is None and isinstance(session.get("payload"), dict):
+            self.save_input_setup(
+                gm_id,
+                side,
+                payload=session["payload"],
+                client_state=session.get("clientState") if isinstance(session.get("clientState"), dict) else {},
+            )
+            input_setup = self.get_input_setup(gm_id)
         return {
             "gmId": gm_id,
             "homeTeamId": match.homeTeamId,
@@ -1528,20 +1775,35 @@ class JpdDidData:
                 "date": match.date, "kickoffTime": match.kickoffTime, "stadiumId": match.stadiumId,
                 "matchType": match.matchType, "homeTeamId": match.homeTeamId, "awayTeamId": match.awayTeamId,
             },
+            "inputSetup": input_setup,
             "session": session,
             "dashboardKpis": dashboard_kpis,
         }
 
     def restore_input_draft_from_raw(self, gm_id: str, side: Side, *, user_id: str) -> dict[str, Any]:
-        """Make a new editable Draft from an already-final RAW recording."""
+        """Make (or reuse) an editable Draft from an already-final RAW recording."""
+        try:
+            existing = self.get_input_draft(gm_id, side)
+            if existing.get("payload"):
+                return existing
+        except NotFoundError:
+            pass
         raw_state = self.read_input_state_from_raw(gm_id, side)
-        return self.save_input_draft(
+        draft = self.save_input_draft(
             gm_id,
             side,
             payload=raw_state["payload"],
             client_state=raw_state["clientState"],
             user_id=user_id,
         )
+        # Final RAW already owns formation, field side and lineup. Seed the
+        # temporary setup when the explicit edit action recreates its Draft.
+        self.save_input_setup(
+            gm_id, side,
+            payload=raw_state["payload"],
+            client_state=raw_state["clientState"],
+        )
+        return draft
 
     def replace_recording_raw(
         self,

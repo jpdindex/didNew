@@ -1,4 +1,4 @@
-from backend.api.api_match_input import MatchInputCommit, router
+from backend.api.api_match_input import DraftWriteRequest, InputPreviewRequest, MatchInputCommit, calculate_input_preview, router
 from backend.app import app
 from pydantic_core import PydanticUndefined
 
@@ -28,6 +28,32 @@ def test_input_commit_contract_accepts_raw_only_payload() -> None:
 
     assert payload.gmId == "sample-match"
     assert payload.records[0].area == 10
+
+
+def test_draft_write_contract_supports_backend_record_merge() -> None:
+    payload = {
+        "gmId": "sample-match", "side": "H", "inputMode": "분석", "fieldSide": "left",
+        "formationKey": "4-3-3", "homeScore": 0, "awayScore": 0, "status": "H1",
+        "halves": {"H1": {"seconds": 12}, "H2": {"seconds": 0}}, "lineup": [], "records": [], "cards": [],
+    }
+    request = DraftWriteRequest.model_validate({
+        "payload": payload, "clientState": {"seconds": 12}, "syncScope": "records", "deletedRecordIds": ["old-record"],
+    })
+
+    assert request.syncScope == "records"
+    assert request.deletedRecordIds == ["old-record"]
+
+
+def test_input_preview_returns_kpi_and_per_record_flags() -> None:
+    request = InputPreviewRequest.model_validate({
+        "half": "H1",
+        "records": [{"id": "r1", "half": "H1", "halfSeconds": 5, "seq": 0, "act": "P", "res": "O", "area": 5}],
+    })
+    result = calculate_input_preview(request)
+
+    assert result["status"] == "ok"
+    assert "TAP" in result["kpis"]
+    assert "r1" in result["flags"]
 
 
 def test_internal_bootstrap_route_requires_selected_side_and_is_hidden_from_openapi() -> None:

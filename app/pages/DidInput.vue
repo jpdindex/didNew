@@ -26,7 +26,7 @@ import {
 } from '~/utils/goalCoordinates'
 import { canPickForCard, groupCardsByPlayer, isSentOff, secondYellowCards, type CardRecord } from '~/utils/card'
 import type { HalfStatus, MatchSquadPlayer, SubRecord } from '~/composables/useMatchState'
-import { FORMATIONS, GK_SLOT } from '~/utils/formationLayout'
+import { FORMATIONS, GK_SLOT, assignmentsFromLineup } from '~/utils/formationLayout'
 
 const route = useRoute()
 const home = computed(() => String(route.query.home ?? route.query.homeName ?? 'Vallecano').trim() || 'Vallecano')
@@ -38,9 +38,10 @@ const inputMode = computed(() => (route.query.mode === '실시간' ? '실시간'
 // TeamSelection 으로 돌아가며, "수정"/"후반전 시작"으로 다시 들어올 때 이어서 불러온다.
 const game = useMatchState()
 const { request } = useBackendApi()
-const { saveLocal, save: saveDraft, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
-const { start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, removeRecord } = useMatchCollaboration()
+const { saveLocal, save: saveDraft, saveSetup, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
+const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, removeRecord, mergeRemoteRecords } = useMatchCollaboration()
 const isPrimary = computed(() => game.value.participantRole === 'primary')
+const requestedRole = route.query.role === 'assistant' ? 'assistant' : 'primary'
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
 // "수정"으로 들어온 경우(이미 끝난 half를 고치러 옴)와 실시간으로 기록 중인 경우를
 // 구분한다. 수정 화면은 시계가 멈춰 있고, 우상단 버튼도 "{half} 종료"가 아니라
@@ -49,6 +50,22 @@ const isEditMode = route.query.edit === '1'
 // 최종 RAW를 다시 열어 고치는 경우에는 대기방 복귀가 아니라, 즉시 RAW를 교체하는
 // "수정 완료" 흐름을 쓴다. 일반 전/후반 편집과 상태 전이를 섞지 않는다.
 const isFinalCorrection = route.query.finalCorrection === '1'
+
+type InputSetup = {
+  formationKey: string
+  fieldSide: 'left' | 'right' | null
+  lineup: Array<Record<string, unknown>>
+  inputMode: '분석' | '실시간'
+}
+
+function applyInputSetup(setup: InputSetup | null | undefined) {
+  if (!setup || !FORMATIONS[setup.formationKey]) return
+  game.value.formationKey = setup.formationKey
+  if (setup.fieldSide === 'left' || setup.fieldSide === 'right') game.value.side = setup.fieldSide
+  game.value.assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
+  game.value.inputMode = setup.inputMode
+}
+let appliedSetupRevision = -1
 // 수정 화면에서 "대기방으로 나가기"를 누르면 돌아갈 상태. 끝난 half 를 고치러 왔으면
 // 'H1_done'/'H2_done' 이 들어있어 후반전 시작 화면으로, 정지 중이던 half 를 고치러
 // 왔으면 'H1'/'H2' 가 들어있어 그 정지 화면으로 정확히 되돌아간다. 없으면(수정이 아닌
@@ -102,27 +119,35 @@ let timer: ReturnType<typeof setInterval> | undefined
 let applyingRemoteDraft = false
 let tickStartedAt = 0
 let tickBaseSeconds = 0
-function startTicking() {
+function startTicking(sharedStartedAt?: number) {
   if (timer) clearInterval(timer)
   // setInterval 호출 횟수 대신 실제 시각을 기준으로 계산한다.
   // 브라우저가 백그라운드 탭의 타이머를 지연시켜도 초가 10초 단위로 튀지 않는다.
-  tickStartedAt = Date.now()
-  tickBaseSeconds = seconds.value
-  game.value.clockStartedAt = tickStartedAt - tickBaseSeconds * 1000
+  const resumedAt = sharedStartedAt ?? game.value.clockStartedAt
+  tickStartedAt = resumedAt ?? Date.now()
+  tickBaseSeconds = resumedAt ? 0 : seconds.value
+  if (resumedAt) seconds.value = Math.max(seconds.value, Math.floor((Date.now() - resumedAt) / 1000))
+  game.value.clockStartedAt = sharedStartedAt ?? (tickStartedAt - tickBaseSeconds * 1000)
+  game.value.seconds = seconds.value
   timer = setInterval(() => {
-    const elapsed = Math.floor((Date.now() - tickStartedAt) / 1000)
+      const elapsed = Math.floor((Date.now() - tickStartedAt) / 1000)
     seconds.value = tickBaseSeconds + elapsed
     game.value.seconds = seconds.value
   }, 250)
 }
 onMounted(async () => {
   const matchId = String(route.query.matchId ?? '')
+  // A direct URL entry or browser refresh creates the shared state with its
+  // default "home" team. The route is the session identity, so apply it
+  // before selecting the Draft/IndexedDB key.
+  const requestedTeam = route.query.team === 'away' ? 'away' : 'home'
 
   // 이미 TeamSelection에서 만들어 둔 진행 중 상태가 있으면 절대 Draft로 덮어쓰지 않는다.
   // 새로고침/직접 URL 진입처럼 메모리 상태가 실제로 비어 있을 때만 복구를 시도한다.
   const hasActiveClientState = Boolean(
     matchId &&
     game.value.matchId === matchId &&
+    game.value.team === requestedTeam &&
     (
       Object.keys(game.value.assigned).length ||
       game.value.squads.home.length ||
@@ -131,28 +156,58 @@ onMounted(async () => {
     )
   )
 
+  // The URL identity must win over useState's initial defaults on every
+  // entry. In particular, an assistant refresh must never become primary
+  // before the server confirms its existing participant role.
+  game.value.team = requestedTeam
+  if (matchId) game.value.matchId = matchId
+  game.value.participantRole = requestedRole
+
+  if (matchId) {
+    try {
+      await joinCollaboration(game.value, requestedRole)
+    } catch {
+      // TeamSelection already prevents a new primary from entering an owned
+      // session. Keep the URL role as a read-only fallback while offline.
+    }
+  }
+
+  let recoveredDraft = false
   if (matchId && !hasActiveClientState) {
-    if (!game.value.matchId) game.value.matchId = matchId
-    if (!game.value.team) game.value.team = route.query.team === 'away' ? 'away' : 'home'
     game.value.inputMode = inputMode.value
-    await recoverDraft(game.value).catch(() => false)
+    recoveredDraft = await recoverDraft(game.value).catch(() => false)
     // records is a screen-local ref for rendering/editing. A direct URL entry
     // restores game.records asynchronously, so mirror it after recovery.
     records.value = [...game.value.records]
   }
 
-  if (matchId && !game.value.squads.home.length && !game.value.squads.away.length) {
+  if (matchId) {
     try {
-      const payload = await request<{ H: MatchSquadPlayer[]; A: MatchSquadPlayer[] }>(
+      const payload = await request<{
+        H: MatchSquadPlayer[]
+        A: MatchSquadPlayer[]
+        inputSetup: { H: InputSetup | null; A: InputSetup | null }
+      }>(
         `/api/v1/match-input/matches/${encodeURIComponent(matchId)}/squads`
       )
-      game.value.squads = { home: payload.H, away: payload.A }
+      if (!game.value.squads.home.length || !game.value.squads.away.length) game.value.squads = { home: payload.H, away: payload.A }
+      const setups = payload.inputSetup ?? { H: null, A: null }
+      applyInputSetup(requestedTeam === 'away' ? setups.A : setups.H)
     } catch {
       // 개발·오프라인 입력은 기존 임시 명단으로도 화면을 열 수 있다.
     }
   }
+  // A running clock is never restored from an old seconds snapshot. Rejoin it
+  // from the durable start timestamp; only a paused clock uses saved seconds.
+  if (!isEditMode && game.value.clockStartedAt) {
+    seconds.value = Math.max(game.value.seconds, Math.floor((Date.now() - game.value.clockStartedAt) / 1000))
+  } else {
+    seconds.value = game.value.seconds
+  }
   game.value.seconds = seconds.value
-  void syncState(game.value).catch(() => false)
+  // A new primary session needs its first shared-state write. A recovered
+  // session must not immediately overwrite its own server clock with a stale UI ref.
+  if (!recoveredDraft) void syncState(game.value).catch(() => false)
 
   const restoredRecords = [...records.value]
   await startCollaboration(game.value, {
@@ -160,21 +215,48 @@ onMounted(async () => {
       applyingRemoteDraft = true
       // Records are deliberately excluded from sharedState and arrive through
       // their own subcollection, so an ACT correction never replaces the list.
+      const previousClockStartedAt = game.value.clockStartedAt
       Object.assign(game.value, state)
       homeScore.value = game.value.homeScore
       awayScore.value = game.value.awayScore
+      if (!isEditMode && !isPrimary.value) {
+        if (state.clockStartedAt) {
+          paused.value = false
+          if (!timer || previousClockStartedAt !== state.clockStartedAt) startTicking(Number(state.clockStartedAt))
+        } else {
+          paused.value = true
+          if (timer) clearInterval(timer)
+          timer = undefined
+        }
+        if (state.halfStatus === 'H1_done' || state.halfStatus === 'H2_done' || state.halfStatus === 'final') {
+          if (timer) clearInterval(timer)
+          timer = undefined
+          paused.value = true
+          // The primary has ended this half/session. Assistants must not keep
+          // entering records against a closed shared Draft.
+          void goTeamSelection()
+        }
+      }
       // 공유 상태의 스코어가 늦게 도착해도 입력 팀 점수는 레코드 기준을 유지한다.
       if (records.value.length) syncOwnScore()
       nextTick(() => { applyingRemoteDraft = false })
     },
     applyRecords: (remoteRecords) => {
-      // RAW restoration reaches payload.records first. An empty live records
-      // snapshot is only the unseeded Draft, never an instruction to erase it.
-      if (!remoteRecords.length && records.value.length) return
-      if (draftSavePending) return
+      // Polling is eventually consistent. Preserve this device's pending
+      // record IDs and merge the rest from the server, rather than replacing
+      // the list with an older snapshot while someone is entering quickly.
+      const mergedRecords = mergeRemoteRecords(remoteRecords, records.value)
+      if (mergedRecords.length === records.value.length && mergedRecords.every((record, index) => record === records.value[index])) return
       applyingRemoteDraft = true
-      records.value = remoteRecords
-      game.value.records = remoteRecords
+      records.value = mergedRecords
+      game.value.records = mergedRecords
+      nextTick(() => { applyingRemoteDraft = false })
+    },
+    applySetup: (setup) => {
+      if (setup.revision <= appliedSetupRevision) return
+      appliedSetupRevision = setup.revision
+      applyingRemoteDraft = true
+      applyInputSetup(setup)
       nextTick(() => { applyingRemoteDraft = false })
     },
   }).catch(() => false)
@@ -187,11 +269,16 @@ onMounted(async () => {
     seconds.value = Math.max(seconds.value, Math.floor((Date.now() - game.value.clockStartedAt) / 1000))
   }
 
-  // clockStartedAt이 있으면 진행 중, 없으면 기존 일시정지 상태를 유지한다.
-  // 완전히 새로 시작한 0초 세션만 여기서 시계를 시작한다.
+  // A clock may only be created by a brand-new primary session. Re-entry and
+  // assistant screens must wait for the durable server timestamp instead of
+  // silently creating a fresh 00:00 timer from an incomplete old Draft.
   if (!isEditMode) {
     const isFreshStart = seconds.value === 0 && !game.value.clockStartedAt
-    if (game.value.clockStartedAt || isFreshStart) startTicking()
+    if (game.value.clockStartedAt) startTicking()
+    else if (!recoveredDraft && isPrimary.value && isFreshStart && (game.value.halfStatus === 'H1' || game.value.halfStatus === 'H2')) {
+      startTicking()
+      void syncState(game.value).catch(() => false)
+    }
     else paused.value = true
   }
 
@@ -210,6 +297,7 @@ onUnmounted(() => {
 
 function togglePause() {
   if (!isPrimary.value) return
+  if (isEditMode) return
   if (inputMode.value === '실시간') return // 실시간 모드는 정지 불가
   paused.value = !paused.value
   if (paused.value) {
@@ -239,7 +327,7 @@ function closeConfirm(ok: boolean) {
 // 돌아갈 상태는 editReturnStatus 가 있으면 그걸 그대로 쓰고(수정 화면 — 원래 있던
 // 화면으로 정확히 복귀), 없으면 진행중인 half 를 정지시키는 것뿐이므로 'H1'/'H2'.
 async function exitToLobby() {
-  const clockMessage = paused.value
+  const clockMessage = isEditMode || paused.value
     ? `${clock.value}에 일시정지된 상태로 대기방으로 나갑니다.`
     : '대기방으로 나가도 경기 시간은 계속 흐릅니다.'
   if (!await askConfirm('대기방으로 나가시겠습니까?', clockMessage, '나가기')) return
@@ -250,7 +338,7 @@ async function exitToLobby() {
   // 대기방 이동 자체는 half 종료가 아니다.
   // 진행 중이면 clockStartedAt을 그대로 둬 대기방에서도 시간이 흐르게 하고,
   // 사용자가 먼저 일시정지한 경우에만 null로 유지해 정지 상태를 보존한다.
-  if (paused.value) game.value.clockStartedAt = null
+  if (isEditMode || paused.value) game.value.clockStartedAt = null
   game.value.halfStatus = editReturnStatus ?? (half.value === '전반' ? 'H1' : 'H2')
 
   // 저장 성공 여부가 화면 이동을 막으면 안 된다. 로컬/서버 Draft 저장은 비동기로 시도한다.
@@ -265,23 +353,17 @@ async function exitToLobby() {
 const records = ref<DidRecord[]>(resumeHalf ? [...game.value.records] : [])
 let draftSaveTimer: ReturnType<typeof setTimeout> | undefined
 
-// 로컬 변경이 아직 서버로 저장되기 전(0.5초 대기 중)인지. 이 사이에 서버 스냅샷이 오면
-// (예: 직전 저장의 서버 확정 — updatedAt 이 채워지며 스냅샷이 다시 온다) 옛 값으로
-// 방금 입력을 덮어쓰게 되므로(H 누르고 곧바로 HX → HX 가 O 로 되돌아감), 그동안은 받지 않는다.
-// 대기 중인 저장이 끝나면 그 결과가 다시 스냅샷으로 들어온다.
-let draftSavePending = false
-
 function queueDraftSave() {
   if (applyingRemoteDraft) return
+  // Offline/reload protection is immediate. Only the network write is debounced.
+  saveToStore()
+  void saveLocal(game.value).catch(() => false)
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
-  draftSavePending = true
   draftSaveTimer = setTimeout(() => {
-    draftSavePending = false
-    saveToStore()
-    void saveLocal(game.value).catch(() => false)
-    // Live work uses direct Firestore writes inside the existing Draft. REST is
-    // reserved for H1/H2 confirmation and final RAW validation.
-    void Promise.all([syncState(game.value), syncRecords(game.value, records.value)]).catch(() => false)
+    // The collaboration composable serializes state and record writes, while
+    // its optimistic record merge keeps this screen stable during the round trip.
+    void Promise.all([syncState(game.value), syncRecords(game.value, records.value)])
+      .catch(() => false)
   }, 500)
 }
 
@@ -1208,6 +1290,13 @@ function insertSubSorted(list: SubRecord[], sub: SubRecord): SubRecord[] {
   return next
 }
 
+function persistSubstitutionSetup() {
+  // Assistants contribute event records, while the primary remains owner of
+  // the shared lineup configuration. Their screen receives the new snapshot
+  // through the collaboration poll immediately after this write.
+  if (isPrimary.value) void saveSetup(game.value).catch(() => false)
+}
+
 function submitSub() {
   const outSlot = subOutSlot.value
   const inSlot = subInSlot.value
@@ -1254,6 +1343,9 @@ function submitSub() {
   subInSlot.value = null
   subAddedInPanel.value = true
   syncSubTimeToClock() // 다음 교체는 다시 현재 시계부터
+  // 교체만 durable lineup snapshot을 바꾼다. 기록/시계 자동 저장은
+  // 이 경로를 타지 않으므로 대기방 구성이 흔들리지 않는다.
+  persistSubstitutionSetup()
 }
 
 // 카드 입력창과 같은 흐름: "목록추가"(submitSub)는 교체를 넣고 패널을 열어 둔 채 다음 교체를 받고,
@@ -1274,6 +1366,7 @@ function undoSub(index: number) {
   revertSubsFrom(game.value.subs, index)
   game.value.subs = game.value.subs.filter((_, i) => i !== index)
   applySubsFrom(game.value.subs, index)
+  persistSubstitutionSetup()
 }
 
 /** 수정 중인 교체를 지운다 — editSub 에서 이미 그 교체 직전 배치로 되돌려 뒀으므로, 빼고 뒤 교체만 다시 적용한다. */
@@ -1286,6 +1379,7 @@ function deleteEditingSub() {
   subOutSlot.value = null
   subInSlot.value = null
   syncSubTimeToClock()
+  persistSubstitutionSetup()
 }
 
 /**
@@ -1938,7 +2032,7 @@ async function finishHalf() {
             </div>
             <button class="swapIcon" :class="{ on: subOpen }" title="선수 교체" @click="openSubPanel">🔄</button>
             <div class="clockCtrl">
-              <button v-if="inputMode === '분석'" class="pauseBtn" :disabled="!isPrimary" :class="{ paused }"
+              <button v-if="inputMode === '분석'" class="pauseBtn" :disabled="!isPrimary || isEditMode" :class="{ paused }"
                 @click="togglePause">{{ paused ? '▶' : '❚❚' }}</button>
               <button class="liveTimeBtn" :class="{ on: liveDraftTime }" title="가안 행 시간을 경기 시계에 맞춰 흐르게 한다"
                 @click="liveDraftTime = !liveDraftTime">흐르는 초</button>
