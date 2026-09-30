@@ -35,7 +35,9 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
     assert set(schema["paths"]) == {
         "/health",
         "/api/v1/match-kpis/build",
+        "/api/v1/match-kpis/status",
         "/api/v1/match-ratings/build",
+        "/api/v1/match-ratings/status",
         "/api/v1/match-ratings/read",
         "/api/v1/legacy-import",
         "/api/v1/legacy-import/status",
@@ -57,6 +59,12 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
     kpi_schema = kpi_operation["requestBody"]["content"]["application/x-www-form-urlencoded"]["schema"]
     kpi_properties = schema["components"]["schemas"][kpi_schema["$ref"].split("/")[-1]]["properties"]
     assert kpi_properties["force"]["default"] is False
+    assert {"round_from", "round_to"} <= set(kpi_properties)
+    assert "round" not in kpi_properties
+    assert "/api/v1/match-kpis/status" in schema["paths"]
+    assert "/api/v1/match-ratings/status" in schema["paths"]
+    assert {"round_from", "round_to"} <= set(rating_properties)
+    assert "round" not in rating_properties
     import_operation = schema["paths"]["/api/v1/legacy-import"]["post"]
     assert import_operation["security"] == [{"SwaggerKey": []}]
     assert "multipart/form-data" in import_operation["requestBody"]["content"]

@@ -309,7 +309,8 @@ class JpdDidData:
         *,
         league_id: str | None = None,
         season_id: str | None = None,
-        round_number: int | None = None,
+        round_from: int | None = None,
+        round_to: int | None = None,
         team_id: str | None = None,
         gm_id: str | None = None,
         limit: int = 2000,
@@ -325,7 +326,8 @@ class JpdDidData:
             item for item in matches
             if (league_id is None or item[1].leagueId == league_id)
             and (season_id is None or item[1].seasonId == season_id)
-            and (round_number is None or item[1].round == round_number)
+            and (round_from is None or item[1].round >= round_from)
+            and (round_to is None or item[1].round <= round_to)
             and (team_id is None or team_id in {item[1].homeTeamId, item[1].awayTeamId})
         ]
 
