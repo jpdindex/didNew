@@ -400,6 +400,9 @@ export interface PlayerDoc extends AuditFields {
   height?: number
   foot?: 'L' | 'R' | 'B'
   nation?: string
+  /** 선수 관리의 이름·성·생년월일 검색용 파생 색인 */
+  searchTerms?: string[]
+  birthKey?: string
   /** 은퇴/삭제 대신 비활성 — 과거 기록을 고아로 만들지 않는다 */
   active: boolean
   /** 파생 캐시. 계약 원장에서 갱신된다 */

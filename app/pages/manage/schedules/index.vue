@@ -8,7 +8,7 @@
 
 import { collection, deleteDoc, deleteField, doc, getDoc, getDocs, orderBy, query, setDoc, Timestamp, writeBatch, type Firestore } from 'firebase/firestore'
 import * as XLSX from 'xlsx'
-import type { MatchDoc, StadiumDoc, TeamDoc } from '~/types/schema'
+import type { MatchDoc, StadiumDoc, TeamDoc, TeamSeasonEntry } from '~/types/schema'
 
 const { $db } = useNuxtApp()
 const db = $db as Firestore
@@ -40,7 +40,7 @@ onMounted(async () => {
     teams.value = teamsSnap.docs.map(d => ({ id: d.id, ...(d.data() as TeamDoc) }))
     stadiums.value = stadiumsSnap.docs.map(d => {
       const s = d.data() as StadiumDoc
-      return { id: d.id, label: s.nameKr || s.name }
+      return { id: d.id, label: s.name || s.nameKr || d.id }
     })
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : String(e)
@@ -53,12 +53,12 @@ function teamLabel(id: string) {
   const t = teams.value.find(t => t.id === id)
   return t ? (t.nameKr || t.name) : id
 }
-function stadiumLabel(id: string) {
-  const s = stadiums.value.find(s => s.id === id)
-  return s ? `${id} (${s.label})` : id
+function stadiumName(id: string) {
+  return stadiums.value.find(stadium => stadium.id === id)?.label ?? ''
 }
 function teamStadiumId(teamId: string) {
-  return teams.value.find(t => t.id === teamId)?.stadiumId
+  const stadiumId = teams.value.find(t => t.id === teamId)?.stadiumId
+  return stadiumId?.startsWith('UK_') ? stadiumId : undefined
 }
 function leagueLabel(id: string) {
   return LEAGUES.find(l => l.id === id)?.label ?? id
@@ -69,6 +69,76 @@ function roundLabel(m: MatchRow) {
   }
   return m.round !== undefined ? `R${m.round}` : '-'
 }
+
+function formatMatchDateInput(value: string): string {
+  const digits = value.replace(/\D/g, '').slice(0, 8)
+  if (digits.length < 4) return digits
+  if (digits.length === 4) return `${digits}.`
+  if (digits.length < 6) return `${digits.slice(0, 4)}.${digits.slice(4)}`
+  if (digits.length === 6) return `${digits.slice(0, 4)}.${digits.slice(4)}.`
+  return `${digits.slice(0, 4)}.${digits.slice(4, 6)}.${digits.slice(6)}`
+}
+
+function isCompleteMatchDate(value: string): boolean {
+  return /^\d{4}\.\d{2}\.\d{2}$/.test(value)
+}
+
+function matchDateForStorage(value: string): string {
+  return value.replaceAll('.', '-')
+}
+
+function applyFormattedDate(event: Event, setValue: (value: string) => void) {
+  const input = event.target as HTMLInputElement
+  const formatted = formatMatchDateInput(input.value)
+  input.value = formatted
+  setValue(formatted)
+}
+
+function handleDateSeparatorBackspace(event: KeyboardEvent, setValue: (value: string) => void) {
+  const input = event.target as HTMLInputElement
+  if (event.key !== 'Backspace' || input.selectionStart !== input.value.length || input.selectionEnd !== input.value.length || !input.value.endsWith('.')) return
+  event.preventDefault()
+  const value = input.value.slice(0, -1)
+  input.value = value
+  setValue(value)
+}
+
+function inputBulkDate(event: Event, row: BulkRow) { applyFormattedDate(event, value => { row.date = value }) }
+function keydownBulkDate(event: KeyboardEvent, row: BulkRow) { handleDateSeparatorBackspace(event, value => { row.date = value }) }
+function inputEditDate(event: Event) { applyFormattedDate(event, value => { editForm.value.date = value }) }
+function keydownEditDate(event: KeyboardEvent) { handleDateSeparatorBackspace(event, value => { editForm.value.date = value }) }
+
+function formatKickoffInput(value: string): string {
+  const digits = value.replace(/\D/g, '').slice(0, 4)
+  if (digits.length < 2) return digits
+  if (digits.length === 2) return `${digits}:`
+  return `${digits.slice(0, 2)}:${digits.slice(2)}`
+}
+
+function isValidKickoff(value: string): boolean {
+  return !value || /^([01]\d|2[0-3]):[0-5]\d$/.test(value)
+}
+
+function applyFormattedKickoff(event: Event, setValue: (value: string) => void) {
+  const input = event.target as HTMLInputElement
+  const formatted = formatKickoffInput(input.value)
+  input.value = formatted
+  setValue(formatted)
+}
+
+function handleKickoffSeparatorBackspace(event: KeyboardEvent, setValue: (value: string) => void) {
+  const input = event.target as HTMLInputElement
+  if (event.key !== 'Backspace' || input.selectionStart !== input.value.length || input.selectionEnd !== input.value.length || !input.value.endsWith(':')) return
+  event.preventDefault()
+  const value = input.value.slice(0, -1)
+  input.value = value
+  setValue(value)
+}
+
+function inputBulkKickoff(event: Event, row: BulkRow) { applyFormattedKickoff(event, value => { row.kickoffTime = value }) }
+function keydownBulkKickoff(event: KeyboardEvent, row: BulkRow) { handleKickoffSeparatorBackspace(event, value => { row.kickoffTime = value }) }
+function inputEditKickoff(event: Event) { applyFormattedKickoff(event, value => { editForm.value.kickoffTime = value }) }
+function keydownEditKickoff(event: KeyboardEvent) { handleKickoffSeparatorBackspace(event, value => { editForm.value.kickoffTime = value }) }
 
 const deletingId = ref<string | null>(null)
 async function deleteMatch(m: MatchRow) {
@@ -95,14 +165,15 @@ function openEditMatch(m: MatchRow) {
   editingMatchId.value = m.id
   formError.value = ''
   editForm.value = {
-    date: m.date, kickoffTime: m.kickoffTime ?? '', round: m.round !== undefined ? String(m.round) : '',
+    date: formatMatchDateInput(m.date), kickoffTime: m.kickoffTime ?? '', round: m.round !== undefined ? String(m.round) : '',
     stadiumId: m.stadiumId, homeTeamId: m.homeTeamId, awayTeamId: m.awayTeamId,
   }
 }
 function cancelEditMatch() { editingMatchId.value = null }
 
 async function applyEditMatch(m: MatchRow) {
-  if (!editForm.value.date) { formError.value = '날짜를 입력하세요.'; return }
+  if (!isCompleteMatchDate(editForm.value.date)) { formError.value = '날짜를 YYYY.MM.DD 형식으로 입력하세요.'; return }
+  if (!isValidKickoff(editForm.value.kickoffTime)) { formError.value = '킥오프를 HH:MM 형식으로 입력하세요.'; return }
   if (!editForm.value.stadiumId) { formError.value = '경기장을 선택하세요.'; return }
   if (!editForm.value.homeTeamId || !editForm.value.awayTeamId) { formError.value = '홈/원정 팀을 선택하세요.'; return }
   if (editForm.value.homeTeamId === editForm.value.awayTeamId) { formError.value = '홈팀과 원정팀이 같을 수 없습니다.'; return }
@@ -110,13 +181,14 @@ async function applyEditMatch(m: MatchRow) {
   savingEdit.value = true
   formError.value = ''
   try {
+    const storedDate = matchDateForStorage(editForm.value.date)
     const roundNum = editForm.value.round ? Number(editForm.value.round) : undefined
     const kickoff = editForm.value.kickoffTime || undefined
     // 옵셔널 필드를 지우는 경우(빈칸으로 비움)는 merge 로 표현이 안 되므로(머지는 없는 키를
     // 그냥 건드리지 않을 뿐 지우지 않는다) deleteField() 로 명시적으로 지운다.
     // score는 여기서 다루지 않는다(경기 결과 입력은 이 화면 책임이 아니다).
     await setDoc(doc(db, 'matches', m.id), {
-      date: editForm.value.date,
+      date: storedDate,
       stadiumId: editForm.value.stadiumId,
       homeTeamId: editForm.value.homeTeamId,
       awayTeamId: editForm.value.awayTeamId,
@@ -125,7 +197,7 @@ async function applyEditMatch(m: MatchRow) {
       round: roundNum ?? deleteField(),
     }, { merge: true })
     Object.assign(m, {
-      date: editForm.value.date, stadiumId: editForm.value.stadiumId,
+      date: storedDate, stadiumId: editForm.value.stadiumId,
       homeTeamId: editForm.value.homeTeamId, awayTeamId: editForm.value.awayTeamId,
       kickoffTime: kickoff, round: roundNum,
     })
@@ -153,24 +225,48 @@ watch(seasonsInLeague, list => {
 
 const filteredMatches = computed(() => matches.value
   .filter(m => m.leagueId === selectedLeague.value && m.seasonId === selectedSeason.value)
-  // 최신 라운드가 맨 위로 — 경기 추가할 때 항상 "다음 라운드" 번호를 넣으니, 라운드
-  // 내림차순이 곧 최신순이다(날짜는 일정이 밀리거나 당겨질 수 있어 기준으로 못 쓴다).
-  // 라운드가 없는 토너먼트 경기는 날짜로만 정렬한다.
-  .sort((a, b) => {
-    const ra = a.round ?? -1
-    const rb = b.round ?? -1
-    if (ra !== rb) return rb - ra
-    return (b.date + (b.kickoffTime ?? '')).localeCompare(a.date + (a.kickoffTime ?? ''))
-  }))
-const leagueTeams = computed(() => teams.value.filter(t => t.currentLeagueId === selectedLeague.value))
+  // 경기 일정은 문서 ID인 gm_id의 오름차순으로 고정한다.
+  .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true })))
 
-// 킥오프는 30분 단위(00/30)로만 잡는다 — 자유 입력 대신 목록에서 고르게 해서 오전/오후
-// 표기가 있는 브라우저 기본 time input의 불편함도 같이 없앤다.
-const TIME_SLOTS = Array.from({ length: 48 }, (_, i) => {
-  const h = String(Math.floor(i / 2)).padStart(2, '0')
-  const m = i % 2 === 0 ? '00' : '30'
-  return `${h}:${m}`
-})
+const seasonFirstDivisionTeamIds = ref<Set<string>>(new Set())
+let seasonTeamsRequestId = 0
+
+async function loadSeasonFirstDivisionTeams() {
+  const requestId = ++seasonTeamsRequestId
+  if (!selectedSeason.value || !teams.value.length) {
+    seasonFirstDivisionTeamIds.value = new Set()
+    return
+  }
+  const seasonId = seasonLabel(selectedSeason.value)
+  try {
+    const results = await Promise.all(teams.value.map(async team => {
+      const snap = await getDoc(doc(db, 'teams', team.id, 'seasons', seasonId))
+      if (!snap.exists()) return null
+      const entry = snap.data() as TeamSeasonEntry
+      return entry.leagueId === selectedLeague.value && entry.division === 'D1' ? team.id : null
+    }))
+    if (requestId === seasonTeamsRequestId) {
+      seasonFirstDivisionTeamIds.value = new Set(results.filter((id): id is string => Boolean(id)))
+    }
+  } catch (e) {
+    if (requestId === seasonTeamsRequestId) {
+      seasonFirstDivisionTeamIds.value = new Set()
+      loadError.value = e instanceof Error ? e.message : String(e)
+    }
+  }
+}
+
+watch([selectedLeague, selectedSeason, () => teams.value.length], loadSeasonFirstDivisionTeams, { immediate: true })
+
+const leagueTeams = computed(() => teams.value
+  .filter(t => seasonFirstDivisionTeamIds.value.has(t.id))
+  .sort((a, b) => (a.nameKr || a.name).localeCompare(b.nameKr || b.name, 'ko')))
+const allTeamOptions = computed(() => [...teams.value]
+  .sort((a, b) => (a.nameKr || a.name).localeCompare(b.nameKr || b.name, 'ko'))
+  .map(team => ({ id: team.id, label: team.nameKr || team.name })))
+const ukStadiums = computed(() => stadiums.value
+  .filter(stadium => stadium.id.startsWith('UK_'))
+  .sort((a, b) => a.label.localeCompare(b.label, 'en')))
 
 // 대부분 홈팀 구장에서 열리니 홈팀을 고르면 경기장을 자동으로 맞춰준다 — 중립 경기장 등
 // 다른 경우는 그 다음에 경기장 드롭다운에서 직접 바꾸면 된다. watch가 아니라 select의
@@ -293,11 +389,11 @@ function openExcelPicker() { excelInputEl.value?.click() }
 function formatExcelDate(v: unknown): string {
   if (v instanceof Date) {
     const y = v.getFullYear(), m = String(v.getMonth() + 1).padStart(2, '0'), d = String(v.getDate()).padStart(2, '0')
-    return `${y}-${m}-${d}`
+    return `${y}.${m}.${d}`
   }
   const s = String(v ?? '').trim()
   const m = /^(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})/.exec(s)
-  return m ? `${m[1]}-${m[2]!.padStart(2, '0')}-${m[3]!.padStart(2, '0')}` : s
+  return m ? `${m[1]}.${m[2]!.padStart(2, '0')}.${m[3]!.padStart(2, '0')}` : formatMatchDateInput(s)
 }
 function formatExcelTime(v: unknown): string {
   if (v instanceof Date) {
@@ -380,25 +476,36 @@ function gmIdFor(row: BulkRow): string {
   return row.manualGmId.trim()
 }
 
+function isBulkRowStarted(row: BulkRow): boolean {
+  return Boolean(
+    row.date.trim() || row.kickoffTime.trim() || row.round.trim() ||
+    row.stadiumId.trim() || row.homeTeamId.trim() || row.awayTeamId.trim() ||
+    (!leagueConstant.value && row.manualGmId.trim()),
+  )
+}
+
+const activeBulkRows = computed(() => bulkRows.value.filter(isBulkRowStarted))
+
 async function submitAdd() {
   formError.value = ''
-  const rows = bulkRows.value
-  if (!rows.length) { formError.value = '추가할 경기가 없습니다 — 전부 닫혀 있어요.'; return }
+  for (const row of bulkRows.value) row.error = ''
+  const rows = activeBulkRows.value
+  if (!rows.length) { formError.value = '입력된 경기가 없습니다.'; return }
 
   const gmIds: string[] = []
   let anyError = false
   for (const row of rows) {
-    row.error = ''
     const gmId = gmIdFor(row)
     const fmtErr = validateGmIdFormat(gmId)
     if (fmtErr) row.error = fmtErr
-    else if (!row.date) row.error = '날짜를 입력하세요.'
+    else if (!isCompleteMatchDate(row.date)) row.error = '날짜를 YYYY.MM.DD 형식으로 입력하세요.'
+    else if (!isValidKickoff(row.kickoffTime)) row.error = '킥오프를 HH:MM 형식으로 입력하세요.'
     else if (!row.stadiumId) row.error = '경기장을 선택하세요.'
     else if (!row.homeTeamId || !row.awayTeamId) row.error = '홈/원정 팀을 선택하세요.'
-    else if (!leagueTeams.value.some(t => t.id === row.homeTeamId)) row.error = `홈팀 코드를 찾을 수 없습니다(이 리그 소속 아님): "${row.homeTeamId}"`
-    else if (!leagueTeams.value.some(t => t.id === row.awayTeamId)) row.error = `원정팀 코드를 찾을 수 없습니다(이 리그 소속 아님): "${row.awayTeamId}"`
+    else if (!teams.value.some(t => t.id === row.homeTeamId)) row.error = `등록된 홈팀 코드를 찾을 수 없습니다: "${row.homeTeamId}"`
+    else if (!teams.value.some(t => t.id === row.awayTeamId)) row.error = `등록된 원정팀 코드를 찾을 수 없습니다: "${row.awayTeamId}"`
     else if (row.homeTeamId === row.awayTeamId) row.error = '홈팀과 원정팀이 같을 수 없습니다.'
-    else if (!stadiums.value.some(s => s.id === row.stadiumId)) row.error = `경기장 코드를 찾을 수 없습니다: "${row.stadiumId}"`
+    else if (!ukStadiums.value.some(s => s.id === row.stadiumId)) row.error = `UK_ 경기장 코드를 찾을 수 없습니다: "${row.stadiumId}"`
     else if (gmIds.includes(gmId)) row.error = `이 배치 안에서 gm_id가 중복됩니다: "${gmId}"`
     if (row.error) anyError = true
     gmIds.push(gmId)
@@ -418,7 +525,7 @@ async function submitAdd() {
     rows.forEach((row, i) => {
       const gmId = gmIds[i]!
       const data: MatchDoc = {
-        date: row.date,
+        date: matchDateForStorage(row.date),
         leagueId: selectedLeague.value,
         seasonId: /^\d{8}/.test(gmId) ? gmId.slice(0, 8) : selectedSeason.value,
         matchType: 'league',
@@ -489,14 +596,11 @@ async function submitAdd() {
             </div>
 
             <div class="bulkField fillableField">
-              <input v-model="row.date" type="date">
+              <input :value="row.date" inputmode="numeric" maxlength="10" placeholder="YYYY.MM.DD" @input="inputBulkDate($event, row)" @keydown="keydownBulkDate($event, row)">
               <button type="button" class="fillDownBtn" title="다음 칸에 같은 날짜 복사" @click="fillNextRow(row.key, 'date')">↓</button>
             </div>
             <div class="bulkField fillableField">
-              <select v-model="row.kickoffTime">
-                <option value="">-</option>
-                <option v-for="t in TIME_SLOTS" :key="t" :value="t">{{ t }}</option>
-              </select>
+              <input :value="row.kickoffTime" inputmode="numeric" maxlength="5" placeholder="HH:MM" @input="inputBulkKickoff($event, row)" @keydown="keydownBulkKickoff($event, row)">
               <button type="button" class="fillDownBtn" title="다음 칸에 같은 킥오프 복사" @click="fillNextRow(row.key, 'kickoffTime')">↓</button>
             </div>
             <div class="bulkField fillableField">
@@ -504,15 +608,15 @@ async function submitAdd() {
               <button type="button" class="fillDownBtn" title="다음 칸에 같은 라운드 복사" @click="fillNextRow(row.key, 'round')">↓</button>
             </div>
             <div class="bulkField bulkFieldLg teamField">
-              <TeamCombo v-model="row.homeTeamId" :options="leagueTeams.map(t => ({ id: t.id, label: t.nameKr || t.name }))" @select="onBulkHomeTeamChange(row)" />
+              <TeamCombo v-model="row.homeTeamId" :options="leagueTeams.map(t => ({ id: t.id, label: t.nameKr || t.name }))" :search-options="allTeamOptions" @select="onBulkHomeTeamChange(row)" />
             </div>
             <div class="bulkField bulkFieldLg teamField">
-              <TeamCombo v-model="row.awayTeamId" :options="leagueTeams.map(t => ({ id: t.id, label: t.nameKr || t.name }))" />
+              <TeamCombo v-model="row.awayTeamId" :options="leagueTeams.map(t => ({ id: t.id, label: t.nameKr || t.name }))" :search-options="allTeamOptions" />
             </div>
             <div class="bulkField bulkFieldLg">
               <select v-model="row.stadiumId">
                 <option value="" disabled>선택</option>
-                <option v-for="s in stadiums" :key="s.id" :value="s.id">{{ s.label }}</option>
+                <option v-for="s in ukStadiums" :key="s.id" :value="s.id">{{ s.label }}</option>
               </select>
             </div>
 
@@ -524,7 +628,7 @@ async function submitAdd() {
 
         <p v-if="formError" class="formErrorMsg">{{ formError }}</p>
         <div class="addActionsRow">
-          <button :disabled="saving" class="applyBtn" @click="submitAdd">{{ bulkRows.length }}개 저장</button>
+          <button :disabled="saving" class="applyBtn" @click="submitAdd">{{ activeBulkRows.length || 0 }}개 저장</button>
           <button @click="cancelAdd">취소</button>
         </div>
       </div>
@@ -547,27 +651,24 @@ async function submitAdd() {
 
       <div class="matchTable">
         <div class="matchHead">
-          <span>gm_id</span><span>날짜</span><span>라운드</span><span>대진</span><span>경기장</span><span>스코어</span><span></span>
+          <span>gm_id</span><span>날짜/시간</span><span>라운드</span><span>대진</span><span>경기장</span><span>스코어</span><span></span>
         </div>
         <div v-if="!loading && !filteredMatches.length" class="matchEmpty">등록된 경기가 없습니다.</div>
         <div v-for="m in filteredMatches" :key="m.id" class="matchRow" :class="{ editingRow: editingMatchId === m.id }">
           <template v-if="editingMatchId === m.id">
             <span class="mono gmIdCell" :title="m.id">{{ m.id }}</span>
             <span class="editCell">
-              <input v-model="editForm.date" type="date">
-              <select v-model="editForm.kickoffTime">
-                <option value="">-</option>
-                <option v-for="t in TIME_SLOTS" :key="t" :value="t">{{ t }}</option>
-              </select>
+              <input :value="editForm.date" inputmode="numeric" maxlength="10" placeholder="YYYY.MM.DD" @input="inputEditDate" @keydown="keydownEditDate">
+              <input :value="editForm.kickoffTime" inputmode="numeric" maxlength="5" placeholder="HH:MM" @input="inputEditKickoff" @keydown="keydownEditKickoff">
             </span>
             <span class="editCell"><input v-model="editForm.round" type="number" min="1" placeholder="라운드"></span>
             <span class="editCell">
-              <TeamCombo v-model="editForm.homeTeamId" :options="leagueTeams.map(t => ({ id: t.id, label: t.nameKr || t.name }))" @select="onEditHomeTeamChange" />
-              <TeamCombo v-model="editForm.awayTeamId" :options="leagueTeams.map(t => ({ id: t.id, label: t.nameKr || t.name }))" />
+              <TeamCombo v-model="editForm.homeTeamId" :options="leagueTeams.map(t => ({ id: t.id, label: t.nameKr || t.name }))" :search-options="allTeamOptions" @select="onEditHomeTeamChange" />
+              <TeamCombo v-model="editForm.awayTeamId" :options="leagueTeams.map(t => ({ id: t.id, label: t.nameKr || t.name }))" :search-options="allTeamOptions" />
             </span>
             <span class="editCell">
               <select v-model="editForm.stadiumId">
-                <option v-for="s in stadiums" :key="s.id" :value="s.id">{{ s.label }}</option>
+                <option v-for="s in ukStadiums" :key="s.id" :value="s.id">{{ s.label }}</option>
               </select>
             </span>
             <span>{{ m.score.home }} - {{ m.score.away }}</span>
@@ -578,10 +679,17 @@ async function submitAdd() {
           </template>
           <template v-else>
             <span class="mono gmIdCell" :title="m.id">{{ m.id }}</span>
-            <span>{{ m.date }}<i v-if="m.kickoffTime"> {{ m.kickoffTime }}</i></span>
+            <span class="dateTimeCell"><span>{{ m.date }}</span><span v-if="m.kickoffTime" class="kickoffTime">{{ m.kickoffTime }}</span></span>
             <span>{{ roundLabel(m) }}</span>
-            <span>{{ teamLabel(m.homeTeamId) }} vs {{ teamLabel(m.awayTeamId) }}</span>
-            <span>{{ stadiumLabel(m.stadiumId) }}</span>
+            <span class="matchupCell">
+              <span class="matchupTeam homeTeam" :title="teamLabel(m.homeTeamId)">{{ teamLabel(m.homeTeamId) }}</span>
+              <span class="versus">vs</span>
+              <span class="matchupTeam awayTeam" :title="teamLabel(m.awayTeamId)">{{ teamLabel(m.awayTeamId) }}</span>
+            </span>
+            <span class="stadiumCell">
+              <span>{{ m.stadiumId }}</span>
+              <span v-if="stadiumName(m.stadiumId)" class="stadiumName">({{ stadiumName(m.stadiumId) }})</span>
+            </span>
             <span>{{ m.score.home }} - {{ m.score.away }}</span>
             <span class="matchRowActions">
               <button class="editRowBtn" @click="openEditMatch(m)">수정</button>
@@ -622,7 +730,8 @@ async function submitAdd() {
 .bulkField input,.bulkField select{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:4px;color:#fff;padding:6px;font-size:11px;width:100%;box-sizing:border-box;margin:0;display:block}
 .bulkFieldLg input,.bulkFieldLg select{padding:12px 8px;font-size:14px}
 .teamField :deep(.teamCombo input){padding:12px 8px;font-size:14px}
-.bulkField select{appearance:none;-webkit-appearance:none;-moz-appearance:none;background-image:linear-gradient(45deg,transparent 50%,rgba(255,255,255,.5) 50%),linear-gradient(135deg,rgba(255,255,255,.5) 50%,transparent 50%);background-position:calc(100% - 14px) 55%,calc(100% - 9px) 55%;background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:22px}
+.bulkField select{appearance:none;-webkit-appearance:none;-moz-appearance:none;background-color:#202731;background-image:linear-gradient(45deg,transparent 50%,rgba(255,255,255,.7) 50%),linear-gradient(135deg,rgba(255,255,255,.7) 50%,transparent 50%);background-position:calc(100% - 14px) 55%,calc(100% - 9px) 55%;background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:22px;color-scheme:dark}
+.bulkField select option,.editCell select option{background:#202731;color:#fff}
 .fillableField{gap:2px}
 .fillDownBtn{width:100%;height:13px;padding:0;margin:0;line-height:11px;border-radius:3px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:rgba(255,255,255,.6);font-size:8px;cursor:pointer;box-sizing:border-box;display:block}
 .fillDownBtn:hover{background:rgba(240,180,41,.2);border-color:#f0b429;color:#f0b429}
@@ -637,16 +746,21 @@ async function submitAdd() {
 .addBulkRowBtn:hover{background:rgba(255,255,255,.06)}
 .toolbar{display:flex;justify-content:space-between;align-items:center;margin:20px 0;color:#aab3be}.filters{display:flex;gap:18px;align-items:center}select{margin-left:10px;background:#202731;color:#fff;border:1px solid #4a5563;padding:8px 28px 8px 10px;border-radius:4px}
 .matchTable{border:1px solid #303a48;border-radius:5px;overflow:hidden}
-.matchHead,.matchRow{display:grid;grid-template-columns:280px .8fr .6fr 1.2fr 1fr .55fr 115px;align-items:center;gap:12px;padding:10px 14px}
+.matchHead,.matchRow{display:grid;grid-template-columns:250px 110px 38px 270px minmax(240px,1fr) 50px 105px;align-items:center;gap:12px;padding:10px 14px}
 .matchHead{background:#202731;color:#8f9baa;font-size:12px;font-weight:800}
+.matchHead>span{text-align:center}
 .matchRow{border-top:1px solid #2a3340;background:#171d25;color:#eee;font-size:13px}
+.matchRow>span:nth-child(3),.matchRow>span:nth-child(6){text-align:center}
 .matchRow:hover{background:#1c232c}
 .matchRow.editingRow{background:#1c232c;box-shadow:inset 3px 0 0 #f0b429}
-.gmIdCell{white-space:nowrap}
+.gmIdCell{white-space:nowrap;font-size:12px}
+.dateTimeCell{display:flex;flex-direction:column;align-items:center;gap:3px;text-align:center}.kickoffTime{color:#9da7b3;font-size:12px}
+.stadiumCell{display:flex;flex-direction:column;gap:3px;min-width:0}.stadiumCell>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.stadiumName{color:#c7ced7;font-size:12px}
+.matchupCell{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:8px;min-width:0}.matchupTeam{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.homeTeam{text-align:right}.awayTeam{text-align:left}.versus{color:#8f9baa;font-size:11px;font-weight:700}
 .matchEmpty{padding:20px;text-align:center;color:#77818d;font-size:13px}
 .matchRowActions{justify-self:end;display:flex;gap:6px}
 .editCell{display:flex;flex-direction:column;gap:4px}
-.editCell select,.editCell input{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.15);border-radius:4px;color:#fff;padding:5px;font-size:11px;width:100%;box-sizing:border-box}
+.editCell select,.editCell input{background:#202731;border:1px solid rgba(255,255,255,.15);border-radius:4px;color:#fff;padding:5px;font-size:11px;width:100%;box-sizing:border-box;color-scheme:dark}
 .editRowBtn{padding:5px 10px;border-radius:3px;border:1px solid #596474;background:transparent;color:#ddd;font-size:11px;cursor:pointer}
 .editRowBtn:hover{background:rgba(255,255,255,.08)}
 .deleteRowBtn{padding:5px 10px;border-radius:3px;border:1px solid #7a3a3a;background:transparent;color:#f16a6a;font-size:11px;cursor:pointer}

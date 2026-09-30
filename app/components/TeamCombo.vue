@@ -1,9 +1,10 @@
 <script setup lang="ts">
-// 홈/원정팀 선택용 검색형 콤보박스. 클릭만 하면(입력 없이) 전체 목록이 드롭다운으로 뜨고,
-// 글자를 치면 그 글자로 "시작하는" 팀만 남는다(예: "아스" -> 아스날 등).
+// 홈/원정팀 선택용 검색형 콤보박스. 클릭 시에는 options 목록을 보여주고,
+// 글자를 입력하면 별도의 searchOptions 전체에서 부분 검색할 수 있다.
 const props = defineProps<{
   modelValue: string
   options: { id: string; label: string }[]
+  searchOptions?: { id: string; label: string }[]
   placeholder?: string
 }>()
 const emit = defineEmits<{ 'update:modelValue': [string]; 'select': [] }>()
@@ -16,15 +17,15 @@ const inputEl = ref<HTMLInputElement | null>(null)
 const rootEl = ref<HTMLElement | null>(null)
 
 function labelFor(id: string) {
-  return props.options.find(o => o.id === id)?.label ?? ''
+  return [...props.options, ...(props.searchOptions ?? [])].find(o => o.id === id)?.label ?? ''
 }
 watch(() => props.modelValue, id => { query.value = labelFor(id) }, { immediate: true })
-watch(() => props.options, () => { query.value = labelFor(props.modelValue) })
+watch([() => props.options, () => props.searchOptions], () => { query.value = labelFor(props.modelValue) })
 
 const filtered = computed(() => {
   if (!typed.value || !query.value.trim()) return props.options
   const q = query.value.trim().toLowerCase()
-  return props.options.filter(o => o.label.toLowerCase().startsWith(q))
+  return (props.searchOptions ?? props.options).filter(o => o.label.toLowerCase().includes(q))
 })
 
 function onFocus() {
