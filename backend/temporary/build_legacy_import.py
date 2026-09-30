@@ -207,6 +207,20 @@ class BuildLegacyImport:
         self._write_items(items, on_progress=on_progress, total_matches=len(ordered_gm_ids))
         return LegacyImportResult(len(gm_ids), len(items), record_count)
 
+    def backfill_legacy_kpi_evidence(self, sql: str, *, on_progress: ImportProgress | None = None) -> LegacyImportResult:
+        """Add only SQL KPI evidence to existing RAW; never replace match trees."""
+        tables = parse_sql_dump(sql)
+        games = _rows(tables.get("ff_game"))
+        items, gm_ids, record_count = self._build_items(tables, games)
+        evidence_by_path: dict[str, dict[str, Any]] = {}
+        for path, payload, _ in items:
+            values = {key: value for key, value in payload.items() if key in {"legacyPathId", "legacyPathType", "legacyPathTtp", "legacyKpiFlags"}}
+            if "/records/" in path and values:
+                evidence_by_path.setdefault(path, {}).update(values)
+        evidence = [(path, payload, True) for path, payload in evidence_by_path.items()]
+        self._write_items(evidence, on_progress=on_progress, total_matches=len(gm_ids))
+        return LegacyImportResult(len(gm_ids), len(evidence), record_count)
+
     def _write_items(
         self,
         items: list[tuple[str, dict[str, Any], bool]],
@@ -302,7 +316,8 @@ class BuildLegacyImport:
             record_id = _string(row.get("gr_id"))
             if row.get("gt_id") is not None:
                 path_records[f"{gm_id}:{side}:{_string(row.get('gt_id'))}"].append(record_id)
-            append((f"matches/{gm_id}/recordings/{side}/records/{record_id}", {"half": half, "halfSeconds": seconds, "seq": seq, "act": _string(row.get("gr_act_code")), "res": _string(row.get("gr_res_code")), "area": _integer(row.get("gr_area_code")), "posX": _number(row.get("gr_pos_x")) / 971 * 100 if row.get("gr_pos_x") is not None else None, "posY": _number(row.get("gr_pos_y")) / 634 * 100 if row.get("gr_pos_y") is not None else None, "shootPosX": _number(row.get("gr_shoot_pos_x")) if row.get("gr_shoot_pos_x") is not None else None, "shootPosY": _number(row.get("gr_shoot_pos_y")) if row.get("gr_shoot_pos_y") is not None else None, "playerId": _string(row.get("p_id")) or None, "createdBy": "legacy-import", "source": "did", "createdAt": _timestamp(row.get("gr_regdt")) or now}, False))
+            legacy_flags = {"tap": bool(_integer(row.get("gr_is_tmp"))), "tapSuccess": bool(_integer(row.get("gr_is_tmp_s"))), "dap": bool(_integer(row.get("gr_is_tap"))), "dapSuccess": bool(_integer(row.get("gr_is_tap_s"))), "ast": bool(_integer(row.get("gr_is_ast"))), "shot": bool(_integer(row.get("gr_is_sht"))), "shotSuccess": bool(_integer(row.get("gr_is_sht_s"))), "goal": bool(_integer(row.get("gr_is_gol"))), "dtb": bool(_integer(row.get("gr_is_ctb"))), "dtm": bool(_integer(row.get("gr_is_ctm"))), "dta": bool(_integer(row.get("gr_is_cta"))), "dts": bool(_integer(row.get("gr_is_cts"))), "gtb": bool(_integer(row.get("gr_is_gtb"))), "gtm": bool(_integer(row.get("gr_is_gtm")))}
+            append((f"matches/{gm_id}/recordings/{side}/records/{record_id}", {"half": half, "halfSeconds": seconds, "seq": seq, "act": _string(row.get("gr_act_code")), "res": _string(row.get("gr_res_code")), "area": _integer(row.get("gr_area_code")), "posX": _number(row.get("gr_pos_x")) / 971 * 100 if row.get("gr_pos_x") is not None else None, "posY": _number(row.get("gr_pos_y")) / 634 * 100 if row.get("gr_pos_y") is not None else None, "shootPosX": _number(row.get("gr_shoot_pos_x")) if row.get("gr_shoot_pos_x") is not None else None, "shootPosY": _number(row.get("gr_shoot_pos_y")) if row.get("gr_shoot_pos_y") is not None else None, "legacyPathId": _string(row.get("gt_id")) or None, "legacyKpiFlags": legacy_flags, "playerId": _string(row.get("p_id")) or None, "createdBy": "legacy-import", "source": "did", "createdAt": _timestamp(row.get("gr_regdt")) or now}, False))
             record_count += 1
 
         lineups: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
@@ -353,6 +368,8 @@ class BuildLegacyImport:
                 gm_id, side, path_id = *recording, _string(row.get("gt_id"))
                 ptype = "DTP" if _integer(row.get("gt_ctp")) else ("UTP" if _integer(row.get("gt_utp")) else ("STP" if _integer(row.get("gt_stp")) else "UPP"))
                 append((f"matches/{gm_id}/recordings/{side}/paths/{path_id}", {"gtId": path_id, "resCode": _string(row.get("gt_res_code")), "dsp": bool(_integer(row.get("gt_csp"))), "ttp": bool(_integer(row.get("gt_ttp"))), "ptype": ptype, "recordIds": path_records[f"{gm_id}:{side}:{path_id}"]}, False))
+                for record_id in path_records[f"{gm_id}:{side}:{path_id}"]:
+                    append((f"matches/{gm_id}/recordings/{side}/records/{record_id}", {"legacyPathType": ptype, "legacyPathTtp": bool(_integer(row.get("gt_ttp")))}, True))
         for row in _rows(tables.get("ff_game_bap")):
             if (recording := recordings.get(_string(row.get("gi_id")))):
                 gm_id, side = recording

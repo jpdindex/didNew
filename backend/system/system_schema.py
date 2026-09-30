@@ -151,6 +151,11 @@ class RecordDoc(SchemaModel):
     source: DataSource
     playerIdSource: DataSource | None = None
     bapReason: str | None = None
+    # SQL migration-only evidence. New DID input never populates these fields.
+    legacyPathId: str | None = None
+    legacyPathType: Literal["UPP", "UTP", "DTP", "STP"] | None = None
+    legacyPathTtp: bool | None = None
+    legacyKpiFlags: dict[str, bool] | None = None
     createdAt: datetime
 
     @field_validator("res", mode="before")

@@ -25,6 +25,11 @@ class KpiRecord:
     is_shot: bool | None = None
     created_by: str = ""
     created_at: str = ""
+    legacy_path_id: str | None = None
+    legacy_path_type: PathType | None = None
+    legacy_path_ttp: bool | None = None
+    legacy_flags: dict[str, bool] | None = None
+    bap_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +323,8 @@ def _ratio(numerator: int, denominator: int) -> float:
 
 
 def calculate_kpis(records: list[KpiRecord], *, close_trailing_bap: bool = True) -> KpiCalculation:
+    if records and all(record.legacy_flags is not None for record in records):
+        return _calculate_legacy_kpis(records)
     paths: list[AttackPath] = []
     flags: dict[str, RecordFlags] = {}
     bap_events: list[BapEvent] = []
@@ -377,6 +384,51 @@ def calculate_kpis(records: list[KpiRecord], *, close_trailing_bap: bool = True)
         player["ASR"] = _ratio(player_dap_success[player_id], player["DAP"])
         player["SSR"] = _ratio(player["GOAL"], player["SHOT"])
     return KpiCalculation(team, dict(players), tuple(paths), flags, tuple(bap_events))
+
+
+def _calculate_legacy_kpis(records: list[KpiRecord]) -> KpiCalculation:
+    """Use PHP's persisted per-record flags for SQL-imported RAW exactly."""
+    team = _empty(TEAM_KPI_FIELDS)
+    players: defaultdict[str, dict[str, int]] = defaultdict(lambda: _empty(PLAYER_KPI_FIELDS))
+    flags: dict[str, RecordFlags] = {}
+    paths: dict[str, AttackPath] = {}
+    player_paths: defaultdict[str, set[str]] = defaultdict(set)
+    dap_success = 0
+    player_dap_success: Counter[str] = Counter()
+    for record in records:
+        legacy = record.legacy_flags or {}
+        value = lambda name: bool(legacy.get(name, False))
+        flag = RecordFlags(record.legacy_path_id or record.id, value("tap"), value("tapSuccess"), value("dap"), value("dapSuccess"), value("shot"), value("shotSuccess"), value("goal"), value("ast"), value("dts"), value("dta"), value("dtm"), value("dtb"), value("gtm"), value("gtb"))
+        flags[record.id] = flag
+        for field, enabled in (("TAP", flag.is_tap), ("DAP", flag.is_dap), ("SHOT", flag.is_shot), ("GOAL", flag.is_goal), ("DTB", flag.is_dtb), ("DTM", flag.is_dtm), ("DTA", flag.is_dta), ("DTS", flag.is_dts)):
+            team[field] += int(enabled)
+        team["OG"] += int(flag.is_goal and record.player_id == "OWN")
+        dap_success += int(flag.is_dap_success)
+        if record.legacy_path_id and record.legacy_path_type:
+            paths.setdefault(record.legacy_path_id, AttackPath(record.legacy_path_id, (), record.legacy_path_type, False, bool(record.legacy_path_ttp), ""))
+        if not record.player_id or record.player_id == "OWN":
+            continue
+        player = players[record.player_id]
+        for field, enabled in (("TAP", flag.is_tap), ("DAP", flag.is_dap), ("SHOT", flag.is_shot), ("AST", flag.is_ast), ("GOAL", flag.is_goal), ("DTB", flag.is_dtb), ("DTM", flag.is_dtm), ("DTA", flag.is_dta), ("DTS", flag.is_dts), ("GTB", flag.is_gtb), ("GTM", flag.is_gtm)):
+            player[field] += int(enabled)
+        player_dap_success[record.player_id] += int(flag.is_dap_success)
+        if record.legacy_path_id:
+            player_paths[record.player_id].add(record.legacy_path_id)
+    team["TTP"] = sum(int(path.ttp) for path in paths.values())
+    team["DTP"] = sum(int(path.path_type == "DTP") for path in paths.values())
+    team["BAP"] = sum(int(bool(record.bap_reason)) for record in records)
+    team["ASR"] = _ratio(dap_success, team["DAP"])
+    team["SSR"] = _ratio(team["GOAL"] - team["OG"], team["SHOT"])
+    for player_id, player in players.items():
+        for path_id in player_paths[player_id]:
+            path = paths.get(path_id)
+            if path:
+                player["UTP"] += int(path.path_type == "UTP")
+                player["DTP"] += int(path.path_type == "DTP")
+        player["TTP"] = player["UTP"] + player["DTP"]
+        player["ASR"] = _ratio(player_dap_success[player_id], player["DAP"])
+        player["SSR"] = _ratio(player["GOAL"], player["SHOT"])
+    return KpiCalculation(team, dict(players), tuple(paths.values()), flags, ())
 
 
 def calculate_team_kpi_5min(

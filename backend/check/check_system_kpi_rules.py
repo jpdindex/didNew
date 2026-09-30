@@ -106,3 +106,29 @@ def test_legacy_validation_does_not_compare_own_goal_placeholder() -> None:
     actual = expected.model_copy(update={"OG": 1})
 
     assert _team_differences(expected, actual) == {}
+
+
+def test_legacy_records_use_persisted_sql_flags_and_path_identity() -> None:
+    records = [
+        KpiRecord("r1", "H1", 1, 0, "P", "O", 12, "p1", legacy_path_id="path-1", legacy_path_type="UTP", legacy_path_ttp=True, legacy_flags={"tap": True, "tapSuccess": True, "dap": True, "dapSuccess": True, "ast": False, "shot": False, "shotSuccess": False, "goal": False, "dtb": False, "dtm": False, "dta": False, "dts": False, "gtb": False, "gtm": False}),
+        KpiRecord("r2", "H1", 2, 0, "S", "GOAL", 4, "p2", legacy_path_id="path-1", legacy_path_type="UTP", legacy_path_ttp=True, legacy_flags={"tap": True, "tapSuccess": True, "dap": True, "dapSuccess": True, "ast": True, "shot": True, "shotSuccess": True, "goal": True, "dtb": True, "dtm": False, "dta": True, "dts": True, "gtb": True, "gtm": False}),
+    ]
+    result = calculate_kpis(records)
+    assert result.team_kpi["TTP"] == 1
+    assert result.team_kpi["DTP"] == 0
+    assert result.team_kpi["TAP"] == 2
+    assert result.team_kpi["GOAL"] == 1
+    assert result.player_kpis["p2"]["UTP"] == 1
+    assert result.player_kpis["p2"]["AST"] == 1
+
+
+def test_legacy_aggregate_only_path_counts_for_team_but_not_players() -> None:
+    result = calculate_kpis([
+        KpiRecord("raw", "H1", 1, 0, "P", "O", 12, "p1", legacy_path_id="raw-path", legacy_path_type="UPP", legacy_path_ttp=False, legacy_flags={"tap": True, "tapSuccess": True, "dap": True, "dapSuccess": True}),
+        KpiRecord("legacy-path:empty", "H4", 0, 0, "", "", 18, legacy_path_id="empty-path", legacy_path_type="DTP", legacy_path_ttp=True, legacy_flags={}),
+    ])
+
+    assert result.team_kpi["TTP"] == 1
+    assert result.team_kpi["DTP"] == 1
+    assert result.player_kpis["p1"]["TTP"] == 0
+    assert result.player_kpis["p1"]["DTP"] == 0

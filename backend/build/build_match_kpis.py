@@ -147,9 +147,28 @@ class BuildMatchKpis:
                 is_shot=record.isShot,
                 created_by=record.createdBy,
                 created_at=record.createdAt.isoformat(),
+                legacy_path_id=record.legacyPathId,
+                legacy_path_type=record.legacyPathType,
+                legacy_path_ttp=record.legacyPathTtp,
+                legacy_flags=record.legacyKpiFlags,
+                bap_reason=record.bapReason,
             )
             for record_id, record in source.records
         ]
+        # Some historic SQL dumps retain an aggregate-only attack path after
+        # its raw records were removed. It contributes to team TTP/DTP but to
+        # no player KPI. The importer persists those path snapshots, so include
+        # a flag-free virtual record only for legacy recordings.
+        if records and all(record.legacy_flags is not None for record in records):
+            record_path_ids = {record.legacy_path_id for record in records if record.legacy_path_id}
+            for path_id, path in source.paths:
+                if path_id in record_path_ids or path.gtId in record_path_ids:
+                    continue
+                records.append(KpiRecord(
+                    id=f"legacy-path:{path_id}", half="H4", seconds=0, seq=0, act="", res="",
+                    area=18, legacy_path_id=path.gtId, legacy_path_type=path.ptype,
+                    legacy_path_ttp=path.ttp, legacy_flags={},
+                ))
         calculation = calculate_kpis(records)
         team_kpi = RecordingKpi(**calculation.team_kpi)
         player_kpis = {

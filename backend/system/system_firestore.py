@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
-from backend.system.system_schema import MatchDoc, PlayerKpi, RecordDoc, RecordingDoc, RecordingKpi, Side, TeamRatingSnapshot
+from backend.system.system_schema import MatchDoc, PathSnapshotDoc, PlayerKpi, RecordDoc, RecordingDoc, RecordingKpi, Side, TeamRatingSnapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROOT_ENV_FILE = PROJECT_ROOT / ".env"
@@ -276,6 +276,7 @@ class MatchKpiSource:
     match: MatchDoc
     recording: RecordingDoc
     records: list[tuple[str, RecordDoc]]
+    paths: list[tuple[str, PathSnapshotDoc]]
     fingerprint: str
 
 
@@ -469,14 +470,24 @@ class JpdDidData:
 
     def read_match_kpi_source(self, gm_id: str, side: Side) -> MatchKpiSource:
         records = self.list_records(gm_id, side)
+        path_collection = self.db.collection("matches").document(gm_id).collection("recordings").document(side).collection("paths")
+        paths = [
+            (snapshot.id, _validate_document(PathSnapshotDoc, snapshot.to_dict() or {}, path=snapshot.reference.path))
+            for snapshot in path_collection.stream(retry=None, timeout=15)
+        ]
         serializable = [
             {"id": record_id, **record.model_dump(mode="json", exclude_none=False)}
             for record_id, record in records
         ]
+        serializable.extend(
+            {"legacyPath": path_id, **path.model_dump(mode="json")}
+            for path_id, path in paths
+        )
         return MatchKpiSource(
             match=self.get_match(gm_id),
             recording=self.get_recording(gm_id, side),
             records=records,
+            paths=paths,
             fingerprint=sha256(
                 json.dumps(serializable, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest(),
