@@ -64,6 +64,20 @@ def test_server_batch_keeps_blank_result_action_records_in_the_path() -> None:
     assert flags["action"].is_tap is True
 
 
+def test_only_shots_linked_from_a_connect_act_are_dtp() -> None:
+    linked, _ = compute_attack_paths([
+        KpiRecord("p", "H1", 1, 1, "P", "O", 8, "p1"),
+        KpiRecord("s", "H1", 3, 2, "S", "B", 4, "p2", is_shot=True),
+    ])
+    shot_to_shot, _ = compute_attack_paths([
+        KpiRecord("s1", "H1", 1, 1, "S", "O", 4, "p1", is_shot=True),
+        KpiRecord("s2", "H1", 3, 2, "S", "X", 4, "p2", is_shot=True),
+    ])
+
+    assert [path.path_type for path in linked] == ["DTP"]
+    assert [path.path_type for path in shot_to_shot] == ["STP"]
+
+
 def test_legacy_path_cache_drift_is_limited_to_one_count_path_fields() -> None:
     assert _is_legacy_baseline_drift(
         {"TTP": {"expected": 53, "calculated": 52}},

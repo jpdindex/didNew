@@ -520,16 +520,19 @@ function startBenchDrag(e: PointerEvent) {
   benchDragStartX = e.clientX
   benchDragStartScrollLeft = bench.scrollLeft
   benchDragMoved = false
-  bench.setPointerCapture(e.pointerId)
 }
 
 function moveBenchDrag(e: PointerEvent) {
   if (benchDragPointerId !== e.pointerId) return
   const dx = e.clientX - benchDragStartX
   if (!benchDragMoved && Math.abs(dx) < 4) return
+  const bench = e.currentTarget as HTMLElement
+  // 누르자마자 capture 하면 click/dblclick 이 슬롯 버튼이 아니라 .bench 로 가버린다.
+  // 실제로 끌기 시작했을 때만 capture 해서 슬롯 클릭·더블클릭(빼기)이 살아 있게 한다.
+  if (!benchDragMoved) bench.setPointerCapture(e.pointerId)
   benchDragMoved = true
   benchDragging.value = true
-  ;(e.currentTarget as HTMLElement).scrollLeft = benchDragStartScrollLeft - dx
+  bench.scrollLeft = benchDragStartScrollLeft - dx
   e.preventDefault()
 }
 

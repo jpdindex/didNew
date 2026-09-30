@@ -242,13 +242,14 @@ export function closePrecedingOpenAct(records: DidRecord[], resultRecordId: stri
     prev.res = resultRec.res
     return
   }
-  // 골대 결과(GB/GX/L/H/R/LX/HX/RX)로 끝난 슛 바로 뒤(4초 이내)에 X/B 를 넣으면, 알고 보니
+  // 골대 결과(GOAL/GB/GX/L/H/R/LX/HX/RX)로 끝난 슛 바로 뒤에 X/B 를 넣으면, 알고 보니
   // 수비 블락·실책이었다는 정정으로 보고 슛 결과를 X/B 로 바꾼다 (예: S|GB → S|B + B).
-  // 골대 좌표·DSP 범위도 지워 유효슈팅으로 잡히지 않게 한다. 득점(GOAL)은 점수가 걸려 있어 건드리지 않는다.
-  if (
-    prev && (prev.isShot || isShotAct(prev.act)) && SHOT_ZONE_RESULTS.has(prev.res) &&
-    resultRec.seconds - prev.seconds <= 4
-  ) {
+  // 시간 차이는 보지 않는다 — 기록원이 뒤늦게 확인하고 넣는 경우가 많아서, 4초가 지났어도
+  // 같은 half 안에서 바로 앞 레코드가 그 슛이면 짝으로 본다.
+  // 득점(GOAL)도 정정 대상이다(예: 골 취소). 스코어는 DidInput 의 syncOwnScore 가
+  // GOAL 레코드 수로 다시 세므로 여기서 결과만 바꾸면 점수도 자동으로 내려간다.
+  // 골대 좌표·DSP 범위도 지워 유효슈팅으로 잡히지 않게 한다.
+  if (prev && (prev.isShot || isShotAct(prev.act)) && SHOT_ZONE_RESULTS.has(prev.res)) {
     prev.res = resultRec.res
     prev.shootPosX = undefined
     prev.shootPosY = undefined
@@ -256,7 +257,7 @@ export function closePrecedingOpenAct(records: DidRecord[], resultRecordId: stri
   }
 }
 
-const SHOT_ZONE_RESULTS = new Set<ResCode>(['GB', 'GX', 'L', 'H', 'R', 'LX', 'HX', 'RX'])
+const SHOT_ZONE_RESULTS = new Set<ResCode>(['GOAL', 'GB', 'GX', 'L', 'H', 'R', 'LX', 'HX', 'RX'])
 
 // =============================================================================
 // 1. 공격루트(Path) 그룹핑 + DAP 판정

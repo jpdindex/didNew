@@ -666,12 +666,37 @@ function applyEdit() {
       closePrecedingOpenAct(records.value, rec.id)
     }
     game.value.records = records.value
+    // 시간을 앞으로 당기면 그 줄은 위쪽(화면 밖)으로 옮겨가서 사라진 것처럼 보인다.
+    // 옮겨간 자리로 표를 스크롤해 바로 확인할 수 있게 한다(초록 표시와 함께 보인다).
+    scrollRowIntoView(rec.id)
   }
   editingId.value = null
+}
+async function scrollRowIntoView(id: string) {
+  await nextTick()
+  const table = tableEl.value
+  const row = table?.querySelector<HTMLElement>(`[data-row-id="${id}"]`)
+  if (!table || !row) return
+  // getBoundingClientRect 는 화면 배율(태블릿 맞춤 확대·축소)이 곱해진 값이라 scrollTop 과
+  // 단위가 어긋난다. 배율과 무관한 offsetTop(.table 기준)으로 계산하고, 위에 고정된
+  // 제목줄(thead)에 가리지 않도록 그 아래 보이는 영역의 가운데에 맞춘다.
+  const headH = table.querySelector<HTMLElement>('.thead')?.offsetHeight ?? 0
+  const visibleH = table.clientHeight - headH
+  table.scrollTop = Math.max(0, row.offsetTop - headH - (visibleH - row.offsetHeight) / 2)
 }
 function deleteEdit() {
   if (!editingId.value) return
   const deletedId = editingId.value
+  // 액트 없는 X/B 결과 레코드를 지우면, 그 결과로 마감됐던 바로 앞 짝 액트(예: P|X)를
+  // 다시 진행중('O')으로 되돌린다 — 결과가 사라졌으니 액트도 아직 끝나지 않은 상태다.
+  const deleted = records.value.find(r => r.id === deletedId)
+  if (deleted && !deleted.act && (deleted.res === 'X' || deleted.res === 'B')) {
+    const paired = records.value.find(r => r.id === findPairedResultRecordId(deleted))
+    if (paired) {
+      paired.res = 'O'
+      markEdited(paired)
+    }
+  }
   records.value = records.value.filter(r => r.id !== deletedId)
   game.value.records = records.value
   void removeRecord(game.value, deletedId).catch(() => false)
@@ -722,6 +747,13 @@ function confirmMirror() {
   game.value.mirrored = pendingMirrored.value
   mirrorOpen.value = false
 }
+// 반전 팝업도 잔디 팝업처럼 바깥을 누르면 적용 없이 닫힌다(아이콘은 래퍼 안이라 제외).
+const mirrorWrapRef = ref<HTMLElement | null>(null)
+function closeMirrorOnOutside(e: PointerEvent) {
+  if (mirrorOpen.value && mirrorWrapRef.value && !mirrorWrapRef.value.contains(e.target as Node)) mirrorOpen.value = false
+}
+onMounted(() => document.addEventListener('pointerdown', closeMirrorOnOutside))
+onUnmounted(() => document.removeEventListener('pointerdown', closeMirrorOnOutside))
 
 const pendingPos = ref<{ x: number; y: number } | null>(null)
 // 슛(S/H/R)도 C/P/K/F 와 동일하게 버튼을 누르는 즉시 실제 레코드를 만든다(res:'O').
@@ -838,6 +870,17 @@ const cardQueue = ref<CardRecord[]>([])
 const cardByPlayer = computed(() => groupCardsByPlayer(game.value.cards, cardQueue.value))
 // 히스토리에서 "경고 · 퇴장"으로 같이 보여줄 두 번째 경고 카드들
 const secondYellows = computed(() => secondYellowCards([...game.value.cards, ...cardQueue.value]))
+// 히스토리 표는 입력 순서가 아니라 시간순(half → seconds)으로 보여준다 — 뒤늦게 앞선 시각의
+// 카드를 입력하거나 수정으로 시각을 바꿔도 제자리에 끼어 보이게. 수정/삭제는 원래 배열의
+// index 로 동작하므로 queue 여부와 index 를 함께 들고 다닌다. 같은 시각이면 입력 순서 유지.
+const cardHistory = computed(() => {
+  const key = (c: CardRecord) => (HALF_ORDER[c.half] ?? 0) * 100000 + c.seconds
+  return [
+    ...game.value.cards.map((c, index) => ({ c, queue: false, index })),
+    ...cardQueue.value.map((c, index) => ({ c, queue: true, index })),
+  ].map((row, order) => ({ ...row, order }))
+    .sort((a, b) => key(a.c) - key(b.c) || a.order - b.order)
+})
 /** 카드 패널을 완전히 새로 여는 경우에만 쓰는 초기화. 편집 중이던 큐는 버린다. */
 function resetCardDraft() {
   cardPlayer.value = null
@@ -1308,8 +1351,12 @@ const displayRecord = computed(() => {
 // 위 레코드의 act 를 채워서 보여준다. act 가 없는 레코드(결과 전용)면 아무 액트도
 // 채우지 않는다 — 예를 들어 P 가 B 로 막힌 직후엔 P 를 더 이상 채우지 않는다.
 // 수정 중일 때는 저장된 값이 아니라 아직 적용 전인 임시값(editAct)을 보여준다.
+// 기록표에서 짧게 눌러 보는(peek) 중이면 그 레코드에 입력했던 액트를 켜서 보여준다.
 const activeAct = computed(() => (
-  editingId.value ? editAct.value : pendingShot.value ? pendingShot.value.act : null
+  editingId.value ? editAct.value
+    : pendingShot.value ? pendingShot.value.act
+      : peekRecord.value ? peekRecord.value.act
+        : null
 ) || null)
 
 // 위 레코드의 결과가 X/B 면 그 결과 버튼도 "선택됨"으로 보여준다.
@@ -1318,7 +1365,8 @@ const activeAct = computed(() => (
 // 수정 중일 때는 저장된 값이 아니라 아직 적용 전인 임시값(editRes)을 보여준다.
 const activeResult = computed(() => {
   if (editingId.value) return editRes.value
-  return null
+  const res = peekRecord.value?.res
+  return res === 'X' || res === 'B' ? res : null
 })
 
 // 수정 중일 때는 저장된 좌표가 아니라 아직 적용 전인 임시 위치(editPos)를 보여준다.
@@ -1383,16 +1431,28 @@ function cellFromPos(pos: { x: number; y: number }) {
   return { col, row }
 }
 
-// 카드 입력·선수교체 중에 경기장·기록표를 터치하면 Cancel/Close 를 누른 것과 같이
+// 카드 입력·선수교체·선수선택 중에 경기장·기록표를 터치하면 Cancel/Close 를 누른 것과 같이
 // 그 창을 닫는다 — 창을 따로 안 닫고 바로 기록을 이어서 찍을 수 있게 해준다.
+// 경기장은 창을 닫은 그 터치로 위치 입력까지 이어서 처리한다(clickPitch).
 function closeOverlayPanelsOnOutsideTouch(e: Event): boolean {
   if (cardOpen.value) { e.stopPropagation(); cancelCards(); return true }
   if (subOpen.value) { e.stopPropagation(); closeSubPanel(); return true }
+  // 선수선택 창은 Cancel 과 같이 닫되 터치는 막지 않는다 — 기록표 행 보기/Select 도 그 터치로 이어진다.
+  // (Submit OFF 로 이미 고른 선수가 표시 대기 중이면 그 선수는 저장하고 닫는다.)
+  if (playerPickFor.value) {
+    if (pickSubmitTimer) {
+      clearTimeout(pickSubmitTimer)
+      pickSubmitTimer = null
+      submitPlayer()
+    } else {
+      cancelPlayerPick()
+    }
+  }
   return false
 }
 
 function clickPitch(e: MouseEvent) {
-  if (closeOverlayPanelsOnOutsideTouch(e)) return
+  closeOverlayPanelsOnOutsideTouch(e)
 
   const el = e.currentTarget as HTMLElement
   const rect = el.getBoundingClientRect()
@@ -1557,6 +1617,9 @@ function recordGoalResult(zone: Exclude<ResCode, 'O' | ''>, point?: { x: number;
         rec.shootDspRange = undefined
       }
     }
+    // LX/HX/RX 는 위치 없이 누르는 것 자체가 최종 결정이라, "적용"까지 바로 눌러
+    // 함께 고친 시간·위치 등도 반영하고 수정 모드를 닫는다.
+    if (zone === 'LX' || zone === 'HX' || zone === 'RX') applyEdit()
     return
   }
   if (!pendingShot.value) return
@@ -1678,6 +1741,38 @@ function submitPlayer() {
   const rec = records.value.find(r => r.id === playerPickFor.value)
   if (rec) {
     rec.playerId = pickedPlayerId.value
+    game.value.records = records.value
+  }
+  cancelPlayerPick()
+}
+
+// Submit ON(기본): 선수를 고른 뒤 Submit 을 눌러야 저장된다. OFF: 선수를 누르는 즉시 저장하고 창을 닫는다. 기기별로 기억한다.
+const PICK_SUBMIT_ON_KEY = 'did:pickSubmitOn'
+const pickSubmitOn = ref(true)
+onMounted(() => {
+  try { pickSubmitOn.value = localStorage.getItem(PICK_SUBMIT_ON_KEY) !== '0' } catch { }
+})
+function togglePickSubmit() {
+  pickSubmitOn.value = !pickSubmitOn.value
+  try { localStorage.setItem(PICK_SUBMIT_ON_KEY, pickSubmitOn.value ? '1' : '0') } catch { }
+}
+// OFF 일 때도 고른 선수가 선택 표시(노란 카드)로 잠깐 보인 뒤 저장·닫힘 — 그 사이 추가 터치는 무시한다.
+let pickSubmitTimer: ReturnType<typeof setTimeout> | null = null
+function pickPlayer(playerId: string) {
+  if (pickSubmitTimer) return
+  pickedPlayerId.value = playerId
+  if (pickSubmitOn.value) return
+  const recordId = playerPickFor.value
+  pickSubmitTimer = setTimeout(() => {
+    pickSubmitTimer = null
+    if (playerPickFor.value === recordId) submitPlayer()
+  }, 100)
+}
+// 잘못 넣은 선수를 기록에서 지우고 창을 닫는다.
+function resetPlayerPick() {
+  const rec = records.value.find(r => r.id === playerPickFor.value)
+  if (rec?.playerId) {
+    rec.playerId = undefined
     game.value.records = records.value
   }
   cancelPlayerPick()
@@ -1863,7 +1958,7 @@ async function finishHalf() {
               <span>No.</span><span>Time</span><span>Act</span><span>Result</span><span>Area</span><span>Player</span>
             </div>
             <div class="tbody">
-              <div v-for="r in rows" :key="r.id" class="trow"
+              <div v-for="r in rows" :key="r.id" class="trow" :data-row-id="r.id"
                 :class="{ pending: r.isDap, editing: editingId === r.id, peeking: peekId === r.id, edited: recentlyEditedIds.has(r.id), rangeSel: rangeMode && rangeSelectedIds.has(r.id), rangeAnchor: rangeMode && r.id === rangeStartId && !rangeEndId, draft: r.draft }"
                 @mousedown="!r.draft && startPress(r.id)" @mouseup="!r.draft && endPress(r.id)"
                 @mouseleave="cancelPress" @touchstart="!r.draft && startPress(r.id, true)" @touchmove="handleTouchMove"
@@ -1885,8 +1980,8 @@ async function finishHalf() {
                       <button class="editCancel editCancelInline" @mousedown.stop @touchstart.stop
                         @click.stop="cancelEdit">취소</button>
                     </div>
-                    <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn" @mousedown.stop @touchstart.stop
-                      @click.stop="openPlayerPick(r.id)">{{ r.playerName || '선수 선택' }}</button>
+                    <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn" :class="{ assigned: !!r.playerName }"
+                      @mousedown.stop @touchstart.stop @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select' }}</button>
                   </div>
                 </template>
                 <template v-else>
@@ -1924,7 +2019,7 @@ async function finishHalf() {
             </template>
           </div>
 
-          <div v-if="!editingId" class="mirrorWrap">
+          <div v-if="!editingId" ref="mirrorWrapRef" class="mirrorWrap">
             <button class="mirrorIcon" :class="{ on: mirrorOpen }" @click="openMirrorPopup">⇄</button>
             <div v-if="mirrorOpen" class="mirrorPop">
               <div class="popRow">
@@ -1982,16 +2077,16 @@ async function finishHalf() {
               <div class="cardHistHead">
                 <span>Half</span><span>Time</span><span>Player</span><span>Card</span><span></span>
               </div>
-              <div v-for="(c, i) in [...game.cards, ...cardQueue]" :key="i" class="cardHistRow">
+              <div v-for="{ c, queue, index } in cardHistory" :key="`${queue ? 'q' : 'c'}${index}`" class="cardHistRow">
                 <span>{{ subHalfLabel[c.half] }}</span><span>{{ fmtTime(c.seconds) }}</span><span class="histPlayer"><b
                   v-if="findPlayer(c.player)" class="histNo" :class="`pos${findPlayer(c.player)!.pos}`">{{ findPlayer(c.player)!.no }}</b>{{
                   findPlayer(c.player)?.name ?? '-' }}</span><span class="cardKind">{{ c.card === 'Y' ? '🟨 경고' : '🟥 퇴장' }}<template
                     v-if="secondYellows.has(c)"> · 🟥 퇴장</template></span>
                 <span class="cardRowActions">
                   <button class="cardRowEdit"
-                    @click="openCardPlayerEdit(i >= game.cards.length, i >= game.cards.length ? i - game.cards.length : i)">수정</button>
+                    @click="openCardPlayerEdit(queue, index)">수정</button>
                   <button class="cardRowCancel"
-                    @click="i >= game.cards.length ? removeQueuedCard(i - game.cards.length) : removeCard(i)">삭제</button>
+                    @click="queue ? removeQueuedCard(index) : removeCard(index)">삭제</button>
                 </span>
               </div>
             </div>
@@ -2137,8 +2232,14 @@ async function finishHalf() {
           <!-- 선수선택: PPT 대로 액트 입력창 자리에서 UI 를 전환한다 -->
           <div v-if="!cardOpen && !subOpen && playerPickFor" class="group pickGroup">
             <div class="pickField">
+              <button class="pickLineBtn pickReset" :style="{ top: GK_LINEUP_SLOT.y + '%' }"
+                @click="resetPlayerPick">Reset</button>
+              <button class="pickLineBtn pickSubmitToggle" :class="{ on: pickSubmitOn }"
+                :style="{ top: GK_LINEUP_SLOT.y + '%' }" @click="togglePickSubmit">
+                Submit<br>{{ pickSubmitOn ? 'ON' : 'OFF' }}
+              </button>
               <button v-for="p in lineup" :key="p.playerId" class="jersey" :class="{ on: pickedPlayerId === p.playerId }"
-                :style="{ left: p.slot.x + '%', top: p.slot.y + '%' }" @click="pickedPlayerId = p.playerId">
+                :style="{ left: p.slot.x + '%', top: p.slot.y + '%' }" @click="pickPlayer(p.playerId)">
                 <span class="shirt">{{ p.no }}</span>
                 <span class="jname">{{ p.name }}</span>
               </button>
@@ -2146,7 +2247,7 @@ async function finishHalf() {
             <div v-if="subPickPlayers.length" class="pickSubs">
               <span class="pickSubsLabel">교체<br>OUT</span>
               <button v-for="p in subPickPlayers" :key="p.playerId" class="jersey subJersey"
-                :class="{ on: pickedPlayerId === p.playerId }" @click="pickedPlayerId = p.playerId">
+                :class="{ on: pickedPlayerId === p.playerId }" @click="pickPlayer(p.playerId)">
                 <span class="shirt">{{ p.no }}</span>
                 <span class="jname">{{ p.name }}</span>
               </button>
@@ -3099,29 +3200,49 @@ button {
   background: rgba(240, 180, 41, .06)
 }
 
+/* 태블릿(터치) 전용 — hover 가 없으니 가만히 있을 때부터 "누를 수 있는 칸"으로 보여야 하고,
+   손가락으로 정확히 누를 수 있게 행(42px) 안에서 최대한 크게 잡는다.
+   아직 선수를 안 고른 칸은 옅게 채운 노랑 + 점선으로 "비어 있는 자리"를 표현한다. */
 .playerBtn {
-  height: 26px;
-  min-width: 72px;
-  padding: 0 10px;
-  border-radius: 4px;
-  border: 1px dashed #f0b429;
-  background: rgba(240, 180, 41, .1);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 32px;
+  min-width: 88px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 1.5px dashed rgba(240, 180, 41, .65);
+  background: rgba(240, 180, 41, .08);
   color: #f0b429;
-  font-size: 11px;
-  font-weight: 700;
-  cursor: pointer
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform .08s, background .08s
 }
 
-.playerBtn:hover {
-  background: rgba(240, 180, 41, .25)
-}
-
-.playerBtn.assigned {
+/* 누르는 순간의 피드백 — 터치에선 이게 유일한 반응이라 확실하게 준다. */
+.playerBtn:active {
+  transform: scale(.95);
   border-style: solid;
-  border-color: #9aa0a6;
-  background: #9aa0a6;
-  color: #111;
-  font-style: italic
+  background: rgba(240, 180, 41, .28)
+}
+
+/* 배정된 선수는 "해야 할 일"(점선 노랑)이 아니라 이미 채워진 값이므로,
+   어두운 표에 녹아드는 차분한 칩으로 보여준다. */
+.playerBtn.assigned {
+  border: 1.5px solid rgba(255, 255, 255, .16);
+  background: rgba(255, 255, 255, .07);
+  color: #e8eaed;
+  letter-spacing: .01em
+}
+
+/* 눌렀을 때도 노랑으로 바꾸지 않고, 같은 톤에서 살짝 밝아지기만 한다. */
+.playerBtn.assigned:active {
+  border-color: rgba(255, 255, 255, .28);
+  background: rgba(255, 255, 255, .16);
+  color: #e8eaed
 }
 
 .editTimeRow {
@@ -3282,6 +3403,43 @@ button {
   color: #ddd;
   font-size: 10px;
   white-space: nowrap
+}
+
+/* 골키퍼 라인 양 끝: 왼쪽 Reset, 오른쪽 터치 닫기 토글 */
+.pickLineBtn {
+  position: absolute;
+  transform: translateY(-50%);
+  z-index: 1;
+  min-width: 72px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-weight: 800;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, .25);
+  background: transparent;
+  color: rgba(255, 255, 255, .6)
+}
+
+.pickReset {
+  left: 8px;
+  border-color: #e5484d;
+  color: #e5484d
+}
+
+.pickReset:hover {
+  background: rgba(229, 72, 77, .15)
+}
+
+.pickSubmitToggle {
+  right: 8px
+}
+
+.pickSubmitToggle.on {
+  border-color: #f0b429;
+  background: #f0b429;
+  color: #191919
 }
 
 .pickSubs {
