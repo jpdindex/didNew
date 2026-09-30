@@ -36,25 +36,11 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
         "/health",
         "/api/v1/match-kpis/build",
         "/api/v1/match-ratings/build",
-            "/api/v1/match-ratings/read",
-            "/api/v1/legacy-import",
-            "/api/v1/legacy-import/jobs/{job_id}",
-                "/api/v1/match-input/matches",
-                "/api/v1/match-input/analyst-dashboard",
-                "/api/v1/match-input/matches/{gm_id}/squads",
-                "/api/v1/match-input/matches/{gm_id}/bootstrap",
-                "/api/v1/match-input/matches/{gm_id}/dashboard-kpis",
-                "/api/v1/match-input/matches/{gm_id}/squads/refresh",
-                "/api/v1/match-input/legacy-lineups/backfill",
-                "/api/v1/match-input/matches/{gm_id}/recordings/{side}/input-state",
-                "/api/v1/match-input/drafts/{gm_id}/{side}",
-                "/api/v1/match-input/drafts/{gm_id}/{side}/participants",
-            "/api/v1/match-input/drafts/{gm_id}/{side}/restore-raw",
-            "/api/v1/match-input/drafts/{gm_id}/{side}/promote-h1",
-            "/api/v1/match-input/drafts/{gm_id}/{side}/finalize",
-            "/api/v1/match-input/approvals",
-            "/api/v1/match-input/approvals/{gm_id}/{side}/promote",
-        }
+        "/api/v1/match-ratings/read",
+        "/api/v1/legacy-import",
+        "/api/v1/legacy-import/jobs/{job_id}",
+    }
+    assert not any(path.startswith("/api/v1/match-input/") for path in schema["paths"])
     assert schema["components"]["securitySchemes"]["SwaggerKey"]["name"] == "X-Swagger-Key"
     assert schema["paths"]["/api/v1/match-kpis/build"]["post"]["security"] == [{"SwaggerKey": []}]
     assert schema["paths"]["/api/v1/match-ratings/build"]["post"]["security"] == [{"SwaggerKey": []}]
@@ -69,8 +55,6 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
     kpi_schema = kpi_operation["requestBody"]["content"]["application/x-www-form-urlencoded"]["schema"]
     kpi_properties = schema["components"]["schemas"][kpi_schema["$ref"].split("/")[-1]]["properties"]
     assert kpi_properties["force"]["default"] is False
-    input_operation = schema["paths"]["/api/v1/match-input/drafts/{gm_id}/{side}"]["put"]
-    assert "application/json" in input_operation["requestBody"]["content"]
     import_operation = schema["paths"]["/api/v1/legacy-import"]["post"]
     assert import_operation["security"] == [{"SwaggerKey": []}]
     assert "multipart/form-data" in import_operation["requestBody"]["content"]

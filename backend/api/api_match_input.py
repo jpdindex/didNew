@@ -264,7 +264,7 @@ def _promote(
     )
 
 
-@router.get("/match-input/matches", summary="Read scheduled matches")
+@router.get("/match-input/matches", include_in_schema=False)
 def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Query(..., ge=1, le=12), _: RequiredUser = None) -> dict:
     data = JpdDidData()
     month_matches = data.list_matches_for_month(year, month)
@@ -325,7 +325,7 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
     return {"status": "ok", "matches": sorted(matches, key=lambda item: (item["date"], item["kickoffTime"] or "", item["gmId"]))}
 
 
-@router.get("/match-input/analyst-dashboard", summary="Read analyst operations dashboard")
+@router.get("/match-input/analyst-dashboard", include_in_schema=False)
 def read_analyst_dashboard(
     date_from: str | None = Query(default=None, max_length=20),
     date_to: str | None = Query(default=None, max_length=20),
@@ -338,7 +338,7 @@ def read_analyst_dashboard(
     )
 
 
-@router.get("/match-input/matches/{gm_id}/bootstrap", summary="Read input lobby bootstrap")
+@router.get("/match-input/matches/{gm_id}/bootstrap", include_in_schema=False)
 def read_match_input_bootstrap(
     gm_id: str,
     side: Side = Query(...),
@@ -348,7 +348,7 @@ def read_match_input_bootstrap(
     return {"status": "ok", **JpdDidData().build_input_bootstrap(gm_id, side)}
 
 
-@router.get("/match-input/matches/{gm_id}/dashboard-kpis", summary="Read both teams' input dashboard KPI")
+@router.get("/match-input/matches/{gm_id}/dashboard-kpis", include_in_schema=False)
 def read_match_dashboard_kpis(
     gm_id: str,
     half: Literal["all", "H1", "H2"] = Query(default="all"),
@@ -358,7 +358,7 @@ def read_match_dashboard_kpis(
     return {"status": "ok", "gmId": gm_id, "half": half, "kpis": JpdDidData().read_match_dashboard_kpis(gm_id, half=half)}
 
 
-@router.get("/match-input/matches/{gm_id}/squads", summary="Read match squads")
+@router.get("/match-input/matches/{gm_id}/squads", include_in_schema=False)
 def read_match_squads(gm_id: str, _: RequiredUser = None) -> dict:
     data = JpdDidData()
     match = data.get_match(gm_id)
@@ -376,52 +376,7 @@ def read_match_squads(gm_id: str, _: RequiredUser = None) -> dict:
     }
 
 
-@router.post("/match-input/matches/{gm_id}/squads/refresh", summary="Refresh match squad snapshot")
-def refresh_match_squads(gm_id: str, _: RequiredUser = None) -> dict:
-    """Use only after correcting player contract data for a fixture."""
-    data = JpdDidData()
-    match = data.get_match(gm_id)
-    squads = data.refresh_input_squads(gm_id, match)
-    return {"status": "ok", "gmId": gm_id, "H": squads["H"], "A": squads["A"], "cached": False}
-
-
-@router.post("/match-input/legacy-lineups/backfill", summary="Backfill imported match input snapshots")
-def backfill_legacy_lineups(
-    limit: int = Query(default=100, ge=1, le=500),
-    _: RequiredUser = None,
-) -> dict:
-    """Create lineup-aware input snapshots for a bounded set of imported finals."""
-    return {"status": "ok", **JpdDidData().backfill_legacy_input_squads(limit=limit)}
-
-
-@router.put("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse, summary="Save input draft")
-def save_draft(gm_id: str, side: Side, request: DraftWriteRequest, user: RequiredUser = None) -> DraftResponse:
-    if request.payload.gmId != gm_id or request.payload.side != side:
-        raise BackendError("Draft path and payload must identify the same match side", status_code=422, code="draft_target_mismatch")
-    data = JpdDidData()
-    match = data.get_match(gm_id)
-    snapshot = request.payload.matchSnapshot
-    if snapshot and (snapshot.homeTeamId != match.homeTeamId or snapshot.awayTeamId != match.awayTeamId):
-        raise BackendError("Draft match snapshot does not match this fixture", status_code=422, code="draft_match_mismatch")
-    document = data.save_input_draft(gm_id, side, payload=request.payload.model_dump(mode="python"), client_state=request.clientState, user_id=user.uid)
-    return _draft_response(document)
-
-
-@router.post("/match-input/drafts/{gm_id}/{side}/participants", summary="Join a shared input draft")
-def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinRequest, user: RequiredUser = None) -> dict:
-    data = JpdDidData()
-    # The selected fixture must exist even before its first Draft is created.
-    data.get_match(gm_id)
-    document = data.join_input_draft_participant(
-        gm_id, side, user_id=user.uid, role=request.role, display_name=request.displayName,
-    )
-    return {
-        "status": "ok", "gmId": gm_id, "side": side,
-        "primaryUid": document.get("primaryUid"), "participants": document.get("participants", {}),
-    }
-
-
-@router.get("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse | DraftMissingResponse, summary="Read input draft")
+@router.get("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse | DraftMissingResponse, include_in_schema=False)
 def get_draft(gm_id: str, side: Side, _: RequiredUser = None) -> DraftResponse | DraftMissingResponse:
     try:
         document = JpdDidData().get_input_draft(gm_id, side)
@@ -435,24 +390,47 @@ def get_draft(gm_id: str, side: Side, _: RequiredUser = None) -> DraftResponse |
         return DraftMissingResponse(status="missing", gmId=gm_id, side=side)
 
 
-@router.get("/match-input/matches/{gm_id}/recordings/{side}/input-state", response_model=DraftResponse, summary="Read final raw for input display")
+@router.get("/match-input/matches/{gm_id}/recordings/{side}/input-state", response_model=DraftResponse, include_in_schema=False)
 def get_final_raw_input_state(gm_id: str, side: Side, _: RequiredUser = None) -> DraftResponse:
     """Read a final RAW recording as an input-screen snapshot without creating a Draft."""
     return _draft_response(JpdDidData().read_input_state_from_raw(gm_id, side))
 
 
-@router.delete("/match-input/drafts/{gm_id}/{side}", summary="Delete input draft")
-def delete_draft(gm_id: str, side: Side, _: RequiredUser = None) -> dict:
-    JpdDidData().delete_input_draft(gm_id, side)
-    return {"status": "ok", "gmId": gm_id, "side": side}
+@router.get("/match-input/approvals", include_in_schema=False)
+def list_approvals(_: RequiredUser = None) -> dict:
+    drafts = JpdDidData().list_input_drafts(recorder_level="basic", status="final")
+    return {"status": "ok", "drafts": [{"gmId": item["gmId"], "side": item["side"], "updatedAt": item.get("updatedAt"), "payload": item["payload"]} for item in drafts]}
 
 
-@router.post("/match-input/drafts/{gm_id}/{side}/restore-raw", response_model=DraftResponse, summary="Create editable draft from final raw")
+@router.post("/match-input/legacy-lineups/backfill", include_in_schema=False)
+def backfill_legacy_lineups(
+    limit: int = Query(default=100, ge=1, le=500),
+    _: RequiredUser = None,
+) -> dict:
+    """Create lineup-aware input snapshots for a bounded set of imported finals."""
+    return {"status": "ok", **JpdDidData().backfill_legacy_input_squads(limit=limit)}
+
+
+@router.post("/match-input/drafts/{gm_id}/{side}/participants", include_in_schema=False)
+def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinRequest, user: RequiredUser = None) -> dict:
+    data = JpdDidData()
+    # The selected fixture must exist even before its first Draft is created.
+    data.get_match(gm_id)
+    document = data.join_input_draft_participant(
+        gm_id, side, user_id=user.uid, role=request.role, display_name=request.displayName,
+    )
+    return {
+        "status": "ok", "gmId": gm_id, "side": side,
+        "primaryUid": document.get("primaryUid"), "participants": document.get("participants", {}),
+    }
+
+
+@router.post("/match-input/drafts/{gm_id}/{side}/restore-raw", response_model=DraftResponse, include_in_schema=False)
 def restore_raw_to_draft(gm_id: str, side: Side, user: RequiredUser = None) -> DraftResponse:
     return _draft_response(JpdDidData().restore_input_draft_from_raw(gm_id, side, user_id=user.uid))
 
 
-@router.post("/match-input/drafts/{gm_id}/{side}/promote-h1", response_model=PromotionResponse, summary="Confirm H1 draft without RAW promotion")
+@router.post("/match-input/drafts/{gm_id}/{side}/promote-h1", response_model=PromotionResponse, include_in_schema=False)
 def promote_h1(gm_id: str, side: Side, user: RequiredUser = None) -> PromotionResponse:
     data = JpdDidData()
     draft = data.get_input_draft(gm_id, side)
@@ -465,7 +443,7 @@ def promote_h1(gm_id: str, side: Side, user: RequiredUser = None) -> PromotionRe
     return PromotionResponse(status="ok", gmId=gm_id, side=side, recordsSaved=0, cardsSaved=0, draftDeleted=False)
 
 
-@router.post("/match-input/drafts/{gm_id}/{side}/finalize", response_model=PromotionResponse, summary="Finalize advanced draft as raw")
+@router.post("/match-input/drafts/{gm_id}/{side}/finalize", response_model=PromotionResponse, include_in_schema=False)
 def finalize_advanced(gm_id: str, side: Side, user: RequiredUser = None) -> PromotionResponse:
     data = JpdDidData()
     draft = data.get_input_draft(gm_id, side)
@@ -479,16 +457,23 @@ def finalize_advanced(gm_id: str, side: Side, user: RequiredUser = None) -> Prom
     return _promote(data, payload, user.uid, status="final", halves={"H1", "H2"}, delete_draft=False)
 
 
-@router.get("/match-input/approvals", summary="List basic drafts awaiting administrator approval")
-def list_approvals(_: RequiredUser = None) -> dict:
-    drafts = JpdDidData().list_input_drafts(recorder_level="basic", status="final")
-    return {"status": "ok", "drafts": [{"gmId": item["gmId"], "side": item["side"], "updatedAt": item.get("updatedAt"), "payload": item["payload"]} for item in drafts]}
-
-
-@router.post("/match-input/approvals/{gm_id}/{side}/promote", response_model=PromotionResponse, summary="Approve basic draft and promote it to raw")
+@router.post("/match-input/approvals/{gm_id}/{side}/promote", response_model=PromotionResponse, include_in_schema=False)
 def approve_basic(gm_id: str, side: Side, user: RequiredUser = None) -> PromotionResponse:
     data = JpdDidData()
     payload = MatchInputPayload.model_validate(data.get_input_draft(gm_id, side)["payload"])
     if payload.recorderLevel != "basic" or payload.status != "final":
         raise BackendError("Only submitted basic drafts can be approved", status_code=409, code="draft_not_awaiting_approval")
     return _promote(data, payload, user.uid, status="final", halves={"H1", "H2"}, delete_draft=True)
+
+
+@router.put("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse, include_in_schema=False)
+def save_draft(gm_id: str, side: Side, request: DraftWriteRequest, user: RequiredUser = None) -> DraftResponse:
+    if request.payload.gmId != gm_id or request.payload.side != side:
+        raise BackendError("Draft path and payload must identify the same match side", status_code=422, code="draft_target_mismatch")
+    data = JpdDidData()
+    match = data.get_match(gm_id)
+    snapshot = request.payload.matchSnapshot
+    if snapshot and (snapshot.homeTeamId != match.homeTeamId or snapshot.awayTeamId != match.awayTeamId):
+        raise BackendError("Draft match snapshot does not match this fixture", status_code=422, code="draft_match_mismatch")
+    document = data.save_input_draft(gm_id, side, payload=request.payload.model_dump(mode="python"), client_state=request.clientState, user_id=user.uid)
+    return _draft_response(document)

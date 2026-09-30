@@ -1,5 +1,6 @@
-from backend.api.api_match_input import MatchInputCommit
+from backend.api.api_match_input import MatchInputCommit, router
 from backend.app import app
+from pydantic_core import PydanticUndefined
 
 
 def test_input_commit_contract_accepts_raw_only_payload() -> None:
@@ -29,12 +30,12 @@ def test_input_commit_contract_accepts_raw_only_payload() -> None:
     assert payload.records[0].area == 10
 
 
-def test_bootstrap_contract_requires_selected_side() -> None:
-    operation = app.openapi()["paths"]["/api/v1/match-input/matches/{gm_id}/bootstrap"]["get"]
-    parameters = {item["name"]: item for item in operation["parameters"]}
+def test_internal_bootstrap_route_requires_selected_side_and_is_hidden_from_openapi() -> None:
+    route = next(route for route in router.routes if route.path == "/match-input/matches/{gm_id}/bootstrap")
 
-    assert parameters["side"]["in"] == "query"
-    assert parameters["side"]["required"] is True
+    assert route.include_in_schema is False
+    parameters = {item.name: item for item in route.dependant.query_params}
+    assert parameters["side"].field_info.default is PydanticUndefined
 
 
 def test_legacy_lineup_snapshot_separates_gk_from_start_order_one() -> None:
