@@ -1,5 +1,6 @@
 import type { DidRecord } from '~/utils/didLogic'
 import type { MatchState } from '~/composables/useMatchState'
+import type { CardRecord } from '~/utils/card'
 import { cloneState, payloadFromState, type InputPayload } from '~/composables/useMatchDraft'
 
 type ParticipantRole = 'primary' | 'assistant'
@@ -44,6 +45,23 @@ function recordFingerprint(record: DidRecord): string {
   })
 }
 
+function cardsFromPayload(cards: Array<Record<string, unknown>>): CardRecord[] {
+  return cards.flatMap(card => {
+    const player = card.playerId
+    const half = card.half
+    const seconds = card.halfSeconds
+    const type = card.card
+    if (typeof player !== 'string' || (half !== 'H1' && half !== 'H2') || typeof seconds !== 'number' || (type !== 'Y' && type !== 'R')) return []
+    return [{ player, half, seconds, card: type }]
+  })
+}
+
+function cardsFingerprint(cards: CardRecord[]) {
+  return JSON.stringify([...cards]
+    .map(card => ({ player: card.player, half: card.half, seconds: card.seconds, card: card.card }))
+    .sort((a, b) => `${a.half}:${a.seconds}:${a.player}:${a.card}`.localeCompare(`${b.half}:${b.seconds}:${b.player}:${b.card}`)))
+}
+
 function sortRecords(records: DidRecord[]): DidRecord[] {
   return records.sort((a, b) =>
     ((a.half || 'H1').localeCompare(b.half || 'H1')) || a.seconds - b.seconds || (a.seq ?? 0) - (b.seq ?? 0),
@@ -60,6 +78,7 @@ interface DraftResponse {
     formationKey: string
     fieldSide: 'left' | 'right' | null
     lineup: Array<Record<string, unknown>>
+    subs: Array<{ half: 'H1' | 'H2'; seconds: number; outPlayer: string; inPlayer: string }>
     inputMode: '분석' | '실시간'
     revision: number
   } | null
@@ -82,6 +101,7 @@ export function useMatchCollaboration() {
   let confirmedRecordFingerprints = new Map<string, string>()
   let pendingRecordFingerprints = new Map<string, string>()
   let pendingDeletedRecordIds = new Set<string>()
+  let pendingCardsFingerprint: string | undefined
 
   function markPendingRecords(records: DidRecord[]) {
     for (const record of records) {
@@ -149,6 +169,7 @@ export function useMatchCollaboration() {
     confirmedRecordFingerprints = new Map()
     pendingRecordFingerprints = new Map()
     pendingDeletedRecordIds = new Set()
+    pendingCardsFingerprint = undefined
     if (pollTimer) clearInterval(pollTimer)
     pollTimer = undefined
   }
@@ -156,6 +177,7 @@ export function useMatchCollaboration() {
   async function start(game: MatchState, handlers: {
     applyState: (state: Partial<MatchState>) => void
     applyRecords: (records: DidRecord[]) => void
+    applyCards?: (cards: CardRecord[]) => void
     applySetup?: (setup: NonNullable<DraftResponse['inputSetup']>) => void
   }) {
     stop()
@@ -194,6 +216,12 @@ export function useMatchCollaboration() {
         const records = sortRecords(response.payload.records.map(recordFromPayload))
         observeServerRecords(records)
         handlers.applyRecords(records)
+        const cards = cardsFromPayload(response.payload.cards)
+        const fingerprint = cardsFingerprint(cards)
+        if (pendingCardsFingerprint === undefined || pendingCardsFingerprint === fingerprint) {
+          pendingCardsFingerprint = undefined
+          handlers.applyCards?.(cards)
+        }
       } catch {
         // Offline is normal. IndexedDB preserves the next retry checkpoint.
       } finally {
@@ -208,7 +236,7 @@ export function useMatchCollaboration() {
     return true
   }
 
-  async function sync(game: MatchState, syncScope: 'state' | 'records', deletedRecordIds: string[] = []) {
+  async function sync(game: MatchState, syncScope: 'state' | 'records' | 'cards', deletedRecordIds: string[] = []) {
     const { $auth } = useNuxtApp()
     if (!$auth.currentUser || !game.matchId) return false
     // Capture each edit at call time, then send mutations in that exact order.
@@ -226,6 +254,7 @@ export function useMatchCollaboration() {
         pendingDeletedRecordIds.add(recordId)
       }
     }
+    if (syncScope === 'cards') pendingCardsFingerprint = cardsFingerprint(game.cards)
     const send = async () => {
       const response = await request<DraftResponse>(`/api/v1/match-input/drafts/${encodeURIComponent(payload.gmId)}/${payload.side}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -233,6 +262,7 @@ export function useMatchCollaboration() {
       })
       latestRevision = Math.max(latestRevision, response.revision)
       if (syncScope === 'records') acknowledgeServerRecords(sortRecords(response.payload.records.map(recordFromPayload)))
+      if (syncScope === 'cards' && cardsFingerprint(cardsFromPayload(response.payload.cards)) === pendingCardsFingerprint) pendingCardsFingerprint = undefined
       return true
     }
     const pending = writeChain.then(send, send)
@@ -253,5 +283,9 @@ export function useMatchCollaboration() {
     return await sync(game, 'records', [recordId])
   }
 
-  return { join, start, stop, syncState, syncRecords, removeRecord, mergeRemoteRecords }
+  async function syncCards(game: MatchState) {
+    return await sync(game, 'cards')
+  }
+
+  return { join, start, stop, syncState, syncRecords, syncCards, removeRecord, mergeRemoteRecords }
 }

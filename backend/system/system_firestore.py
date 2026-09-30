@@ -637,6 +637,46 @@ class JpdDidData:
         return self.db.collection("inputDrafts").document(f"{gm_id}_{side}")
 
     @staticmethod
+    def _normalise_input_subs(values: Any) -> list[dict[str, Any]]:
+        if not isinstance(values, list):
+            return []
+        normalised: list[dict[str, Any]] = []
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            half = value.get("half")
+            out_player = value.get("outPlayer")
+            in_player = value.get("inPlayer")
+            seconds = value.get("seconds")
+            if half not in {"H1", "H2"} or not isinstance(out_player, str) or not isinstance(in_player, str):
+                continue
+            if not isinstance(seconds, int) or seconds < 0:
+                continue
+            normalised.append({"half": half, "seconds": seconds, "outPlayer": out_player, "inPlayer": in_player})
+        return sorted(normalised, key=lambda item: (item["half"], item["seconds"], item["outPlayer"], item["inPlayer"]))
+
+    @classmethod
+    def _subs_from_input_lineup(cls, lineup: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Recover substitutions from final RAW lineup metadata when needed."""
+        outgoing: dict[tuple[str, int], list[str]] = {}
+        incoming: dict[tuple[str, int], list[str]] = {}
+        for item in lineup:
+            player_id = item.get("playerId")
+            if not isinstance(player_id, str):
+                continue
+            out_half, out_seconds = item.get("outHalf"), item.get("outSeconds")
+            in_half, in_seconds = item.get("inHalf"), item.get("inSeconds")
+            if out_half in {"H1", "H2"} and isinstance(out_seconds, int):
+                outgoing.setdefault((out_half, out_seconds), []).append(player_id)
+            if in_half in {"H1", "H2"} and isinstance(in_seconds, int) and in_seconds > 0:
+                incoming.setdefault((in_half, in_seconds), []).append(player_id)
+        result: list[dict[str, Any]] = []
+        for key in sorted(set(outgoing) | set(incoming)):
+            for out_player, in_player in zip(sorted(outgoing.get(key, [])), sorted(incoming.get(key, []))):
+                result.append({"half": key[0], "seconds": key[1], "outPlayer": out_player, "inPlayer": in_player})
+        return result
+
+    @staticmethod
     def _normalise_input_setup(values: Any) -> dict[str, Any] | None:
         if not isinstance(values, dict):
             return None
@@ -649,6 +689,7 @@ class JpdDidData:
             "formationKey": formation_key,
             "fieldSide": field_side if field_side in {"left", "right"} else None,
             "lineup": [item for item in lineup if isinstance(item, dict)],
+            "subs": JpdDidData._normalise_input_subs(values.get("subs")),
             "inputMode": values.get("inputMode") if values.get("inputMode") in {"분석", "실시간"} else "분석",
             "revision": int(values.get("revision") or 0),
         }
@@ -690,6 +731,9 @@ class JpdDidData:
             "formationKey": formation_key,
             "fieldSide": selected_field_side if selected_field_side in {"left", "right"} else previous.get("fieldSide"),
             "lineup": [item for item in lineup if isinstance(item, dict)],
+            "subs": self._normalise_input_subs(client_state.get("subs"))
+                if isinstance(client_state.get("subs"), list)
+                else self._subs_from_input_lineup([item for item in lineup if isinstance(item, dict)]),
             "inputMode": payload.get("inputMode") if payload.get("inputMode") in {"분석", "실시간"} else previous.get("inputMode", "분석"),
         }
         previous_comparable = {key: previous.get(key) for key in next_comparable}
@@ -1106,7 +1150,7 @@ class JpdDidData:
         payload: dict[str, Any],
         client_state: dict[str, Any],
         user_id: str,
-        sync_scope: Literal["checkpoint", "state", "records"] = "checkpoint",
+        sync_scope: Literal["checkpoint", "state", "records", "cards"] = "checkpoint",
         deleted_record_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
@@ -1120,7 +1164,7 @@ class JpdDidData:
         # An assistant's record sync must never pause, restart or reopen a half.
         primary_uid = str(previous.get("primaryUid") or "")
         can_write_live_state = not primary_uid or primary_uid == user_id
-        if sync_scope == "records" or not can_write_live_state:
+        if sync_scope in {"records", "cards"} or not can_write_live_state:
             shared_state = previous_shared
         else:
             shared_state = {
@@ -1134,8 +1178,10 @@ class JpdDidData:
                 "awayScore": payload.get("awayScore", previous_shared.get("awayScore", 0)),
             }
         root_payload = payload if sync_scope == "checkpoint" or not previous_payload else previous_payload
+        payload_update: dict[str, Any] | None = None
         if sync_scope == "checkpoint":
             root_payload = {**payload, "records": previous_payload.get("records", [])}
+            payload_update = root_payload
         elif sync_scope == "state" and can_write_live_state:
             root_payload = {
                 **previous_payload,
@@ -1144,6 +1190,13 @@ class JpdDidData:
                 "awayScore": payload.get("awayScore", previous_payload.get("awayScore", 0)),
                 "halves": payload.get("halves", previous_payload.get("halves", {})),
             }
+            payload_update = {
+                "status": root_payload["status"], "homeScore": root_payload["homeScore"],
+                "awayScore": root_payload["awayScore"], "halves": root_payload["halves"],
+            }
+        elif sync_scope == "cards":
+            root_payload = {**previous_payload, "cards": payload.get("cards", previous_payload.get("cards", []))}
+            payload_update = {"cards": root_payload["cards"]}
         if sync_scope == "checkpoint" and not can_write_live_state and previous_payload:
             root_payload = previous_payload
 
@@ -1172,16 +1225,15 @@ class JpdDidData:
                 **previous_client,
                 **{key: client_state[key] for key in ("seconds", "h1Seconds", "h2Seconds", "clockStartedAt", "halfStatus", "homeScore", "awayScore") if key in client_state},
             }
-        elif sync_scope == "records":
+        elif sync_scope in {"records", "cards"}:
             next_client_state = previous_client or client_state
         elif sync_scope == "checkpoint" and not can_write_live_state:
             next_client_state = previous_client
         else:
             next_client_state = client_state
-        document = {
+        document: dict[str, Any] = {
             "gmId": gm_id,
             "side": side,
-            "payload": root_payload,
             "clientState": next_client_state,
             "recorderLevel": root_payload.get("recorderLevel", "advanced"),
             "status": root_payload.get("status", "ready"),
@@ -1195,12 +1247,15 @@ class JpdDidData:
             "primaryUid": previous.get("primaryUid"),
             "collaboration": previous.get("collaboration", {}),
             "sharedState": shared_state,
-            # setup is a separate Draft state. Record, timer and lifecycle
-            # checkpoints replace this document, so explicitly retain it.
-            "setup": previous.get("setup"),
         }
-        reference.set(document, retry=None, timeout=20)
-        return self._with_draft_records(reference, document)
+        if payload_update is not None:
+            document["payload"] = payload_update
+        # Setup has its own event-driven write path. Never include it in a
+        # record/clock checkpoint: this request may have read an older Draft
+        # just before a substitution wrote a newer setup revision.
+        reference.set(document, merge=True, retry=None, timeout=20)
+        saved = reference.get(retry=None, timeout=10).to_dict() or {}
+        return self._with_draft_records(reference, saved)
 
     def join_input_draft_participant(
         self,
@@ -1254,8 +1309,7 @@ class JpdDidData:
             "joinedAt": participants.get(user_id, {}).get("joinedAt", now),
             "lastSeenAt": now,
         }
-        document = {
-            **current,
+        updates = {
             "gmId": gm_id,
             "side": side,
             "primaryUid": primary_uid,
@@ -1264,8 +1318,10 @@ class JpdDidData:
             "updatedBy": user_id,
             "createdAt": current.get("createdAt", now),
         }
-        reference.set(document, retry=None, timeout=20)
-        return document
+        # A participant refresh must not overwrite setup with a stale document
+        # read. Merge only collaboration metadata into the Draft root.
+        reference.set(updates, merge=True, retry=None, timeout=20)
+        return {**current, **updates}
 
     def ensure_recorder_profile(self, user_id: str, *, name: str | None = None) -> dict[str, Any]:
         """Create/update the minimal operational profile after Firebase Auth login."""

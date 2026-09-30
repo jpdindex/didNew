@@ -120,7 +120,7 @@ class DraftWriteRequest(BaseModel):
     clientState: dict[str, Any]
     # One endpoint serves durable checkpoints and the two lightweight live-sync
     # mutations.  These endpoints are intentionally internal to the frontend.
-    syncScope: Literal["checkpoint", "state", "records"] = "checkpoint"
+    syncScope: Literal["checkpoint", "state", "records", "cards"] = "checkpoint"
     deletedRecordIds: list[str] = Field(default_factory=list)
 
 

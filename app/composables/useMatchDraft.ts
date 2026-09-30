@@ -1,4 +1,5 @@
 import type { DidRecord } from '~/utils/didLogic'
+import type { CardRecord } from '~/utils/card'
 import type { FormationChange, MatchSnapshot, MatchState, MatchSquadPlayer } from '~/composables/useMatchState'
 import { assignmentsFromLineup, lineupOrderForSlot } from '~/utils/formationLayout'
 
@@ -32,6 +33,10 @@ interface StoredDraft {
 
 const DB_NAME = 'jpd-did-input'
 const STORE_NAME = 'match-drafts'
+// Setup mutations are infrequent but must retain their user-action order. A
+// slow first substitution request must never arrive after and replace a later
+// substitution's complete lineup snapshot.
+let setupWriteChain: Promise<unknown> = Promise.resolve()
 
 function inputSide(game: MatchState): Side {
   return game.team === 'away' ? 'A' : 'H'
@@ -105,6 +110,17 @@ function assignedLineup(game: MatchState, squad: MatchSquadPlayer[]) {
         outHalf: subOut?.half ?? null, outSeconds: subOut?.seconds ?? null,
       }
     })
+}
+
+function cardsFromPayload(cards: Array<Record<string, unknown>>): CardRecord[] {
+  return cards.flatMap(card => {
+    const player = card.playerId
+    const half = card.half
+    const seconds = card.halfSeconds
+    const type = card.card
+    if (typeof player !== 'string' || (half !== 'H1' && half !== 'H2') || typeof seconds !== 'number' || (type !== 'Y' && type !== 'R')) return []
+    return [{ player, half, seconds, card: type }]
+  })
 }
 
 export function payloadFromState(game: MatchState): InputPayload {
@@ -228,6 +244,10 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
       shootDspRange: record.shootDspRange as boolean | undefined, isShot: record.isShot as boolean | undefined,
       playerId: record.playerId as string | undefined,
     }))
+    // Cards are server-owned Draft data, not a browser-only UI scratchpad.
+    // Without this assignment a lobby re-entry restored an older clientState
+    // and made persisted yellow/red cards look as if they had disappeared.
+    game.cards = cardsFromPayload(payload.cards)
     return
   }
   // Direct entries also set the requested team before hydration. Preserve it
@@ -254,6 +274,7 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
     shootDspRange: record.shootDspRange as boolean | undefined, isShot: record.isShot as boolean | undefined,
     playerId: record.playerId as string | undefined,
   }))
+  game.cards = cardsFromPayload(payload.cards)
   game.halfStatus = payload.status
   Object.assign(game, sessionIdentity)
 }
@@ -294,11 +315,17 @@ export function useMatchDraft() {
   async function saveSetup(game: MatchState): Promise<boolean> {
     if (!game.matchId) return false
     const payload = payloadFromState(game)
-    try {
+    const clientState = cloneState(game)
+    const send = async () => {
       await request(`/api/v1/match-input/drafts/${encodeURIComponent(payload.gmId)}/${payload.side}/setup`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ payload, clientState: cloneState(game) }),
+        body: JSON.stringify({ payload, clientState }),
       })
+    }
+    const pending = setupWriteChain.then(send, send)
+    setupWriteChain = pending.catch(() => false)
+    try {
+      await pending
       return true
     } catch {
       return false

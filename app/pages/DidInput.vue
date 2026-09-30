@@ -39,7 +39,7 @@ const inputMode = computed(() => (route.query.mode === '실시간' ? '실시간'
 const game = useMatchState()
 const { request } = useBackendApi()
 const { saveLocal, save: saveDraft, saveSetup, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
-const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, removeRecord, mergeRemoteRecords } = useMatchCollaboration()
+const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncCards, removeRecord, mergeRemoteRecords } = useMatchCollaboration()
 const isPrimary = computed(() => game.value.participantRole === 'primary')
 const requestedRole = route.query.role === 'assistant' ? 'assistant' : 'primary'
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
@@ -55,6 +55,7 @@ type InputSetup = {
   formationKey: string
   fieldSide: 'left' | 'right' | null
   lineup: Array<Record<string, unknown>>
+  subs: SubRecord[]
   inputMode: '분석' | '실시간'
 }
 
@@ -63,6 +64,7 @@ function applyInputSetup(setup: InputSetup | null | undefined) {
   game.value.formationKey = setup.formationKey
   if (setup.fieldSide === 'left' || setup.fieldSide === 'right') game.value.side = setup.fieldSide
   game.value.assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
+  game.value.subs = setup.subs.map(sub => ({ ...sub }))
   game.value.inputMode = setup.inputMode
 }
 let appliedSetupRevision = -1
@@ -252,6 +254,16 @@ onMounted(async () => {
       game.value.records = mergedRecords
       nextTick(() => { applyingRemoteDraft = false })
     },
+    applyCards: (remoteCards) => {
+      const unchanged = remoteCards.length === game.value.cards.length && remoteCards.every((card, index) =>
+        card.player === game.value.cards[index]?.player && card.half === game.value.cards[index]?.half &&
+        card.seconds === game.value.cards[index]?.seconds && card.card === game.value.cards[index]?.card,
+      )
+      if (unchanged) return
+      applyingRemoteDraft = true
+      game.value.cards = remoteCards
+      nextTick(() => { applyingRemoteDraft = false })
+    },
     applySetup: (setup) => {
       if (setup.revision <= appliedSetupRevision) return
       appliedSetupRevision = setup.revision
@@ -362,7 +374,7 @@ function queueDraftSave() {
   draftSaveTimer = setTimeout(() => {
     // The collaboration composable serializes state and record writes, while
     // its optimistic record merge keeps this screen stable during the round trip.
-    void Promise.all([syncState(game.value), syncRecords(game.value, records.value)])
+    void Promise.all([syncState(game.value), syncRecords(game.value, records.value), syncCards(game.value)])
       .catch(() => false)
   }, 500)
 }

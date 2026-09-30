@@ -99,6 +99,7 @@ type InputSetup = {
   formationKey: string
   fieldSide: FieldSide | null
   lineup: Array<Record<string, unknown>>
+  subs: SubRecord[]
   inputMode: '분석' | '실시간'
 }
 
@@ -118,10 +119,11 @@ function applyInputSetup(setup: InputSetup | null | undefined) {
   game.value.formationKey = setup.formationKey
   if (setup.fieldSide === 'left' || setup.fieldSide === 'right') game.value.side = setup.fieldSide
   game.value.assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
+  game.value.subs = setup.subs.map(sub => ({ ...sub }))
   game.value.inputMode = setup.inputMode
 }
 
-function setupFingerprint(setup: Pick<InputSetup, 'formationKey' | 'fieldSide' | 'lineup' | 'inputMode'>) {
+function setupFingerprint(setup: Pick<InputSetup, 'formationKey' | 'fieldSide' | 'lineup' | 'subs' | 'inputMode'>) {
   return JSON.stringify({
     formationKey: setup.formationKey,
     fieldSide: setup.fieldSide,
@@ -131,6 +133,7 @@ function setupFingerprint(setup: Pick<InputSetup, 'formationKey' | 'fieldSide' |
       inHalf: item.inHalf ?? null, inSeconds: item.inSeconds ?? null,
       outHalf: item.outHalf ?? null, outSeconds: item.outSeconds ?? null,
     })).sort((a, b) => String(a.slot).localeCompare(String(b.slot))),
+    subs: [...setup.subs].sort((a, b) => `${a.half}:${a.seconds}:${a.outPlayer}`.localeCompare(`${b.half}:${b.seconds}:${b.outPlayer}`)),
   })
 }
 
@@ -148,7 +151,7 @@ function currentSetupFingerprint() {
       outHalf: subOut?.half ?? null, outSeconds: subOut?.seconds ?? null,
     }
   })
-  return setupFingerprint({ formationKey: game.value.formationKey, fieldSide: game.value.side, lineup, inputMode: game.value.inputMode })
+  return setupFingerprint({ formationKey: game.value.formationKey, fieldSide: game.value.side, lineup, subs: game.value.subs, inputMode: game.value.inputMode })
 }
 
 async function loadBootstrap() {
