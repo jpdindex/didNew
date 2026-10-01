@@ -98,7 +98,10 @@ export interface MatchState {
   recorderLevel: RecorderLevel
   // 입력 등급과 협업 역할은 다른 개념이다. 등급은 recorders/{uid}의 계정 속성이고,
   // 역할은 일정 화면에서 매 입력 세션마다 선택한다. RAW 확정 권한은 둘을 함께 판별한다.
-  participantRole: 'primary' | 'assistant'
+  participantRole: 'primary' | 'assistant' | 'manager'
+  // 시계·전후반 종료·최종 갱신 권한. 주 분석관, 또는 주 분석관이 없는 수정 Draft의
+  // 매니저가 가진다. 서버 join 응답(control)이 최종 판단이다.
+  lifecycleControl: boolean
   participantName: string
   // 전반전/후반전 갱신을 누르면 true. basic 등급에서만 의미가 있으며, true 인 동안은
   // 그 half 의 "수정"·"갱신" 버튼이 함께 잠긴다. 관리자 잠금 해제로만 다시 false 가 된다.
@@ -132,6 +135,7 @@ function defaultMatchState(): MatchState {
     formationChanges: [],
     recorderLevel: 'advanced',
     participantRole: 'primary',
+    lifecycleControl: true,
     participantName: '',
     h1Locked: false,
     h2Locked: false,

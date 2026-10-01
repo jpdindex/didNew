@@ -14,7 +14,7 @@ Side = Literal["H", "A"]
 HalfStatus = Literal["ready", "H1", "H1_done", "H2", "H2_done", "final"]
 InputMode = Literal["분석", "실시간"]
 RecorderLevel = Literal["basic", "advanced"]
-RecorderRank = Literal["main", "sub"]
+RecorderRank = Literal["main", "sub", "manager"]
 DataSource = Literal["did", "vision"]
 ActCode = Literal["C", "P", "K", "F", "S", "H", "R", ""]
 ResCode = Literal["O", "X", "B", "GB", "GX", "GOAL", "L", "H", "R", "LX", "HX", "RX", ""]
@@ -68,6 +68,8 @@ class LineupEntry(SchemaModel):
 class RecorderEntry(SchemaModel):
     rank: RecorderRank
     joinedAt: datetime
+    # Display name at finalize time. Legacy imports have no name.
+    name: str | None = None
 
 
 class RecordingKpi(SchemaModel):
@@ -102,8 +104,8 @@ class RecordingDoc(SchemaModel):
     side: Side
     teamId: str
     opponentTeamId: str
-    # RAW is the match-data source of truth. Analyst participation belongs to
-    # operational Draft/audit data, so new RAW documents do not carry it.
+    # Final analyst roster copied from the Draft at promotion, because the
+    # promoted Draft is deleted. primary=main, assistant=sub, manager=manager.
     recorders: dict[str, RecorderEntry] = Field(default_factory=dict)
     recorderIds: list[str] = Field(default_factory=list)
     status: HalfStatus

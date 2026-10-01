@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { signOut } from 'firebase/auth'
 
 const { $auth } = useNuxtApp()
@@ -139,9 +139,26 @@ async function loadMatches() {
 
 onMounted(loadMatches)
 
+// 리그 필터: 월이 바뀌어도 선택은 유지하고, 그 달에 경기가 없어도 옵션은 남긴다.
+const selectedLeague = ref<string>('all')
+const leagueOptions = computed(() => {
+  const leagues = new Set(matches.value.map(match => match.league).filter(Boolean))
+  if (selectedLeague.value !== 'all') leagues.add(selectedLeague.value)
+  return [...leagues].sort((a, b) => a.localeCompare(b))
+})
+
+const visibleMatches = computed(() => (
+  selectedLeague.value === 'all' ? matches.value : matches.value.filter(match => match.league === selectedLeague.value)
+))
+
+function applyLeagueFilter() {
+  selectedMatchId.value = ''
+  selectedTeam.value = null
+}
+
 const matchList = computed(() => {
   if (!selectedDate.value) return []
-  return matches.value.filter(match => match.date === selectedDate.value)
+  return visibleMatches.value.filter(match => match.date === selectedDate.value)
 })
 
 function selectMatch(id: string) {
@@ -166,6 +183,12 @@ function teamAnalysisLabel(status: TeamInputStatus) {
   return labels[status.lifecycleStatus] || '분석 대기'
 }
 
+function teamStatusTone(status: TeamInputStatus) {
+  if (status.lifecycleStatus === 'final') return 'done'
+  if (!status.lifecycleStatus || status.lifecycleStatus === 'ready') return 'waiting'
+  return 'live'
+}
+
 function isMatchComplete(match: MatchItem) {
   return match.inputStatus.H.completed && match.inputStatus.A.completed
 }
@@ -175,12 +198,39 @@ function teamCollaboration(match: MatchItem, team: 'home' | 'away') {
 }
 
 function orderedParticipants(summary: CollaborationSummary) {
-  return [...(summary.participants || [])].sort((a, b) => (a.role === 'primary' ? -1 : 1) - (b.role === 'primary' ? -1 : 1))
+  const order: Record<string, number> = { primary: 0, assistant: 1, manager: 2 }
+  return [...(summary.participants || [])].sort((a, b) => (order[a.role || ''] ?? 1) - (order[b.role || ''] ?? 1))
 }
 
-const selectedTeamHasOtherPrimary = computed(() => {
+type ParticipantRole = 'primary' | 'assistant' | 'manager'
+
+const ROLE_NAMES: Record<ParticipantRole, string> = { primary: '주 분석관', assistant: '부 분석관', manager: '매니저' }
+
+// 매니저 버튼은 ADVANCED 분석관에게만 열린다. 최종 판단은 서버 join이 다시 한다.
+const recorderLevel = ref<'basic' | 'advanced' | null>(null)
+async function loadRecorderLevel() {
+  try {
+    const profile = await request<{ level?: 'basic' | 'advanced' }>('/api/v1/match-input/recorder-profile')
+    recorderLevel.value = profile.level === 'basic' ? 'basic' : 'advanced'
+  } catch {
+    recorderLevel.value = null
+  }
+}
+onMounted(loadRecorderLevel)
+
+const selectedSummary = computed(() => (
+  selectedMatch.value && selectedTeam.value ? teamCollaboration(selectedMatch.value, selectedTeam.value) : null
+))
+
+// 팀 입력이 끝나면(RAW 확정 또는 BASIC 제출) 매니저만 들어갈 수 있다.
+const selectedTeamFinished = computed(() => {
   if (!selectedMatch.value || !selectedTeam.value) return false
-  const summary = teamCollaboration(selectedMatch.value, selectedTeam.value)
+  return selectedMatch.value.inputStatus[selectedTeam.value === 'home' ? 'H' : 'A'].lifecycleStatus === 'final'
+})
+
+const selectedTeamHasOtherPrimary = computed(() => {
+  const summary = selectedSummary.value
+  if (!summary) return false
   const primary = summary.primaryUid || summary.participants?.find(item => item.role === 'primary')?.uid
   const primaryName = summary.participants?.find(item => item.uid === primary)?.name
   const currentNames = [$auth.currentUser?.displayName, $auth.currentUser?.email].filter(Boolean)
@@ -190,12 +240,15 @@ const selectedTeamHasOtherPrimary = computed(() => {
   return Boolean(primary && primary !== $auth.currentUser?.uid)
 })
 
-const selectedParticipantRole = computed<'primary' | 'assistant' | null>(() => {
-  if (!selectedMatch.value || !selectedTeam.value || !$auth.currentUser) return null
+const selectedParticipantRole = computed<ParticipantRole | null>(() => {
+  const summary = selectedSummary.value
+  if (!summary || !$auth.currentUser) return null
+  const isRole = (role?: string): role is ParticipantRole => role === 'primary' || role === 'assistant' || role === 'manager'
 
-  const summary = teamCollaboration(selectedMatch.value, selectedTeam.value)
   const direct = summary.participants?.find(item => item.uid === $auth.currentUser?.uid)
-  if (direct?.role === 'primary' || direct?.role === 'assistant') return direct.role
+  // 끝난 경기의 주/부 기록은 명단으로만 남는다. 다시 들어오려면 매니저로 입장한다.
+  if (selectedTeamFinished.value) return direct?.role === 'manager' ? 'manager' : null
+  if (isRole(direct?.role)) return direct.role
 
   // Legacy local Drafts used a shared UID. Until the backend migrates one,
   // recognize its stored name so the original participant can re-enter only
@@ -204,39 +257,45 @@ const selectedParticipantRole = computed<'primary' | 'assistant' | null>(() => {
   const legacy = summary.participants?.find(item => (
     item.uid === 'local-did-input' && currentNames.includes(item.name || '')
   ))
-  return legacy?.role === 'primary' || legacy?.role === 'assistant' ? legacy.role : null
+  return isRole(legacy?.role) ? legacy.role : null
 })
 
 const selectedTeamHasPrimary = computed(() => {
-  if (!selectedMatch.value || !selectedTeam.value) return false
-  const summary = teamCollaboration(selectedMatch.value, selectedTeam.value)
-  return Boolean(summary.primaryUid || summary.participants?.some(item => item.role === 'primary'))
+  const summary = selectedSummary.value
+  return Boolean(summary && (summary.primaryUid || summary.participants?.some(item => item.role === 'primary')))
 })
 
-const primaryRoleDisabled = computed(() => (
-  selectedParticipantRole.value === 'assistant' || selectedTeamHasOtherPrimary.value
+const selectedTeamHasOtherAssistant = computed(() => Boolean(
+  selectedSummary.value?.participants?.some(item => item.role === 'assistant' && item.uid !== $auth.currentUser?.uid)
 ))
 
-const assistantRoleDisabled = computed(() => (
-  selectedParticipantRole.value === 'primary' ||
-  (!selectedParticipantRole.value && !selectedTeamHasPrimary.value)
-))
+const roleState = computed(() => {
+  const mine = selectedParticipantRole.value
+  const finished = selectedTeamFinished.value
 
-const primaryRoleLabel = computed(() => {
-  if (selectedParticipantRole.value === 'primary') return '주 분석관으로 재입장'
-  if (selectedParticipantRole.value === 'assistant') return '이미 부 분석관으로 참여 중입니다'
-  if (selectedTeamHasOtherPrimary.value) return '주 분석관이 이미 입장했습니다'
-  return '주 분석관으로 분석 진행'
+  const primary = finished ? { disabled: true, label: '주 분석관으로 분석 진행' }
+    : mine === 'primary' ? { disabled: false, label: '주 분석관으로 재입장' }
+    : mine ? { disabled: true, label: '주 분석관으로 분석 진행' }
+    : selectedTeamHasOtherPrimary.value ? { disabled: true, label: '주 분석관이 이미 입장했습니다' }
+    : { disabled: false, label: '주 분석관으로 분석 진행' }
+
+  const assistant = finished ? { disabled: true, label: '부 분석관으로 분석 진행' }
+    : mine === 'assistant' ? { disabled: false, label: '부 분석관으로 재입장' }
+    : mine ? { disabled: true, label: '부 분석관으로 분석 진행' }
+    : !selectedTeamHasPrimary.value ? { disabled: true, label: '주 분석관 입장 후 참여할 수 있습니다' }
+    : selectedTeamHasOtherAssistant.value ? { disabled: true, label: '부 분석관이 이미 입장했습니다' }
+    : { disabled: false, label: '부 분석관으로 분석 진행' }
+
+  const manager = mine === 'manager' ? { disabled: false, label: '매니저로 재입장' }
+    : mine ? { disabled: true, label: '매니저 권한으로 입장' }
+    : recorderLevel.value !== 'advanced' ? { disabled: true, label: '매니저 권한(ADVANCED)이 필요합니다' }
+    : !finished && !selectedTeamHasPrimary.value ? { disabled: true, label: '주 분석관 입장 후 참여할 수 있습니다' }
+    : { disabled: false, label: '매니저 권한으로 입장' }
+
+  return { primary, assistant, manager }
 })
 
-const assistantRoleLabel = computed(() => {
-  if (selectedParticipantRole.value === 'assistant') return '부 분석관으로 재입장'
-  if (selectedParticipantRole.value === 'primary') return '이미 주 분석관으로 참여 중입니다'
-  if (!selectedTeamHasPrimary.value) return '주 분석관 입장 후 참여할 수 있습니다'
-  return '부 분석관으로 분석 진행'
-})
-
-async function goTeamSelection(role: 'primary' | 'assistant') {
+async function goTeamSelection(role: ParticipantRole) {
   const m = selectedMatch.value
   if (!selectedDate.value || !m || !selectedTeam.value) return
 
@@ -263,9 +322,8 @@ function onSubmit() {
   roleDialogOpen.value = true
 }
 
-function chooseRole(role: 'primary' | 'assistant') {
-  if (role === 'primary' && primaryRoleDisabled.value) return
-  if (role === 'assistant' && assistantRoleDisabled.value) return
+function chooseRole(role: ParticipantRole) {
+  if (roleState.value[role].disabled) return
   roleDialogOpen.value = false
   goTeamSelection(role)
 }
@@ -293,19 +351,17 @@ function onCancel() {
         <!-- LEFT: Calendar -->
         <section class="left">
           <div class="toolbar">
-            <div class="calendarFilter" aria-label="조회 기간">
-              <label>
-                <span>연도</span>
-                <select v-model.number="viewYear" @change="applyCalendarView">
-                  <option v-for="year in yearOptions" :key="year" :value="year">{{ year }}</option>
-                </select>
-              </label>
-              <label>
-                <span>월</span>
-                <select v-model.number="viewMonth" @change="applyCalendarView">
-                  <option v-for="month in monthOptions" :key="month" :value="month">{{ month + 1 }}월</option>
-                </select>
-              </label>
+            <div class="calendarFilter" aria-label="조회 조건">
+              <select v-model="selectedLeague" aria-label="리그" @change="applyLeagueFilter">
+                <option value="all">전체 리그</option>
+                <option v-for="league in leagueOptions" :key="league" :value="league">{{ league }}</option>
+              </select>
+              <select v-model.number="viewYear" aria-label="연도" @change="applyCalendarView">
+                <option v-for="year in yearOptions" :key="year" :value="year">{{ year }}년</option>
+              </select>
+              <select v-model.number="viewMonth" class="monthSelect" aria-label="월" @change="applyCalendarView">
+                <option v-for="month in monthOptions" :key="month" :value="month">{{ month + 1 }}월</option>
+              </select>
             </div>
             <div class="monthNav" aria-label="월 이동">
               <button class="iconBtn" @click="prevMonth" aria-label="Prev month">‹</button>
@@ -325,7 +381,7 @@ function onCancel() {
               :class="{
                 empty: !c.day,
                 active: c.ymd && c.ymd === selectedDate,
-                hasMatch: c.ymd && matches.some(match => match.date === c.ymd),
+                hasMatch: c.ymd && visibleMatches.some(match => match.date === c.ymd),
               }"
               :disabled="!c.day"
               @click="pickDate(c.ymd)"
@@ -362,50 +418,41 @@ function onCancel() {
                 @keydown.enter="selectMatch(m.id)"
               >
               <div class="time">
+                <div class="t">{{ m.time || '시간 미정' }}</div>
                 <div class="timeRow">
-                  <div class="t">{{ m.time || '시간 미정' }}</div>
+                  <div class="competition">{{ m.league }}</div>
                   <div class="roundBadge">{{ m.round }}</div>
                 </div>
-                <div class="competition">{{ m.league }}</div>
                 <div class="stadium">{{ m.stadium }}</div>
               </div>
 
               <div class="vs">
-                <div class="analystStack analystStackHome" aria-label="홈팀 분석관">
-                  <div v-for="participant in orderedParticipants(teamCollaboration(m, 'home'))" :key="participant.uid" class="analyst">
-                    {{ participant.role === 'primary' ? 'Main' : 'Sub' }}: {{ (participant.name || participant.uid).split('@')[0] }}
-                  </div>
-                </div>
                 <button
-                  class="teamCell teamChoice teamHome"
-                  :class="{ chosen: m.id === selectedMatchId && selectedTeam === 'home' }"
+                  v-for="side in (['home', 'away'] as const)"
+                  :key="side"
+                  class="teamChoice"
+                  :class="[side === 'home' ? 'teamHome' : 'teamAway', { chosen: m.id === selectedMatchId && selectedTeam === side }]"
+                  :style="{ order: side === 'home' ? 0 : 2 }"
                   type="button"
-                  @click.stop="selectTeam(m.id, 'home')"
+                  @click.stop="selectTeam(m.id, side)"
                 >
-                  <div class="team">{{ m.home.name }}</div>
-                  <div class="teamStatus" :class="m.inputStatus.H.completed ? 'teamStatus-done' : 'teamStatus-waiting'">
-                    {{ teamAnalysisLabel(m.inputStatus.H) }}
+                  <div class="teamHead">
+                    <div class="team">{{ m[side].name }}</div>
+                    <div class="teamStatus" :class="`teamStatus-${teamStatusTone(m.inputStatus[side === 'home' ? 'H' : 'A'])}`">
+                      {{ teamAnalysisLabel(m.inputStatus[side === 'home' ? 'H' : 'A']) }}
+                    </div>
+                  </div>
+                  <div class="analystLine" :aria-label="side === 'home' ? '홈팀 분석관' : '원정팀 분석관'">
+                    <span v-for="participant in orderedParticipants(teamCollaboration(m, side))" :key="participant.uid" class="analyst">
+                      <span class="analystRole" :class="{ main: participant.role === 'primary' }">{{ participant.role === 'primary' ? 'Main' : participant.role === 'manager' ? 'Manager' : 'Sub' }}</span>
+                      <span class="analystName">{{ (participant.name || participant.uid).split('@')[0] }}</span>
+                    </span>
+                    <span v-if="!teamCollaboration(m, side).participants?.length" class="analystEmpty">배정된 분석관 없음</span>
                   </div>
                 </button>
                 <div class="mid">
                   <div class="score" :aria-label="`스코어 ${m.score.home} 대 ${m.score.away}`">
                     <span>{{ m.score.home }}</span><span class="scoreDivider">:</span><span>{{ m.score.away }}</span>
-                  </div>
-                </div>
-                <button
-                  class="teamCell teamChoice teamAway"
-                  :class="{ chosen: m.id === selectedMatchId && selectedTeam === 'away' }"
-                  type="button"
-                  @click.stop="selectTeam(m.id, 'away')"
-                >
-                  <div class="team">{{ m.away.name }}</div>
-                  <div class="teamStatus" :class="m.inputStatus.A.completed ? 'teamStatus-done' : 'teamStatus-waiting'">
-                    {{ teamAnalysisLabel(m.inputStatus.A) }}
-                  </div>
-                </button>
-                <div class="analystStack analystStackAway" aria-label="원정팀 분석관">
-                  <div v-for="participant in orderedParticipants(teamCollaboration(m, 'away'))" :key="participant.uid" class="analyst">
-                    {{ participant.role === 'primary' ? 'Main' : 'Sub' }}: {{ (participant.name || participant.uid).split('@')[0] }}
                   </div>
                 </div>
               </div>
@@ -426,13 +473,24 @@ function onCancel() {
 
       <div v-if="roleDialogOpen" class="roleOverlay" @click.self="roleDialogOpen = false">
         <section class="roleDialog" role="dialog" aria-modal="true" aria-label="분석 역할 선택">
-          <h2>분석 역할 선택</h2>
-          <p>{{ selectedTeam === 'home' ? selectedMatch?.home.name : selectedMatch?.away.name }} 입력 역할을 선택하세요.</p>
-          <button class="roleChoice primary" :disabled="primaryRoleDisabled" @click="chooseRole('primary')">
-            {{ primaryRoleLabel }}
-          </button>
-          <button class="roleChoice assistant" :disabled="assistantRoleDisabled" @click="chooseRole('assistant')">
-            {{ assistantRoleLabel }}
+          <div class="roleHeader">
+            <h2>분석 역할 선택</h2>
+            <button class="roleClose" type="button" aria-label="닫기" @click="roleDialogOpen = false">
+              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" /></svg>
+            </button>
+          </div>
+          <p v-if="selectedTeamFinished">분석이 종료된 경기입니다. 매니저 권한으로만 입장할 수 있습니다.</p>
+          <p v-else-if="selectedParticipantRole">이미 {{ ROLE_NAMES[selectedParticipantRole] }}로 참여 중이라 같은 역할로만 재입장할 수 있습니다.</p>
+          <p v-else>{{ selectedTeam === 'home' ? selectedMatch?.home.name : selectedMatch?.away.name }} 입력 역할을 선택하세요.</p>
+          <button
+            v-for="role in (['primary', 'assistant', 'manager'] as const)"
+            :key="role"
+            class="roleChoice"
+            :class="role"
+            :disabled="roleState[role].disabled"
+            @click="chooseRole(role)"
+          >
+            {{ roleState[role].label }}
           </button>
           <button class="roleCancel" @click="roleDialogOpen = false">취소</button>
         </section>
@@ -506,7 +564,7 @@ function onCancel() {
 }
 .manageBtn:hover { background: rgba(0,217,255,0.16); }
 
-.body { grid-area: schedule-body; width: 100%; min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-columns: 420px 860px; }
+.body { grid-area: schedule-body; width: 100%; min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-columns: 460px 820px; }
 
 .left {
   border-right: 1px solid rgba(255,255,255,0.06);
@@ -518,14 +576,37 @@ function onCancel() {
 
 .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .calendarFilter { display: flex; align-items: center; gap: 8px; }
-.calendarFilter label { display: flex; align-items: center; gap: 5px; color: rgba(255,255,255,.52); font-size: 11px; font-weight: 700; }
 .calendarFilter select {
-  height: 30px; padding: 0 26px 0 8px;
+  appearance: none; -webkit-appearance: none;
+  height: 32px; padding: 0 28px 0 10px;
   border: 1px solid rgba(255,255,255,.14); border-radius: 4px;
-  background: #171b22; color: rgba(255,255,255,.9);
-  font: inherit; font-weight: 750; color-scheme: dark; cursor: pointer;
+  background: #171b22 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%2376d7e8' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 9px center;
+  color: rgba(255,255,255,.9);
+  font: inherit; font-size: 13px; font-weight: 750; color-scheme: dark; cursor: pointer;
 }
-.calendarFilter select:focus { outline: 2px solid rgba(93,204,229,.72); outline-offset: 1px; }
+.calendarFilter select:focus { outline: none; border-color: rgba(93,204,229,.72); box-shadow: 0 0 0 2px rgba(93,204,229,.18); }
+.calendarFilter select option { background: #171b22; color: rgba(255,255,255,.9); font-weight: 700; }
+.calendarFilter select.monthSelect {
+  flex: 0 0 76px; box-sizing: border-box;
+  width: 76px; min-width: 76px; max-width: 76px;
+  field-sizing: fixed; font-variant-numeric: tabular-nums;
+}
+/* 지원 브라우저(Chromium 135+)에서는 펼침 목록까지 다크 테마로 */
+@supports (appearance: base-select) {
+  .calendarFilter select, .calendarFilter select::picker(select) { appearance: base-select; }
+  .calendarFilter select { display: inline-flex; align-items: center; }
+  .calendarFilter select::picker-icon { display: none; }
+  .calendarFilter select::picker(select) {
+    max-height: 280px; margin-top: 4px; padding: 4px; overflow-y: auto;
+    background: #171b22; border: 1px solid rgba(255,255,255,.14); border-radius: 6px;
+    box-shadow: 0 12px 28px rgba(0,0,0,.5); scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.2) transparent;
+  }
+  .calendarFilter select option { min-height: 36px; padding: 0 10px; border-radius: 4px; font-size: 13px; }
+  .calendarFilter select option::checkmark { display: none; }
+  .calendarFilter select option:checked { background: rgba(241,180,0,.14); color: #f1b400; }
+  .calendarFilter select option:focus-visible { outline: none; background: rgba(255,255,255,.08); }
+  .calendarFilter select option:active { background: rgba(255,255,255,.12); }
+}
 .monthNav { display: flex; align-items: center; gap: 10px; }
 .iconBtn {
   width: 28px; height: 28px; border-radius: 4px;
@@ -545,11 +626,11 @@ function onCancel() {
 .cal {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  gap: 6px;
+  gap: 12px 6px;
   align-content: start;
 }
 .cell {
-  height: 44px;
+  height: 56px;
   border-radius: 4px;
   border: 1px solid rgba(255,255,255,0.10);
   background: rgba(255,255,255,0.03);
@@ -564,30 +645,29 @@ function onCancel() {
 .rightTitle { color: rgba(255,255,255,0.85); font-weight: 800; font-size: 18px; text-align: center; }
 
 .hint { color: rgba(255,255,255,0.45); display: grid; place-items: center; font-size: 14px; }
-.analyst { color: #f4b928; font-size: 11px; line-height: 16px; white-space: nowrap; }
-.analystStack { min-width: 0; min-height: 34px; display: flex; flex-direction: column; justify-content: center; }
-.analystStackHome { align-items: flex-end; text-align: right; }
-.analystStackAway { align-items: flex-start; text-align: left; }
-.analystStack .analyst { max-width: 100%; }
 .roleOverlay { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; background: rgba(0,0,0,.58); }
-.roleDialog { width: min(390px, calc(100% - 40px)); padding: 24px; border: 1px solid rgba(255,255,255,.16); border-radius: 6px; background: #151a22; box-shadow: 0 20px 60px rgba(0,0,0,.55); }
+.roleDialog { width: min(520px, calc(100% - 40px)); padding: 24px; border: 1px solid rgba(255,255,255,.16); border-radius: 6px; background: #151a22; box-shadow: 0 20px 60px rgba(0,0,0,.55); }
+.roleHeader { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .roleDialog h2 { margin: 0; color: #fff; font-size: 20px; }
+.roleClose { flex: none; display: grid; place-items: center; width: 40px; height: 40px; align-self: flex-start; margin: -14px -12px -8px 0; border: 0; border-radius: 4px; background: transparent; color: rgba(255,255,255,.6); cursor: pointer; }
+.roleClose:active { background: rgba(255,255,255,.1); color: #fff; }
 .roleDialog p { margin: 8px 0 20px; color: rgba(255,255,255,.55); font-size: 13px; }
 .roleChoice, .roleCancel { width: 100%; height: 46px; margin-top: 8px; border-radius: 4px; cursor: pointer; font-weight: 800; }
 .roleChoice.primary { border: 1px solid #eab529; background: #eab529; color: #16120a; }
-.roleChoice.primary:disabled { border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.08); color: rgba(255,255,255,.4); cursor: not-allowed; }
 .roleChoice.assistant { border: 1px solid #42b8d2; background: rgba(66,184,210,.12); color: #8ce6f5; }
+.roleChoice.manager { border: 1px solid #7fd99a; background: rgba(80,200,120,.12); color: #a6ecbb; }
+.roleChoice:disabled { border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.08); color: rgba(255,255,255,.4); cursor: not-allowed; }
 .roleCancel { border: 1px solid rgba(255,255,255,.15); background: transparent; color: rgba(255,255,255,.7); }
 
 .list { display: grid; gap: 10px; align-content: start; overflow: auto; padding: 2px 6px 12px 2px; }
 
 .matchRow {
   display: grid;
-  grid-template-columns: 174px minmax(0, 1fr);
-  gap: 20px;
+  grid-template-columns: 116px minmax(0, 1fr);
+  gap: 14px;
   align-items: center;
   min-height: 98px;
-  padding: 12px 16px;
+  padding: 12px 14px;
   border-radius: 6px;
   border: 1px solid rgba(255,255,255,.10);
   background: rgba(255,255,255,0.025);
@@ -605,7 +685,7 @@ function onCancel() {
   border-color: rgba(255,255,255,0.10);
   box-shadow: none;
 }
-.matchRow:hover { border-color: rgba(255,255,255,.26); background: rgba(255,255,255,.055); }
+.matchRow:active { background: rgba(255,255,255,.055); }
 .matchRow.selected {
   background: rgba(241,180,0,0.055);
   box-shadow: 0 0 0 2px rgba(241,180,0,0.46);
@@ -613,46 +693,65 @@ function onCancel() {
 .time { display: grid; gap: 5px; align-content: center; min-width: 0; }
 .timeRow { display: flex; align-items: center; gap: 8px; }
 .time .t { color: rgba(255,255,255,.94); font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; }
-.roundBadge { padding: 3px 6px; border: 1px solid rgba(255,255,255,.16); border-radius: 3px; color: rgba(255,255,255,.58); font-size: 11px; font-weight: 800; }
+.roundBadge { color: rgba(255,255,255,.58); font-size: 12px; font-weight: 750; }
 .competition { color: #76d7e8; font-size: 12px; font-weight: 750; }
-.stadium { overflow: hidden; color: rgba(255,255,255,.43); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.stadium { color: rgba(255,255,255,.43); font-size: 12px; line-height: 1.35; word-break: keep-all; }
 .vs {
   display: grid;
-  grid-template-columns: minmax(90px, .6fr) minmax(132px, 1fr) 76px minmax(132px, 1fr) minmax(90px, .6fr);
-  align-items: center;
-  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) 68px minmax(0, 1fr);
+  align-items: stretch;
+  gap: 8px;
   min-width: 0;
 }
-.teamCell { min-width: 0; display: grid; gap: 7px; }
+.mid { order: 1; display: grid; place-items: center; }
+.score { display: flex; align-items: center; justify-content: center; gap: 7px; min-width: 64px; padding: 10px 4px; border-radius: 4px; background: rgba(255,255,255,.05); color: rgba(255,255,255,.92); font-size: 24px; font-weight: 850; line-height: 1; font-variant-numeric: tabular-nums; }
+.scoreDivider { color: rgba(255,255,255,.35); font-size: 16px; }
+
+/* 팀 카드 = 선택 버튼. 팀명·진행 상태·분석관을 한 덩어리로 묶는다. */
 .teamChoice {
-  width: 100%;
-  padding: 10px 8px;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  background: transparent;
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255,255,255,.10);
+  border-radius: 6px;
+  background: rgba(255,255,255,.03);
   cursor: pointer;
   font: inherit;
+  transition: border-color 120ms ease, background 120ms ease;
 }
-.teamChoice:hover { background: rgba(255,255,255,0.07); }
-.teamChoice.chosen { border-color: rgba(241,180,0,0.85); background: rgba(241,180,0,0.10); }
+.teamChoice:active { background: rgba(255,255,255,.09); }
+/* 노란색은 '내가 고른 팀' 표시에만 쓴다. */
+.teamChoice.chosen { border-color: rgba(241,180,0,.85); background: rgba(241,180,0,.10); box-shadow: inset 0 0 0 1px rgba(241,180,0,.35); }
 .teamChoice:focus-visible { outline: 2px solid #5dcce5; outline-offset: 2px; }
 .teamHome { text-align: right; justify-items: end; }
 .teamAway { text-align: left; justify-items: start; }
+
+.teamHead { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; }
+.teamHome .teamHead { flex-direction: row-reverse; }
 .team {
-  max-width: 100%;
-  color: rgba(255,255,255,0.88);
-  font-size: 16px;
+  min-width: 0;
+  color: rgba(255,255,255,0.92);
+  font-size: 17px;
   font-weight: 800;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.teamStatus { padding: 3px 6px; border-radius: 3px; font-size: 11px; line-height: 1.1; white-space: nowrap; font-weight: 800; }
-.teamStatus-waiting { background: rgba(241,180,0,.12); color: rgba(241,180,0,.96); }
-.teamStatus-done { background: rgba(92,200,255,.11); color: rgba(110,209,255,.94); }
-.mid { display: grid; place-items: center; align-self: center; }
-.score { display: flex; align-items: center; justify-content: center; gap: 7px; min-width: 68px; padding: 10px 4px; border: 1px solid rgba(241,180,0,.32); border-radius: 4px; background: rgba(241,180,0,.08); color: #f4b928; font-size: 22px; font-weight: 850; line-height: 1; font-variant-numeric: tabular-nums; }
-.scoreDivider { color: rgba(255,255,255,.45); font-size: 16px; }
+.teamChoice.chosen .team { color: #fff; }
+.teamStatus { flex: none; padding: 3px 6px; border-radius: 3px; font-size: 11px; line-height: 1.1; white-space: nowrap; font-weight: 800; }
+.teamStatus-waiting { background: rgba(255,255,255,.07); color: rgba(255,255,255,.55); }
+.teamStatus-live { background: rgba(0,217,255,.12); color: #76d7e8; }
+.teamStatus-done { background: rgba(80,200,120,.13); color: #7fd99a; }
+
+.analystLine { display: flex; flex-wrap: wrap; gap: 4px 10px; min-width: 0; max-width: 100%; min-height: 18px; align-items: center; }
+.teamHome .analystLine { justify-content: flex-end; }
+.analyst { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; font-size: 12px; line-height: 18px; }
+.analystRole { flex: none; padding: 0 4px; border: 1px solid rgba(255,255,255,.16); border-radius: 3px; color: rgba(255,255,255,.5); font-size: 10px; font-weight: 800; line-height: 14px; }
+.analystRole.main { border-color: rgba(255,255,255,.3); color: rgba(255,255,255,.8); }
+.analystName { overflow: hidden; color: rgba(255,255,255,.62); text-overflow: ellipsis; white-space: nowrap; }
+.analystEmpty { color: rgba(255,255,255,.28); font-size: 12px; line-height: 18px; }
 
 .bottomBar {
   grid-area: schedule-bottom;

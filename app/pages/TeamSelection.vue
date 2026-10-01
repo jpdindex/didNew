@@ -70,8 +70,9 @@ if (matchId.value && game.value.matchId !== matchId.value) {
 // 일정 화면에서 선택한 팀은 새 세션마다 명시적으로 적용한다. 같은 경기의 반대 팀으로
 // 다시 들어오는 경우에도 useState에 남아 있던 이전 팀을 재사용하면 안 된다.
 game.value.team = route.query.team === 'away' ? 'away' : 'home'
-const requestedRole = route.query.role === 'assistant' ? 'assistant' : 'primary'
+const requestedRole = route.query.role === 'assistant' || route.query.role === 'manager' ? route.query.role : 'primary'
 game.value.participantRole = requestedRole
+game.value.lifecycleControl = requestedRole === 'primary'
 
 const players = computed<MatchSquadPlayer[]>(() => (game.value.team === 'home' ? game.value.squads.home : game.value.squads.away))
 
@@ -392,6 +393,7 @@ function resetForInputTeam(team: 'home' | 'away') {
     mirrored: game.value.mirrored,
     recorderLevel: game.value.recorderLevel,
     participantRole: game.value.participantRole,
+    lifecycleControl: game.value.lifecycleControl,
     participantName: game.value.participantName,
   }
   Object.assign(game.value, {
@@ -673,7 +675,7 @@ async function startFirstHalf() {
   const previousClockStartedAt = game.value.clockStartedAt
   try {
     await joinCollaboration(game.value, requestedRole)
-    if (game.value.participantRole !== 'primary') throw new Error('주 분석관만 전반전을 시작할 수 있습니다.')
+    if (!game.value.lifecycleControl) throw new Error('주 분석관만 전반전을 시작할 수 있습니다.')
     // Create the durable setup before the first live Draft checkpoint. An
     // assistant can therefore render formation and lineup on its first poll.
     if (!await saveSetup(game.value)) throw new Error('포메이션과 명단 스냅샷을 저장하지 못했습니다.')
@@ -695,12 +697,16 @@ async function startFirstHalf() {
   navigateTo({ path: '/DidInput', query: didInputQuery() })
 }
 
+function roleLabel(role: 'primary' | 'assistant' | 'manager') {
+  return role === 'primary' ? '주 분석관' : role === 'manager' ? '매니저' : '부 분석관'
+}
+
 async function enterAsAssistant() {
   lifecycleBusy.value = true
   lifecycleError.value = ''
   try {
-    game.value.participantRole = 'assistant'
-    await joinCollaboration(game.value, 'assistant')
+    game.value.participantRole = requestedRole === 'manager' ? 'manager' : 'assistant'
+    await joinCollaboration(game.value, game.value.participantRole)
     // The shared Draft subscription in DidInput replaces this local shell with
     // the primary analyst's current clock, lineup, and records.
     navigateTo({ path: '/DidInput', query: didInputQuery() })
@@ -774,7 +780,7 @@ async function startSecondHalf() {
   game.value.seconds = 0
   game.value.clockStartedAt = Date.now()
   try {
-    if (game.value.participantRole !== 'primary') throw new Error('주 분석관만 후반전을 시작할 수 있습니다.')
+    if (!game.value.lifecycleControl) throw new Error('주 분석관만 후반전을 시작할 수 있습니다.')
     // H1 종료는 Draft 확인점일 뿐이며, 이 시점에 RAW를 만들지 않는다.
     if (!await saveDraft(game.value)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 저장되었습니다.')
   } catch (error) {
@@ -818,12 +824,13 @@ onMounted(async () => {
   bootstrapApplied.value = true
 
   const selectedState = game.value.team === 'home' ? inputStatus.value.H : inputStatus.value.A
-  if (selectedState.rawStatus !== 'final') {
+  // 끝난 팀 입력에는 매니저만 들어온다. 수정 Draft의 제어 권한을 받으려면 여기서도 join한다.
+  if (selectedState.rawStatus !== 'final' || requestedRole === 'manager') {
     // Participation writes must not hold back the player list, formation or KPI paint.
     void joinCollaboration(game.value, requestedRole).catch(error => {
       lifecycleError.value = error instanceof Error
         ? error.message
-        : `${requestedRole === 'primary' ? '주' : '부'} 분석관 참여 상태를 확인하지 못했습니다.`
+        : `${roleLabel(requestedRole)} 참여 상태를 확인하지 못했습니다.`
     })
   }
   // 현재 팀에 저장된 세션이 없는 신규 입력이라면, 이미 RAW가 있는 상대 팀의
@@ -859,7 +866,7 @@ async function finishMatch() {
   game.value.halfStatus = 'final'
   game.value.clockStartedAt = null
   try {
-    if (game.value.participantRole !== 'primary') throw new Error('주 분석관만 제출 또는 최종 갱신을 할 수 있습니다.')
+    if (!game.value.lifecycleControl) throw new Error('주 분석관만 제출 또는 최종 갱신을 할 수 있습니다.')
     if (!await saveDraft(game.value)) throw new Error('최종 Draft를 검증 API에 전달하지 못했습니다.')
     // BASIC 주 분석관은 최종 Draft를 제출만 한다. RAW 승격은 관리자 승인 화면에서만 가능하다.
     if (game.value.recorderLevel === 'advanced') await finalizeAdvanced(game.value)
@@ -875,7 +882,7 @@ async function finishMatch() {
 async function editFinal() {
   // 부 분석관은 최종 RAW를 직접 교체하지 않는다. 마지막 half의 Draft 편집으로
   // 들어가면 입력 화면에서 전반/후반을 모두 선택해 수정할 수 있다.
-  if (game.value.participantRole === 'assistant') {
+  if (!game.value.lifecycleControl) {
     game.value.halfStatus = 'H2_done'
     navigateTo({ path: '/DidInput', query: didInputQuery('후반', true, 'H2_done') })
     return
@@ -1314,8 +1321,8 @@ function undoSub(index: number) {
           <div class="analystInfo analystLevel" :class="{ basic: game.recorderLevel === 'basic' }">
             분석관 등급: {{ game.recorderLevel === 'basic' ? 'BASIC' : 'ADVANCED' }}
           </div>
-          <div class="analystInfo analystRole" :class="{ assistant: game.participantRole === 'assistant' }">
-            분석 역할: {{ game.participantRole === 'primary' ? '주 분석관' : '부 분석관' }}
+          <div class="analystInfo analystRole" :class="{ assistant: game.participantRole !== 'primary' }">
+            분석 역할: {{ roleLabel(game.participantRole) }}
           </div>
         </div>
       </aside>
@@ -1521,30 +1528,30 @@ function undoSub(index: number) {
             </section>
             <section class="startPanel">
               <template v-if="game.halfStatus === 'ready'">
-                <div v-if="game.recorderLevel === 'advanced' && game.participantRole === 'primary'" class="modeToggle">
+                <div v-if="game.recorderLevel === 'advanced' && game.lifecycleControl" class="modeToggle">
                   <button class="modeBtn" :class="{ on: game.inputMode === '분석' }"
                     @click="game.inputMode = '분석'">분석<small>정지 가능</small></button>
                   <button class="modeBtn" :class="{ on: game.inputMode === '실시간' }"
                     @click="game.inputMode = '실시간'">실시간<small>정지 불가</small></button>
                 </div>
                 <p>아래의 버튼을 터치하시면<br><b>경기데이터 입력이 시작됩니다.</b></p>
-                <button v-if="game.participantRole === 'primary'" class="startBtn" :disabled="!canStart" @click="startFirstHalf">전반전 시작</button>
-                <button v-else class="startBtn" :disabled="lifecycleBusy" @click="enterAsAssistant">부 분석관 참여</button>
+                <button v-if="game.lifecycleControl" class="startBtn" :disabled="!canStart" @click="startFirstHalf">전반전 시작</button>
+                <button v-else class="startBtn" :disabled="lifecycleBusy" @click="enterAsAssistant">{{ roleLabel(game.participantRole) }} 참여</button>
               </template>
               <template v-else-if="game.halfStatus === 'H1_done'">
                 <p>전반 기록을 확인하세요<br><b>기록을 수정하거나 후반전을 시작할 수 있습니다.</b></p>
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">BASIC 주 분석관 기록은 제출 후 관리자 승인 전까지 Draft에만 저장됩니다.</p>
                 <div class="halfActions">
                   <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
-                  <button v-if="game.participantRole === 'primary'" class="startBtn" :disabled="lifecycleBusy" @click="startSecondHalf">후반전 시작</button>
+                  <button v-if="game.lifecycleControl" class="startBtn" :disabled="lifecycleBusy" @click="startSecondHalf">후반전 시작</button>
                 </div>
               </template>
               <template v-else-if="game.halfStatus === 'H2_done'">
-                <p>후반 기록을 확인하세요<br><b>{{ game.participantRole === 'primary' ? '기록을 수정하거나 처리할 수 있습니다.' : '전반 또는 후반 기록을 수정할 수 있습니다.' }}</b></p>
+                <p>후반 기록을 확인하세요<br><b>{{ game.lifecycleControl ? '기록을 수정하거나 처리할 수 있습니다.' : '전반 또는 후반 기록을 수정할 수 있습니다.' }}</b></p>
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">제출하면 관리자 승인 대기 Draft로 유지됩니다.</p>
                 <div class="halfActions">
                   <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
-                  <button v-if="game.participantRole === 'primary'" class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">{{ game.recorderLevel ===
+                  <button v-if="game.lifecycleControl" class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">{{ game.recorderLevel ===
                     'basic' ? '제출' : '최종 갱신' }}</button>
                 </div>
               </template>
@@ -1559,9 +1566,9 @@ function undoSub(index: number) {
                 </div>
               </template>
               <template v-else>
-                <p>{{ game.participantRole === 'assistant' ? '분석 협업 종료' : (game.recorderLevel === 'basic' ? '관리자 승인 대기' : statusLabel) }}</p>
+                <p>{{ !game.lifecycleControl ? '분석 협업 종료' : (game.recorderLevel === 'basic' ? '관리자 승인 대기' : statusLabel) }}</p>
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">관리자 페이지에서 RAW 승격 전까지 Draft만 유지됩니다.</p>
-                <button class="editBtn" :disabled="lifecycleBusy" @click="editFinal">{{ game.participantRole === 'assistant' ? '전반/후반 수정' : '수정' }}</button>
+                <button class="editBtn" :disabled="lifecycleBusy" @click="editFinal">{{ !game.lifecycleControl ? '전반/후반 수정' : '수정' }}</button>
               </template>
               <p v-if="lifecycleError" class="lifecycleError">{{ lifecycleError }}</p>
               <small v-if="matchId">matchId: {{ matchId }}</small>

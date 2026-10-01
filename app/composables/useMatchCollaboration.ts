@@ -3,7 +3,7 @@ import type { MatchState } from '~/composables/useMatchState'
 import type { CardRecord } from '~/utils/card'
 import { cloneState, payloadFromState, type InputPayload } from '~/composables/useMatchDraft'
 
-type ParticipantRole = 'primary' | 'assistant'
+type ParticipantRole = 'primary' | 'assistant' | 'manager'
 
 function sideFor(game: MatchState) {
   return game.team === 'away' ? 'A' : 'H'
@@ -153,11 +153,12 @@ export function useMatchCollaboration() {
 
   async function join(game: MatchState, role: ParticipantRole) {
     const user = await currentIdentity()
-    const response = await request<{ role?: ParticipantRole; participants: Record<string, { name?: string; role?: ParticipantRole }> }>(
+    const response = await request<{ role?: ParticipantRole; control?: boolean; participants: Record<string, { name?: string; role?: ParticipantRole }> }>(
       `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${sideFor(game)}/participants`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role, displayName: user?.displayName || user?.email || undefined }) },
     )
     game.participantRole = response.role ?? role
+    game.lifecycleControl = response.control ?? game.participantRole === 'primary'
     game.participantName = user?.displayName || user?.email || ''
     return response
   }

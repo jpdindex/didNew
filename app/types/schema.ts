@@ -42,7 +42,7 @@ export type InputMode = '분석' | '실시간'
 export type RecorderLevel = 'basic' | 'advanced'
 
 /** recordings.recorders 맵의 값. 조직상 구분일 뿐 권한이 아니다 (§6.3) */
-export type RecorderRank = 'main' | 'sub'
+export type RecorderRank = 'main' | 'sub' | 'manager'
 
 /** 이 값을 누가 입력했나. 비전 연동 전까지는 전부 'did' (§7, 원칙 8) */
 export type DataSource = 'did' | 'vision'
@@ -110,6 +110,8 @@ export interface LineupEntry {
 export interface RecorderEntry {
   rank: RecorderRank
   joinedAt: Timestamp
+  /** 최종 저장 시점의 표시 이름. 레거시 import에는 없다 */
+  name?: string | null
 }
 
 /** recordings.kpi — 확정 스냅샷. dMST 중 우리가 산출하는 14개 그대로 (§9.2) */
@@ -162,9 +164,9 @@ export interface RecordingDoc {
   side: Side
   teamId: string
   opponentTeamId: string
-  /** Legacy RAW compatibility only. New RAW documents keep analyst history outside recordings. */
+  /** 최종 저장 시 Draft에서 복사한 분석관 명단 (primary=main, assistant=sub, manager=manager) */
   recorders?: Record<string, RecorderEntry>
-  /** Legacy RAW compatibility only. */
+  /** recorders의 uid 목록, main이 먼저 */
   recorderIds?: string[]
   status: HalfStatus
   inputMode: InputMode

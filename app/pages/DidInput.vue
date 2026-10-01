@@ -40,8 +40,8 @@ const game = useMatchState()
 const { request } = useBackendApi()
 const { saveLocal, save: saveDraft, saveSetup, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
 const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncCards, removeRecord, mergeRemoteRecords } = useMatchCollaboration()
-const isPrimary = computed(() => game.value.participantRole === 'primary')
-const requestedRole = route.query.role === 'assistant' ? 'assistant' : 'primary'
+const isPrimary = computed(() => game.value.lifecycleControl)
+const requestedRole = route.query.role === 'assistant' || route.query.role === 'manager' ? route.query.role : 'primary'
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
 // "수정"으로 들어온 경우(이미 끝난 half를 고치러 옴)와 실시간으로 기록 중인 경우를
 // 구분한다. 수정 화면은 시계가 멈춰 있고, 우상단 버튼도 "{half} 종료"가 아니라
@@ -164,6 +164,7 @@ onMounted(async () => {
   game.value.team = requestedTeam
   if (matchId) game.value.matchId = matchId
   game.value.participantRole = requestedRole
+  game.value.lifecycleControl = requestedRole === 'primary'
 
   if (matchId) {
     try {

@@ -433,14 +433,21 @@ class JpdDidData:
         return states
 
     def get_recording_statuses_many(self, gm_ids: list[str]) -> dict[str, dict[Side, str | None]]:
-        """Batch-read H/A recording heads for many fixtures.
+        """Batch-read H/A recording status for many fixtures."""
+        return {
+            gm_id: {side: heads[side].get("status") for side in ("H", "A")}
+            for gm_id, heads in self.get_recording_heads_many(gm_ids).items()
+        }
+
+    def get_recording_heads_many(self, gm_ids: list[str]) -> dict[str, dict[Side, dict[str, Any]]]:
+        """Batch-read H/A recording heads (status, recorders) for many fixtures.
 
         This avoids one recordings subcollection stream per schedule row. Only the
         two known recording documents (H and A) are requested for each fixture.
         """
         unique_ids = list(dict.fromkeys(gm_id for gm_id in gm_ids if gm_id))
-        statuses: dict[str, dict[Side, str | None]] = {
-            gm_id: {"H": None, "A": None} for gm_id in unique_ids
+        heads: dict[str, dict[Side, dict[str, Any]]] = {
+            gm_id: {"H": {}, "A": {}} for gm_id in unique_ids
         }
         refs: list[Any] = []
         for gm_id in unique_ids:
@@ -452,12 +459,16 @@ class JpdDidData:
                 if not snapshot.exists or snapshot.id not in {"H", "A"}:
                     continue
                 match_ref = snapshot.reference.parent.parent
-                if match_ref is None or match_ref.id not in statuses:
+                if match_ref is None or match_ref.id not in heads:
                     continue
                 document = snapshot.to_dict() or {}
                 value = document.get("status")
-                statuses[match_ref.id][snapshot.id] = str(value) if value is not None else None
-        return statuses
+                recorders = document.get("recorders")
+                heads[match_ref.id][snapshot.id] = {
+                    "status": str(value) if value is not None else None,
+                    "recorders": recorders if isinstance(recorders, dict) else {},
+                }
+        return heads
 
     def list_records(self, gm_id: str, side: Side, *, limit: int = 2000) -> list[tuple[str, RecordDoc]]:
         collection = self.db.collection("matches").document(gm_id).collection("recordings").document(side).collection("records")
@@ -1265,10 +1276,13 @@ class JpdDidData:
         side: Side,
         *,
         user_id: str,
-        role: Literal["primary", "assistant"],
+        role: Literal["primary", "assistant", "manager"],
         display_name: str | None = None,
     ) -> dict[str, Any]:
         """Register a recorder on the existing Draft root without touching records.
+
+        Seats: one primary, one assistant. Once both are taken, or once the team
+        input is finished, only an advanced analyst can join, as a manager.
 
         The browser writes live state/records directly under this same Draft. This
         server endpoint only establishes the durable role assignment used by rules
@@ -1288,8 +1302,26 @@ class JpdDidData:
         # Re-entry never changes a role. The schedule can carry an old/default
         # role query after a refresh, so return the role already assigned to
         # this UID instead of treating its own re-entry as a conflict.
-        if existing_role in {"primary", "assistant"}:
+        if existing_role in {"primary", "assistant", "manager"}:
             role = existing_role
+        else:
+            shared = current.get("sharedState") if isinstance(current.get("sharedState"), dict) else {}
+            payload = current.get("payload") if isinstance(current.get("payload"), dict) else {}
+            finished = (
+                self.get_recording_statuses(gm_id)[side] == "final"
+                or (shared.get("halfStatus") or payload.get("status") or current.get("status")) == "final"
+            )
+            if role == "manager":
+                if recorder_level != "advanced":
+                    raise BackendError("Only an advanced analyst can join as a manager", status_code=403, code="manager_requires_advanced")
+                if not finished and not primary_uid:
+                    raise BackendError("The primary analyst must join before a manager", status_code=409, code="primary_required")
+            elif finished:
+                raise BackendError("A finished team input accepts managers only", status_code=409, code="manager_only")
+            elif role == "assistant" and any(
+                isinstance(item, dict) and item.get("role") == "assistant" for item in participants.values()
+            ):
+                raise BackendError("An assistant analyst is already assigned for this team", status_code=409, code="assistant_already_assigned")
         if role == "primary":
             if primary_uid and primary_uid != user_id:
                 legacy_primary = participants.get(primary_uid) if isinstance(participants.get(primary_uid), dict) else {}
@@ -1301,7 +1333,7 @@ class JpdDidData:
                 else:
                     raise BackendError("A primary analyst is already assigned for this team", status_code=409, code="primary_already_assigned")
             primary_uid = user_id
-        elif not primary_uid:
+        elif role == "assistant" and not primary_uid:
             raise BackendError("The primary analyst must join before an assistant", status_code=409, code="primary_required")
 
         participants[user_id] = {

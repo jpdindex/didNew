@@ -161,7 +161,7 @@ class PromotionResponse(BaseModel):
 
 class ParticipantJoinRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    role: Literal["primary", "assistant"]
+    role: Literal["primary", "assistant", "manager"]
     displayName: str | None = Field(default=None, max_length=100)
 
 
@@ -262,9 +262,45 @@ def _raw_values(
     return recording, records, cards
 
 
+def _draft_recorders(
+    draft: dict[str, Any],
+    existing: dict[str, Any] | None = None,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Merge Draft participants into the RAW recorders map (main first).
+
+    A correction Draft restored from RAW starts without participants, so the
+    roster already in RAW is kept and only newly joined analysts are added.
+    Everyone who ever entered stays on the roster, managers included.
+    The original main keeps its rank; a later primary is recorded as sub.
+    Managers (advanced analysts entering a full or finished session) are kept
+    as their own rank because they can write records too.
+    """
+    recorders = {
+        uid: dict(entry) for uid, entry in (existing or {}).items()
+        if isinstance(entry, dict) and entry.get("rank") in {"main", "sub", "manager"}
+    }
+    has_main = any(entry["rank"] == "main" for entry in recorders.values())
+    participants = draft.get("participants") if isinstance(draft.get("participants"), dict) else {}
+    for uid, values in participants.items():
+        if uid in recorders or not isinstance(values, dict) or values.get("role") not in {"primary", "assistant", "manager"}:
+            continue
+        if values["role"] == "manager":
+            rank = "manager"
+        else:
+            rank = "main" if values["role"] == "primary" and not has_main else "sub"
+        has_main = has_main or rank == "main"
+        recorders[uid] = {"rank": rank, "joinedAt": values.get("joinedAt") or utc_now(), "name": values.get("name")}
+    recorder_ids = sorted(recorders, key=lambda uid: recorders[uid]["rank"] != "main")
+    return recorders, recorder_ids
+
+
+_RANK_ROLES = {"main": "primary", "sub": "assistant", "manager": "manager"}
+
+
 def _promote(
     data: JpdDidData,
     payload: MatchInputPayload,
+    draft: dict[str, Any],
     user_id: str,
     *,
     status: Literal["H1_done", "final"],
@@ -281,6 +317,8 @@ def _promote(
     ):
         raise BackendError("Draft match snapshot no longer matches the selected match", status_code=409, code="draft_match_mismatch")
     recording, records, cards = _raw_values(payload, status=status, halves=halves)
+    existing_recorders = data.get_recording_heads_many([payload.gmId])[payload.gmId][payload.side].get("recorders")
+    recording["recorders"], recording["recorderIds"] = _draft_recorders(draft, existing_recorders)
     recording["teamId"], recording["opponentTeamId"] = (
         (match.homeTeamId, match.awayTeamId) if payload.side == "H" else (match.awayTeamId, match.homeTeamId)
     )
@@ -312,7 +350,7 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
     teams = data.get_documents_by_ids("teams", team_ids)
     stadiums = data.get_documents_by_ids("stadiums", stadium_ids)
     gm_ids = [gm_id for gm_id, _ in month_matches]
-    statuses_by_match = data.get_recording_statuses_many(gm_ids)
+    heads_by_match = data.get_recording_heads_many(gm_ids)
     collaboration_by_match = data.get_input_draft_participants_many(gm_ids)
 
     matches = []
@@ -320,8 +358,23 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
         home = teams.get(match.homeTeamId, {})
         away = teams.get(match.awayTeamId, {})
         stadium = stadiums.get(match.stadiumId, {})
-        recording_status = statuses_by_match.get(gm_id, {"H": None, "A": None})
+        heads = heads_by_match.get(gm_id, {"H": {}, "A": {}})
+        recording_status = {side: heads[side].get("status") for side in ("H", "A")}
         collaboration = collaboration_by_match.get(gm_id, {"H": {}, "A": {}})
+        # A finalized Draft is deleted after promotion; RAW keeps the final
+        # analyst roster so the schedule can still show who worked it. A later
+        # correction Draft only adds people (e.g. a manager) to that roster.
+        for side in ("H", "A"):
+            recorders = heads[side].get("recorders") or {}
+            if not recorders:
+                continue
+            roster = [
+                {"uid": uid, "role": _RANK_ROLES.get(entry.get("rank"), "assistant"), "name": entry.get("name")}
+                for uid, entry in recorders.items() if isinstance(entry, dict)
+            ]
+            known = {item["uid"] for item in roster}
+            roster += [item for item in collaboration[side].get("participants") or [] if item.get("uid") not in known]
+            collaboration[side] = {**collaboration[side], "participants": roster}
 
         # Imported/finalized fixtures keep their official score on matches.
         # During live input, both team Drafts carry the same scoreboard; use a
@@ -499,6 +552,9 @@ def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinReque
         "status": "ok", "gmId": gm_id, "side": side,
         "primaryUid": document.get("primaryUid"), "participants": document.get("participants", {}),
         "role": (document.get("participants", {}).get(user.uid) or {}).get("role"),
+        # Lifecycle (clock, half end, final update) belongs to the primary. A
+        # manager in a correction Draft has no primary above it, so it owns it.
+        "control": not document.get("primaryUid") or document.get("primaryUid") == user.uid,
     }
 
 
@@ -529,20 +585,19 @@ def finalize_advanced(gm_id: str, side: Side, user: RequiredUser = None) -> Prom
     payload = MatchInputPayload.model_validate(draft["payload"])
     if payload.recorderLevel != "advanced":
         raise BackendError("Basic input requires administrator approval", status_code=409, code="basic_approval_required")
-    # Keep the final Draft as the editable source for later corrections. RAW is
-    # replaced atomically, but the Draft is retained and marked final.
     # RAW is the only durable final source. A later edit explicitly recreates a
     # short-lived Draft from RAW, so stale collaboration records cannot reopen.
-    return _promote(data, payload, user.uid, status="final", halves={"H1", "H2"}, delete_draft=True)
+    return _promote(data, payload, draft, user.uid, status="final", halves={"H1", "H2"}, delete_draft=True)
 
 
 @router.post("/match-input/approvals/{gm_id}/{side}/promote", response_model=PromotionResponse, include_in_schema=False)
 def approve_basic(gm_id: str, side: Side, user: RequiredUser = None) -> PromotionResponse:
     data = JpdDidData()
-    payload = MatchInputPayload.model_validate(data.get_input_draft(gm_id, side)["payload"])
+    draft = data.get_input_draft(gm_id, side)
+    payload = MatchInputPayload.model_validate(draft["payload"])
     if payload.recorderLevel != "basic" or payload.status != "final":
         raise BackendError("Only submitted basic drafts can be approved", status_code=409, code="draft_not_awaiting_approval")
-    return _promote(data, payload, user.uid, status="final", halves={"H1", "H2"}, delete_draft=True)
+    return _promote(data, payload, draft, user.uid, status="final", halves={"H1", "H2"}, delete_draft=True)
 
 
 @router.put("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse, include_in_schema=False)
