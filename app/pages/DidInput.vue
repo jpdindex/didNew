@@ -39,7 +39,7 @@ const inputMode = computed(() => (route.query.mode === '실시간' ? '실시간'
 const game = useMatchState()
 const { request } = useBackendApi()
 const { saveLocal, save: saveDraft, saveSetup, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
-const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncCards, removeRecord, mergeRemoteRecords } = useMatchCollaboration()
+const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncCards, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards } = useMatchCollaboration()
 const isPrimary = computed(() => game.value.lifecycleControl)
 const requestedRole = route.query.role === 'assistant' || route.query.role === 'manager' ? route.query.role : 'primary'
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
@@ -98,6 +98,11 @@ const clock = computed(() => {
 })
 // 시계 양옆 화살표로 시간을 수동 보정한다. ◀ 는 1초 줄이고 ▶ 는 1초 늘린다(0초 아래로는 안 내려간다).
 function stepSeconds(delta: number) {
+  // 기록 수정 중이면 경기 시계 대신 그 기록의 시간(아래 수정 바의 초)을 움직인다.
+  if (editingId.value) {
+    stepEditSecond(delta)
+    return
+  }
   if (!isPrimary.value) return
   seconds.value = Math.max(0, seconds.value + delta)
   // 실행 중인 타이머가 다음 tick에서 이전 기준값으로 되돌리지 않도록
@@ -118,6 +123,10 @@ function selectHalf(target: '전반' | '후반') {
   seconds.value = target === '전반' ? game.value.h1Seconds : game.value.h2Seconds
 }
 let timer: ReturnType<typeof setInterval> | undefined
+// onMounted awaits several requests. If the screen is left meanwhile, the rest
+// of the entry (sync start, first writes) must not run against the shared game
+// state that now belongs to the next screen or another match.
+let disposed = false
 let applyingRemoteDraft = false
 let tickStartedAt = 0
 let tickBaseSeconds = 0
@@ -173,12 +182,14 @@ onMounted(async () => {
       // TeamSelection already prevents a new primary from entering an owned
       // session. Keep the URL role as a read-only fallback while offline.
     }
+    if (disposed) return
   }
 
   let recoveredDraft = false
   if (matchId && !hasActiveClientState) {
     game.value.inputMode = inputMode.value
     recoveredDraft = await recoverDraft(game.value).catch(() => false)
+    if (disposed) return
     // records is a screen-local ref for rendering/editing. A direct URL entry
     // restores game.records asynchronously, so mirror it after recovery.
     records.value = [...game.value.records]
@@ -199,6 +210,7 @@ onMounted(async () => {
     } catch {
       // 개발·오프라인 입력은 기존 임시 명단으로도 화면을 열 수 있다.
     }
+    if (disposed) return
   }
   // A running clock is never restored from an old seconds snapshot. Rejoin it
   // from the durable start timestamp; only a paused clock uses saved seconds.
@@ -213,13 +225,28 @@ onMounted(async () => {
   if (!recoveredDraft) void syncState(game.value).catch(() => false)
 
   const restoredRecords = [...records.value]
+  // 공유 game 상태는 화면을 나가면 다음 경기가 쓴다. 이 화면의 경기·팀이 아닐 때 도착한
+  // 응답은 절대 반영하지 않는다(다른 경기 기록이 새 경기 화면에 덮이던 문제).
+  const isCurrentSession = () => !disposed && game.value.matchId === matchId && game.value.team === requestedTeam
   await startCollaboration(game.value, {
     applyState: (state) => {
+      if (!isCurrentSession()) return
+      // 전/후반 종료 저장 중에 도착한 이전 폴링 응답이 방금 바꾼 H1_done/H2_done 을
+      // H1/H2 로 되돌리면 대기방이 "전반전 입장"으로 보인다. 종료 처리 중에는 무시한다.
+      if (halfFinishBusy.value) return
       applyingRemoteDraft = true
       // Records are deliberately excluded from sharedState and arrive through
       // their own subcollection, so an ACT correction never replaces the list.
       const previousClockStartedAt = game.value.clockStartedAt
+      const previousSeconds = game.value.seconds
       Object.assign(game.value, state)
+      // 시계가 이 화면에서 이미 돌거나 멈춰 있으면 주 분석관 화면이 시계의 주인이다.
+      // 일시정지 직전에 보낸 폴링 응답이 늦게 도착해 clockStartedAt 을 되살리면
+      // 이후 저장·대기방 이동 때 멈춘 시계가 다시 흐르게 되므로 덮어쓰지 않는다.
+      if (isPrimary.value && (paused.value || timer)) {
+        game.value.clockStartedAt = previousClockStartedAt
+        game.value.seconds = previousSeconds
+      }
       homeScore.value = game.value.homeScore
       awayScore.value = game.value.awayScore
       if (!isEditMode && !isPrimary.value) {
@@ -245,6 +272,7 @@ onMounted(async () => {
       nextTick(() => { applyingRemoteDraft = false })
     },
     applyRecords: (remoteRecords) => {
+      if (!isCurrentSession()) return
       // Polling is eventually consistent. Preserve this device's pending
       // record IDs and merge the rest from the server, rather than replacing
       // the list with an older snapshot while someone is entering quickly.
@@ -256,6 +284,7 @@ onMounted(async () => {
       nextTick(() => { applyingRemoteDraft = false })
     },
     applyCards: (remoteCards) => {
+      if (!isCurrentSession()) return
       const unchanged = remoteCards.length === game.value.cards.length && remoteCards.every((card, index) =>
         card.player === game.value.cards[index]?.player && card.half === game.value.cards[index]?.half &&
         card.seconds === game.value.cards[index]?.seconds && card.card === game.value.cards[index]?.card,
@@ -266,6 +295,7 @@ onMounted(async () => {
       nextTick(() => { applyingRemoteDraft = false })
     },
     applySetup: (setup) => {
+      if (!isCurrentSession()) return
       if (setup.revision <= appliedSetupRevision) return
       appliedSetupRevision = setup.revision
       applyingRemoteDraft = true
@@ -273,6 +303,12 @@ onMounted(async () => {
       nextTick(() => { applyingRemoteDraft = false })
     },
   }).catch(() => false)
+  // 시작 도중 화면을 나갔으면 여기서 끝낸다. 이후의 기록 저장·시계 시작이 다음 화면의
+  // game 상태(다른 경기일 수 있음)에 대해 실행되면 안 된다.
+  if (disposed) {
+    stopCollaboration()
+    return
+  }
 
   // Put restored RAW records into the same InputDraft subcollection used by
   // primary/assistant live collaboration. Repeated writes are idempotent.
@@ -301,6 +337,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  disposed = true
   if (timer) clearInterval(timer)
   if (flashTimer) clearTimeout(flashTimer)
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
@@ -346,6 +383,9 @@ async function exitToLobby() {
   if (!await askConfirm('대기방으로 나가시겠습니까?', clockMessage, '나가기')) return
 
   if (timer) clearInterval(timer)
+  timer = undefined
+  // 화면 이동이 끝나기 전에 도착한 폴링 응답이 대기방과 공유하는 game 상태를 덮지 않게 한다.
+  stopCollaboration()
   saveToStore()
 
   // 대기방 이동 자체는 half 종료가 아니다.
@@ -365,18 +405,26 @@ async function exitToLobby() {
 // 이어서 입력/수정하는 경우(resumeHalf) 저장해둔 기록을 그대로 불러온다.
 const records = ref<DidRecord[]>(resumeHalf ? [...game.value.records] : [])
 let draftSaveTimer: ReturnType<typeof setTimeout> | undefined
+// 카드는 이 화면에서 실제로 바뀌었을 때만 서버에 보낸다. 기록 저장(흐르는 초로 매초 발생)
+// 때마다 같이 보내면, 카드가 옛 상태인 다른 화면이 매초 그 목록으로 덮어써 카드가 깜빡인다.
+let cardsDirty = false
 
 function queueDraftSave() {
   if (applyingRemoteDraft) return
   // Offline/reload protection is immediate. Only the network write is debounced.
+  markLocalRecords(records.value)
   saveToStore()
   void saveLocal(game.value).catch(() => false)
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
   draftSaveTimer = setTimeout(() => {
+    const sendCards = cardsDirty
+    cardsDirty = false
     // The collaboration composable serializes state and record writes, while
     // its optimistic record merge keeps this screen stable during the round trip.
-    void Promise.all([syncState(game.value), syncRecords(game.value, records.value), syncCards(game.value)])
-      .catch(() => false)
+    void Promise.all([
+      syncState(game.value), syncRecords(game.value, records.value),
+      ...(sendCards ? [syncCards(game.value)] : []),
+    ]).catch(() => false)
   }, 500)
 }
 
@@ -404,7 +452,13 @@ function exitFinalCorrection() {
   goTeamSelection()
 }
 
-watch([records, homeScore, awayScore, () => game.value.cards, () => game.value.subs], queueDraftSave, { deep: true })
+watch([records, homeScore, awayScore, () => game.value.subs], queueDraftSave, { deep: true })
+watch(() => game.value.cards, () => {
+  if (applyingRemoteDraft) return
+  cardsDirty = true
+  markLocalCards(game.value)
+  queueDraftSave()
+}, { deep: true })
 
 // 입력 중인 팀. TeamSelection 에서 team 쿼리로 넘어온다.
 const team = computed(() => (route.query.team === 'away' ? 'away' : 'home'))
@@ -1488,7 +1542,7 @@ const infoRecord = computed(() => editingRecord.value ?? peekRecord.value)
 // 길게 눌러 수정 중인 레코드가 있으면, 위쪽 시계는 진행 시각 대신 그 레코드의 시간을
 // 보여준다. 짧게 눌러 보기(peek)만 할 때는 진행 시각을 그대로 둔다. seconds.value(전/후반
 // 종료 시각, 나가기 시 저장되는 값)는 그대로 유지되므로 화면 표시만 바뀐다.
-const displayClock = computed(() => (editingRecord.value ? fmtTime(editingRecord.value.seconds) : clock.value))
+const displayClock = computed(() => (editingRecord.value ? fmtTime(editSeconds.value) : clock.value))
 
 // Kick/Shooting 패널에 "채워서" 보여줄 레코드. 레코드를 클릭/롱프레스해서 보고 있는
 // 중이면 그 레코드를 그대로 보여준다. 아무것도 안 보고 있을 때는 마지막 레코드가
@@ -1982,6 +2036,9 @@ async function finishHalf() {
 
   halfFinishBusy.value = true
   if (timer) clearInterval(timer)
+  // 아직 나가지 않은 자동 저장은 진행 중 상태(H1/H2)를 담고 있으므로 취소한다.
+  if (draftSaveTimer) clearTimeout(draftSaveTimer)
+  draftSaveTimer = undefined
   saveToStore()
   game.value.clockStartedAt = null
   game.value.halfStatus = doneStatus
@@ -1992,6 +2049,8 @@ async function finishHalf() {
     if (!await saveDraft(game.value)) {
       throw new Error(`${half.value} Draft를 Firestore에 저장하지 못했습니다. 네트워크 연결을 확인하고 다시 종료해 주세요.`)
     }
+    // 종료 전에 대기열에 있던 H1/H2 상태 쓰기가 늦게 도착해도 서버(save_input_draft)가
+    // lifecycle 후퇴를 거부하므로 여기서 협업 쓰기 대기열을 기다리지 않는다.
     goTeamSelection()
   } catch (error) {
     game.value.halfStatus = runningStatus
@@ -2058,13 +2117,13 @@ async function finishHalf() {
             <div class="score">{{ homeScore }}</div>
             <div class="halfBox">
               <div class="clockRow">
-                <button class="timeStep" :disabled="!isPrimary" @click="stepSeconds(-1)">−</button>
+                <button class="timeStep" :disabled="!isPrimary && !editingId" @click="stepSeconds(-1)">−</button>
                 <div class="halfLabel" :class="{ on: half === '전반', clickable: isEditMode }" @click="selectHalf('전반')">
                   전반</div>
                 <div class="clock" :class="{ paused }">{{ displayClock }}</div>
                 <div class="halfLabel" :class="{ on: half === '후반', clickable: isEditMode }" @click="selectHalf('후반')">
                   후반</div>
-                <button class="timeStep" :disabled="!isPrimary" @click="stepSeconds(1)">+</button>
+                <button class="timeStep" :disabled="!isPrimary && !editingId" @click="stepSeconds(1)">+</button>
               </div>
             </div>
             <div class="score">{{ awayScore }}</div>
@@ -2467,9 +2526,9 @@ async function finishHalf() {
 }
 
 .confirmBox {
-  width: 580px;
+  width: 500px;
   max-width: calc(100vw - 32px);
-  padding: 40px 36px 30px;
+  padding: 32px 30px 24px;
   border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 10px;
   background: #1b1f24;
@@ -2478,15 +2537,15 @@ async function finishHalf() {
 
 .confirmTitle {
   color: #fff;
-  font-size: 24px;
+  font-size: 21px;
   font-weight: 800;
   text-align: center
 }
 
 .confirmMessage {
-  margin-top: 14px;
+  margin-top: 12px;
   color: rgba(255, 255, 255, .65);
-  font-size: 18px;
+  font-size: 16px;
   line-height: 1.5;
   text-align: center;
   white-space: pre-line
@@ -2495,14 +2554,14 @@ async function finishHalf() {
 .confirmBtns {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 14px;
-  margin-top: 32px
+  gap: 12px;
+  margin-top: 26px
 }
 
 .confirmBtns button {
-  height: 64px;
+  height: 56px;
   border-radius: 8px;
-  font-size: 19px;
+  font-size: 17px;
   font-weight: 800;
   cursor: pointer
 }

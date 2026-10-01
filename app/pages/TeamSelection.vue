@@ -666,9 +666,21 @@ function didInputQuery(resumeHalf?: '전반' | '후반', edit?: boolean, editRet
   }
 }
 
+// 전반/후반 시작 확인 팝업 — DidInput 의 확인 팝업과 같은 모양(태블릿 터치 기준).
+const confirmDialog = ref<{ title: string; message: string; okLabel: string; resolve: (ok: boolean) => void } | null>(null)
+function askConfirm(title: string, message = '', okLabel = '확인') {
+  confirmDialog.value?.resolve(false)
+  return new Promise<boolean>(resolve => { confirmDialog.value = { title, message, okLabel, resolve } })
+}
+function closeConfirm(ok: boolean) {
+  const dialog = confirmDialog.value
+  confirmDialog.value = null
+  dialog?.resolve(ok)
+}
+
 async function startFirstHalf() {
   if (!canStart.value) return
-  if (!confirm('전반전을 시작하시겠습니까?')) return
+  if (!await askConfirm('전반전을 시작하시겠습니까?', '시작하면 경기 시간이 흐르기 시작합니다.', '전반전 시작')) return
   lifecycleBusy.value = true
   const previousStatus = game.value.halfStatus
   const previousSeconds = game.value.seconds
@@ -768,7 +780,7 @@ function editHalf() {
   navigateTo({ path: '/DidInput', query: didInputQuery(game.value.halfStatus === 'H2' ? '후반' : '전반', true, prevStatus) })
 }
 async function startSecondHalf() {
-  if (!confirm('후반전을 시작하시겠습니까?')) return
+  if (!await askConfirm('후반전을 시작하시겠습니까?', '시작하면 경기 시간이 흐르기 시작합니다.', '후반전 시작')) return
   lifecycleBusy.value = true
   lifecycleError.value = ''
   const previousStatus = game.value.halfStatus
@@ -1577,12 +1589,94 @@ function undoSub(index: number) {
         </div>
       </main>
     </div>
+
+    <div v-if="confirmDialog" class="confirmOverlay" @pointerdown.self="closeConfirm(false)">
+      <div class="confirmBox" role="dialog" aria-modal="true">
+        <div class="confirmTitle">{{ confirmDialog.title }}</div>
+        <div v-if="confirmDialog.message" class="confirmMessage">{{ confirmDialog.message }}</div>
+        <div class="confirmBtns">
+          <button class="confirmCancel" @click="closeConfirm(false)">취소</button>
+          <button class="confirmOk" @click="closeConfirm(true)">{{ confirmDialog.okLabel }}</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <style scoped>
 * {
   box-sizing: border-box
+}
+
+/* 확인 팝업 — 태블릿 터치 기준: hover 없이 :active 로 눌림 표시, 버튼은 크게 */
+.confirmOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, .6)
+}
+
+.confirmBox {
+  width: 500px;
+  max-width: calc(100vw - 32px);
+  padding: 32px 30px 24px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 10px;
+  background: #1b1f24;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, .5)
+}
+
+.confirmTitle {
+  color: #fff;
+  font-size: 21px;
+  font-weight: 800;
+  text-align: center
+}
+
+.confirmMessage {
+  margin-top: 12px;
+  color: rgba(255, 255, 255, .65);
+  font-size: 16px;
+  line-height: 1.5;
+  text-align: center;
+  white-space: pre-line
+}
+
+.confirmBtns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 26px
+}
+
+.confirmBtns button {
+  height: 56px;
+  border-radius: 8px;
+  font-size: 17px;
+  font-weight: 800;
+  cursor: pointer
+}
+
+.confirmCancel {
+  border: 1px solid rgba(255, 255, 255, .15);
+  background: #23262b;
+  color: #ddd
+}
+
+.confirmOk {
+  border: 1px solid #f0b429;
+  background: #f0b429;
+  color: #191919
+}
+
+.confirmCancel:active {
+  background: #2e3238
+}
+
+.confirmOk:active {
+  background: #d99e1c
 }
 
 button {

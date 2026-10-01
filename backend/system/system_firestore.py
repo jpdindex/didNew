@@ -399,8 +399,10 @@ class JpdDidData:
         No document is created by this read.
         """
         states: dict[Side, dict[str, Any]] = {
-            "H": {"rawStatus": None, "completed": False, "fieldSide": None},
-            "A": {"rawStatus": None, "completed": False, "fieldSide": None},
+            # A side with neither RAW nor a live Draft is a fresh "ready" session;
+            # the lobby resets its shared state only on an explicit ready status.
+            "H": {"rawStatus": None, "completed": False, "fieldSide": None, "lifecycleStatus": "ready"},
+            "A": {"rawStatus": None, "completed": False, "fieldSide": None, "lifecycleStatus": "ready"},
         }
         collection = self.db.collection("matches").document(gm_id).collection("recordings")
         refs = [collection.document("H"), collection.document("A")]
@@ -1114,6 +1116,12 @@ class JpdDidData:
     def _input_draft_id(gm_id: str, side: Side) -> str:
         return f"{gm_id}_{side}"
 
+    _LIFECYCLE_ORDER = ("ready", "H1", "H1_done", "H2", "H2_done", "H3", "H3_done", "H4", "H4_done", "final")
+
+    @classmethod
+    def _lifecycle_rank(cls, status: Any) -> int:
+        return cls._LIFECYCLE_ORDER.index(status) if status in cls._LIFECYCLE_ORDER else -1
+
     def get_input_draft(self, gm_id: str, side: Side) -> dict[str, Any]:
         reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
         snapshot = reference.get(retry=None, timeout=10)
@@ -1177,6 +1185,17 @@ class JpdDidData:
         # An assistant's record sync must never pause, restart or reopen a half.
         primary_uid = str(previous.get("primaryUid") or "")
         can_write_live_state = not primary_uid or primary_uid == user_id
+        if sync_scope == "state" and can_write_live_state:
+            # A live state write queued before "half end" can reach the server after
+            # the H1_done/H2_done checkpoint. It must never reopen a finished half.
+            previous_status = previous_shared.get("halfStatus") or previous_payload.get("status")
+            if self._lifecycle_rank(payload.get("status")) < self._lifecycle_rank(previous_status):
+                payload = {**payload, "status": previous_status}
+                client_state = {
+                    **client_state, "halfStatus": previous_status,
+                    "seconds": previous_shared.get("seconds", client_state.get("seconds", 0)),
+                    "clockStartedAt": previous_shared.get("clockStartedAt"),
+                }
         if sync_scope in {"records", "cards"} or not can_write_live_state:
             shared_state = previous_shared
         else:

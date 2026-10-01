@@ -74,6 +74,7 @@ interface DraftResponse {
   clientState: Partial<MatchState>
   sharedState?: Partial<MatchState>
   revision: number
+  participantCount?: number
   inputSetup?: {
     formationKey: string
     fieldSide: 'left' | 'right' | null
@@ -91,7 +92,12 @@ interface DraftResponse {
 export function useMatchCollaboration() {
   const { request } = useBackendApi()
   let pollTimer: ReturnType<typeof setInterval> | undefined
+  let pollOnce: (() => Promise<void>) | undefined
   let stopped = true
+  // stop() can run while start() is still awaiting auth or its first read
+  // (the screen was left early). Each start owns one session number, and a
+  // stale start must never arm a timer that nothing will clear again.
+  let session = 0
   let polling = false
   let latestRevision = 0
   let writeChain: Promise<unknown> = Promise.resolve()
@@ -163,8 +169,18 @@ export function useMatchCollaboration() {
     return response
   }
 
+  // A solo analyst has nothing to receive. Repeated reads start only once the
+  // server reports another participant on this Draft.
+  function followParticipants(count: number | undefined) {
+    if (stopped || pollTimer || !pollOnce || (count ?? 0) < 2) return
+    const run = pollOnce
+    pollTimer = setInterval(() => { void run() }, 400)
+  }
+
   function stop() {
     stopped = true
+    session += 1
+    pollOnce = undefined
     latestRevision = 0
     writeChain = Promise.resolve()
     confirmedRecordFingerprints = new Map()
@@ -182,29 +198,35 @@ export function useMatchCollaboration() {
     applySetup?: (setup: NonNullable<DraftResponse['inputSetup']>) => void
   }) {
     stop()
+    const current = session
     const { $auth, $authReady } = useNuxtApp()
     await $authReady
-    if (!$auth.currentUser || !game.matchId) return false
+    if (current !== session || !$auth.currentUser || !game.matchId) return false
     stopped = false
+    // Fix the target at start. The shared game object can later hold another
+    // match; this session must keep reading only the Draft it was started for.
+    const gmId = game.matchId
+    const side = sideFor(game)
     // Direct re-entry can begin with an IndexedDB checkpoint before the first
     // server poll. Protect it until its idempotent record sync is acknowledged.
     markPendingRecords(game.records)
 
     const poll = async () => {
-      if (stopped || polling) return
+      if (stopped || polling || current !== session) return
       polling = true
       try {
         const response = await request<DraftResponse>(
-          `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${sideFor(game)}`,
+          `/api/v1/match-input/drafts/${encodeURIComponent(gmId)}/${side}`,
         )
+        if (current !== session) return
         if (response.status === 'missing') {
           // Final promotion deletes the Draft. Check final RAW once so an
           // assistant that polls just after deletion still leaves this screen.
           try {
             const raw = await request<{ payload?: InputPayload }>(
-              `/api/v1/match-input/matches/${encodeURIComponent(game.matchId)}/recordings/${sideFor(game)}/input-state`,
+              `/api/v1/match-input/matches/${encodeURIComponent(gmId)}/recordings/${side}/input-state`,
             )
-            if (raw.payload?.status === 'final') handlers.applyState({ halfStatus: 'final', clockStartedAt: null })
+            if (current === session && raw.payload?.status === 'final') handlers.applyState({ halfStatus: 'final', clockStartedAt: null })
           } catch {
             // A missing Draft before the first input session is normal.
           }
@@ -212,6 +234,7 @@ export function useMatchCollaboration() {
         }
         if (response.status !== 'ok' || stopped || response.revision < latestRevision) return
         latestRevision = response.revision
+        followParticipants(response.participantCount)
         if (response.sharedState && Object.keys(response.sharedState).length) handlers.applyState(plain(response.sharedState))
         if (response.inputSetup) handlers.applySetup?.(response.inputSetup)
         const records = sortRecords(response.payload.records.map(recordFromPayload))
@@ -229,12 +252,12 @@ export function useMatchCollaboration() {
         polling = false
       }
     }
+    pollOnce = poll
+    // One read on entry restores the shared Draft. The 400ms loop (single-flight,
+    // so a slower backend never stacks reads) starts only once another analyst
+    // shares it — reported by this read or by a later save response.
     await poll()
-    // Active two-person input needs near-immediate visibility. The request is
-    // still single-flight, so a slower backend never accumulates overlapping
-    // reads.
-    pollTimer = setInterval(() => { void poll() }, 400)
-    return true
+    return current === session
   }
 
   async function sync(game: MatchState, syncScope: 'state' | 'records' | 'cards', deletedRecordIds: string[] = []) {
@@ -262,6 +285,8 @@ export function useMatchCollaboration() {
         body: JSON.stringify({ payload, clientState, syncScope, deletedRecordIds }),
       })
       latestRevision = Math.max(latestRevision, response.revision)
+      // A solo primary does not poll; its own saves reveal a newly joined analyst.
+      followParticipants(response.participantCount)
       if (syncScope === 'records') acknowledgeServerRecords(sortRecords(response.payload.records.map(recordFromPayload)))
       if (syncScope === 'cards' && cardsFingerprint(cardsFromPayload(response.payload.cards)) === pendingCardsFingerprint) pendingCardsFingerprint = undefined
       return true
@@ -288,5 +313,19 @@ export function useMatchCollaboration() {
     return await sync(game, 'cards')
   }
 
-  return { join, start, stop, syncState, syncRecords, syncCards, removeRecord, mergeRemoteRecords }
+  // The screen debounces its network write, but polling runs every 400ms.
+  // Protect a local edit from the moment it is made; otherwise a poll inside
+  // the debounce window replaces it with the older server list.
+  function markLocalRecords(records: DidRecord[]) {
+    markPendingRecords(records)
+  }
+
+  // Call only when this device actually changed its cards. Re-marking on every
+  // record save made a stale screen ignore the server and keep rewriting its
+  // old card list, so two screens overwrote each other every second.
+  function markLocalCards(game: MatchState) {
+    pendingCardsFingerprint = cardsFingerprint(game.cards)
+  }
+
+  return { join, start, stop, syncState, syncRecords, syncCards, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards }
 }

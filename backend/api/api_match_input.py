@@ -142,6 +142,9 @@ class DraftResponse(BaseModel):
     revision: int = 0
     updatedAt: str | None = None
     inputSetup: dict[str, Any] | None = None
+    # Browsers poll only while someone else shares this Draft. A solo primary
+    # learns about a newly joined analyst from its own save responses.
+    participantCount: int = 0
 
 
 class DraftMissingResponse(BaseModel):
@@ -195,6 +198,7 @@ def _draft_response(document: dict[str, Any], input_setup: dict[str, Any] | None
         revision=int(document.get("revision") or 0),
         updatedAt=updated_at.isoformat() if updated_at else None,
         inputSetup=input_setup,
+        participantCount=len(participants) if isinstance(participants := document.get("participants"), dict) else 0,
     )
 
 
