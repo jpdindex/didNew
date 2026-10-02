@@ -2,14 +2,16 @@
 const inputMenus = [
   { label: '팀 관리', desc: '팀 정보와 엠블럼을 빠르게 등록·수정', to: '/manage/teams', ready: true },
   { label: '선수 관리', desc: '선수·등번호·포지션을 한 번에 등록·수정', to: '/manage/players', ready: true },
-  { label: '감독 관리', desc: '감독 정보와 소속 팀을 빠르게 등록·수정', to: '/manage/coaches', ready: true },
-  { label: '경기 일정 관리', desc: '경기 날짜·팀·리그 일정을 빠르게 등록·수정', to: '/manage/schedules', ready: true }
+  { label: '경기 일정 관리', desc: '경기 날짜·팀·리그 일정을 빠르게 등록·수정', to: '/manage/schedules', ready: true },
+  { label: '감독 관리', desc: '감독 정보와 소속 팀을 빠르게 등록·수정', to: '/manage/coaches', ready: true }
 ]
-const menus = [
+const operationMenus = [
   { label: '분석관 운영 대시보드', desc: '경기·팀·주/부 역할·담당 DAP 기준으로 분석관 운영 현황 조회', to: '/manage/analyst-dashboard', ready: true },
   { label: '분석관 계정 관리', desc: '분석관 표시 이름·등급·관리자 권한 변경', to: '/manage/recorders', ready: true },
   { label: 'BASIC 기록 승인', desc: '승인 대기 Draft 검토 후 최종 RAW로 승격', to: '/manage/input-approvals', ready: true },
-  { label: '기록 잠금 관리', desc: '갱신으로 잠긴 반(半) 잠금 해제', to: '/manage/locks', ready: true },
+  { label: '기록 잠금 관리', desc: '갱신으로 잠긴 반(半) 잠금 해제', to: '/manage/locks', ready: true }
+]
+const dataMenus = [
   { label: 'SQL 데이터 이관', desc: '레거시 SQL 경기 데이터를 Firestore로 이관 (1회성)', to: '/manage/legacy-import', ready: true },
   { label: 'Firestore 데이터 뷰어', desc: '컬렉션 조회 + 값 수정 (삭제는 없음)', to: '/manage/data-viewer', ready: true },
   { label: '입력 데이터 (경기 기록)', desc: '경기 → 팀 → 레코드/KPI/카드 순으로 클릭만으로 조회', to: '/manage/input-data', ready: true }
@@ -26,13 +28,17 @@ const menus = [
         <NuxtLink class="backBtn" to="/schedule">← 경기 선택으로</NuxtLink>
       </div>
 
-      <div class="grid">
+      <div class="sectionTitle firstSection">
+        <span>경기 입력 준비</span>
+        <small>경기 기록 전에 필요한 기준 정보</small>
+      </div>
+      <div class="grid twoColumnGrid">
         <template v-for="menu in inputMenus" :key="menu.label">
-          <NuxtLink v-if="menu.ready" :to="menu.to" class="card inputCard">
+          <NuxtLink v-if="menu.ready" :to="menu.to" class="card">
             <div class="label">{{ menu.label }}</div>
             <div class="desc">{{ menu.desc }}</div>
           </NuxtLink>
-          <div v-else class="card disabled inputCard">
+          <div v-else class="card disabled">
             <div class="label">{{ menu.label }}</div>
             <div class="desc">{{ menu.desc }}</div>
             <div class="badge">준비 중</div>
@@ -40,10 +46,13 @@ const menus = [
         </template>
       </div>
 
-      <div class="sectionTitle">관리 도구</div>
-      <div class="grid">
+      <div class="sectionTitle">
+        <span>경기 기록 운영</span>
+        <small>입력된 기록과 분석관 업무 관리</small>
+      </div>
+      <div class="grid twoColumnGrid">
         <NuxtLink
-          v-for="menu in menus.filter(menu => menu.ready)"
+          v-for="menu in operationMenus.filter(menu => menu.ready)"
           :key="menu.label"
           :to="menu.to"
           class="card"
@@ -53,7 +62,33 @@ const menus = [
         </NuxtLink>
 
         <div
-          v-for="menu in menus.filter(menu => !menu.ready)"
+          v-for="menu in operationMenus.filter(menu => !menu.ready)"
+          :key="menu.label"
+          class="card disabled"
+        >
+          <div class="label">{{ menu.label }}</div>
+          <div class="desc">{{ menu.desc }}</div>
+          <div class="badge">준비 중</div>
+        </div>
+      </div>
+
+      <div class="sectionTitle">
+        <span>데이터 점검·이관</span>
+        <small>원본 데이터 조회와 시스템 관리</small>
+      </div>
+      <div class="grid threeColumnGrid">
+        <NuxtLink
+          v-for="menu in dataMenus.filter(menu => menu.ready)"
+          :key="menu.label"
+          :to="menu.to"
+          class="card"
+        >
+          <div class="label">{{ menu.label }}</div>
+          <div class="desc">{{ menu.desc }}</div>
+        </NuxtLink>
+
+        <div
+          v-for="menu in dataMenus.filter(menu => !menu.ready)"
           :key="menu.label"
           class="card disabled"
         >
@@ -104,7 +139,7 @@ const menus = [
   align-items: center;
   justify-content: space-between;
   padding-bottom: 16px;
-  margin-bottom: 20px;
+  margin-bottom: 17px;
   border-bottom: 1px solid rgba(255,255,255,0.06);
 }
 .title { color: rgba(255,255,255,0.85); font-weight: 700; letter-spacing: 0.02em; }
@@ -118,23 +153,42 @@ const menus = [
 
 .grid {
   display: grid;
+  gap: 14px 16px;
+}
+.twoColumnGrid {
+  grid-template-columns: repeat(2, 1fr);
+}
+.threeColumnGrid {
   grid-template-columns: repeat(3, 1fr);
-  gap: 16px;
 }
 .sectionTitle {
-  margin: 28px 0 12px;
-  padding-top: 18px;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin: 21px 0 11px;
+  padding-top: 16px;
   border-top: 1px solid rgba(255,255,255,0.08);
   color: rgba(255,255,255,0.72);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 800;
   letter-spacing: .04em;
+}
+.sectionTitle small {
+  color: rgba(255,255,255,0.34);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.firstSection {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
 }
 
 .card {
   position: relative;
   display: block;
-  padding: 20px;
+  padding: 18px 20px;
   border-radius: 8px;
   border: 1px solid rgba(255,255,255,0.1);
   background: rgba(255,255,255,0.03);
@@ -145,8 +199,8 @@ const menus = [
 .card.disabled { cursor: not-allowed; opacity: 0.5; }
 .card.disabled:hover { border-color: rgba(255,255,255,0.1); background: rgba(255,255,255,0.03); }
 
-.label { color: #fff; font-weight: 700; font-size: 15px; margin-bottom: 6px; }
-.desc { color: rgba(255,255,255,0.55); font-size: 13px; }
+.label { color: #fff; font-weight: 700; font-size: 15.5px; margin-bottom: 6px; }
+.desc { color: rgba(255,255,255,0.55); font-size: 13px; line-height: 1.4; }
 
 .badge {
   position: absolute;

@@ -158,10 +158,11 @@ function teamLabel(t: TeamRow) { return t.nameKr || t.name }
   <div class="page">
     <div class="bg" />
     <div class="frame">
-      <div class="topBar">
-        <div class="title">감독 관리</div>
-        <NuxtLink class="backBtn" to="/manage">← 데이터 관리로</NuxtLink>
-      </div>
+      <header>
+        <NuxtLink class="back" to="/manage">← 데이터 관리</NuxtLink>
+        <h1>감독 관리</h1>
+        <button class="add" :disabled="!selectedTeam" @click="openAdd">+ 감독 추가</button>
+      </header>
 
       <div class="body">
         <section class="teamPane">
@@ -190,7 +191,6 @@ function teamLabel(t: TeamRow) { return t.nameKr || t.name }
           <template v-else>
             <div class="coachHead">
               <h2>{{ teamLabel(selectedTeam) }} — 감독 재임 이력</h2>
-              <button class="addBtn" @click="openAdd">+ 감독 추가</button>
             </div>
 
             <div v-if="addOpen" class="addForm">
@@ -253,13 +253,14 @@ function teamLabel(t: TeamRow) { return t.nameKr || t.name }
 </template>
 
 <style scoped>
-.page { box-sizing: border-box; width: 1280px; height: 800px; display: grid; place-items: center; position: relative; overflow: hidden; background: #0b0f17; }
-.bg { position: absolute; inset: 0; background: radial-gradient(1200px 500px at 50% 35%, rgba(255,255,255,0.08), transparent 60%), linear-gradient(180deg, rgba(0,0,0,0.55), rgba(0,0,0,0.75)); }
-.frame { box-sizing: border-box; position: relative; width: 1280px; height: 800px; background: rgba(10, 14, 22, 0.75); border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 18px 60px rgba(0,0,0,0.55); backdrop-filter: blur(8px); padding: 24px; display: flex; flex-direction: column; gap: 12px; }
-.topBar { display: flex; align-items: center; justify-content: space-between; padding-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,0.06); }
-.title { color: rgba(255,255,255,0.85); font-weight: 700; letter-spacing: 0.02em; }
-.backBtn { color: rgba(255,255,255,0.55); font-size: 13px; text-decoration: none; }
-.backBtn:hover { color: #fff; }
+.page { box-sizing: border-box; width: 1280px; height: 800px; overflow: hidden; background: #0b0f17; color: #eee; padding: 28px; }
+.bg { display: none; }
+.frame { box-sizing: border-box; width: 100%; height: 100%; min-height: 100%; border: 1px solid #29313b; background: #151a21; padding: 24px; display: flex; flex-direction: column; gap: 12px; }
+header { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 20px; border-bottom: 1px solid #29313b; padding-bottom: 18px; }
+h1 { text-align: center; font-size: 26px; margin: 0; }
+.back { justify-self: start; color: #9da7b3; text-decoration: none; }
+.add { justify-self: end; background: #f0b429; border: 0; padding: 10px 16px; font-weight: 800; border-radius: 4px; cursor: pointer; }
+.add:disabled { opacity: .4; cursor: not-allowed; }
 
 .body { flex: 1; min-height: 0; display: grid; grid-template-columns: 260px 1fr; gap: 16px; }
 .teamPane { min-height: 0; display: flex; flex-direction: column; gap: 8px; }
@@ -274,7 +275,6 @@ function teamLabel(t: TeamRow) { return t.nameKr || t.name }
 .coachPane { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
 .coachHead { display: flex; justify-content: space-between; align-items: center; }
 .coachHead h2 { margin: 0; font-size: 16px; color: #fff; }
-.addBtn { background: rgba(0,217,255,0.12); border: 1px solid rgba(0,217,255,0.4); color: #0dc; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
 
 .hint { color: rgba(255,255,255,0.4); font-size: 12px; padding: 10px; }
 .hint.big { padding: 40px 10px; text-align: center; }

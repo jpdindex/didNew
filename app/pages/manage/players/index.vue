@@ -794,7 +794,7 @@ async function submitAddPlayer() {
 </template>
 
 <style scoped>
-.page{width:1280px;height:800px;background:#0b0f17;color:#eee;padding:28px;box-sizing:border-box;overflow-y:auto}.frame{min-height:100%;border:1px solid #29313b;background:#151a21;padding:24px;box-sizing:border-box}header{display:flex;align-items:center;gap:20px;border-bottom:1px solid #29313b;padding-bottom:18px}h1{flex:1;text-align:center;font-size:26px;margin:0}.back{color:#9da7b3;text-decoration:none}.add{background:#f0b429;border:0;padding:10px 16px;font-weight:800;border-radius:4px;cursor:pointer}
+.page{width:1280px;height:800px;background:#0b0f17;color:#eee;padding:28px;box-sizing:border-box;overflow-y:auto}.frame{min-height:100%;border:1px solid #29313b;background:#151a21;padding:24px;box-sizing:border-box}header{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:20px;border-bottom:1px solid #29313b;padding-bottom:18px}h1{text-align:center;font-size:26px;margin:0}.back{justify-self:start;color:#9da7b3;text-decoration:none}.add{justify-self:end;background:#f0b429;border:0;padding:10px 16px;font-weight:800;border-radius:4px;cursor:pointer}
 .errBanner{margin:12px 0 0;padding:8px 12px;background:rgba(241,106,106,.12);border:1px solid rgba(241,106,106,.4);border-radius:4px;color:#f16a6a;font-size:12px}
 .addForm{margin-top:12px;padding:14px;display:flex;flex-direction:column;gap:10px;border:1px solid rgba(240,180,41,.4);border-radius:6px;background:rgba(240,180,41,.05)}
 .addFormRow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
