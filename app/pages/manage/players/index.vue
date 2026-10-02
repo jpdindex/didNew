@@ -5,7 +5,7 @@
 // 계약만 모아서 찾는 방식이라 결과는 항상 그 리그로 좁혀진다.
 
 import { collection, doc, getDocs, orderBy, query, setDoc, Timestamp, writeBatch, type Firestore } from 'firebase/firestore'
-import type { PlayerDoc, TeamDoc } from '~/types/schema'
+import type { LeagueDoc, PlayerDoc, TeamDoc } from '~/types/schema'
 import {
   fetchPlayerContracts, fetchPlayersByTeamsAndSeason, todayLabel, transferPlayer, retirePlayer, departToOtherLeague,
   updatePlayerContract, deletePlayerContract, type PlayerContract, type PlayerRow,
@@ -27,6 +27,7 @@ const LEAGUES = [
 const seasons = ['2026/27', '2025/26', '2024/25', '2023/24', '2022/23', '2021/22', '2020/21']
 
 const teams = ref<TeamRow[]>([])
+const competitionTypes = ref<Map<string, NonNullable<PlayerContract['competitionType']>>>(new Map())
 const selectedLeague = ref('EPL')
 const selectedSeason = ref(seasons[0])
 const selectedTeamFilter = ref('') // '' = 전체
@@ -182,6 +183,12 @@ function teamLabel(id: string) {
   const t = teams.value.find(t => t.id === id)
   return t ? (t.nameKr || t.name) : id
 }
+function contractType(contract: PlayerContract): NonNullable<PlayerContract['competitionType']> {
+  return contract.competitionType ?? competitionTypes.value.get(contract.leagueId ?? '') ?? 'league'
+}
+function currentClubContract(contracts: PlayerContract[]) {
+  return contracts.find(contract => contract.to === null && contractType(contract) !== 'national')
+}
 // 필터로 보고 있는 시즌 기준 "그 팀 계약"을 그 선수의 계약 목록에서 골라 표시용으로 쓴다 —
 // 이적 이력이 있으면 한 선수가 여러 계약을 가질 수 있어서, 지금 필터에 맞는 것 하나를 고른다.
 // 검색 결과(contracts가 비어있음)는 계약 대신 PlayerDoc의 currentTeamId 등 캐시를 쓴다.
@@ -190,7 +197,7 @@ function contractForFilter(r: { player: PlayerRow; contracts: PlayerContract[] }
     return r.player.currentTeamId ? { teamId: r.player.currentTeamId, no: r.player.currentNo, pos: r.player.currentPos } : undefined
   }
   if (selectedTeamFilter.value) return r.contracts.find(c => c.teamId === selectedTeamFilter.value) ?? r.contracts[0]
-  return r.contracts.find(c => c.to === null) ?? r.contracts[0]
+  return currentClubContract(r.contracts) ?? r.contracts[0]
 }
 
 async function loadPlayers() {
@@ -208,8 +215,17 @@ async function loadPlayers() {
 
 onMounted(async () => {
   try {
-    const snap = await getDocs(query(collection(db, 'teams'), orderBy('name')))
-    teams.value = snap.docs.map(d => ({ id: d.id, ...(d.data() as TeamDoc) }))
+    const [teamsSnap, leaguesSnap] = await Promise.all([
+      getDocs(query(collection(db, 'teams'), orderBy('name'))),
+      getDocs(collection(db, 'leagues')),
+    ])
+    teams.value = teamsSnap.docs.map(d => ({ id: d.id, ...(d.data() as TeamDoc) }))
+    const nextCompetitionTypes = new Map<string, NonNullable<PlayerContract['competitionType']>>()
+    for (const item of leaguesSnap.docs) {
+      const league = item.data() as LeagueDoc
+      if (league.competitionType) nextCompetitionTypes.set(item.id, league.competitionType)
+    }
+    competitionTypes.value = nextCompetitionTypes
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : String(e)
   }
@@ -226,6 +242,14 @@ const editFields = ref({ name: '', nameEn: '', nameFull: '', birth: '', height: 
 const savingPlayer = ref(false)
 const detailContracts = ref<PlayerContract[]>([])
 const detailError = ref('')
+const contractGroups = computed(() => [
+  { type: 'league' as const, label: '리그 소속/계약 이력' },
+  { type: 'national' as const, label: '국가대표 이력' },
+  { type: 'cup' as const, label: '컵 대회 이력' },
+].map(group => ({
+  ...group,
+  contracts: detailContracts.value.filter(contract => contractType(contract) === group.type),
+})).filter(group => group.contracts.length > 0))
 
 function selectedRow() {
   return filteredRows.value.find(r => r.player.id === selectedPlayerId.value) ?? null
@@ -264,7 +288,7 @@ async function loadDetailContracts() {
   try {
     detailContracts.value = await fetchPlayerContracts(db, selectedPlayerId.value)
     if (!isEditingDetail.value) {
-      editFields.value.pos = detailContracts.value.find(c => c.to === null)?.pos ?? editFields.value.pos
+      editFields.value.pos = currentClubContract(detailContracts.value)?.pos ?? editFields.value.pos
     }
   } catch (e) {
     detailError.value = e instanceof Error ? e.message : String(e)
@@ -284,7 +308,7 @@ async function applyEditDetail() {
   if (!r) return
   savingPlayer.value = true
   try {
-    const currentContract = detailContracts.value.find(c => c.to === null)
+    const currentContract = currentClubContract(detailContracts.value)
     const nextPos = editFields.value.pos.trim() || null
     const now = Timestamp.now()
     const patch = {
@@ -331,7 +355,7 @@ const transferForm = ref({
 })
 function openTransfer() {
   const r = selectedRow()
-  const currentContract = detailContracts.value.find(c => c.to === null)
+  const currentContract = currentClubContract(detailContracts.value)
   transferForm.value = {
     teamId: currentContract?.teamId ?? r?.player.currentTeamId ?? '',
     no: '', pos: currentContract?.pos ?? (r ? (contractForFilter(r)?.pos ?? '') : ''), transferType: 'TRANSFER',
@@ -343,7 +367,7 @@ async function submitTransfer() {
   const r = selectedRow()
   if (!r || !transferForm.value.from.trim()) return
   const numberChange = transferForm.value.transferType === 'NUMBER_CHANGE'
-  const currentTeamId = detailContracts.value.find(c => c.to === null)?.teamId ?? r.player.currentTeamId ?? ''
+  const currentTeamId = currentClubContract(detailContracts.value)?.teamId ?? r.player.currentTeamId ?? ''
   const targetTeamId = numberChange ? currentTeamId : transferForm.value.teamId
   if (!targetTeamId) {
     detailError.value = numberChange ? '현재 소속팀을 확인할 수 없습니다.' : '이적할 팀을 선택하세요.'
@@ -357,7 +381,7 @@ async function submitTransfer() {
     } else {
       await transferPlayer(db, r.player.id, r.player.name, {
         teamId: targetTeamId, no: transferForm.value.no || undefined, pos: transferForm.value.pos || undefined,
-        leagueId: selectedLeague.value,
+        leagueId: selectedLeague.value, competitionType: 'league',
         transferType: numberChange ? 'TRANSFER' : transferForm.value.transferType,
         from: transferForm.value.from.trim(),
         fee: transferForm.value.fee ? Number(transferForm.value.fee) : undefined,
@@ -545,7 +569,7 @@ async function submitAddPlayer() {
     })
     await transferPlayer(db, id, name, {
       teamId: newPlayer.value.teamId, no: newPlayer.value.no || undefined, pos: newPlayer.value.pos || undefined,
-      leagueId: selectedLeague.value, transferType: newPlayer.value.transferType, from: newPlayer.value.from.trim(),
+      leagueId: selectedLeague.value, competitionType: 'league', transferType: newPlayer.value.transferType, from: newPlayer.value.from.trim(),
       fee: newPlayer.value.fee ? Number(newPlayer.value.fee) : undefined,
       currency: newPlayer.value.fee ? newPlayer.value.currency : undefined,
     })
@@ -759,32 +783,35 @@ async function submitAddPlayer() {
             </div>
 
             <div class="contractHistory">
-              <b>이적/계약 이력</b>
+              <b>소속 이력</b>
               <div v-if="!detailContracts.length" class="contractEmpty">등록된 계약이 없습니다.</div>
-              <div v-for="c in detailContracts" :key="c.id" class="contractRow" :class="{ current: c.to === null }">
-                <template v-if="editingContractId === c.id">
-                  <div class="editContractFields">
-                    <input v-model="editContract.from" placeholder="시작일">
-                    <input v-model="editContract.to" placeholder="종료일" :disabled="editContract.current">
-                    <label class="currentToggle"><input v-model="editContract.current" type="checkbox"> 진행중</label>
-                    <input v-model="editContract.no" placeholder="등번호">
-                    <input v-model="editContract.pos" placeholder="포지션">
+              <section v-for="group in contractGroups" :key="group.type" class="contractGroup">
+                <h3>{{ group.label }}</h3>
+                <div v-for="c in group.contracts" :key="c.id" class="contractRow" :class="{ current: c.to === null && group.type !== 'national' }">
+                  <template v-if="editingContractId === c.id">
+                    <div class="editContractFields">
+                      <input v-model="editContract.from" placeholder="시작일">
+                      <input v-model="editContract.to" placeholder="종료일" :disabled="editContract.current">
+                      <label class="currentToggle"><input v-model="editContract.current" type="checkbox"> 진행중</label>
+                      <input v-model="editContract.no" placeholder="등번호">
+                      <input v-model="editContract.pos" placeholder="포지션">
+                      <span class="contractRowActions">
+                        <button class="contractActionBtn" :disabled="savingPlayer" @click="submitEditContract">{{ savingPlayer ? '적용 중...' : '적용' }}</button>
+                        <button class="contractActionBtn" :disabled="savingPlayer" @click="cancelEditContract">취소</button>
+                      </span>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <span class="teamNameGroup">{{ teamLabel(c.teamId) }}</span>
+                    <span>{{ c.from }} ~ {{ c.to ?? '진행중' }}</span>
+                    <span>{{ c.no ? `#${c.no}` : '-' }} {{ c.pos || '' }}</span>
                     <span class="contractRowActions">
-                      <button class="contractActionBtn" :disabled="savingPlayer" @click="submitEditContract">{{ savingPlayer ? '적용 중...' : '적용' }}</button>
-                      <button class="contractActionBtn" :disabled="savingPlayer" @click="cancelEditContract">취소</button>
+                      <button class="contractActionBtn" @click="openEditContract(c)">수정</button>
+                      <button class="contractActionBtn contractRemoveBtn" @click="removeContract(c)">삭제</button>
                     </span>
-                  </div>
-                </template>
-                <template v-else>
-                  <span class="teamNameGroup">{{ teamLabel(c.teamId) }}</span>
-                  <span>{{ c.from }} ~ {{ c.to ?? '진행중' }}</span>
-                  <span>{{ c.no ? `#${c.no}` : '-' }} {{ c.pos || '' }}</span>
-                  <span class="contractRowActions">
-                    <button class="contractActionBtn" @click="openEditContract(c)">수정</button>
-                    <button class="contractActionBtn contractRemoveBtn" @click="removeContract(c)">삭제</button>
-                  </span>
-                </template>
-              </div>
+                  </template>
+                </div>
+              </section>
             </div>
           </div>
         </template>
@@ -833,7 +860,7 @@ select option{background:#202731;color:#fff}
 .addFromHint{grid-column:1/-1;color:rgba(255,255,255,.45);font-size:11px}
 .addActions{grid-column:1/-1;display:flex;gap:8px}
 .addActions button{padding:6px 14px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:transparent;color:#ddd;cursor:pointer;font-size:12px}
-.contractHistory{margin-top:16px;border-top:1px solid #303a48;padding-top:12px}
+.contractHistory{margin-top:16px;border-top:1px solid #303a48;padding-top:12px}.contractGroup{margin-top:14px}.contractGroup h3{margin:0 0 4px;color:#f0b429;font-size:12px}
 .contractEmpty{margin-top:8px;color:#77818d;font-size:12px}
 .contractRow{display:grid;grid-template-columns:1.6fr 1.6fr 1.2fr auto;align-items:center;gap:8px;padding:8px 0;border-top:1px solid #232b36;font-size:12px;color:rgba(255,255,255,.8)}.contractRow.current{color:#f0b429}
 .teamNameGroup{font-weight:700}

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
-from backend.temporary.build_legacy_import import _half, _integer, _number, _string, _tuple_values
+from backend.temporary.build_legacy_import import _half, _integer, _number, _string, _tuple_values, legacy_record_sort_key
 
 
 TEAM_COLUMNS = {
@@ -179,7 +179,14 @@ def _read_dump(path: Path) -> list[SqlRecording]:
     flags_by_gi: dict[str, dict[str, dict[str, bool]]] = defaultdict(dict)
     path_record_ids_by_gi: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     sequences: dict[tuple[str, str, int], int] = defaultdict(int)
-    for row in rows["ff_game_record"]:
+    record_identities = {
+        gi_id: (gm_id, side)
+        for gi_id, (gm_id, side, _) in info_by_gi.items()
+    }
+    for row in sorted(
+        rows["ff_game_record"],
+        key=lambda item: legacy_record_sort_key(item, record_identities.get(_string(item.get("gi_id")))),
+    ):
         gi_id = _string(row.get("gi_id"))
         if gi_id not in info_by_gi:
             continue

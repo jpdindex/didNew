@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computeAttackPaths, computeBap } from '~/utils/didLogic'
+import { useInputPreview } from '~/composables/useInputPreview'
 import type { HalfStatus, MatchSnapshot, MatchSquadPlayer, MatchState, SubRecord } from '~/composables/useMatchState'
 import type { Half } from '~/types/schema'
 import type { InputPayload } from '~/composables/useMatchDraft'
@@ -44,6 +44,7 @@ let appliedSetupFingerprint = ''
 // selectedTeam/formationKey/assigned/side/inputMode/잔디 설정을 전부 여기로 옮겼다.
 const game = useMatchState()
 const { request } = useBackendApi()
+const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
 const { saveLocal, save: saveDraft, saveSetup, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover: recoverDraft, hydrate } = useMatchDraft()
 const { join: joinCollaboration } = useMatchCollaboration()
 const lifecycleBusy = ref(false)
@@ -172,6 +173,7 @@ function applyBootstrap(payload: InputBootstrap) {
   const selectedTeam = game.value.team
   const selectedStatus = selectedTeam === 'home' ? payload.inputStatus.H : payload.inputStatus.A
   const setups = payload.inputSetup ?? { H: null, A: null }
+  applySetupFieldSides(setups)
   const selectedSetup = selectedTeam === 'home' ? setups.H : setups.A
   if (payload.session.status === 'ok' && payload.session.payload) {
     hydrate(game.value, payload.session.payload, payload.session.clientState)
@@ -211,8 +213,11 @@ async function loadDashboardKpis(half: 'all' | 'H1' | 'H2' = kpiHalf.value) {
   )
   dashboardKpis.value.H[half] = payload.kpis.H
   dashboardKpis.value.A[half] = payload.kpis.A
-  const setup = game.value.team === 'away' ? payload.inputSetup?.A : payload.inputSetup?.H
+  const setups = payload.inputSetup ?? { H: null, A: null }
+  applySetupFieldSides(setups)
+  const setup = game.value.team === 'away' ? setups.A : setups.H
   if (setup) applyInputSetup(setup)
+  if (game.value.halfStatus === 'ready') applyOpponentFieldSideDefault(game.value.team)
   } finally {
     dashboardKpiLoading = false
   }
@@ -231,6 +236,13 @@ function applyOpponentFieldSideDefault(team: 'home' | 'away') {
   if (game.value.side !== null) return
   const automatic = counterpartFieldSide(team)
   if (automatic) game.value.side = automatic
+}
+
+function applySetupFieldSides(setups: { H: InputSetup | null; A: InputSetup | null }) {
+  for (const side of ['H', 'A'] as const) {
+    const fieldSide = setups[side]?.fieldSide
+    if (fieldSide === 'left' || fieldSide === 'right') inputStatus.value[side].fieldSide = fieldSide
+  }
 }
 
 function applyCurrentMatchSquads(squads: { home: MatchSquadPlayer[]; away: MatchSquadPlayer[] }, snapshot: MatchSnapshot) {
@@ -436,6 +448,7 @@ async function pickTeam(team: 'home' | 'away') {
     if (refreshed) {
       applyCurrentMatchSquads(refreshed.squads, refreshed.snapshot)
       const setups = refreshed.inputSetup ?? { H: null, A: null }
+      applySetupFieldSides(setups)
       selectedSetup = team === 'home' ? setups.H : setups.A
       applyInputSetup(selectedSetup)
     }
@@ -548,9 +561,6 @@ function recordFormationChange() {
   if (!game.value.matchId) return
   if (formationSaveTimer) clearTimeout(formationSaveTimer)
   formationSaveTimer = setTimeout(() => {
-    // A ready lobby is not shared input yet. Its first durable setup write is
-    // the primary's explicit "전반전 시작" action below.
-    if (game.value.halfStatus === 'ready') return
     const fingerprint = currentSetupFingerprint()
     if (!game.value.formationKey || fingerprint === appliedSetupFingerprint) return
     const half = game.value.halfStatus
@@ -956,22 +966,24 @@ const kpiRecords = computed(() => {
   if (kpiHalf.value === 'all') return game.value.records
   return game.value.records.filter(r => (r.half ?? 'H1') === kpiHalf.value)
 })
+const currentPreview = computed(() => previewInput(
+  kpiRecords.value,
+  kpiHalf.value === 'all' ? undefined : kpiHalf.value,
+))
+watch([kpiRecords, kpiHalf], () => {
+  scheduleInputPreview(kpiRecords.value, kpiHalf.value === 'all' ? undefined : kpiHalf.value)
+}, { deep: true, immediate: true })
 const kpiValues = computed(() => {
-  const { paths, flags } = computeAttackPaths(kpiRecords.value, { closeTrailing: true })
-  let tap = 0, dap = 0, dapSc = 0, sht = 0, gol = 0
-  for (const f of flags.values()) {
-    if (f.isTap) tap++
-    if (f.isDap) { dap++; if (f.isDapS) dapSc++ }
-    if (f.isSht) sht++
-    if (f.isGol) gol++
-  }
-  const dtp = paths.filter(p => p.ptype === 'DTP').length
-  const bap = computeBap(kpiRecords.value).length
+  const values = currentPreview.value.kpis
   return {
-    TAP: tap, DAP: dap, DTP: dtp, Shoot: sht, Goal: gol,
-    ASR: dap ? Math.round((dapSc / dap) * 100) : 0,
-    SSR: sht ? Math.round((gol / sht) * 100) : 0,
-    BAP: bap,
+    TAP: values.TAP ?? 0,
+    DAP: values.DAP ?? 0,
+    DTP: values.DTP ?? 0,
+    Shoot: values.SHOT ?? 0,
+    Goal: values.GOAL ?? 0,
+    ASR: Math.round((values.ASR ?? 0) * 100),
+    SSR: Math.round((values.SSR ?? 0) * 100),
+    BAP: values.BAP ?? 0,
   }
 })
 const displayedKpis = computed(() => {
@@ -1019,7 +1031,7 @@ const kpiErrors = computed(() => {
   })
   const playerList = halves.flatMap(halfKey => {
     const records = game.value.records.filter(record => (record.half ?? 'H1') === halfKey)
-    const { flags } = computeAttackPaths(records, { closeTrailing: true })
+    const flags = currentPreview.value.flags
     return records
       .filter(record => flags.get(record.id)?.isDap && !record.playerId)
       .map(record => ({ half: halfKey, no: numberByHalf[halfKey].get(record.id) ?? 0, time: fmtErrTime(record.seconds) }))

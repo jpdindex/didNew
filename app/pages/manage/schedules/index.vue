@@ -243,7 +243,9 @@ async function loadSeasonFirstDivisionTeams() {
       const snap = await getDoc(doc(db, 'teams', team.id, 'seasons', seasonId))
       if (!snap.exists()) return null
       const entry = snap.data() as TeamSeasonEntry
-      return entry.leagueId === selectedLeague.value && entry.division === 'D1' ? team.id : null
+      const belongsToLeague = entry.competitionIds?.includes(selectedLeague.value)
+        ?? entry.leagueId === selectedLeague.value
+      return belongsToLeague && entry.division === 'D1' ? team.id : null
     }))
     if (requestId === seasonTeamsRequestId) {
       seasonFirstDivisionTeamIds.value = new Set(results.filter((id): id is string => Boolean(id)))

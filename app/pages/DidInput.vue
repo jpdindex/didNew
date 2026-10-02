@@ -9,6 +9,7 @@ import {
   type DidRecord,
   type ResCode,
 } from '~/utils/didLogic'
+import { useInputPreview } from '~/composables/useInputPreview'
 import {
   GRASS_LINE_OPTIONS,
   GRASS_PATTERNS,
@@ -38,6 +39,7 @@ const inputMode = computed(() => (route.query.mode === '실시간' ? '실시간'
 // TeamSelection 으로 돌아가며, "수정"/"후반전 시작"으로 다시 들어올 때 이어서 불러온다.
 const game = useMatchState()
 const { request } = useBackendApi()
+const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
 const { saveLocal, save: saveDraft, saveSetup, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
 const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncCards, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards } = useMatchCollaboration()
 const isPrimary = computed(() => game.value.lifecycleControl)
@@ -483,7 +485,10 @@ const visibleRecords = computed(() => records.value.filter(r => (r.half ?? 'H1')
 // 진행 중인 루트도 매번 판정한다. 그래야 DAP 존(구역 1~6)에 찍는 순간
 // 그 루트가 UTP 로 확정되어 진입 레코드 + 직전 2개에 선수 입력 버튼이 바로 뜬다.
 // (DAP 존에 못 들어갔고 슛도 없으면 여전히 UPP 라 뜨지 않는다)
-const analysis = computed(() => computeAttackPaths(visibleRecords.value, { closeTrailing: true }))
+const analysis = computed(() => previewInput(visibleRecords.value, halfCode.value))
+watch([visibleRecords, halfCode], () => {
+  scheduleInputPreview(visibleRecords.value, halfCode.value)
+}, { deep: true, immediate: true })
 
 // 가안 행 시간: 기본은 위치를 찍은 순간에 멈춘다. '흐르는 초' 버튼을 켜면 경기 시계를 그대로 따라간다.
 // 확정되는 레코드의 시간도 가안 행에 보이던 값과 같게 draftSeconds 를 쓴다.
@@ -939,19 +944,8 @@ watch(() => rows.value.length, async () => {
 })
 
 const playerPickFor = ref<string | null>(null) // 선수 입력창을 띄운 레코드
-// DAP 가 아닌 레코드에는 선수를 남기지 않는다. 기록을 끼워 넣거나 시간을 옮겨서
-// DAP 가 풀린 경우(예: P 30:44 → P|B 30:46 사이에 30:45 X/B 삽입)는 물론, 이미 저장돼 있던
-// 비DAP 레코드의 선수도 화면을 여는 순간 지운다. 지운 결과는 자동 저장(queueDraftSave)된다.
-watch(analysis, now => {
-  if (applyingRemoteDraft) return
-  for (const rec of visibleRecords.value) {
-    if (!rec.playerId || rec.playerId === 'OWN') continue
-    if (!now.flags.get(rec.id)?.isDap) {
-      rec.playerId = undefined
-      if (playerPickFor.value === rec.id) playerPickFor.value = null
-    }
-  }
-}, { immediate: true })
+// Preview disagreement never mutates persisted input. The server may change
+// only the DAP/E-Player display; a recorder explicitly corrects any player.
 const pickedPlayerId = ref<string | null>(null)
 
 // 선수 선택창도 TeamSelection에서 확정한 포메이션 좌표를 그대로 쓴다.

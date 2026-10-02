@@ -1,6 +1,6 @@
 // =============================================================================
 // players/{id} + players/{id}/contracts 읽기/쓰기 — manage/players/index.vue 전용.
-// 스키마는 app/types/schema.ts의 PlayerDoc/ContractDoc이 정본이다.
+// 화면에서 다루는 문서 형태는 app/types/schema.ts의 PlayerDoc/ContractDoc으로 제한한다.
 //
 // 계약(ContractDoc)엔 seasonId를 안 채운다(레거시 이관도 안 채움) — "이 시즌에 이 팀
 // 소속이었나"는 from/to 날짜가 시즌 경계(8/1~다음해 5/31)와 겹치는지로 판단한다.
@@ -17,6 +17,12 @@ import type { ContractDoc, PlayerDoc } from '~/types/schema'
 
 export type PlayerContract = ContractDoc & { id: string }
 export type PlayerRow = PlayerDoc & { id: string }
+
+function currentClubContract(contracts: PlayerContract[]): PlayerContract | undefined {
+  // National-team selection is an independent affiliation. It must never
+  // close, replace, or become the player's current club contract.
+  return contracts.find(contract => contract.to === null && contract.competitionType !== 'national')
+}
 
 /** "오늘"을 이 화면들이 쓰는 점(.) 표기로. coachContracts.ts와 같은 관례. */
 export function todayLabel(): string {
@@ -105,12 +111,13 @@ export async function transferPlayer(
   db: Firestore, playerId: string, playerName: string,
   data: {
     teamId: string; no?: string; pos?: string; leagueId?: string
+    competitionType?: ContractDoc['competitionType']
     transferType?: NonNullable<ContractDoc['transferType']>; from?: string
     fee?: number; currency?: string
   },
 ): Promise<void> {
   const existing = await fetchPlayerContracts(db, playerId)
-  const current = existing.find(c => c.to === null)
+  const current = currentClubContract(existing)
   const today = todayLabel()
   // 새 계약 시작일 — 지정 안 하면(보통 진짜 이적 처리 때) 오늘. 선수를 처음 등록할 때는
   // 실제 입단일이 오늘이 아닐 수 있어 화면에서 직접 받는다.
@@ -134,6 +141,7 @@ export async function transferPlayer(
     contractId = doc(collection(db, 'players', playerId, 'contracts')).id
     await setDoc(doc(db, 'players', playerId, 'contracts', contractId), {
       teamId: data.teamId, leagueId: data.leagueId ?? null,
+      competitionType: data.competitionType ?? 'league',
       from: startDate, to: null, no: data.no ?? null, pos: data.pos ?? null,
       fromTeamId: current?.teamId ?? null, transferType: data.transferType ?? 'TRANSFER',
       fee: data.fee ?? null, currency: data.currency ?? null,
@@ -158,7 +166,7 @@ export async function transferPlayer(
  */
 export async function retirePlayer(db: Firestore, playerId: string, date?: string): Promise<void> {
   const existing = await fetchPlayerContracts(db, playerId)
-  const current = existing.find(c => c.to === null)
+  const current = currentClubContract(existing)
   const endDate = date?.trim() || todayLabel()
   if (current) {
     await updatePlayerContract(db, playerId, current.id, { to: endDate })
@@ -177,7 +185,7 @@ export async function retirePlayer(db: Firestore, playerId: string, date?: strin
  */
 export async function departToOtherLeague(db: Firestore, playerId: string, date?: string): Promise<void> {
   const existing = await fetchPlayerContracts(db, playerId)
-  const current = existing.find(c => c.to === null)
+  const current = currentClubContract(existing)
   const endDate = date?.trim() || todayLabel()
   if (current) {
     await updatePlayerContract(db, playerId, current.id, { to: endDate })

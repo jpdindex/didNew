@@ -8,13 +8,15 @@ from threading import Lock, Thread
 from typing import Literal
 
 from fastapi import APIRouter, File, Form, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from backend.temporary.build_legacy_import import BuildLegacyImport
+from backend.check.audit_legacy_firestore_import import LegacyFirestoreImportAudit
+from backend.temporary.build_legacy_import import BuildLegacyImport, LegacyMetadataRepair
 from backend.system.system_firestore import BackendError, JpdDidData, RequiredUser
+from backend.system.system_pipeline_jobs import PipelineJob, pipeline_jobs
 
 
-JobState = Literal["queued", "preparing", "replacing", "writing", "complete", "failed"]
+JobState = Literal["queued", "preparing", "preflight", "resuming", "replacing", "writing", "cleaning", "complete", "failed"]
 
 
 @dataclass(slots=True)
@@ -28,7 +30,14 @@ class LegacyImportJob:
     error: str | None = None
     lock: Lock = field(default_factory=Lock)
 
-    def update(self, state: JobState, matches_total: int, matches_processed: int, documents_total: int, documents_written: int) -> None:
+    def update(
+        self,
+        state: JobState,
+        matches_total: int,
+        matches_processed: int,
+        documents_total: int,
+        documents_written: int,
+    ) -> None:
         with self.lock:
             self.state = state
             self.matches_total = matches_total
@@ -38,7 +47,7 @@ class LegacyImportJob:
 
 
 class LegacyImportStatusResponse(BaseModel):
-    status: Literal["idle", "queued", "preparing", "replacing", "writing", "complete", "failed"]
+    status: Literal["idle", "queued", "preparing", "preflight", "resuming", "replacing", "writing", "cleaning", "complete", "failed"]
     matchesTotal: int
     matchesProcessed: int
     documentsTotal: int
@@ -66,6 +75,41 @@ class LegacySnapshotStatusResponse(BaseModel):
     error: str | None = None
 
 
+class LegacyVerifyStatusResponse(BaseModel):
+    status: Literal["idle", "queued", "running", "complete", "failed"]
+    matchesTotal: int
+    matchesProcessed: int
+    documentsTotal: int
+    documentsCompared: int
+    documentsActual: int | None = None
+    percent: int
+    passed: bool | None = None
+    diagnostics: int = 0
+    categoryCounts: dict[str, int] = Field(default_factory=dict)
+    examples: list[dict[str, object]] = Field(default_factory=list)
+    reportPath: str | None = None
+    error: str | None = None
+
+
+class LegacyMetadataRepairStatusResponse(BaseModel):
+    status: Literal["idle", "queued", "running", "complete", "failed"]
+    targetsTotal: int
+    targetsProcessed: int
+    percent: int
+    leaguesConfigured: int = 0
+    leaguesDeleted: int = 0
+    teamSeasonsMerged: int = 0
+    teamSeasonsDeleted: int = 0
+    teamsRestored: int = 0
+    stadiumHomeTeamsNormalized: int = 0
+    teamStadiumsRestored: int = 0
+    contractsNormalized: int = 0
+    contractsDeleted: int = 0
+    contractConflicts: int = 0
+    contractCompetitionTypesAssigned: int = 0
+    error: str | None = None
+
+
 @dataclass(slots=True)
 class LegacySnapshotBackfillJob:
     season: str
@@ -82,12 +126,28 @@ class LegacySnapshotBackfillJob:
     lock: Lock = field(default_factory=Lock)
 
 
+@dataclass(slots=True)
+class LegacyVerifyJob:
+    state: Literal["queued", "running", "complete", "failed"] = "queued"
+    matches_total: int = 0
+    matches_processed: int = 0
+    documents_total: int = 0
+    documents_compared: int = 0
+    summary: dict[str, object] = field(default_factory=dict)
+    examples: list[dict[str, object]] = field(default_factory=list)
+    report_path: str | None = None
+    error: str | None = None
+    lock: Lock = field(default_factory=Lock)
+
+
 router = APIRouter(tags=["legacy-import"])
 logger = logging.getLogger(__name__)
 _import_job: LegacyImportJob | None = None
 _import_job_lock = Lock()
 _snapshot_jobs: dict[str, LegacySnapshotBackfillJob] = {}
 _snapshot_jobs_lock = Lock()
+_verify_job: LegacyVerifyJob | None = None
+_verify_job_lock = Lock()
 
 
 def _import_response(job: LegacyImportJob | None) -> LegacyImportStatusResponse:
@@ -175,6 +235,76 @@ def _snapshot_response(job: LegacySnapshotBackfillJob) -> LegacySnapshotStatusRe
         )
 
 
+def _verify_response(job: LegacyVerifyJob | None) -> LegacyVerifyStatusResponse:
+    if job is None:
+        return LegacyVerifyStatusResponse(
+            status="idle", matchesTotal=0, matchesProcessed=0,
+            documentsTotal=0, documentsCompared=0, percent=0,
+        )
+    with job.lock:
+        if job.state == "complete":
+            percent = 100
+        elif job.documents_total:
+            percent = min(99, int((job.documents_compared / job.documents_total) * 100))
+        elif job.matches_total:
+            percent = min(99, int((job.matches_processed / job.matches_total) * 100))
+        else:
+            percent = 0
+        summary = dict(job.summary)
+        category_counts = {
+            str(key): int(value)
+            for key, value in summary.items()
+            if key not in {"matches", "records", "documentsExpected", "documentsCompared", "documentsActual", "passed", "diagnostics"}
+            and isinstance(value, int)
+        }
+        return LegacyVerifyStatusResponse(
+            status=job.state,
+            matchesTotal=job.matches_total,
+            matchesProcessed=job.matches_processed,
+            documentsTotal=job.documents_total,
+            documentsCompared=job.documents_compared,
+            documentsActual=(
+                int(summary["documentsActual"])
+                if isinstance(summary.get("documentsActual"), int)
+                else None
+            ),
+            percent=percent,
+            passed=summary.get("passed") if isinstance(summary.get("passed"), bool) else None,
+            diagnostics=int(summary.get("diagnostics", 0)),
+            categoryCounts=category_counts,
+            examples=list(job.examples),
+            reportPath=job.report_path,
+            error=job.error,
+        )
+
+
+def _metadata_repair_response(job: PipelineJob | None) -> LegacyMetadataRepairStatusResponse:
+    if job is None:
+        return LegacyMetadataRepairStatusResponse(
+            status="idle", targetsTotal=0, targetsProcessed=0, percent=0,
+        )
+    snapshot = job.snapshot()
+    counts = snapshot["counts"]
+    return LegacyMetadataRepairStatusResponse(
+        status=str(snapshot["status"]),
+        targetsTotal=int(snapshot["targetsTotal"]),
+        targetsProcessed=int(snapshot["targetsProcessed"]),
+        percent=int(snapshot["percent"]),
+        leaguesConfigured=int(counts.get("leaguesConfigured", 0)),
+        leaguesDeleted=int(counts.get("leaguesDeleted", 0)),
+        teamSeasonsMerged=int(counts.get("teamSeasonsMerged", 0)),
+        teamSeasonsDeleted=int(counts.get("teamSeasonsDeleted", 0)),
+        teamsRestored=int(counts.get("teamsRestored", 0)),
+        stadiumHomeTeamsNormalized=int(counts.get("stadiumHomeTeamsNormalized", 0)),
+        teamStadiumsRestored=int(counts.get("teamStadiumsRestored", 0)),
+        contractsNormalized=int(counts.get("contractsNormalized", 0)),
+        contractsDeleted=int(counts.get("contractsDeleted", 0)),
+        contractConflicts=int(counts.get("contractConflicts", 0)),
+        contractCompetitionTypesAssigned=int(counts.get("contractCompetitionTypesAssigned", 0)),
+        error=snapshot["error"] if isinstance(snapshot["error"], str) else None,
+    )
+
+
 def _run_snapshot_backfill(job: LegacySnapshotBackfillJob) -> None:
     try:
         logger.info(
@@ -214,11 +344,82 @@ def _run_snapshot_backfill(job: LegacySnapshotBackfillJob) -> None:
             job.error = str(exc) or type(exc).__name__
 
 
+def _run_verify(job: LegacyVerifyJob, upload_path: Path) -> None:
+    try:
+        logger.info("SQL legacy import verification started")
+        sql = upload_path.read_text(encoding="utf-8-sig")
+
+        def progress(values: dict[str, int]) -> None:
+            with job.lock:
+                job.state = "running"
+                job.matches_total = values["matchesTotal"]
+                job.matches_processed = values["matchesProcessed"]
+                job.documents_total = values["documentsTotal"]
+                job.documents_compared = values["documentsCompared"]
+
+        result = LegacyFirestoreImportAudit().verify(sql, on_progress=progress)
+        with job.lock:
+            job.state = "complete"
+            job.summary = dict(result["summary"])
+            job.examples = list(result["examples"][:20])
+            job.report_path = str(result["reportPath"])
+            job.matches_total = int(result["summary"]["matches"])
+            job.matches_processed = int(result["summary"]["matches"])
+            job.documents_total = int(result["summary"]["documentsExpected"])
+            job.documents_compared = int(result["summary"]["documentsCompared"])
+        logger.info("SQL legacy import verification complete: matches=%s diagnostics=%s", job.matches_total, result["summary"]["diagnostics"])
+    except Exception as exc:
+        logger.exception("SQL legacy import verification failed")
+        with job.lock:
+            job.state = "failed"
+            job.error = str(exc) or type(exc).__name__
+    finally:
+        upload_path.unlink(missing_ok=True)
+
+
+def _run_metadata_repair(job: PipelineJob) -> None:
+    logger.info("Legacy metadata repair started")
+
+    def progress(processed: int, total: int, counts: dict[str, int]) -> None:
+        if job.state == "queued":
+            job.begin(matches_total=0, targets_total=total)
+        job.progress(
+            matches_processed=0,
+            targets_processed=processed,
+            counts=counts,
+            errors=[],
+        )
+
+    counts = LegacyMetadataRepair().repair(on_progress=progress)
+    if job.state == "queued":
+        job.begin(matches_total=0, targets_total=0)
+    snapshot = job.snapshot()
+    job.complete(
+        matches_processed=0,
+        targets_processed=int(snapshot["targetsTotal"]),
+        counts=counts,
+        errors=[],
+    )
+    logger.info("Legacy metadata repair complete: %s", counts)
+
+
 @router.get("/legacy-import/status", response_model=LegacyImportStatusResponse, summary="Read SQL import status")
 def read_legacy_import_status(_: RequiredUser = None) -> LegacyImportStatusResponse:
     with _import_job_lock:
         job = _import_job
     return _import_response(job)
+
+
+@router.get("/legacy-import/verify-status", response_model=LegacyVerifyStatusResponse, summary="Read SQL import verification status")
+def read_legacy_verify_status(_: RequiredUser = None) -> LegacyVerifyStatusResponse:
+    with _verify_job_lock:
+        job = _verify_job
+    return _verify_response(job)
+
+
+@router.get("/legacy-import/metadata-status", response_model=LegacyMetadataRepairStatusResponse, summary="Read legacy metadata repair status")
+def read_legacy_metadata_repair_status(_: RequiredUser = None) -> LegacyMetadataRepairStatusResponse:
+    return _metadata_repair_response(pipeline_jobs.get("legacy-metadata-repair"))
 
 
 @router.get("/legacy-import/snapshot-status/{season}", response_model=LegacySnapshotStatusResponse, summary="Read imported lineup snapshot status")
@@ -258,13 +459,44 @@ async def import_legacy_sql(
     with _import_job_lock:
         if _import_job is not None:
             with _import_job.lock:
-                if _import_job.state in {"queued", "preparing", "replacing", "writing"}:
+                if _import_job.state in {"queued", "preparing", "preflight", "resuming", "replacing", "writing", "cleaning"}:
                     upload_path.unlink(missing_ok=True)
                     raise BackendError("SQL legacy import is already running", status_code=409, code="legacy_import_running")
         job = LegacyImportJob()
         _import_job = job
     Thread(target=_run_import, args=(job, upload_path), daemon=True).start()
     return _import_response(job)
+
+
+@router.post("/legacy-import/verify", response_model=LegacyVerifyStatusResponse, status_code=202, summary="Start SQL import verification")
+async def verify_legacy_sql(
+    dump: UploadFile = File(...),
+    _: RequiredUser = None,
+) -> LegacyVerifyStatusResponse:
+    if not dump.filename or not dump.filename.lower().endswith((".sql", ".txt")):
+        raise BackendError("Upload a .sql dump file", status_code=422, code="legacy_file_invalid")
+    with NamedTemporaryFile(delete=False, suffix=".sql") as upload:
+        upload.write(await dump.read())
+        upload_path = Path(upload.name)
+    global _verify_job
+    with _verify_job_lock:
+        if _verify_job is not None:
+            with _verify_job.lock:
+                if _verify_job.state in {"queued", "running"}:
+                    upload_path.unlink(missing_ok=True)
+                    raise BackendError("SQL import verification is already running", status_code=409, code="legacy_verify_running")
+        job = LegacyVerifyJob()
+        _verify_job = job
+    Thread(target=_run_verify, args=(job, upload_path), daemon=True, name="legacy-import-verify").start()
+    return _verify_response(job)
+
+
+@router.post("/legacy-import/metadata-repair", response_model=LegacyMetadataRepairStatusResponse, status_code=202, summary="Start legacy league, team, and contract metadata repair")
+def repair_legacy_metadata(_: RequiredUser = None) -> LegacyMetadataRepairStatusResponse:
+    job = pipeline_jobs.start("legacy-metadata-repair", {}, _run_metadata_repair)
+    if job is None:
+        raise BackendError("Legacy metadata repair is already running", status_code=409, code="legacy_metadata_repair_running")
+    return _metadata_repair_response(job)
 
 
 @router.post("/legacy-import/snapshot-backfill", response_model=LegacySnapshotStatusResponse, status_code=202, summary="Start imported lineup snapshot backfill")

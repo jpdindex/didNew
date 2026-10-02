@@ -8,8 +8,7 @@ import type { Half, HalfStatus, RecorderLevel } from '~/types/schema'
 // 필드 모양은 나중에 Firestore 문서로 그대로 옮길 수 있도록, 계산 가능한 값(KPI 등)은
 // 저장하지 않고 records 로부터 항상 다시 계산한다.
 //
-// HalfStatus/RecorderLevel 은 types/schema.ts 가 정본이다 — recordings.status /
-// recorders.level 과 같은 타입을 써야 나중에 Firestore 연동 시 값이 어긋나지 않는다.
+// HalfStatus/RecorderLevel은 화면 상태와 제어 노출을 위한 UI 타입이다.
 // CardRecord 는 utils/card.ts 가 정본이다 — 카드 판정 로직(isSentOff 등)과 같은 곳에 둬서
 // 타입과 로직이 갈라지지 않게 한다. (여기서는 재수출하지 않는다 — 쓰는 쪽은 '~/utils/card'에서
 // 직접 import 한다. 재수출하면 Nuxt 자동 import가 두 경로를 같은 이름으로 보고 경고를 낸다.)

@@ -1,7 +1,7 @@
 // =============================================================================
 // coachContracts 컬렉션 읽기/쓰기 — manage/teams.vue(팀 상세의 감독 재임 이력)와
-// manage/coaches/index.vue(감독 관리 화면)가 공유한다. 스키마는 app/types/schema.ts의
-// CoachContractDoc이 정본이다.
+// manage/coaches/index.vue(감독 관리 화면)가 공유한다. 화면 타입은 app/types/schema.ts의
+// CoachContractDoc 타입을 사용한다.
 // =============================================================================
 
 import {

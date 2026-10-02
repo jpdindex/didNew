@@ -98,6 +98,11 @@ def _run_rating_job(job: PipelineJob) -> None:
             counts["failed"] += 1
             if len(errors) < 20:
                 errors.append(f"{current_gm_id}/{current_side}: {exc.code}")
+        except Exception as exc:
+            counts["failed"] += 1
+            logger.exception("Rating pipeline target failed: %s/%s", current_gm_id, current_side)
+            if len(errors) < 20:
+                errors.append(f"{current_gm_id}/{current_side}: unexpected_error ({type(exc).__name__}: {exc})")
         else:
             counts["unchanged" if result.unchanged else "rated"] += 1
         remaining_by_match[current_gm_id] -= 1

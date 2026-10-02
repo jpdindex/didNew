@@ -37,6 +37,9 @@ const teams = ref<TeamRow[]>([])
 const teamsLoading = ref(true)
 const teamsError = ref('')
 const stadiumNames = ref<Map<string, string>>(new Map())
+const stadiumOptions = computed(() => [...stadiumNames.value.entries()]
+  .sort(([leftId, leftName], [rightId, rightName]) => `${leftName} ${leftId}`.localeCompare(`${rightName} ${rightId}`, 'ko'))
+  .map(([id, name]) => ({ id, name })))
 // 목록의 "현 감독" 칸용 — 팀마다 따로 조회하면 N+1이라, coachContracts를 한 번에 다 불러와서
 // teamId별 "to === null"인 것만 골라 맵으로 만든다.
 const currentCoachByTeam = ref<Map<string, string>>(new Map())
@@ -71,7 +74,12 @@ function currentCoachLabel(team: TeamRow) { return currentCoachByTeam.value.get(
 
 // ---- 시즌별 1부/1부아님 (teams/{id}/seasons가 정본) ----
 const seasonDivisionByTeam = ref<Map<string, Division>>(new Map())
-const seasonDocId = (season: string) => season.replace('/', '-')
+// Match documents use YYYYYYYY and team season documents now share that one
+// canonical ID, rather than the older YYYY-YY spelling.
+const seasonDocId = (season: string) => {
+  const [start, end] = season.split('/')
+  return start && end ? `${start}${start.slice(0, 2)}${end}` : season
+}
 const isCurrentSeason = computed(() => selectedSeason.value === seasons[0])
 
 async function loadSeasonDivisions() {
@@ -145,7 +153,7 @@ async function setDivision(team: TeamRow, next: Division) {
 // ---- 상세정보(행 클릭하면 그 아래로 펼쳐짐) ----
 const selectedTeam = ref<TeamRow | null>(null)
 const isEditingDetail = ref(false)
-const editFields = ref({ nameKr: '', nameFull: '', nameShort: '', stadiumId: '', crestUrl: '' })
+const editFields = ref({ name: '', nameKr: '', nameFull: '', nameShort: '', stadiumId: '', crestUrl: '', active: true })
 const savingTeam = ref(false)
 
 function toggleDetail(team: TeamRow) {
@@ -163,8 +171,8 @@ function startEditDetail() {
   if (!selectedTeam.value) return
   const t = selectedTeam.value
   editFields.value = {
-    nameKr: t.nameKr ?? '', nameFull: t.nameFull ?? '', nameShort: t.nameShort ?? '',
-    stadiumId: t.stadiumId ?? '', crestUrl: t.crestUrl ?? '',
+    name: t.name ?? '', nameKr: t.nameKr ?? '', nameFull: t.nameFull ?? '', nameShort: t.nameShort ?? '',
+    stadiumId: t.stadiumId ?? '', crestUrl: t.crestUrl ?? '', active: t.active !== false,
   }
   isEditingDetail.value = true
 }
@@ -174,7 +182,17 @@ async function applyEditDetail() {
   if (!selectedTeam.value) return
   savingTeam.value = true
   try {
-    const patch = { ...editFields.value, updatedAt: Timestamp.now(), updatedBy: 'manage-ui' }
+    const patch = {
+      name: editFields.value.name.trim(),
+      nameKr: editFields.value.nameKr.trim() || null,
+      nameFull: editFields.value.nameFull.trim() || null,
+      nameShort: editFields.value.nameShort.trim() || null,
+      stadiumId: editFields.value.stadiumId || null,
+      crestUrl: editFields.value.crestUrl.trim() || null,
+      active: editFields.value.active,
+      updatedAt: Timestamp.now(), updatedBy: 'manage-ui',
+    }
+    if (!patch.name) throw new Error('영문 팀명은 필수입니다.')
     await setDoc(doc(db, 'teams', selectedTeam.value.id), patch, { merge: true })
     Object.assign(selectedTeam.value, patch)
     isEditingDetail.value = false
@@ -207,26 +225,27 @@ async function deleteTeam(team: TeamRow) {
 const addTeamOpen = ref(false)
 const savingNewTeam = ref(false)
 const newTeamError = ref('')
-const newTeam = ref({ id: '', nameKr: '', nameFull: '', nameShort: '', stadiumId: '', crestUrl: '', leagueId: 'EPL' })
+const newTeam = ref({ id: '', name: '', nameKr: '', nameFull: '', nameShort: '', stadiumId: '', crestUrl: '', leagueId: 'EPL' })
 
 function openAddTeam() {
   addTeamOpen.value = true
   newTeamError.value = ''
-  newTeam.value = { id: '', nameKr: '', nameFull: '', nameShort: '', stadiumId: '', crestUrl: '', leagueId: selectedLeague.value }
+  newTeam.value = { id: '', name: '', nameKr: '', nameFull: '', nameShort: '', stadiumId: '', crestUrl: '', leagueId: selectedLeague.value }
 }
 function cancelAddTeam() { addTeamOpen.value = false }
 
 async function submitAddTeam() {
   const id = newTeam.value.id.trim()
+  const name = newTeam.value.name.trim()
   const nameKr = newTeam.value.nameKr.trim()
-  if (!id || !nameKr) { newTeamError.value = '팀 코드와 팀명은 필수입니다.'; return }
+  if (!id || !name || !nameKr) { newTeamError.value = '팀 코드, 영문 팀명, 팀명은 필수입니다.'; return }
   savingNewTeam.value = true
   newTeamError.value = ''
   try {
     const existing = await getDoc(doc(db, 'teams', id))
     if (existing.exists()) { newTeamError.value = `팀 코드 "${id}"는 이미 있습니다.`; return }
     const data = {
-      name: nameKr, nameKr, nameFull: newTeam.value.nameFull.trim(), nameShort: newTeam.value.nameShort.trim(),
+      name, nameKr, nameFull: newTeam.value.nameFull.trim() || null, nameShort: newTeam.value.nameShort.trim() || null,
       stadiumId: newTeam.value.stadiumId.trim() || null, crestUrl: newTeam.value.crestUrl.trim() || null,
       currentLeagueId: newTeam.value.leagueId,
       createdAt: Timestamp.now(), createdBy: 'manage-ui', updatedAt: Timestamp.now(), updatedBy: 'manage-ui',
@@ -339,6 +358,7 @@ async function removeCoach(c: CoachContract) {
 
       <div v-if="addTeamOpen" class="addTeamForm">
         <label>팀 코드(ID)<input v-model="newTeam.id" placeholder="예: E-XX (레거시 T_Code 규칙과 맞추는 걸 권장)"></label>
+        <label>영문 팀명<input v-model="newTeam.name" placeholder="예: Arsenal"></label>
         <label>팀명<input v-model="newTeam.nameKr"></label>
         <label>영문 정식명<input v-model="newTeam.nameFull"></label>
         <label>약칭<input v-model="newTeam.nameShort"></label>
@@ -347,11 +367,16 @@ async function removeCoach(c: CoachContract) {
             <option v-for="l in LEAGUES" :key="l.id" :value="l.id">{{ l.label }}</option>
           </select>
         </label>
-        <label>스타디움 ID<input v-model="newTeam.stadiumId" placeholder="예: UK_Emirates Stadium"></label>
+        <label>스타디움
+          <select v-model="newTeam.stadiumId">
+            <option value="">선택 안 함</option>
+            <option v-for="stadium in stadiumOptions" :key="stadium.id" :value="stadium.id">{{ stadium.id }} · {{ stadium.name }}</option>
+          </select>
+        </label>
         <label>엠블럼 URL<input v-model="newTeam.crestUrl"></label>
         <p v-if="newTeamError" class="addTeamError">{{ newTeamError }}</p>
         <div class="addTeamActions">
-          <button :disabled="!newTeam.id.trim() || !newTeam.nameKr.trim() || savingNewTeam" class="applyBtn" @click="submitAddTeam">저장</button>
+          <button :disabled="!newTeam.id.trim() || !newTeam.name.trim() || !newTeam.nameKr.trim() || savingNewTeam" class="applyBtn" @click="submitAddTeam">저장</button>
           <button @click="cancelAddTeam">취소</button>
         </div>
       </div>
@@ -400,11 +425,18 @@ async function removeCoach(c: CoachContract) {
                 </div>
               </div>
               <div class="fields">
+                <label>영문 팀명<input v-model="editFields.name" :disabled="!isEditingDetail"></label>
                 <label>팀명<input v-model="editFields.nameKr" :disabled="!isEditingDetail"></label>
                 <label>영문 정식명<input v-model="editFields.nameFull" :disabled="!isEditingDetail"></label>
                 <label>약칭<input v-model="editFields.nameShort" :disabled="!isEditingDetail"></label>
-                <label>스타디움 ID<input v-model="editFields.stadiumId" :disabled="!isEditingDetail" placeholder="예: UK_Emirates Stadium"></label>
+                <label>스타디움
+                  <select v-model="editFields.stadiumId" :disabled="!isEditingDetail">
+                    <option value="">선택 안 함</option>
+                    <option v-for="stadium in stadiumOptions" :key="stadium.id" :value="stadium.id">{{ stadium.id }} · {{ stadium.name }}</option>
+                  </select>
+                </label>
                 <label>엠블럼 URL<input v-model="editFields.crestUrl" :disabled="!isEditingDetail"></label>
+                <label class="activeField"><input v-model="editFields.active" :disabled="!isEditingDetail" type="checkbox"> 활성 팀</label>
               </div>
 
               <div class="coachHistory">
@@ -490,11 +522,18 @@ async function removeCoach(c: CoachContract) {
                 </div>
               </div>
               <div class="fields">
+                <label>영문 팀명<input v-model="editFields.name" :disabled="!isEditingDetail"></label>
                 <label>팀명<input v-model="editFields.nameKr" :disabled="!isEditingDetail"></label>
                 <label>영문 정식명<input v-model="editFields.nameFull" :disabled="!isEditingDetail"></label>
                 <label>약칭<input v-model="editFields.nameShort" :disabled="!isEditingDetail"></label>
-                <label>스타디움 ID<input v-model="editFields.stadiumId" :disabled="!isEditingDetail" placeholder="예: UK_Emirates Stadium"></label>
+                <label>스타디움
+                  <select v-model="editFields.stadiumId" :disabled="!isEditingDetail">
+                    <option value="">선택 안 함</option>
+                    <option v-for="stadium in stadiumOptions" :key="stadium.id" :value="stadium.id">{{ stadium.id }} · {{ stadium.name }}</option>
+                  </select>
+                </label>
                 <label>엠블럼 URL<input v-model="editFields.crestUrl" :disabled="!isEditingDetail"></label>
+                <label class="activeField"><input v-model="editFields.active" :disabled="!isEditingDetail" type="checkbox"> 활성 팀</label>
               </div>
 
               <div class="coachHistory">
@@ -593,7 +632,7 @@ section{margin-top:24px}h2{font-size:18px;margin:0 0 12px;border-left:4px solid 
 .teamRow.unclassified{cursor:default}.classifyActions{display:flex;gap:6px;justify-self:end}
 .detail{padding:18px;border-top:2px solid #f0b429;background:#1c222b}.detailHead{display:flex;justify-content:space-between;align-items:center}.detailHead h2{border:0;margin:0}.detailActions{display:flex;gap:8px}
 .detailHead button{background:transparent;color:#ddd;border:1px solid #596474;padding:6px 12px;border-radius:3px;cursor:pointer}.detailHead .applyBtn{background:#f0b429;color:#191919;border-color:#f0b429;font-weight:800}.detailHead .applyBtn:disabled{opacity:.5;cursor:not-allowed}.detailHead .deleteBtn{color:#f16a6a;border-color:#7a3a3a}.detailHead .deleteBtn:hover{background:rgba(241,106,106,.12)}
-.fields{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}.fields label{display:flex;flex-direction:column;gap:4px;color:#aab3be;font-size:11px}.fields input{margin:0;width:100%;box-sizing:border-box;background:#11161d;color:#fff;border:1px solid #3b4654;padding:7px;border-radius:3px}.fields input:disabled{color:#7f8996;background:#171c23;border-color:#2a323d;cursor:not-allowed}
+.fields{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}.fields label{display:flex;flex-direction:column;gap:4px;color:#aab3be;font-size:11px}.fields input,.fields select{margin:0;width:100%;box-sizing:border-box;background:#11161d;color:#fff;border:1px solid #3b4654;padding:7px;border-radius:3px}.fields input:disabled,.fields select:disabled{color:#7f8996;background:#171c23;border-color:#2a323d;cursor:not-allowed}.fields .activeField{flex-direction:row;align-items:center;align-self:end;height:32px;gap:7px}.fields .activeField input{width:auto}
 .coachHistory{margin-top:16px;border-top:1px solid #303a48;padding-top:12px}.coachHistHead{display:flex;justify-content:space-between;align-items:center}.addCoachBtn{background:transparent;color:#f0b429;border:1px dashed #f0b429;border-radius:3px;padding:4px 10px;font-size:11px;cursor:pointer}.coachEmpty{margin-top:8px;color:#77818d;font-size:12px}
 .addForm{display:grid;grid-template-columns:1fr 1fr 120px;gap:8px;padding:12px;margin-top:8px;border:1px solid rgba(0,217,255,.3);border-radius:6px;background:rgba(0,217,255,.05)}.addForm input,.addForm select{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:4px;color:#fff;padding:7px;font-size:12px}.addFromHint{grid-column:1/-1;color:rgba(255,255,255,.45);font-size:11px}.addActions{grid-column:1/-1;display:flex;gap:8px}.addActions button{padding:6px 14px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:transparent;color:#ddd;cursor:pointer;font-size:12px}
 .coachRow{display:grid;grid-template-columns:2.6fr 1fr auto 1fr 1fr;align-items:center;gap:8px;padding:8px 0;border-top:1px solid #232b36;font-size:12px;color:rgba(255,255,255,.8)}.coachRow.current{color:#f0b429}.coachDash{color:#7f8996;text-align:center}.coachNameGroup i{color:#9da7b3;font-style:italic;font-size:11px}

@@ -1,32 +1,10 @@
-// =============================================================================
-// Firestore 스키마 타입 정의
-//
-// docs/04_firestore_schema.html(+ docs/05_legacy_field_mapping.md) 이 사람이 읽는
-// 설계도라면, 이 파일은 그걸 코드가 강제하게 만든 것이다. docs/04_firestore_schema.md는
-// 구 버전(2026-09-02 이전)이라 기준 문서가 아니다. 컬렉션 구조가 바뀌면 .html을 먼저
-// 고치고 여기를 맞춘다.
-// 아직 실제 Firestore 읽기/쓰기 코드(컴포저블)는 없다 — 그건 다음 단계(B/D)다.
-// 여기 정의된 각 인터페이스가 곧 해당 문서가 반드시 지켜야 할 필드 계약이다.
-// =============================================================================
+// Frontend display and management form shapes only.
+// The backend storage and pipeline contract is defined in backend/system/system_schema.py.
 
 import type { Timestamp } from 'firebase/firestore'
-import type { ActCode, ResCode } from '~/utils/didLogic'
 
-// -----------------------------------------------------------------------------
-// 공통 타입
-// -----------------------------------------------------------------------------
-
-/** 'H1'|'H2' = 전·후반, 'H3'|'H4' = 연장전반·연장후반. 45분을 넘긴 것("추가시간")은
- *  half 가 바뀌는 게 아니라 halfSeconds 가 계속 늘어나는 것뿐이다. */
 export type Half = 'H1' | 'H2' | 'H3' | 'H4'
 
-/** recordings 문서 ID와 동일. gi_write_code 대응 (§3, §6) */
-export type Side = 'H' | 'A'
-
-/** recordings.status. 화면 상태와 1:1이라 매핑 코드가 필요 없다 (§6).
- *  H3/H4 는 연장 전·후반 — 토너먼트에서만 쓴다. 리그 경기는 H2_done 다음이 바로 final 이다.
- *  Half 타입·halves 맵·fieldSideEx 가 이미 연장을 받게 되어 있었는데 status 에만 값이
- *  없어서 "연장 진행 중"을 표현할 수 없었다 — 그 구멍을 메운 것이다. */
 export type HalfStatus =
   | 'ready'
   | 'H1' | 'H1_done'
@@ -35,365 +13,33 @@ export type HalfStatus =
   | 'H4' | 'H4_done'
   | 'final'
 
-/** 집계·전송 트리거를 가른다. 레코드 저장 자체는 두 모드 동일 (§11.2) */
-export type InputMode = '분석' | '실시간'
-
-/** recorders/{uid}.level. 갱신 버튼 구성을 가른다 (§11.2.1) */
 export type RecorderLevel = 'basic' | 'advanced'
 
-/** recordings.recorders 맵의 값. 조직상 구분일 뿐 권한이 아니다 (§6.3) */
-export type RecorderRank = 'main' | 'sub' | 'manager'
-
-/** 이 값을 누가 입력했나. 비전 연동 전까지는 전부 'did' (§7, 원칙 8) */
-export type DataSource = 'did' | 'vision'
-
-// -----------------------------------------------------------------------------
-// matches/{gm_id} — 일정 (§5)
-// -----------------------------------------------------------------------------
-
-/** 문서 ID 자체가 gm_id 이므로 별도 필드로 두지 않는다. 구조는 §5 참고:
- *  시즌(8) + 리그(3) + 리그 고정 상수(17) + 일련번호(4) = 32자.
- *  담당자가 경기 일정 관리 화면(/manage/schedules)에서 gm_id 를 직접 입력한다 —
- *  match_schedule.json 자동 임포트도, 우리 쪽 채번도 하지 않는다. */
-export interface MatchDoc {
-  date: string
-  kickoffTime?: string
-  leagueId: string
-  seasonId: string
-  matchType: 'league' | 'tournament'
-  /** 리그 전용 (순번) */
-  round?: number
-  /** 토너먼트 전용. round 를 재사용하지 않는다 */
-  stage?: 'R32' | 'R16' | 'QF' | 'SF' | 'F'
-  /** 토너먼트 조별리그 단계에서만. gm_sub_league 대응 */
-  group?: string
-  /** 2차전(홈/원정 합산) 토너먼트에서 1차전/2차전 구분. 합산 스코어로 진출 여부를 가릴 때 필요 */
-  leg?: 1 | 2
-  stadiumId: string
-  homeTeamId: string
-  awayTeamId: string
-  /** 각 recording 이 자기 쪽 필드만 merge 로 쓴다 (§5.1) */
-  score: { home: number; away: number }
-  createdAt: Timestamp
-  updatedAt: Timestamp
-}
-
-// -----------------------------------------------------------------------------
-// matches/{gm_id}/recordings/{H|A} — 팀별 기록 세션 ★ (§6)
-// -----------------------------------------------------------------------------
-
-/** halves 맵의 값. 레코드에는 half+halfSeconds 만 저장하고, 경기 전체 기준 초는
- *  이 값으로 export 시점에 계산한다 — 저장 안 함 = 어긋날 일 없음 (§6.1) */
-export interface HalfTiming {
-  startedAt: Timestamp
-  /** 종료 시 확정되는 그 half 의 총 경과초 */
-  seconds: number
-}
-
-/** lineup 맵의 값. no/name/pos 는 스냅샷이다 — 이적·번호 변경이 과거 경기를
- *  바꾸면 안 된다 (원칙 7, §6.2) */
-export interface LineupEntry {
-  /** TeamSelection 의 assigned 키 그대로 (예: 'o0', 'gk', 'b3') */
-  slot: string
-  order: number
-  type: 'START' | 'BENCH'
-  no: string
-  name: string
-  pos: string
-  inHalf: Half | null
-  inSeconds: number | null
-  outHalf: Half | null
-  outSeconds: number | null
-}
-
-/** recordings.recorders 맵의 값 (§6.3) */
-export interface RecorderEntry {
-  rank: RecorderRank
-  joinedAt: Timestamp
-  /** 최종 저장 시점의 표시 이름. 레거시 import에는 없다 */
-  name?: string | null
-}
-
-/** recordings.kpi — 확정 스냅샷. dMST 중 우리가 산출하는 14개 그대로 (§9.2) */
-export interface RecordingKpi {
-  /** gi_tmp */
-  TAP: number
-  DAP: number
-  TTP: number
-  DTP: number
-  BAP: number
-  /** 빌더 수 (gr_is_ctb 집계) */
-  DTB: number
-  /** 메이커 수 (gr_is_ctm 집계) */
-  DTM: number
-  /** 어시스터 수 (gr_is_cta 집계) */
-  DTA: number
-  /** 슈터 수 (gr_is_cts 집계) */
-  DTS: number
-  SHOT: number
-  ASR: number
-  /** (GOAL − OG) / SHOT (§7.3) */
-  SSR: number
-  /** 자책골 포함 (§7.3) */
-  GOAL: number
-  /** 자책골 수 */
-  OG: number
-}
-
-/**
- * jpd-rating 이 계산해서 되돌려주는 팀 지수 스냅샷. 공식은 모르고 결과값만 보관한다
- * (§10 — 평점 서비스만 KPI 를 읽고, 값만 jpd-did 로 되돌아온다).
- *
- * jmx 는 그 경기의 최종값(jmxSeries 의 20번째 구간값과 항상 같다).
- * jmxSeries 는 5분 구간별 시계열(1~20구간) — 확정 시점에 한 번 얼려서 저장한다
- * (PathSnapshotDoc/PlayerStatsDoc 과 같은 "확정 스냅샷" 패턴, 원칙 3의 정당한 예외).
- * footballX 쪽 multiSheet 출력에 그대로 꽂아 쓴다.
- */
-export interface TeamRatingSnapshot {
-  jmx: number
-  jmxSeries: number[]
-  apx: number
-  apxGrade: string
-  tpx: number
-  tpxGrade: string
-  fpx: number
-  fpxGrade: string
-}
-
-export interface RecordingDoc {
-  side: Side
-  teamId: string
-  opponentTeamId: string
-  /** 최종 저장 시 Draft에서 복사한 분석관 명단 (primary=main, assistant=sub, manager=manager) */
-  recorders?: Record<string, RecorderEntry>
-  /** recorders의 uid 목록, main이 먼저 */
-  recorderIds?: string[]
-  status: HalfStatus
-  inputMode: InputMode
-  /** 전반 기준 진영. 구역코드 반전에 쓰인다 */
-  fieldSide: 'left' | 'right'
-  /** 연장전(H3) 기준 진영. 토너먼트 연장전 지원용 (gi_part_ex) */
-  fieldSideEx?: 'left' | 'right'
-  formationKey: string
-  lineup: Record<string, LineupEntry>
-  halves: Partial<Record<Half, HalfTiming>>
-  /**
-   * basic 등급이 전/후반 갱신을 누르면 그 half 가 잠긴다 — 수정·재갱신 모두 불가.
-   * 해제는 /manage/locks(관리자 전용)에서만. RecordingDoc 필드라 2인 기록 시 실시간
-   * 구독으로 양쪽 기기에 자동 동기화된다(§11).
-   */
-  h1Locked: boolean
-  h2Locked: boolean
-  /**
-   * 레코드 정렬키 발급용. 세션 로드 시 여기서 이어받는다(§7.2) — 그 이후로는 클라이언트
-   * 메모리에서 증가시키고, 레코드마다 서버에 쓰지 않는다. 서버 반영은 half 종료·일시정지
-   * 때만 해서 RecordingDoc 쓰기 경합을 줄인다. 2인 기록 시 같은 seq 충돌은 (seq, createdBy)
-   * 정렬로 타이브레이크한다 — createdBy 는 RecordDoc 필드, uid 라는 필드는 없다.
-   * 단, 이 타이브레이크는 아직 didLogic.ts 에 구현돼 있지 않다(현재는 seconds→seq 까지만
-   * 정렬한다) — Firestore 저장 코드를 만드는 단계(B/D)에서 실제로 넣어야 한다.
-   */
-  maxSeq: number
-  /** 확정 전에는 null. 기록 중에는 저장하지 않는다 (§8) */
-  kpi: RecordingKpi | null
-  kpiComputedAt: Timestamp | null
-  /** kpi 를 쓸 때마다 +1. jpd-rating 이 되돌려준 teamRating 이 낡았는지 판별하는 기준 */
-  kpiVersion: number
-  /** jpd-rating 이 계산해서 되돌려준 값. 공식은 jpd-rating 에만 있다 */
-  teamRating: TeamRatingSnapshot | null
-  /** teamRating 이 어느 kpiVersion 기준으로 계산됐는지. kpiVersion 과 다르면 낡은 값이라 조립 단계에서 버리고 재요청한다 */
-  ratingBasedOn: number | null
-  /** JaionX/aifootballx 동기화 매핑용. 신규 경기는 null */
-  legacyGiId: number | null
-  syncedAt: Timestamp | null
-  createdAt: Timestamp
-  updatedAt: Timestamp
-}
-
-// -----------------------------------------------------------------------------
-// matches/{gm_id}/recordings/{H|A}/records/{recordId} — 플레이 1건 (§7)
-// -----------------------------------------------------------------------------
-
-/**
- * app/utils/didLogic.ts 의 DidRecord 가 클라이언트 스크래치 타입이고, 이게 그걸
- * Firestore 문서 모양으로 옮긴 것이다. 다른 점 하나: DidRecord 는 half 구분 없이
- * `seconds` 하나뿐이라 후반에도 0부터 다시 센다(§6.1 의 버그). Firestore 로 쓸 때는
- * 반드시 half + halfSeconds 로 분리해야 한다 — 이 변환은 다음 단계(D)에서 한다.
- *
- * 2인 기록 시 쓰기는 항상 updateDoc(부분 갱신)으로 한다 — setDoc(전체 덮어쓰기)을
- * 쓰면 방금 상대방이 채운 필드(예: playerIdBy 가 넣은 playerId)가 사라진다. 액트를
- * 만든 사람과 선수를 넣는 사람이 서로 다른 필드만 건드리는 한 경합이 나지 않는다.
- */
-export interface RecordDoc {
-  half: Half
-  /** 해당 half 기준 경과초. 4초 룰의 입력값 */
-  halfSeconds: number
-  /** 같은 초 안의 순서. 정렬은 half→halfSeconds→seq 순 (§7.2) */
-  seq: number
-  act: ActCode
-  res: ResCode
-  /** 1~18 구역코드 */
-  area: number
-  /** 0~100%. 레거시는 픽셀값이라 export 시 변환 필요 (§15 미결정) */
-  posX?: number
-  posY?: number
-  shootPosX?: number
-  shootPosY?: number
-  /** 골포스트·크로스바 바깥 1m 판정 캐시 */
-  shootDspRange?: boolean
-  /** write-back 으로 act 가 비워져도 원래 슛이었음을 보존 */
-  isShot?: boolean
-  /** 'OWN' = 자책골 */
-  playerId?: string
-  /** Legacy RAW compatibility only. New RAW does not retain operator identity. */
-  createdBy?: string
-  /** Legacy RAW compatibility only. */
-  playerIdBy?: string
-  source: DataSource
-  playerIdSource?: DataSource
-  /**
-   * 이 레코드가 BAP 이벤트면 그 사유(didLogic.ts BapEvent.reason). BAP은 레거시
-   * ff_game_bap 처럼 별도 테이블·ID가 필요 없다 — computeBap() 이 항상 레코드 1개당
-   * 이벤트 0~1개를 산출하는 1:1 관계라, 별도 문서 대신 레코드 자신에게 표시하면 된다.
-   * 확정(status:'final') 시점에만 채운다 — 기록 중에는 다른 파생값처럼 계산만 한다.
-   */
-  bapReason?: string
-  createdAt: Timestamp
-}
-
-// -----------------------------------------------------------------------------
-// matches/{gm_id}/recordings/{H|A}/cards/{cardId} — 경고·퇴장 카드
-// -----------------------------------------------------------------------------
-
-/**
- * ff_game_card. 교체(LineupEntry)와 달리 "act"가 없고 공격 체인과 무관해서
- * RecordDoc 에 병합하면 KPI 계산 필터링만 오염된다 — 별도 컬렉션으로 둔다.
- * c_id/gi_id 는 문서 ID·부모 경로가 대신하므로 없다.
- */
-export interface CardDoc {
-  playerId: string
-  half: Half
-  halfSeconds: number
-  card: 'Y' | 'R'
-  /** Legacy RAW compatibility only. New RAW does not retain operator identity. */
-  createdBy?: string
-  createdAt: Timestamp
-}
-
-// -----------------------------------------------------------------------------
-// exportJobs/{gm_id}_{H|A} — 갱신 파이프라인 진행 상태
-// -----------------------------------------------------------------------------
-
-/**
- * 갱신 버튼은 KPI→평점→조립→전송을 직접 동기로 돌리지 않는다 — 이 문서 하나만 쓰고
- * 끝난다. 파이썬 서비스들이 이 문서를 보고 자기 차례를 진행하는 워커가 된다.
- * 문서 ID(gm_id + team_type)는 JaionX 쪽 자연키와 동일해서, 재시도로 같은 작업이
- * 두 번 돌아도 JaionX에 중복 행이 안 생긴다(멱등성).
- */
-export interface ExportJobDoc {
-  stage: 'kpi' | 'rating' | 'assemble' | 'sent'
-  /** 이 작업이 기준으로 삼는 kpiVersion. rating 단계에서 되돌아온 값과 대조한다 */
-  kpiVersion: number
-  attempts: number
-  error: string | null
-  updatedAt: Timestamp
-}
-
-// -----------------------------------------------------------------------------
-// 파생 데이터 — 확정(status:'final') 시점에만 배치로 쓴다 (§8)
-// -----------------------------------------------------------------------------
-
-/** .../paths/{pathId}. didLogic.ts 의 AttackPath 를 그대로 스냅샷한다 */
-export interface PathSnapshotDoc {
-  gtId: string
-  recordIds: string[]
-  ptype: 'UPP' | 'UTP' | 'DTP' | 'STP'
-  /** DTP 중 유효슈팅을 포함하는 건 */
-  dsp: boolean
-  /** UTP 또는 DTP */
-  ttp: boolean
-  resCode: ResCode
-}
-
-/**
- * .../playerStats/{playerId}. playerMST 의 gp_* 컬럼과 대응하지만, 저장은 신용어로
- * 한다(원칙 2: CT*→DT*, 레거시 이름은 매핑에만 남긴다). JaionX playerMST 자체는 아직
- * gp_ctb 같은 옛 이름을 그대로 쓰지만, 그건 jpd-rating 이 내보낼 때의 이름이지 우리
- * 저장소의 이름이 아니다 — RecordFlags(isDtb/isDtm/isDta/isDts), RecordingKpi(DTB/
- * DTM/DTA/DTS) 와 팀·선수 양쪽 다 같은 어휘를 쓴다.
- * gp_score_rel/gp_score_abs/gp_score(평점) 자체는 여기 있다 — 다만 jpd-did 가 계산하는
- * 게 아니라 jpd-rating 이 계산해서 값만 되돌려준 것이다. 공식은 여전히 jpd-rating 에만
- * 있고, 여기 있는 건 숫자뿐이다(§10).
- */
-export interface PlayerStatsDoc {
-  /**
-   * 문서 ID와 중복이지만 collectionGroup 쿼리 전용으로 둔다. 이 문서는
-   * matches/{gm_id}/recordings/{H|A}/playerStats/{playerId} 에 경기마다 흩어져
-   * 있어서, "선수 한 명의 전 경기 기록"을 모으려면 경로가 아니라 이 필드로 걸러야
-   * 한다 — SQL 시절 p_id 가 모든 행에 있어야 했던 이유와 같다.
-   */
-  playerId: string
-  /** gp_tmp */
-  TAP: number
-  /** gp_tap */
-  DAP: number
-  /** gp_utp (변경 없음) */
-  UTP: number
-  /** gp_ctp */
-  DTP: number
-  /** gp_ttp (변경 없음) */
-  TTP: number
-  /** gp_sht (변경 없음) */
-  SHOT: number
-  /** gp_ast (변경 없음) */
-  AST: number
-  /** gp_goal (변경 없음) */
-  GOAL: number
-  /** gp_ctb */
-  DTB: number
-  /** gp_ctm */
-  DTM: number
-  /** gp_cta */
-  DTA: number
-  /** gp_cts */
-  DTS: number
-  /** gp_gtb (변경 없음) */
-  GTB: number
-  /** gp_gtm (변경 없음) */
-  GTM: number
-  /** gp_asr (변경 없음) */
-  ASR: number
-  /** gp_ssr (변경 없음) */
-  SSR: number
-  /** jpd-rating 이 계산해서 되돌려준 값. 확정 전에는 null */
-  scoreRel: number | null
-  scoreAbs: number | null
-  score: number | null
-  /** 선수 JMX. 팀과 달리 5분 구간으로 쪼개지 않는다 — 경기당 값 하나 */
-  jmx: number | null
-  apx: number | null
-  apxGrade: string | null
-  tpx: number | null
-  tpxGrade: string | null
-  fpx: number | null
-  fpxGrade: string | null
-  /** score/jmx/apx/tpx/fpx 가 어느 kpiVersion(RecordingDoc) 기준으로 계산됐는지. 확정 전에는 null */
-  ratingBasedOn: number | null
-}
-
-// -----------------------------------------------------------------------------
-// 참조 · 데이터 관리 (§10) — 아직 화면 미구현(manage/* 는 "준비 중"). 형태만 먼저 고정한다.
-// -----------------------------------------------------------------------------
-
-/** teams/players/contracts/stadiums/leagues/seasons 공통 감사 필드 (§10.6).
- *  records 에는 붙이지 않는다 — 세션이 이미 recorders 로 귀속된다. */
-export interface AuditFields {
+interface AuditFields {
   createdAt: Timestamp
   createdBy: string
   updatedAt: Timestamp
   updatedBy: string
 }
 
-/** players/{playerId} — 정체성만. 소속 팀은 시간에 따라 변하므로 여기 두지 않는다 (§10.1) */
+export interface MatchDoc {
+  date: string
+  kickoffTime?: string
+  leagueId: string
+  seasonId: string
+  matchType: 'league' | 'tournament'
+  round?: number
+  stage?: 'R32' | 'R16' | 'QF' | 'SF' | 'F'
+  group?: string
+  leg?: 1 | 2
+  stadiumId: string
+  homeTeamId: string
+  awayTeamId: string
+  score: { home: number; away: number }
+  createdAt: Timestamp
+  updatedAt: Timestamp
+}
+
 export interface PlayerDoc extends AuditFields {
   name: string
   nameEn?: string
@@ -402,130 +48,62 @@ export interface PlayerDoc extends AuditFields {
   height?: number
   foot?: 'L' | 'R' | 'B'
   nation?: string
-  /** 선수 관리의 이름·성·생년월일 검색용 파생 색인 */
   searchTerms?: string[]
   birthKey?: string
-  /** 은퇴/삭제 대신 비활성 — 과거 기록을 고아로 만들지 않는다 */
   active: boolean
-  /** 파생 캐시. 계약 원장에서 갱신된다 */
   currentTeamId?: string
   currentNo?: string
   currentPos?: string
   legacyPlayerId?: number
 }
 
-/** players/{playerId}/contracts/{contractId} — 이적시장 원장 ★. 추가 전용 (§10.2) */
 export interface ContractDoc extends AuditFields {
   teamId: string
   leagueId?: string
+  competitionType?: 'league' | 'cup' | 'national' | 'test'
   seasonId?: string
   from: string
-  /** null 이면 현재 소속 */
   to: string | null
   no?: string
   pos?: string
-  /** 직전 소속팀. 이 한 문서로 "A→B" 이적 한 건이 완성된다 */
   fromTeamId?: string
   transferType?: 'TRANSFER' | 'LOAN' | 'LOAN_RETURN' | 'FREE' | 'YOUTH' | 'RETIRE'
   fee?: number
   currency?: string
 }
 
-/** teams/{teamId}/squad/{playerId} — 현재 스쿼드 파생 뷰. 원본이 아니다 (§10.3) */
-export interface SquadEntry {
-  name: string
-  no: string
-  pos: string
-  contractId: string
-  since: string
-}
-
-/**
- * coaches/{coachId} — 정체성만. PlayerDoc 과 같은 이유로 분리했다: 감독이 팀을
- * 옮기면 과거 경기의 "그때 감독이 누구였나"가 바뀌면 안 된다. TeamDoc.coach 처럼
- * 문자열 하나로 두면 이 이력이 통째로 사라진다.
- */
-export interface CoachDoc extends AuditFields {
-  name: string
-  nameKr?: string
-  nameEn?: string
-  birth?: string
-  nation?: string
-  /** 은퇴/삭제 대신 비활성 — 과거 기록을 고아로 만들지 않는다 */
-  active: boolean
-  /** 파생 캐시. 계약 원장에서 갱신된다 */
-  currentTeamId?: string
-  legacyCoachId?: number
-}
-
-/**
- * coachContracts/{id} — 감독 재임기간 원장. coaches/{id}/contracts 서브컬렉션이 아니라
- * 최상위 컬렉션이다 — 지금은 감독 개인 프로필(생년월일 등)이 필요 없어서 CoachDoc과 굳이
- * 분리하지 않고 이름을 여기 그대로 들고 있는다(coach-import 참고). 나중에 프로필 필드가
- * 필요해지면 CoachDoc을 참조하는 방식으로 옮길 수 있다.
- *
- * 추가 전용에 가깝게 쓴다: 같은 감독이 같은 팀에서 시즌 경계로 계속 재임하면(정식/대행
- * 상태도 안 바뀌면) 문서를 새로 안 만들고 `to`만 갱신한다. 다른 사람으로 바뀌거나, 같은
- * 사람이어도 정식↔대행 상태가 바뀌거나, 다른 팀으로 옮기면 새 문서를 만든다.
- *
- * seasonId는 저장하지 않는다 — 시즌 경계(8/1~5/31)가 고정이라 `from`/`to`에서 언제든
- * 역산 가능해서, 중복 저장해서 어긋날 여지를 만들지 않는다.
- */
 export interface CoachContractDoc extends AuditFields {
-  /** 감독 한 명을 구분하는 값(현재는 이관 원본의 고유번호). 다른 컬렉션을 가리키는 참조가 아니다 */
   coachId: string
   coachName: string
   coachNameEn: string
-  /** teams 문서 ID와 동일한 값(T_Code, 예: 'E-AR') */
   teamId: string
   from: string
-  /** null 이면 현재 재임 중 */
   to: string | null
   status: 'MANAGER' | 'CARETAKER'
 }
 
-/**
- * coachRounds/{id} — 라운드별로 미리 펼쳐둔 감독 배정(coach-import 참고). 아직 matches에
- * 연결하지 않은 원본 그대로다 — 지금 Firestore matches가 일부 시즌만 들어와 있어서 대부분
- * 못 붙는다. 나중에 레거시 매치가 더 들어오면 (teamId, plSeason, round) 로 조인해서
- * recordings.coachId를 채우는 데 쓴다.
- */
-export interface CoachRoundDoc {
-  coachId: string
-  coachName: string
-  coachNameEn: string
-  teamId: string
-  round: number
-  plSeason: string
-  status: 'MANAGER' | 'CARETAKER'
-  createdAt: Timestamp
-  createdBy: string
-}
-
-/** teams/{teamId} (§10.4) */
 export interface TeamDoc extends AuditFields {
   name: string
+  active?: boolean
   nameKr?: string
   nameFull?: string
   nameShort?: string
   textColor?: string
   stadiumId?: string
-  /** 파생 캐시. CoachContractDoc 에서 갱신된다 — 현재 감독 이름이 아니라 ID다 */
   currentCoachId?: string
   foundedAt?: string
   dissolvedAt?: string
-  /** 목록 필터용 캐시일 뿐. 승강제 전체 이력은 teams/{id}/seasons 서브컬렉션으로 표현한다 */
   currentLeagueId?: string
-  /** 목록 필터용 캐시일 뿐(currentLeagueId와 같은 패턴) — "지금 1부인지"만 담는다. 시즌별
-   *  전체 승강 이력은 teams/{id}/seasons가 생기면 그쪽이 정본이 된다(아직 매치 데이터가
-   *  부족해 못 만든다) */
+  currentCupIds?: string[]
   currentDivision?: 'D1' | 'D2'
   crestUrl?: string
 }
 
-/** teams/{teamId}/seasons/{seasonId} — 시즌별 소속 리그. 승강제 대응 (§10.4) */
 export interface TeamSeasonEntry {
-  leagueId: string
+  leagueId?: string
+  competitionIds?: string[]
+  leagueIds?: string[]
+  cupIds?: string[]
   division?: string
   finalRank?: number
 }
@@ -534,14 +112,7 @@ export interface LeagueDoc extends AuditFields {
   name: string
   nameEn?: string
   country?: string
-}
-
-export interface SeasonDoc extends AuditFields {
-  leagueId: string
-  name: string
-  from: string
-  to: string
-  alias?: string
+  competitionType?: 'league' | 'cup' | 'national' | 'test'
 }
 
 export interface StadiumDoc extends AuditFields {
@@ -552,16 +123,4 @@ export interface StadiumDoc extends AuditFields {
   city?: string
   homeTeamId?: string
   surface?: string
-}
-
-/** recorders/{uid} — 로그인 프로필. recordings.recorders(RecorderEntry, rank)와는
- *  다른 것이다 — 이건 사람 한 명의 계정 정보, 그건 한 세션 안에서의 참여 기록. */
-export interface RecorderProfileDoc {
-  name: string
-  teamId?: string
-  /** 데이터 관리(이적시장·팀 정보) 권한 기준 */
-  role: 'recorder' | 'admin'
-  /** 갱신 버튼 구성을 가른다 (§11.2.1) */
-  level: RecorderLevel
-  handedness?: 'L' | 'R'
 }

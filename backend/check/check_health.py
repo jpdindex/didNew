@@ -41,6 +41,10 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
         "/api/v1/match-ratings/read",
         "/api/v1/legacy-import",
         "/api/v1/legacy-import/status",
+        "/api/v1/legacy-import/verify",
+        "/api/v1/legacy-import/verify-status",
+        "/api/v1/legacy-import/metadata-repair",
+        "/api/v1/legacy-import/metadata-status",
         "/api/v1/legacy-import/snapshot-status/{season}",
         "/api/v1/legacy-import/snapshot-backfill",
     }
@@ -68,6 +72,9 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
     import_operation = schema["paths"]["/api/v1/legacy-import"]["post"]
     assert import_operation["security"] == [{"SwaggerKey": []}]
     assert "multipart/form-data" in import_operation["requestBody"]["content"]
+    verify_operation = schema["paths"]["/api/v1/legacy-import/verify"]["post"]
+    assert verify_operation["security"] == [{"SwaggerKey": []}]
+    assert "multipart/form-data" in verify_operation["requestBody"]["content"]
     snapshot_operation = schema["paths"]["/api/v1/legacy-import/snapshot-backfill"]["post"]
     snapshot_schema = snapshot_operation["requestBody"]["content"]["application/x-www-form-urlencoded"]["schema"]
     snapshot_properties = schema["components"]["schemas"][snapshot_schema["$ref"].split("/")[-1]]["properties"]

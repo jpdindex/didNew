@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -18,6 +19,10 @@ RecorderRank = Literal["main", "sub", "manager"]
 DataSource = Literal["did", "vision"]
 ActCode = Literal["C", "P", "K", "F", "S", "H", "R", ""]
 ResCode = Literal["O", "X", "B", "GB", "GX", "GOAL", "L", "H", "R", "LX", "HX", "RX", ""]
+# Legacy SQL path rows use "G" while individual raw records are normalized to
+# GOAL by RecordDoc below. Preserve the imported path value without rewriting
+# historical match documents.
+PathResCode = Literal["O", "X", "B", "GB", "GX", "G", "GOAL", "L", "H", "R", "LX", "HX", "RX", ""]
 
 
 class SchemaModel(BaseModel):
@@ -190,7 +195,7 @@ class PathSnapshotDoc(SchemaModel):
     ptype: Literal["UPP", "UTP", "DTP", "STP"]
     dsp: bool
     ttp: bool
-    resCode: ResCode
+    resCode: PathResCode
 
 
 class PlayerStatsDoc(SchemaModel):
@@ -224,6 +229,114 @@ class PlayerStatsDoc(SchemaModel):
     ratingBasedOn: int | None
 
 
+@dataclass(frozen=True)
+class StorageDocumentContract:
+    """The persisted DID contract for one match-tree document shape.
+
+    ``common_required`` is the minimum shared shape produced by both the SQL
+    importer and the new-input promotion path.  ``legacy_optional`` preserves
+    SQL provenance without making it a requirement for new DID RAW.
+    """
+
+    model: type[SchemaModel]
+    common_required: frozenset[str]
+    legacy_optional: frozenset[str] = frozenset()
+    legacy_only: bool = False
+
+
+DID_STORAGE_CONTRACTS: dict[str, StorageDocumentContract] = {
+    "match": StorageDocumentContract(
+        model=MatchDoc,
+        common_required=frozenset({
+            "date", "leagueId", "seasonId", "matchType", "stadiumId",
+            "homeTeamId", "awayTeamId", "score", "createdAt", "updatedAt",
+        }),
+    ),
+    "recording": StorageDocumentContract(
+        model=RecordingDoc,
+        common_required=frozenset({
+            "side", "teamId", "opponentTeamId", "status", "inputMode",
+            "fieldSide", "formationKey", "lineup", "halves", "h1Locked",
+            "h2Locked", "maxSeq", "createdAt", "updatedAt",
+        }),
+        legacy_optional=frozenset({"legacyGiId", "legacyRecorderId"}),
+    ),
+    "record": StorageDocumentContract(
+        model=RecordDoc,
+        common_required=frozenset({
+            "half", "halfSeconds", "seq", "act", "res", "area", "source", "createdAt",
+        }),
+        legacy_optional=frozenset({
+            "legacyPathId", "legacyPathType", "legacyPathTtp", "legacyKpiFlags",
+        }),
+    ),
+    "card": StorageDocumentContract(
+        model=CardDoc,
+        common_required=frozenset({"playerId", "half", "halfSeconds", "card", "createdAt"}),
+    ),
+    "playerStats": StorageDocumentContract(
+        model=PlayerStatsDoc,
+        common_required=frozenset({
+            "playerId", "TAP", "DAP", "UTP", "DTP", "TTP", "SHOT", "AST", "GOAL",
+            "DTB", "DTM", "DTA", "DTS", "GTB", "GTM", "ASR", "SSR",
+        }),
+    ),
+    # SQL path rows are KPI evidence only. New DID input has no equivalent
+    # operator concept and must not be forced to create them.
+    "path": StorageDocumentContract(
+        model=PathSnapshotDoc,
+        common_required=frozenset(),
+        legacy_only=True,
+    ),
+}
+
+
+def storage_contract_for_path(document_path: str) -> StorageDocumentContract | None:
+    """Return the canonical contract for a persisted match-tree path."""
+    parts = document_path.split("/")
+    if len(parts) == 2 and parts[0] == "matches":
+        return DID_STORAGE_CONTRACTS["match"]
+    if len(parts) == 4 and parts[0] == "matches" and parts[2] == "recordings":
+        return DID_STORAGE_CONTRACTS["recording"]
+    if len(parts) != 6 or parts[0] != "matches" or parts[2] != "recordings":
+        return None
+    return {
+        "records": DID_STORAGE_CONTRACTS["record"],
+        "cards": DID_STORAGE_CONTRACTS["card"],
+        "playerStats": DID_STORAGE_CONTRACTS["playerStats"],
+        "paths": DID_STORAGE_CONTRACTS["path"],
+    }.get(parts[4])
+
+
+def storage_field_scope(document_path: str, field_path: tuple[str, ...] = ()) -> str:
+    """Classify a field for diagnostics without treating legacy evidence as RAW."""
+    contract = storage_contract_for_path(document_path)
+    if contract is None:
+        return "outside-contract"
+    if contract.legacy_only:
+        return "legacy-only"
+    field = field_path[0] if field_path else None
+    if field in contract.legacy_optional:
+        return "legacy-optional"
+    if field in contract.common_required:
+        return "common-required"
+    return "common-optional"
+
+
+def storage_field_expectation(document_path: str, field_path: tuple[str, ...] = ()) -> str:
+    """Human-readable expected field contract for API/audit diagnostics."""
+    contract = storage_contract_for_path(document_path)
+    if contract is None:
+        return "no DID storage contract for this document path"
+    if not field_path:
+        return f"{storage_field_scope(document_path)} document validated by {contract.model.__name__}"
+    field = contract.model.model_fields.get(field_path[0])
+    if field is None:
+        return "field is not permitted by the DID storage contract"
+    requirement = "required" if field.is_required() else "optional"
+    return f"{storage_field_scope(document_path, field_path)} {requirement} field: {field.annotation}"
+
+
 class AuditFields(SchemaModel):
     createdAt: datetime
     createdBy: str
@@ -249,6 +362,7 @@ class PlayerDoc(AuditFields):
 class ContractDoc(AuditFields):
     teamId: str
     leagueId: str | None = None
+    competitionType: Literal["league", "cup", "national", "test"] | None = None
     seasonId: str | None = None
     from_: str = Field(alias="from")
     to: str | None
@@ -290,6 +404,7 @@ class CoachContractDoc(AuditFields):
 
 class TeamDoc(AuditFields):
     name: str
+    active: bool = True
     nameKr: str | None = None
     nameFull: str | None = None
     nameShort: str | None = None
@@ -299,11 +414,18 @@ class TeamDoc(AuditFields):
     foundedAt: str | None = None
     dissolvedAt: str | None = None
     currentLeagueId: str | None = None
+    currentCupIds: list[str] = Field(default_factory=list)
     crestUrl: str | None = None
 
 
 class TeamSeasonEntry(SchemaModel):
-    leagueId: str
+    # ``competitionIds`` is authoritative because a club can be in a domestic
+    # league and UCL/UEL during the same season.  ``leagueId`` remains a
+    # compatibility cache for existing administrative screens.
+    leagueId: str | None = None
+    competitionIds: list[str] = Field(default_factory=list)
+    leagueIds: list[str] = Field(default_factory=list)
+    cupIds: list[str] = Field(default_factory=list)
     division: str | None = None
     finalRank: int | None = None
 
@@ -312,6 +434,7 @@ class LeagueDoc(AuditFields):
     name: str
     nameEn: str | None = None
     country: str | None = None
+    competitionType: Literal["league", "cup", "national", "test"] | None = None
 
 
 class SeasonDoc(AuditFields):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
-from backend.system.system_schema import MatchDoc, PathSnapshotDoc, PlayerKpi, RecordDoc, RecordingDoc, RecordingKpi, Side, TeamRatingSnapshot
+from backend.system.system_schema import CardDoc, MatchDoc, PathSnapshotDoc, PlayerKpi, RecordDoc, RecordingDoc, RecordingKpi, Side, TeamRatingSnapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROOT_ENV_FILE = PROJECT_ROOT / ".env"
@@ -429,6 +430,9 @@ class JpdDidData:
                 continue
             shared = draft.get("sharedState") if isinstance(draft.get("sharedState"), dict) else {}
             payload = draft.get("payload") if isinstance(draft.get("payload"), dict) else {}
+            setup = self._normalise_input_setup(draft.get("setup"))
+            if states[side]["fieldSide"] is None and setup and setup.get("fieldSide") in {"left", "right"}:
+                states[side]["fieldSide"] = setup["fieldSide"]
             lifecycle = shared.get("halfStatus") or payload.get("status") or draft.get("status")
             if lifecycle in {"H1", "H1_done", "H2", "H2_done", "final"}:
                 states[side]["lifecycleStatus"] = lifecycle
@@ -561,9 +565,6 @@ class JpdDidData:
         for contract_snapshot in contracts.stream(retry=None, timeout=30):
             contract = contract_snapshot.to_dict() or {}
             if not self._contract_covers_match_date(contract, match_date):
-                continue
-            contract_league = str(contract.get("leagueId") or "")
-            if league_id and contract_league and contract_league != league_id:
                 continue
             parent = contract_snapshot.reference.parent.parent
             if parent is None:
@@ -1037,10 +1038,18 @@ class JpdDidData:
     ) -> list[tuple[str, MatchDoc]]:
         if from_gm_id and to_gm_id and from_gm_id > to_gm_id:
             raise BackendError("from_gm_id must not be greater than to_gm_id", status_code=422, code="snapshot_range_invalid")
+        # Snapshot backfill is always season-scoped.  Do not stream the entire
+        # matches collection and filter it in Python as legacy data grows.
         matches = [
-            item for item in self.list_matches(season_id=season_id, limit=10_000)
-            if (from_gm_id is None or item[0] >= from_gm_id)
-            and (to_gm_id is None or item[0] <= to_gm_id)
+            (
+                snapshot.id,
+                _validate_document(MatchDoc, snapshot.to_dict() or {}, path=snapshot.reference.path),
+            )
+            for snapshot in self.db.collection("matches")
+            .where(filter=FieldFilter("seasonId", "==", season_id))
+            .stream(retry=None, timeout=30)
+            if (from_gm_id is None or snapshot.id >= from_gm_id)
+            and (to_gm_id is None or snapshot.id <= to_gm_id)
         ]
         matches.sort(key=lambda item: item[0])
         return matches[:limit] if limit is not None else matches
@@ -1054,28 +1063,71 @@ class JpdDidData:
     ) -> dict[str, int]:
         """Count usable imported-match snapshots for an explicit legacy scope."""
         counts = {"matched": 0, "legacy": 0, "ready": 0, "missing": 0}
-        for gm_id, match in self._legacy_snapshot_matches(
+        matches = self._legacy_snapshot_matches(
             season_id=season_id, from_gm_id=from_gm_id, to_gm_id=to_gm_id,
-        ):
+        )
+        recordings_by_match, snapshots_by_match = self._legacy_snapshot_state(matches)
+        for gm_id, match in matches:
             counts["matched"] += 1
-            recordings = self._legacy_recordings(gm_id)
+            recordings = recordings_by_match.get(gm_id, {})
             if not recordings:
                 continue
             counts["legacy"] += 1
-            snapshot = self._input_squads_reference(gm_id).get(retry=None, timeout=10).to_dict() or {}
-            lineups = snapshot.get("legacyLineup") if isinstance(snapshot.get("legacyLineup"), dict) else {}
-            ready = (
-                snapshot.get("schemaVersion") == 3
-                and snapshot.get("source") == self._input_squad_source(match)
-                and all(
-                    isinstance(lineups.get(side), dict)
-                    and lineups[side].get("fingerprint") == self._legacy_lineup_fingerprint(recording)
-                    and isinstance(lineups[side].get("lineup"), list)
-                    for side, recording in recordings.items()
-                )
-            )
+            snapshot = snapshots_by_match.get(gm_id, {})
+            ready = self._legacy_input_snapshot_ready(match, recordings, snapshot)
             counts["ready" if ready else "missing"] += 1
         return counts
+
+    def _legacy_input_snapshot_ready(
+        self,
+        match: MatchDoc,
+        recordings: dict[Side, RecordingDoc],
+        snapshot: dict[str, Any],
+    ) -> bool:
+        lineups = snapshot.get("legacyLineup") if isinstance(snapshot.get("legacyLineup"), dict) else {}
+        return (
+            snapshot.get("schemaVersion") == 3
+            and snapshot.get("source") == self._input_squad_source(match)
+            and all(
+                isinstance(lineups.get(side), dict)
+                and lineups[side].get("fingerprint") == self._legacy_lineup_fingerprint(recording)
+                and isinstance(lineups[side].get("lineup"), list)
+                for side, recording in recordings.items()
+            )
+        )
+
+    def _legacy_snapshot_state(
+        self,
+        matches: list[tuple[str, MatchDoc]],
+    ) -> tuple[dict[str, dict[Side, RecordingDoc]], dict[str, dict[str, Any]]]:
+        """Read one backfill range in batches instead of per-document RPCs."""
+        recording_refs: dict[str, tuple[str, Side]] = {}
+        snapshot_refs: dict[str, str] = {}
+        references: list[Any] = []
+        for gm_id, _ in matches:
+            for side in ("H", "A"):
+                reference = self.db.collection("matches").document(gm_id).collection("recordings").document(side)
+                recording_refs[reference.path] = (gm_id, side)
+                references.append(reference)
+            snapshot_reference = self._input_squads_reference(gm_id)
+            snapshot_refs[snapshot_reference.path] = gm_id
+            references.append(snapshot_reference)
+
+        recordings_by_match: dict[str, dict[Side, RecordingDoc]] = defaultdict(dict)
+        snapshots_by_match: dict[str, dict[str, Any]] = {}
+        for offset in range(0, len(references), 200):
+            for snapshot in self.db.get_all(references[offset:offset + 200], retry=None, timeout=30):
+                path = snapshot.reference.path
+                if path in recording_refs:
+                    if not snapshot.exists:
+                        continue
+                    gm_id, side = recording_refs[path]
+                    recording = _validate_document(RecordingDoc, snapshot.to_dict() or {}, path=path)
+                    if recording.status == "final" and recording.legacyGiId is not None and recording.lineup:
+                        recordings_by_match[gm_id][side] = recording
+                elif path in snapshot_refs and snapshot.exists:
+                    snapshots_by_match[snapshot_refs[path]] = snapshot.to_dict() or {}
+        return recordings_by_match, snapshots_by_match
 
     def backfill_legacy_input_squads(
         self,
@@ -1091,14 +1143,14 @@ class JpdDidData:
             season_id=season_id, from_gm_id=from_gm_id, to_gm_id=to_gm_id, limit=limit,
         )
         counts = {"matched": len(matches), "processed": 0, "scanned": 0, "created": 0, "unchanged": 0, "failed": 0}
+        recordings_by_match, snapshots_by_match = self._legacy_snapshot_state(matches)
         for gm_id, match in matches:
             try:
-                recordings = self._legacy_recordings(gm_id)
+                recordings = recordings_by_match.get(gm_id, {})
                 if recordings:
                     counts["scanned"] += 1
-                    reference = self._input_squads_reference(gm_id)
-                    current = reference.get(retry=None, timeout=10).to_dict() or {}
-                    if current.get("schemaVersion") == 3 and current.get("source") == self._input_squad_source(match):
+                    current = snapshots_by_match.get(gm_id, {})
+                    if self._legacy_input_snapshot_ready(match, recordings, current):
                         counts["unchanged"] += 1
                     else:
                         self.refresh_input_squads(gm_id, match, legacy_recordings=recordings)
@@ -1924,6 +1976,13 @@ class JpdDidData:
         cards: list[tuple[str, dict[str, Any]]],
         score: dict[str, int],
     ) -> None:
+        # Validate the complete shared RAW contract before deleting any prior
+        # final tree. This is the new-input counterpart to importer preflight.
+        RecordingDoc.model_validate(recording)
+        for _, values in records:
+            RecordDoc.model_validate(values)
+        for _, values in cards:
+            CardDoc.model_validate(values)
         recording_ref = self.db.collection("matches").document(gm_id).collection("recordings").document(side)
         for name in ("records", "cards", "paths", "playerStats"):
             collection = recording_ref.collection(name)
