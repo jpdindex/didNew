@@ -64,5 +64,64 @@ export function useBackendApi() {
     return await response.json() as T
   }
 
-  return { request }
+  async function openSocket<T>(
+    path: string,
+    onMessage: (data: T) => void,
+    onClose?: () => void,
+  ): Promise<{ close: () => void; send: (data: unknown) => void }> {
+    const { $auth, $authReady } = useNuxtApp()
+    await $authReady
+    const user = ($auth as Auth).currentUser
+    const token = await user?.getIdToken()
+    const url = (await resolveBackendUrl()).replace(/^http/, 'ws') + path
+    return await new Promise((resolve, reject) => {
+      const socket = new WebSocket(url)
+      let ready = false
+      let settled = false
+      const failBeforeReady = (error: Error) => {
+        if (settled || ready) return
+        settled = true
+        window.clearTimeout(timeout)
+        reject(error)
+      }
+      const timeout = window.setTimeout(() => {
+        if (!ready && !settled) {
+          socket.close()
+          failBeforeReady(new Error('실시간 협업 연결 시간이 초과되었습니다.'))
+        }
+      }, 3_000)
+      socket.onopen = () => socket.send(JSON.stringify({ type: 'authenticate', token, uid: user?.uid }))
+      socket.onerror = () => failBeforeReady(new Error('실시간 협업 연결에 실패했습니다.'))
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(String(event.data)) as T & { type?: string }
+          if (data.type === 'ready') {
+            ready = true
+            settled = true
+            window.clearTimeout(timeout)
+            resolve({
+              // The collaboration owner marks an intentional close as stopped
+              // before calling this. Keep onclose installed so a timed-out
+              // command can close a stale socket and trigger reconnection.
+              close: () => socket.close(),
+              send: (value) => {
+                if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(value))
+              },
+            })
+            return
+          }
+          onMessage(data)
+        } catch {
+          // Invalid transport frames must not interrupt the input UI.
+        }
+      }
+      socket.onclose = () => {
+        window.clearTimeout(timeout)
+        if (!ready) failBeforeReady(new Error('실시간 협업 연결이 닫혔습니다.'))
+        else onClose?.()
+      }
+    })
+  }
+
+  return { request, openSocket }
 }

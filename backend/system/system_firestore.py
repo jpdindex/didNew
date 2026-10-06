@@ -653,11 +653,17 @@ class JpdDidData:
         return self.db.collection("inputDrafts").document(f"{gm_id}_{side}")
 
     @staticmethod
+    def _input_sub_id(value: dict[str, Any], index: int) -> str:
+        # A player cannot make the same OUT→IN move twice in one match, so a
+        # deterministic legacy key is safer than an array index after sorting.
+        return str(value.get("id") or f"legacy-sub:{value.get('half')}:{value.get('seconds')}:{value.get('outPlayer')}:{value.get('inPlayer')}")
+
+    @staticmethod
     def _normalise_input_subs(values: Any) -> list[dict[str, Any]]:
         if not isinstance(values, list):
             return []
         normalised: list[dict[str, Any]] = []
-        for value in values:
+        for index, value in enumerate(values):
             if not isinstance(value, dict):
                 continue
             half = value.get("half")
@@ -668,8 +674,14 @@ class JpdDidData:
                 continue
             if not isinstance(seconds, int) or seconds < 0:
                 continue
-            normalised.append({"half": half, "seconds": seconds, "outPlayer": out_player, "inPlayer": in_player})
-        return sorted(normalised, key=lambda item: (item["half"], item["seconds"], item["outPlayer"], item["inPlayer"]))
+            normalised.append({
+                "id": JpdDidData._input_sub_id(value, index),
+                "half": half,
+                "seconds": seconds,
+                "outPlayer": out_player,
+                "inPlayer": in_player,
+            })
+        return sorted(normalised, key=lambda item: (item["half"], item["seconds"], item["outPlayer"], item["inPlayer"], item["id"]))
 
     @classmethod
     def _subs_from_input_lineup(cls, lineup: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -689,8 +701,40 @@ class JpdDidData:
         result: list[dict[str, Any]] = []
         for key in sorted(set(outgoing) | set(incoming)):
             for out_player, in_player in zip(sorted(outgoing.get(key, [])), sorted(incoming.get(key, []))):
-                result.append({"half": key[0], "seconds": key[1], "outPlayer": out_player, "inPlayer": in_player})
+                result.append({
+                    "id": f"legacy-sub:{key[0]}:{key[1]}:{out_player}:{in_player}",
+                    "half": key[0],
+                    "seconds": key[1],
+                    "outPlayer": out_player,
+                    "inPlayer": in_player,
+                })
         return result
+
+    def _with_input_setup_subs(self, reference, setup: dict[str, Any] | None) -> dict[str, Any] | None:
+        if setup is None:
+            return None
+        documents = list(reference.collection("substitutions").stream(retry=None, timeout=20))
+        if not documents:
+            return setup
+        subs = self._normalise_input_subs([
+            {**(values := item.to_dict()), "id": values.get("id") or item.id}
+            for item in documents
+            if isinstance((values := item.to_dict()), dict) and not values.get("deleted")
+        ])
+        return {**setup, "subs": subs}
+
+    @staticmethod
+    def _lineup_before_substitutions(lineup: list[dict[str, Any]], subs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Recover the starting slots once when an older Draft becomes event-based."""
+        base = [dict(item) for item in lineup if isinstance(item, dict)]
+        ordered = sorted(subs, key=lambda item: (str(item.get("half")), int(item.get("seconds", 0)), str(item.get("id"))))
+        for sub in reversed(ordered):
+            out_player, in_player = sub.get("outPlayer"), sub.get("inPlayer")
+            out_index = next((index for index, item in enumerate(base) if item.get("playerId") == out_player), None)
+            in_index = next((index for index, item in enumerate(base) if item.get("playerId") == in_player), None)
+            if out_index is not None and in_index is not None:
+                base[out_index]["playerId"], base[in_index]["playerId"] = in_player, out_player
+        return base
 
     @staticmethod
     def _normalise_input_setup(values: Any) -> dict[str, Any] | None:
@@ -698,13 +742,15 @@ class JpdDidData:
             return None
         formation_key = values.get("formationKey")
         lineup = values.get("lineup")
+        base_lineup = values.get("baseLineup")
         field_side = values.get("fieldSide")
         if not isinstance(formation_key, str) or not formation_key or not isinstance(lineup, list):
             return None
         return {
             "formationKey": formation_key,
             "fieldSide": field_side if field_side in {"left", "right"} else None,
-            "lineup": [item for item in lineup if isinstance(item, dict)],
+            "lineup": [item for item in (base_lineup if isinstance(base_lineup, list) else lineup) if isinstance(item, dict)],
+            "lineupIsBaseline": isinstance(base_lineup, list),
             "subs": JpdDidData._normalise_input_subs(values.get("subs")),
             "inputMode": values.get("inputMode") if values.get("inputMode") in {"분석", "실시간"} else "분석",
             "revision": int(values.get("revision") or 0),
@@ -715,7 +761,10 @@ class JpdDidData:
         for side in ("H", "A"):
             document = self._input_setup_reference(gm_id, side).get(retry=None, timeout=10)
             if document.exists:
-                result[side] = self._normalise_input_setup((document.to_dict() or {}).get("setup"))
+                result[side] = self._with_input_setup_subs(
+                    document.reference,
+                    self._normalise_input_setup((document.to_dict() or {}).get("setup")),
+                )
         return result
 
     def save_input_setup(
@@ -725,11 +774,16 @@ class JpdDidData:
         *,
         payload: dict[str, Any],
         client_state: dict[str, Any],
+        deleted_sub_ids: list[str] | None = None,
+        merge_substitutions: bool = False,
     ) -> dict[str, Any] | None:
         """Checkpoint Draft setup without allowing blank state writes to erase it."""
         reference = self._input_setup_reference(gm_id, side)
         current = reference.get(retry=None, timeout=10).to_dict() or {}
-        previous = self._normalise_input_setup(current.get("setup")) or {}
+        previous = self._with_input_setup_subs(
+            reference,
+            self._normalise_input_setup(current.get("setup")),
+        ) or {}
         formation_key = payload.get("formationKey")
         lineup = payload.get("lineup")
         selected_field_side = client_state.get("side")
@@ -743,26 +797,57 @@ class JpdDidData:
                 return previous
             return None
 
+        next_subs = self._normalise_input_subs(client_state.get("subs")) \
+            if isinstance(client_state.get("subs"), list) \
+            else self._subs_from_input_lineup([item for item in lineup if isinstance(item, dict)])
+        stored_setup = current.get("setup") if isinstance(current.get("setup"), dict) else {}
+        stored_base = stored_setup.get("baseLineup") if isinstance(stored_setup.get("baseLineup"), list) else None
+        base_lineup = [item for item in stored_base if isinstance(item, dict)] if merge_substitutions and stored_base is not None else None
+        if merge_substitutions and base_lineup is None:
+            base_lineup = self._lineup_before_substitutions(
+                [item for item in stored_setup.get("lineup", []) if isinstance(item, dict)],
+                self._normalise_input_subs(previous.get("subs")),
+            )
+        if merge_substitutions and not base_lineup:
+            base_lineup = [item for item in lineup if isinstance(item, dict)]
         next_comparable = {
-            "formationKey": formation_key,
-            "fieldSide": selected_field_side if selected_field_side in {"left", "right"} else previous.get("fieldSide"),
-            "lineup": [item for item in lineup if isinstance(item, dict)],
-            "subs": self._normalise_input_subs(client_state.get("subs"))
-                if isinstance(client_state.get("subs"), list)
-                else self._subs_from_input_lineup([item for item in lineup if isinstance(item, dict)]),
-            "inputMode": payload.get("inputMode") if payload.get("inputMode") in {"분석", "실시간"} else previous.get("inputMode", "분석"),
+            "formationKey": previous.get("formationKey", formation_key) if merge_substitutions else formation_key,
+            "fieldSide": previous.get("fieldSide") if merge_substitutions else (selected_field_side if selected_field_side in {"left", "right"} else previous.get("fieldSide")),
+            "lineup": base_lineup if merge_substitutions else [item for item in lineup if isinstance(item, dict)],
+            "inputMode": previous.get("inputMode", "분석") if merge_substitutions else (payload.get("inputMode") if payload.get("inputMode") in {"분석", "실시간"} else previous.get("inputMode", "분석")),
         }
         previous_comparable = {key: previous.get(key) for key in next_comparable}
-        if previous and previous_comparable == next_comparable:
+        previous_subs = self._normalise_input_subs(previous.get("subs"))
+        deleted_ids = {str(value) for value in deleted_sub_ids or [] if value}
+        if previous and previous_comparable == next_comparable and previous_subs == next_subs and not deleted_ids:
             return previous
 
         next_setup = {
             **next_comparable,
+            "baseLineup": next_comparable["lineup"],
+            # Legacy fallback only. Once substitutions has documents, reads
+            # always use that merge-safe event collection instead.
+            "subs": previous.get("subs", next_subs),
             "revision": int(previous.get("revision") or 0) + 1,
             "updatedAt": utc_now(),
         }
-        reference.set({"setup": next_setup}, merge=True)
-        return self._normalise_input_setup(next_setup)
+        substitutions = reference.collection("substitutions")
+        existing = list(substitutions.stream(retry=None, timeout=20))
+        batch = self.db.batch()
+        # Seed a pre-event-array Draft once. Subsequent saves upsert by event
+        # ID, so an earlier browser snapshot cannot replace another event.
+        if not existing:
+            for index, legacy in enumerate(previous_subs):
+                sub_id = self._input_sub_id(legacy, index)
+                batch.set(substitutions.document(sub_id), {**legacy, "id": sub_id, "deleted": False}, merge=True)
+        for index, sub in enumerate(next_subs):
+            sub_id = self._input_sub_id(sub, index)
+            batch.set(substitutions.document(sub_id), {**sub, "id": sub_id, "deleted": False}, merge=True)
+        for sub_id in deleted_ids:
+            batch.set(substitutions.document(sub_id), {"id": sub_id, "deleted": True}, merge=True)
+        batch.set(reference, {"setup": next_setup}, merge=True)
+        batch.commit(retry=None, timeout=20)
+        return self._with_input_setup_subs(reference, self._normalise_input_setup(next_setup))
 
     @staticmethod
     def _legacy_lineup_fingerprint(recording: RecordingDoc) -> str:
@@ -1180,6 +1265,14 @@ class JpdDidData:
         if not snapshot.exists:
             raise NotFoundError(f"Input draft not found: {gm_id}/{side}")
         document = snapshot.to_dict() or {}
+        payload = document.get("payload")
+        # A document path is not sufficient identity proof: old browser bugs
+        # could leave a payload from another session under a reused Draft key.
+        # Never let that data enter bootstrap, polling, or the live socket.
+        if document.get("gmId") not in {None, gm_id} or document.get("side") not in {None, side}:
+            raise BackendError("Input draft root identity does not match its path", status_code=409, code="draft_identity_mismatch")
+        if isinstance(payload, dict) and (payload.get("gmId") != gm_id or payload.get("side") != side):
+            raise BackendError("Input draft payload identity does not match its path", status_code=409, code="draft_identity_mismatch")
         return self._with_draft_records(reference, document)
 
     @staticmethod
@@ -1204,16 +1297,40 @@ class JpdDidData:
         payload = document.get("payload")
         if not isinstance(payload, dict):
             return document
+        next_payload = dict(payload)
         record_documents = list(reference.collection("records").stream(retry=None, timeout=20))
-        if not record_documents:
-            return document
-        records = [
-            normalised for item in record_documents
+        if record_documents:
+            records = [
+                normalised for item in record_documents
+                if isinstance((values := item.to_dict()), dict)
+                if (normalised := self._normalise_draft_record(item.id, values)) is not None
+            ]
+            records.sort(key=lambda item: (str(item.get("half", "H1")), int(item.get("halfSeconds", 0)), int(item.get("seq", 0))))
+            next_payload["records"] = records
+        card_documents = list(reference.collection("cards").stream(retry=None, timeout=20))
+        if card_documents:
+            next_payload["cards"] = self._draft_cards(reference)
+        return {**document, "payload": next_payload}
+
+    @staticmethod
+    def _normalise_draft_card(card_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
+        player_id = values.get("playerId")
+        half = values.get("half")
+        seconds = values.get("halfSeconds")
+        card = values.get("card")
+        if not isinstance(player_id, str) or half not in {"H1", "H2"} or not isinstance(seconds, int) or card not in {"Y", "R"}:
+            return None
+        return {"id": str(values.get("id") or card_id), "playerId": player_id, "half": half, "halfSeconds": seconds, "card": card}
+
+    def _draft_cards(self, reference: Any) -> list[dict[str, Any]]:
+        cards = [
+            normalised for item in reference.collection("cards").stream(retry=None, timeout=20)
             if isinstance((values := item.to_dict()), dict)
-            if (normalised := self._normalise_draft_record(item.id, values)) is not None
+            if not values.get("deleted")
+            if (normalised := self._normalise_draft_card(item.id, values)) is not None
         ]
-        records.sort(key=lambda item: (str(item.get("half", "H1")), int(item.get("halfSeconds", 0)), int(item.get("seq", 0))))
-        return {**document, "payload": {**payload, "records": records}}
+        cards.sort(key=lambda item: (str(item.get("half", "H1")), int(item.get("halfSeconds", 0)), str(item.get("id"))))
+        return cards
 
     def save_input_draft(
         self,
@@ -1223,8 +1340,10 @@ class JpdDidData:
         payload: dict[str, Any],
         client_state: dict[str, Any],
         user_id: str,
-        sync_scope: Literal["checkpoint", "state", "records", "cards"] = "checkpoint",
+        sync_scope: Literal["checkpoint", "state", "records", "state_records", "cards"] = "checkpoint",
         deleted_record_ids: list[str] | None = None,
+        deleted_card_ids: list[str] | None = None,
+        include_events: bool = True,
     ) -> dict[str, Any]:
         reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
         now = utc_now()
@@ -1237,7 +1356,7 @@ class JpdDidData:
         # An assistant's record sync must never pause, restart or reopen a half.
         primary_uid = str(previous.get("primaryUid") or "")
         can_write_live_state = not primary_uid or primary_uid == user_id
-        if sync_scope == "state" and can_write_live_state:
+        if sync_scope in {"state", "state_records"} and can_write_live_state:
             # A live state write queued before "half end" can reach the server after
             # the H1_done/H2_done checkpoint. It must never reopen a finished half.
             previous_status = previous_shared.get("halfStatus") or previous_payload.get("status")
@@ -1266,7 +1385,7 @@ class JpdDidData:
         if sync_scope == "checkpoint":
             root_payload = {**payload, "records": previous_payload.get("records", [])}
             payload_update = root_payload
-        elif sync_scope == "state" and can_write_live_state:
+        elif sync_scope in {"state", "state_records"} and can_write_live_state:
             root_payload = {
                 **previous_payload,
                 "status": payload.get("status", previous_payload.get("status", "ready")),
@@ -1279,32 +1398,66 @@ class JpdDidData:
                 "awayScore": root_payload["awayScore"], "halves": root_payload["halves"],
             }
         elif sync_scope == "cards":
-            root_payload = {**previous_payload, "cards": payload.get("cards", previous_payload.get("cards", []))}
-            payload_update = {"cards": root_payload["cards"]}
+            # Card events live in their own merge authority. A stale browser
+            # may add/update its own card but can never replace another card's
+            # list by posting an older array.
+            root_payload = previous_payload
         if sync_scope == "checkpoint" and not can_write_live_state and previous_payload:
             root_payload = previous_payload
 
         records_reference = reference.collection("records")
-        if sync_scope in {"checkpoint", "records"}:
-            batch = self.db.batch()
+        records_batch = None
+        record_mutation_count = 0
+        if sync_scope in {"checkpoint", "records", "state_records"}:
+            records_batch = self.db.batch()
             for index, record in enumerate(payload.get("records", [])):
                 if not isinstance(record, dict):
                     continue
                 record_id = str(record.get("id") or uuid4())
-                batch.set(records_reference.document(record_id), {
+                records_batch.set(records_reference.document(record_id), {
                     **record, "id": record_id, "half": record.get("half") or "H1",
                     "deleted": False, "updatedAt": now, "updatedBy": user_id,
                 }, merge=True)
+                record_mutation_count += 1
             for record_id in deleted_record_ids or []:
                 if record_id:
-                    batch.set(records_reference.document(str(record_id)), {
+                    records_batch.set(records_reference.document(str(record_id)), {
                         "id": str(record_id), "deleted": True, "updatedAt": now, "updatedBy": user_id,
                     }, merge=True)
-            batch.commit(retry=None, timeout=20)
+                    record_mutation_count += 1
+
+        cards_batch = None
+        if sync_scope == "cards":
+            cards_reference = reference.collection("cards")
+            cards_batch = self.db.batch()
+            existing_cards = list(cards_reference.stream(retry=None, timeout=20))
+            # Migrate legacy root-array cards once before accepting per-event
+            # writes. Tombstones are documents too, so an all-card deletion is
+            # preserved rather than falling back to the old root array.
+            if not existing_cards:
+                for index, legacy in enumerate(previous_payload.get("cards", [])):
+                    if not isinstance(legacy, dict):
+                        continue
+                    legacy_id = str(legacy.get("id") or f"legacy-card:{legacy.get('playerId')}:{legacy.get('half')}:{legacy.get('halfSeconds')}:{legacy.get('card')}:{index}")
+                    cards_batch.set(cards_reference.document(legacy_id), {
+                        **legacy, "id": legacy_id, "deleted": False, "updatedAt": now, "updatedBy": user_id,
+                    }, merge=True)
+            for index, card in enumerate(payload.get("cards", [])):
+                if not isinstance(card, dict):
+                    continue
+                card_id = str(card.get("id") or f"legacy-card:{card.get('playerId')}:{card.get('half')}:{card.get('halfSeconds')}:{card.get('card')}:{index}")
+                cards_batch.set(cards_reference.document(card_id), {
+                    **card, "id": card_id, "deleted": False, "updatedAt": now, "updatedBy": user_id,
+                }, merge=True)
+            for card_id in deleted_card_ids or []:
+                if card_id:
+                    cards_batch.set(cards_reference.document(str(card_id)), {
+                        "id": str(card_id), "deleted": True, "updatedAt": now, "updatedBy": user_id,
+                    }, merge=True)
 
         # Persist recovery-safe clock data without allowing a record-only sync
         # to replace the rest of another analyst's client snapshot.
-        if sync_scope == "state" and can_write_live_state:
+        if sync_scope in {"state", "state_records"} and can_write_live_state:
             next_client_state = {
                 **previous_client,
                 **{key: client_state[key] for key in ("seconds", "h1Seconds", "h2Seconds", "clockStartedAt", "halfStatus", "homeScore", "awayScore") if key in client_state},
@@ -1334,12 +1487,29 @@ class JpdDidData:
         }
         if payload_update is not None:
             document["payload"] = payload_update
-        # Setup has its own event-driven write path. Never include it in a
-        # record/clock checkpoint: this request may have read an older Draft
-        # just before a substitution wrote a newer setup revision.
-        reference.set(document, merge=True, retry=None, timeout=20)
+        # A normal live command touches one or a handful of record documents.
+        # Commit its root state and record deltas together so subscribers never
+        # receive a timer/lifecycle revision before its accompanying event.
+        # Large restore checkpoints keep the existing split path to stay below
+        # Firestore's 500-write batch limit.
+        if sync_scope == "state_records" and records_batch is not None and record_mutation_count < 450:
+            records_batch.set(reference, document, merge=True)
+            records_batch.commit(retry=None, timeout=20)
+        else:
+            if records_batch is not None:
+                records_batch.commit(retry=None, timeout=20)
+            if cards_batch is not None:
+                cards_batch.commit(retry=None, timeout=20)
+            # Setup has its own event-driven write path. Never include it in a
+            # record/clock checkpoint: this request may have read an older Draft
+            # just before a substitution wrote a newer setup revision.
+            reference.set(document, merge=True, retry=None, timeout=20)
         saved = reference.get(retry=None, timeout=10).to_dict() or {}
-        return self._with_draft_records(reference, saved)
+        if include_events:
+            return self._with_draft_records(reference, saved)
+        if sync_scope == "cards" and isinstance(saved.get("payload"), dict):
+            saved = {**saved, "payload": {**saved["payload"], "cards": self._draft_cards(reference)}}
+        return saved
 
     def join_input_draft_participant(
         self,

@@ -42,6 +42,10 @@ function inputSide(game: MatchState): Side {
   return game.team === 'away' ? 'A' : 'H'
 }
 
+function payloadMatchesGame(game: MatchState, payload: InputPayload | undefined | null) {
+  return Boolean(payload && payload.gmId === game.matchId && payload.side === inputSide(game))
+}
+
 function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, 1)
@@ -113,13 +117,14 @@ function assignedLineup(game: MatchState, squad: MatchSquadPlayer[]) {
 }
 
 function cardsFromPayload(cards: Array<Record<string, unknown>>): CardRecord[] {
-  return cards.flatMap(card => {
+  return cards.flatMap((card, index) => {
     const player = card.playerId
     const half = card.half
     const seconds = card.halfSeconds
     const type = card.card
     if (typeof player !== 'string' || (half !== 'H1' && half !== 'H2') || typeof seconds !== 'number' || (type !== 'Y' && type !== 'R')) return []
-    return [{ player, half, seconds, card: type }]
+    const id = typeof card.id === 'string' && card.id ? card.id : `legacy-card:${player}:${half}:${seconds}:${type}:${index}`
+    return [{ id, player, half, seconds, card: type }]
   })
 }
 
@@ -146,7 +151,7 @@ export function payloadFromState(game: MatchState): InputPayload {
       shootDspRange: record.shootDspRange ?? null, isShot: record.isShot ?? null, playerId: record.playerId ?? null,
     })),
     cards: game.cards.map(card => ({
-      playerId: card.player,
+      id: card.id, playerId: card.player,
       half: card.half, halfSeconds: card.seconds, card: card.card,
     })).filter(card => Boolean(card.playerId)),
     recorderLevel: game.recorderLevel,
@@ -176,6 +181,10 @@ function applySubsToAssigned(game: MatchState) {
 }
 
 function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState?: MatchState) {
+  // Never trust an IndexedDB value or a malformed server response merely
+  // because it was stored under the current key. The route identity is the
+  // hard boundary between matches and teams.
+  if (!payloadMatchesGame(game, payload)) return
   // 역할과 계정 등급은 현재 로그인/일정 진입 세션의 값이다. 다른 기기나 이전
   // 입력자가 남긴 Draft clientState를 복원하면서 이 권한 맥락을 덮으면 안 된다.
   const sessionIdentity = {
@@ -218,7 +227,10 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
     game.subs = game.subs.flatMap(sub => {
       const outPlayer = typeof sub.outPlayer === 'number' ? squad[sub.outPlayer]?.playerId : sub.outPlayer
       const inPlayer = typeof sub.inPlayer === 'number' ? squad[sub.inPlayer]?.playerId : sub.inPlayer
-      return outPlayer && inPlayer ? [{ ...sub, outPlayer, inPlayer }] : []
+      const id = typeof sub.id === 'string' && sub.id
+        ? sub.id
+        : `legacy-sub:${sub.half}:${sub.seconds}:${outPlayer}:${inPlayer}`
+      return outPlayer && inPlayer ? [{ ...sub, id, outPlayer, inPlayer }] : []
     })
     // clientState used to preserve o0…o9, whose coordinate-array order starts
     // at the defensive row. The durable lineup order is now the only authority
@@ -375,13 +387,18 @@ export function useMatchDraft() {
 
   async function recoverLocal(game: MatchState) {
     const draft = await readLocal(keyFor(game))
-    if (draft) hydrateFromPayload(game, draft.payload, draft.clientState)
-    return Boolean(draft)
+    if (!draft || !payloadMatchesGame(game, draft.payload)) return false
+    hydrateFromPayload(game, draft.payload, draft.clientState)
+    return true
   }
 
   async function recover(game: MatchState) {
     if (!game.matchId) return false
-    const local = await readLocal(keyFor(game))
+    let local = await readLocal(keyFor(game))
+    if (local && !payloadMatchesGame(game, local.payload)) {
+      await removeLocal(keyFor(game))
+      local = null
+    }
     try {
       const side = inputSide(game)
       const response = await request<{ status?: string; payload?: InputPayload; clientState?: MatchState; updatedAt?: string }>(
@@ -398,6 +415,7 @@ export function useMatchDraft() {
         }
         return false
       }
+      if (!payloadMatchesGame(game, response.payload)) return false
       const serverUpdatedAt = response.updatedAt ? Date.parse(response.updatedAt) : 0
       // A page reload can happen inside the network debounce window. In that
       // case this device's immediately-written IndexedDB snapshot is newer than

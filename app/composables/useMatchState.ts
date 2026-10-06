@@ -32,6 +32,8 @@ export interface MatchSquadPlayer {
  * assigned 와 같은 키 체계를 써야 슬롯이 바뀌어도 사람이 안 바뀐다.
  */
 export interface SubRecord {
+  /** Stable event identity. Substitution history is merged by this ID. */
+  id: string
   half: Half
   seconds: number
   outPlayer: string

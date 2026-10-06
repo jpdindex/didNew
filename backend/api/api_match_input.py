@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import json
+from collections import defaultdict
+from contextlib import contextmanager
+from threading import Lock
 from typing import Any, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from firebase_admin import auth
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from backend.system.system_firestore import BackendError, JpdDidData, NotFoundError, RequiredUser, utc_now
+from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData, NotFoundError, RequiredUser, ensure_firebase_app, get_settings, utc_now
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
 from backend.system.system_schema import Half, InputMode, Side
 
@@ -46,6 +52,7 @@ class InputRecord(BaseModel):
 
 class InputCard(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    id: str | None = None
     playerId: str
     half: Half
     halfSeconds: int = Field(ge=0)
@@ -120,8 +127,13 @@ class DraftWriteRequest(BaseModel):
     clientState: dict[str, Any]
     # One endpoint serves durable checkpoints and the two lightweight live-sync
     # mutations.  These endpoints are intentionally internal to the frontend.
-    syncScope: Literal["checkpoint", "state", "records", "cards"] = "checkpoint"
+    # `state_records` is the live collaboration mutation: the clock/lifecycle
+    # state and only the changed record documents commit as one ordered command.
+    # It avoids serialising a full state write and a full record write for every
+    # analyst action.
+    syncScope: Literal["checkpoint", "state", "records", "state_records", "cards"] = "checkpoint"
     deletedRecordIds: list[str] = Field(default_factory=list)
+    deletedCardIds: list[str] = Field(default_factory=list)
 
 
 class InputSetupWriteRequest(BaseModel):
@@ -130,6 +142,8 @@ class InputSetupWriteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     payload: MatchInputPayload
     clientState: dict[str, Any]
+    deletedSubIds: list[str] = Field(default_factory=list)
+    syncScope: Literal["setup", "substitutions"] = "setup"
 
 
 class DraftResponse(BaseModel):
@@ -182,6 +196,169 @@ class InputPreviewRequest(BaseModel):
 
 
 router = APIRouter(tags=["match-input"])
+
+
+class DraftSocketHub:
+    """Best-effort live fan-out. Firestore remains the durable Draft authority."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        # A WebSocket may not be written by multiple coroutines at once. Event
+        # fan-out used to spawn concurrent sends for records/cards/setup, so a
+        # busy pair of analysts could lose an ACK although Firestore had saved
+        # the mutation. Keep one send lock per browser connection.
+        self._clients: dict[tuple[str, Side], dict[int, tuple[WebSocket, asyncio.AbstractEventLoop, asyncio.Lock]]] = defaultdict(dict)
+
+    async def connect(self, gm_id: str, side: Side, socket: WebSocket) -> None:
+        with self._lock:
+            self._clients[(gm_id, side)][id(socket)] = (socket, asyncio.get_running_loop(), asyncio.Lock())
+
+    def disconnect(self, gm_id: str, side: Side, socket: WebSocket) -> None:
+        with self._lock:
+            clients = self._clients.get((gm_id, side))
+            if not clients:
+                return
+            clients.pop(id(socket), None)
+            if not clients:
+                self._clients.pop((gm_id, side), None)
+
+    async def send(self, gm_id: str, side: Side, socket: WebSocket, message: dict[str, Any]) -> bool:
+        with self._lock:
+            client = self._clients.get((gm_id, side), {}).get(id(socket))
+        if not client:
+            return False
+        _, _, send_lock = client
+        try:
+            async with send_lock:
+                await socket.send_json(message)
+            return True
+        except Exception:
+            self.disconnect(gm_id, side, socket)
+            return False
+
+    def publish(self, gm_id: str, side: Side, message: dict[str, Any], *, exclude: WebSocket | None = None) -> None:
+        with self._lock:
+            clients = list(self._clients.get((gm_id, side), {}).values())
+        for socket, loop, send_lock in clients:
+            if exclude is socket:
+                continue
+            loop.call_soon_threadsafe(asyncio.create_task, self._send(gm_id, side, socket, send_lock, message))
+
+    async def _send(self, gm_id: str, side: Side, socket: WebSocket, send_lock: asyncio.Lock, message: dict[str, Any]) -> None:
+        try:
+            async with send_lock:
+                await socket.send_json(message)
+        except Exception:
+            self.disconnect(gm_id, side, socket)
+
+
+draft_sockets = DraftSocketHub()
+
+
+class DraftMutationLocks:
+    """Serialise durable mutations per team Draft, never across matches."""
+
+    def __init__(self) -> None:
+        self._guard = Lock()
+        self._locks: dict[tuple[str, Side], Lock] = {}
+
+    @contextmanager
+    def hold(self, gm_id: str, side: Side):
+        key = (gm_id, side)
+        with self._guard:
+            lock = self._locks.setdefault(key, Lock())
+        with lock:
+            yield
+
+
+draft_mutations = DraftMutationLocks()
+
+
+async def _socket_user(socket: WebSocket) -> CurrentUser:
+    hello = json.loads(await asyncio.wait_for(socket.receive_text(), timeout=5))
+    if not isinstance(hello, dict) or hello.get("type") != "authenticate":
+        raise ValueError("authentication message required")
+    settings = get_settings()
+    origin = socket.headers.get("origin")
+    uid = str(hello.get("uid") or "").strip()
+    if settings.app_env == "local" and origin in settings.cors_origins:
+        return CurrentUser(uid=uid or "local-did-input", claims={"auth": "local_frontend"})
+    token = str(hello.get("token") or "").strip()
+    decoded = auth.verify_id_token(token, app=ensure_firebase_app(settings))
+    verified_uid = decoded.get("uid")
+    if not isinstance(verified_uid, str) or not verified_uid:
+        raise ValueError("authentication required")
+    return CurrentUser(uid=verified_uid, claims=dict(decoded))
+
+
+@router.websocket("/match-input/drafts/{gm_id}/{side}/live")
+async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> None:
+    await websocket.accept()
+    try:
+        user = await _socket_user(websocket)
+        JpdDidData().get_match(gm_id)
+        await draft_sockets.connect(gm_id, side, websocket)
+        await websocket.send_json({"type": "ready", "gmId": gm_id, "side": side})
+        while True:
+            message = json.loads(await websocket.receive_text())
+            if not isinstance(message, dict) or message.get("type") != "command":
+                continue
+            command_id = str(message.get("commandId") or "")
+            try:
+                if message.get("command") != "mutation":
+                    await draft_sockets.send(gm_id, side, websocket, {"type": "error", "commandId": command_id, "message": "unknown command"})
+                    continue
+                mutation = message.get("mutation")
+                if mutation == "draft":
+                    request = DraftWriteRequest.model_validate(message.get("request"))
+                    response = await asyncio.to_thread(_save_draft_mutation, gm_id, side, request, user)
+                    if request.syncScope == "state":
+                        event = {
+                            "type": "state", "gmId": gm_id, "side": side,
+                            "sharedState": response.sharedState, "revision": response.revision,
+                        }
+                    elif request.syncScope == "cards":
+                        event = {
+                            "type": "cards", "gmId": gm_id, "side": side,
+                            "cards": response.payload.cards, "revision": response.revision,
+                        }
+                    else:
+                        event = {"type": "draft", "response": response.model_dump(mode="json")}
+                    # The writer must receive its ACK directly. Other clients
+                    # receive a separate fan-out message. Waiting for a shared
+                    # background broadcast made successful card/sub/ACT saves
+                    # appear to fail whenever another send was in progress.
+                    await draft_sockets.send(gm_id, side, websocket, {"type": "mutation", "event": event, "commandId": command_id})
+                    draft_sockets.publish(gm_id, side, {"type": "mutation", "event": event}, exclude=websocket)
+                elif mutation == "setup":
+                    request = InputSetupWriteRequest.model_validate(message.get("request"))
+                    setup = await asyncio.to_thread(_save_setup_mutation, gm_id, side, request, user)
+                    event = {"type": "setup", "gmId": gm_id, "side": side, "setup": setup}
+                    await draft_sockets.send(gm_id, side, websocket, {"type": "mutation", "event": event, "commandId": command_id})
+                    draft_sockets.publish(gm_id, side, {"type": "mutation", "event": event}, exclude=websocket)
+                else:
+                    await draft_sockets.send(gm_id, side, websocket, {"type": "error", "commandId": command_id, "message": "unknown mutation"})
+            except Exception as exc:
+                await draft_sockets.send(gm_id, side, websocket, {"type": "error", "commandId": command_id, "message": str(exc)})
+    except (WebSocketDisconnect, asyncio.TimeoutError, ValueError, RuntimeError):
+        # Refresh, route changes and a browser retry can close the transport
+        # between accept/authentication/receive. That is a normal disconnect,
+        # not an application error and must never trigger a second close.
+        pass
+    except Exception:
+        # The peer may already have sent websocket.disconnect. Returning lets
+        # Starlette complete the close handshake safely; calling close() here
+        # caused a second-close RuntimeError and delayed the next connection.
+        pass
+    finally:
+        draft_sockets.disconnect(gm_id, side, websocket)
+
+
+def _publish_draft_response(response: DraftResponse, command_id: str | None = None) -> None:
+    message: dict[str, Any] = {"type": "draft", "response": response.model_dump(mode="json")}
+    if command_id:
+        message["commandId"] = command_id
+    draft_sockets.publish(response.gmId, response.side, message)
 
 
 def _display_name(document: dict, fallback: str) -> str:
@@ -564,7 +741,9 @@ def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinReque
 
 @router.post("/match-input/drafts/{gm_id}/{side}/restore-raw", response_model=DraftResponse, include_in_schema=False)
 def restore_raw_to_draft(gm_id: str, side: Side, user: RequiredUser = None) -> DraftResponse:
-    return _draft_response(JpdDidData().restore_input_draft_from_raw(gm_id, side, user_id=user.uid))
+    response = _draft_response(JpdDidData().restore_input_draft_from_raw(gm_id, side, user_id=user.uid))
+    _publish_draft_response(response)
+    return response
 
 
 @router.post("/match-input/drafts/{gm_id}/{side}/promote-h1", response_model=PromotionResponse, include_in_schema=False)
@@ -604,25 +783,49 @@ def approve_basic(gm_id: str, side: Side, user: RequiredUser = None) -> Promotio
     return _promote(data, payload, draft, user.uid, status="final", halves={"H1", "H2"}, delete_draft=True)
 
 
-@router.put("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse, include_in_schema=False)
-def save_draft(gm_id: str, side: Side, request: DraftWriteRequest, user: RequiredUser = None) -> DraftResponse:
+def _save_draft_mutation(gm_id: str, side: Side, request: DraftWriteRequest, user: CurrentUser) -> DraftResponse:
     if request.payload.gmId != gm_id or request.payload.side != side:
         raise BackendError("Draft path and payload must identify the same match side", status_code=422, code="draft_target_mismatch")
-    data = JpdDidData()
-    match = data.get_match(gm_id)
-    snapshot = request.payload.matchSnapshot
-    if snapshot and (snapshot.homeTeamId != match.homeTeamId or snapshot.awayTeamId != match.awayTeamId):
-        raise BackendError("Draft match snapshot does not match this fixture", status_code=422, code="draft_match_mismatch")
-    document = data.save_input_draft(
-        gm_id,
-        side,
-        payload=request.payload.model_dump(mode="python"),
-        client_state=request.clientState,
-        user_id=user.uid,
-        sync_scope=request.syncScope,
-        deleted_record_ids=request.deletedRecordIds,
-    )
-    return _draft_response(document, data.get_input_setup(gm_id).get(side))
+    # Every entry point (REST and socket) takes this same lock.  Firestore
+    # document revisions therefore cannot race when the two analysts submit at
+    # almost the same instant.
+    with draft_mutations.hold(gm_id, side):
+        data = JpdDidData()
+        match = data.get_match(gm_id)
+        snapshot = request.payload.matchSnapshot
+        if snapshot and (snapshot.homeTeamId != match.homeTeamId or snapshot.awayTeamId != match.awayTeamId):
+            raise BackendError("Draft match snapshot does not match this fixture", status_code=422, code="draft_match_mismatch")
+        document = data.save_input_draft(
+            gm_id, side, payload=request.payload.model_dump(mode="python"), client_state=request.clientState,
+            user_id=user.uid, sync_scope=request.syncScope, deleted_record_ids=request.deletedRecordIds,
+            deleted_card_ids=request.deletedCardIds,
+            include_events=request.syncScope not in {"state", "cards"},
+        )
+        input_setup = None if request.syncScope in {"state", "cards"} else data.get_input_setup(gm_id).get(side)
+        return _draft_response(document, input_setup)
+
+
+def _save_setup_mutation(gm_id: str, side: Side, request: InputSetupWriteRequest, user: CurrentUser) -> dict[str, Any] | None:
+    if request.payload.gmId != gm_id or request.payload.side != side:
+        raise BackendError("Draft path and payload must identify the same match side", status_code=422, code="draft_target_mismatch")
+    with draft_mutations.hold(gm_id, side):
+        data = JpdDidData()
+        draft = data.get_input_draft(gm_id, side)
+        return data.save_input_setup(
+            gm_id,
+            side,
+            payload=request.payload.model_dump(mode="python"),
+            client_state=request.clientState,
+            deleted_sub_ids=request.deletedSubIds,
+            merge_substitutions=request.syncScope == "substitutions",
+        )
+
+
+@router.put("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse, include_in_schema=False)
+def save_draft(gm_id: str, side: Side, request: DraftWriteRequest, user: RequiredUser = None) -> DraftResponse:
+    response = _save_draft_mutation(gm_id, side, request, user)
+    _publish_draft_response(response)
+    return response
 
 
 @router.put("/match-input/drafts/{gm_id}/{side}/setup", include_in_schema=False)
@@ -633,16 +836,7 @@ def save_draft_setup(gm_id: str, side: Side, request: InputSetupWriteRequest, us
     transport, not an operator action. Records, timer and lifecycle are never
     touched here.
     """
-    if request.payload.gmId != gm_id or request.payload.side != side:
-        raise BackendError("Draft path and payload must identify the same match side", status_code=422, code="draft_target_mismatch")
-    data = JpdDidData()
-    draft = data.get_input_draft(gm_id, side)
-    primary_uid = str(draft.get("primaryUid") or "")
-    if primary_uid and primary_uid != user.uid:
-        raise BackendError("Only the primary analyst can change the shared lineup", status_code=403, code="primary_required")
-    setup = data.save_input_setup(
-        gm_id, side,
-        payload=request.payload.model_dump(mode="python"),
-        client_state=request.clientState,
-    )
+    setup = _save_setup_mutation(gm_id, side, request, user)
+    if setup:
+        draft_sockets.publish(gm_id, side, {"type": "setup", "gmId": gm_id, "side": side, "setup": setup})
     return {"status": "ok", "gmId": gm_id, "side": side, "inputSetup": setup}

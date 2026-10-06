@@ -11,6 +11,8 @@ import type { Half } from '~/types/schema'
 
 /** 레거시 ff_game_card 대응. Firestore CardDoc(schema.ts)의 클라이언트 스크래치 형태. */
 export interface CardRecord {
+  /** Stable event identity; edits keep this ID and deletion is explicit. */
+  id: string
   half: Half
   seconds: number
   /** Firestore players 문서 ID. 배열 순서가 바뀌어도 카드 대상은 유지된다. */

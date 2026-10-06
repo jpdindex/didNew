@@ -1,4 +1,4 @@
-from backend.api.api_match_input import DraftWriteRequest, InputPreviewRequest, MatchInputCommit, calculate_input_preview, router
+from backend.api.api_match_input import DraftSocketHub, DraftWriteRequest, InputPreviewRequest, MatchInputCommit, calculate_input_preview, router
 from backend.app import app
 from pydantic_core import PydanticUndefined
 
@@ -37,10 +37,10 @@ def test_draft_write_contract_supports_backend_record_merge() -> None:
         "halves": {"H1": {"seconds": 12}, "H2": {"seconds": 0}}, "lineup": [], "records": [], "cards": [],
     }
     request = DraftWriteRequest.model_validate({
-        "payload": payload, "clientState": {"seconds": 12}, "syncScope": "records", "deletedRecordIds": ["old-record"],
+        "payload": payload, "clientState": {"seconds": 12}, "syncScope": "state_records", "deletedRecordIds": ["old-record"],
     })
 
-    assert request.syncScope == "records"
+    assert request.syncScope == "state_records"
     assert request.deletedRecordIds == ["old-record"]
 
 
@@ -62,6 +62,12 @@ def test_internal_bootstrap_route_requires_selected_side_and_is_hidden_from_open
     assert route.include_in_schema is False
     parameters = {item.name: item for item in route.dependant.query_params}
     assert parameters["side"].field_info.default is PydanticUndefined
+
+
+def test_live_draft_socket_route_is_not_exposed_in_openapi() -> None:
+    route = next(route for route in router.routes if route.path == "/match-input/drafts/{gm_id}/{side}/live")
+    assert route in router.routes
+    assert isinstance(DraftSocketHub(), DraftSocketHub)
 
 
 def test_legacy_lineup_snapshot_separates_gk_from_start_order_one() -> None:

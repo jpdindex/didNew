@@ -10,6 +10,7 @@ import {
   GK_SLOT,
   assignmentsFromLineup,
   lineupAssignmentOrder as formationAssignmentOrder,
+  lineupOrderForSlot,
   orderedOutfieldSlotIds,
 } from '~/utils/formationLayout'
 import {
@@ -37,6 +38,9 @@ const dashboardKpis = ref<{ H: Record<'all' | 'H1' | 'H2', DashboardKpi>; A: Rec
 let dashboardKpiTimer: ReturnType<typeof setInterval> | undefined
 let dashboardKpiLoading = false
 let appliedSetupFingerprint = ''
+let appliedSetupRevision = -1
+let pendingSetupFingerprint = ''
+let applyingRemoteSetup = false
 
 // ---- 공유 상태 ----
 // TeamSelection ↔ DidInput 이 함께 쓰는 임시 스토어(useState). 전반/후반 종료 후
@@ -45,8 +49,8 @@ let appliedSetupFingerprint = ''
 const game = useMatchState()
 const { request } = useBackendApi()
 const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
-const { saveLocal, save: saveDraft, saveSetup, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover: recoverDraft, hydrate } = useMatchDraft()
-const { join: joinCollaboration } = useMatchCollaboration()
+const { saveLocal, save: saveDraft, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover: recoverDraft, hydrate } = useMatchDraft()
+const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncSetup } = useMatchCollaboration()
 const lifecycleBusy = ref(false)
 const lifecycleError = ref('')
 const bootstrapApplied = ref(false)
@@ -101,8 +105,10 @@ type InputSetup = {
   formationKey: string
   fieldSide: FieldSide | null
   lineup: Array<Record<string, unknown>>
+  lineupIsBaseline?: boolean
   subs: SubRecord[]
   inputMode: '분석' | '실시간'
+  revision: number
 }
 
 type InputBootstrap = {
@@ -117,12 +123,55 @@ type InputBootstrap = {
 
 function applyInputSetup(setup: InputSetup | null | undefined) {
   if (!setup || !FORMATIONS[setup.formationKey]) return
-  appliedSetupFingerprint = setupFingerprint(setup)
+  const revision = Number(setup.revision || 0)
+  const fingerprint = setupFingerprint(setup)
+  // A delayed bootstrap/KPI/socket response is allowed to fill an empty
+  // lobby, but it must never replace a lineup the analyst has just placed and
+  // not yet received an acknowledgement for.
+  if (revision < appliedSetupRevision) return
+  if (pendingSetupFingerprint && fingerprint !== pendingSetupFingerprint) return
+  appliedSetupRevision = Math.max(appliedSetupRevision, revision)
+  appliedSetupFingerprint = fingerprint
+  if (pendingSetupFingerprint === fingerprint) pendingSetupFingerprint = ''
+  applyingRemoteSetup = true
   game.value.formationKey = setup.formationKey
   if (setup.fieldSide === 'left' || setup.fieldSide === 'right') game.value.side = setup.fieldSide
-  game.value.assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
+  const assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
+  if (setup.lineupIsBaseline) {
+    for (const sub of [...setup.subs].sort((a, b) => HALF_ORDER[a.half]! * 100000 + a.seconds - (HALF_ORDER[b.half]! * 100000 + b.seconds))) {
+      const outSlot = Object.entries(assigned).find(([, playerId]) => playerId === sub.outPlayer)?.[0]
+      const inSlot = Object.entries(assigned).find(([, playerId]) => playerId === sub.inPlayer)?.[0]
+      if (outSlot && inSlot) [assigned[outSlot], assigned[inSlot]] = [assigned[inSlot], assigned[outSlot]]
+    }
+  }
+  game.value.assigned = assigned
   game.value.subs = setup.subs.map(sub => ({ ...sub }))
   game.value.inputMode = setup.inputMode
+  nextTick(() => { applyingRemoteSetup = false })
+}
+
+function startLobbyCollaboration() {
+  return startCollaboration(game.value, {
+    applyState: (state) => {
+      // Draft shared state contains only lifecycle, score and timer fields.
+      // Keep route-selected team/role and the loaded squads local to this lobby.
+      Object.assign(game.value, state)
+    },
+    applyRecords: (records) => {
+      game.value.records = records
+      // The lobby has a server KPI view. Refresh it after a peer event instead
+      // of waiting for its recovery timer.
+      void loadDashboardKpis(kpiHalf.value).catch(() => false)
+    },
+    applyCards: (cards) => { game.value.cards = cards },
+    applySetup: (setup) => {
+      applyInputSetup(setup)
+      applySetupFieldSides({
+        H: game.value.team === 'home' ? setup : null,
+        A: game.value.team === 'away' ? setup : null,
+      })
+    },
+  })
 }
 
 function setupFingerprint(setup: Pick<InputSetup, 'formationKey' | 'fieldSide' | 'lineup' | 'subs' | 'inputMode'>) {
@@ -146,7 +195,7 @@ function currentSetupFingerprint() {
     const subOut = game.value.subs.find(sub => sub.outPlayer === playerId)
     const subIn = game.value.subs.find(sub => sub.inPlayer === playerId)
     return {
-      playerId, slot, order: slot === 'gk' ? 1 : Number(slot.slice(1)) || 0,
+      playerId, slot, order: lineupOrderForSlot(game.value.formationKey, slot),
       type: slot.startsWith('b') ? 'BENCH' : 'START', no: player?.no, name: player?.name, pos: player?.pos,
       inHalf: subIn?.half ?? (slot.startsWith('b') ? null : 'H1'),
       inSeconds: subIn?.seconds ?? (slot.startsWith('b') ? null : 0),
@@ -558,11 +607,16 @@ function onDragStart(playerId: string) {
 }
 
 function recordFormationChange() {
+  if (applyingRemoteSetup) return
   if (!game.value.matchId) return
+  // Lock the local lineup immediately, before the debounce starts. A late
+  // response from the old server snapshot must not erase a just-picked player.
+  pendingSetupFingerprint = currentSetupFingerprint()
   if (formationSaveTimer) clearTimeout(formationSaveTimer)
   formationSaveTimer = setTimeout(() => {
     const fingerprint = currentSetupFingerprint()
-    if (!game.value.formationKey || fingerprint === appliedSetupFingerprint) return
+    if (!game.value.formationKey || fingerprint === appliedSetupFingerprint && !pendingSetupFingerprint) return
+    if (pendingSetupFingerprint !== fingerprint) return
     const half = game.value.halfStatus
     if ((half === 'H1' || half === 'H2') && game.value.matchSnapshot) {
       game.value.formationChanges.push({
@@ -574,8 +628,11 @@ function recordFormationChange() {
     }
     // Setup only changes when a formation/lineup action happens. Timer and
     // record autosaves must not rewrite this durable lobby snapshot.
-    appliedSetupFingerprint = fingerprint
-    void saveSetup(game.value).catch(() => { appliedSetupFingerprint = '' })
+    void syncSetup(game.value).catch(() => {
+      // Keep the visible local lineup intact; the next explicit lineup action
+      // retries it instead of allowing an old remote snapshot to wipe it.
+      if (pendingSetupFingerprint === fingerprint) appliedSetupFingerprint = ''
+    })
   }, 300)
 }
 
@@ -700,7 +757,7 @@ async function startFirstHalf() {
     if (!game.value.lifecycleControl) throw new Error('주 분석관만 전반전을 시작할 수 있습니다.')
     // Create the durable setup before the first live Draft checkpoint. An
     // assistant can therefore render formation and lineup on its first poll.
-    if (!await saveSetup(game.value)) throw new Error('포메이션과 명단 스냅샷을 저장하지 못했습니다.')
+    if (!await syncSetup(game.value)) throw new Error('포메이션과 명단 스냅샷을 저장하지 못했습니다.')
     // This checkpoint is the single source of the running-clock timestamp.
     // Do not navigate until the Draft contains formation, lineup and H1 time.
     game.value.halfStatus = 'H1'
@@ -764,7 +821,7 @@ async function toggleMatchInfoEdit() {
 
   lifecycleBusy.value = true
   try {
-    if (!await saveSetup(game.value)) throw new Error('경기 정보 변경 내용을 저장하지 못했습니다.')
+    if (!await syncSetup(game.value)) throw new Error('경기 정보 변경 내용을 저장하지 못했습니다.')
     matchInfoEditMode.value = false
     activeSlot.value = null
     menuOpen.value = false
@@ -855,6 +912,10 @@ onMounted(async () => {
         : `${roleLabel(requestedRole)} 참여 상태를 확인하지 못했습니다.`
     })
   }
+  // Lobby and input screen subscribe to the same per-team Draft channel.
+  // Formation, field side and substitutions therefore do not wait for the
+  // dashboard polling interval to appear after the other analyst changes them.
+  void startLobbyCollaboration().catch(() => false)
   // 현재 팀에 저장된 세션이 없는 신규 입력이라면, 이미 RAW가 있는 상대 팀의
   // 진영을 기준으로 자동 반대 진영을 지정한다. 저장된 세션의 값은 절대 덮지 않는다.
   if (!recovered && game.value.halfStatus === 'ready') applyOpponentFieldSideDefault(game.value.team)
@@ -878,6 +939,7 @@ onUnmounted(() => {
   if (formationSaveTimer) clearTimeout(formationSaveTimer)
   if (lobbyClockTimer) clearInterval(lobbyClockTimer)
   if (dashboardKpiTimer) clearInterval(dashboardKpiTimer)
+  stopCollaboration()
 })
 
 async function finishMatch() {
@@ -1179,7 +1241,13 @@ function swapSlots(a: string, b: string) {
   subOut.value = null
   subIn.value = null
   const moment = subMoment()
-  if (moment) pendingSubs.value = [...pendingSubs.value, { half: moment.half, seconds: subTimeTotal.value, outPlayer, inPlayer }]
+  if (moment) pendingSubs.value = [...pendingSubs.value, {
+    id: crypto.randomUUID(),
+    half: moment.half,
+    seconds: subTimeTotal.value,
+    outPlayer,
+    inPlayer,
+  }]
 }
 // 고르기만 하고, 실제 교체는 "목록추가"/"Submit" 에서 한다. 같은 선수를 다시 누르면 선택 해제.
 function pickOut(id: string) {

@@ -40,8 +40,8 @@ const inputMode = computed(() => (route.query.mode === '실시간' ? '실시간'
 const game = useMatchState()
 const { request } = useBackendApi()
 const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
-const { saveLocal, save: saveDraft, saveSetup, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
-const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncCards, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards } = useMatchCollaboration()
+const { saveLocal, save: saveDraft, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
+const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards } = useMatchCollaboration()
 const isPrimary = computed(() => game.value.lifecycleControl)
 const requestedRole = route.query.role === 'assistant' || route.query.role === 'manager' ? route.query.role : 'primary'
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
@@ -57,6 +57,7 @@ type InputSetup = {
   formationKey: string
   fieldSide: 'left' | 'right' | null
   lineup: Array<Record<string, unknown>>
+  lineupIsBaseline?: boolean
   subs: SubRecord[]
   inputMode: '분석' | '실시간'
 }
@@ -65,7 +66,15 @@ function applyInputSetup(setup: InputSetup | null | undefined) {
   if (!setup || !FORMATIONS[setup.formationKey]) return
   game.value.formationKey = setup.formationKey
   if (setup.fieldSide === 'left' || setup.fieldSide === 'right') game.value.side = setup.fieldSide
-  game.value.assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
+  const assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
+  if (setup.lineupIsBaseline) {
+    for (const sub of [...setup.subs].sort((a, b) => HALF_ORDER[a.half] * 100000 + a.seconds - (HALF_ORDER[b.half] * 100000 + b.seconds))) {
+      const outSlot = Object.entries(assigned).find(([, playerId]) => playerId === sub.outPlayer)?.[0]
+      const inSlot = Object.entries(assigned).find(([, playerId]) => playerId === sub.inPlayer)?.[0]
+      if (outSlot && inSlot) [assigned[outSlot], assigned[inSlot]] = [assigned[inSlot], assigned[outSlot]]
+    }
+  }
+  game.value.assigned = assigned
   game.value.subs = setup.subs.map(sub => ({ ...sub }))
   game.value.inputMode = setup.inputMode
 }
@@ -113,6 +122,14 @@ function stepSeconds(delta: number) {
     tickBaseSeconds = seconds.value
     tickStartedAt = Date.now()
   }
+  // 수동 시계 보정도 일시정지와 같은 공유 경기 상태다. 실행 중에는
+  // 보정된 초를 기준으로 시작 시각을 다시 만들고, 정지 중에는 초 자체를
+  // 확정값으로 보낸다. 그래야 보조 분석관도 앞으로/뒤로 정확히 따른다.
+  game.value.seconds = seconds.value
+  if (half.value === '전반') game.value.h1Seconds = seconds.value
+  else game.value.h2Seconds = seconds.value
+  if (!paused.value) game.value.clockStartedAt = tickStartedAt - tickBaseSeconds * 1000
+  void syncState(game.value).catch(() => false)
 }
 
 // 수정 화면 전용: 시계의 "전반"/"후반" 라벨을 눌러 편집 대상 half 를 바꾼다.
@@ -139,7 +156,10 @@ function startTicking(sharedStartedAt?: number) {
   const resumedAt = sharedStartedAt ?? game.value.clockStartedAt
   tickStartedAt = resumedAt ?? Date.now()
   tickBaseSeconds = resumedAt ? 0 : seconds.value
-  if (resumedAt) seconds.value = Math.max(seconds.value, Math.floor((Date.now() - resumedAt) / 1000))
+  // clockStartedAt is the authoritative wall-clock anchor. Do not retain a
+  // larger local value here: a primary may have deliberately adjusted time
+  // backwards and assistants must apply that correction too.
+  if (resumedAt) seconds.value = Math.max(0, Math.floor((Date.now() - resumedAt) / 1000))
   game.value.clockStartedAt = sharedStartedAt ?? (tickStartedAt - tickBaseSeconds * 1000)
   game.value.seconds = seconds.value
   timer = setInterval(() => {
@@ -222,14 +242,14 @@ onMounted(async () => {
     seconds.value = game.value.seconds
   }
   game.value.seconds = seconds.value
-  // A new primary session needs its first shared-state write. A recovered
-  // session must not immediately overwrite its own server clock with a stale UI ref.
-  if (!recoveredDraft) void syncState(game.value).catch(() => false)
-
   const restoredRecords = [...records.value]
   // 공유 game 상태는 화면을 나가면 다음 경기가 쓴다. 이 화면의 경기·팀이 아닐 때 도착한
   // 응답은 절대 반영하지 않는다(다른 경기 기록이 새 경기 화면에 덮이던 문제).
   const isCurrentSession = () => !disposed && game.value.matchId === matchId && game.value.team === requestedTeam
+  // The first collaboration read is the state boundary for a refresh or
+  // re-entry. Never write this browser's still-empty UI before that read: a
+  // transient recovery failure used to overwrite the active Draft's clock and
+  // lifecycle with defaults.
   await startCollaboration(game.value, {
     applyState: (state) => {
       if (!isCurrentSession()) return
@@ -259,6 +279,10 @@ onMounted(async () => {
           paused.value = true
           if (timer) clearInterval(timer)
           timer = undefined
+          // A paused clock has no wall-clock anchor, so its saved seconds are
+          // the authority. This also makes a primary's -/+ adjustment visible
+          // immediately to the assistant.
+          seconds.value = game.value.seconds
         }
         if (state.halfStatus === 'H1_done' || state.halfStatus === 'H2_done' || state.halfStatus === 'final') {
           if (timer) clearInterval(timer)
@@ -409,25 +433,36 @@ const records = ref<DidRecord[]>(resumeHalf ? [...game.value.records] : [])
 let draftSaveTimer: ReturnType<typeof setTimeout> | undefined
 // 카드는 이 화면에서 실제로 바뀌었을 때만 서버에 보낸다. 기록 저장(흐르는 초로 매초 발생)
 // 때마다 같이 보내면, 카드가 옛 상태인 다른 화면이 매초 그 목록으로 덮어써 카드가 깜빡인다.
-let cardsDirty = false
+let sharedDraftDirty = false
+// Card mutations are independent events, but they still need one browser-side
+// order. Without this chain a watcher write and a "목록 추가" write can race,
+// making an otherwise saved card appear only after refresh.
+let cardSaveChain: Promise<unknown> = Promise.resolve()
 
-function queueDraftSave() {
+function persistCards() {
+  markLocalCards(game.value)
+  cardSaveChain = cardSaveChain
+    .catch(() => undefined)
+    .then(() => syncCards(game.value))
+    .catch(() => false)
+  return cardSaveChain
+}
+
+function queueDraftSave(shared = true) {
   if (applyingRemoteDraft) return
+  sharedDraftDirty = sharedDraftDirty || shared
   // Offline/reload protection is immediate. Only the network write is debounced.
   markLocalRecords(records.value)
   saveToStore()
   void saveLocal(game.value).catch(() => false)
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
   draftSaveTimer = setTimeout(() => {
-    const sendCards = cardsDirty
-    cardsDirty = false
-    // The collaboration composable serializes state and record writes, while
-    // its optimistic record merge keeps this screen stable during the round trip.
-    void Promise.all([
-      syncState(game.value), syncRecords(game.value, records.value),
-      ...(sendCards ? [syncCards(game.value)] : []),
-    ]).catch(() => false)
-  }, 500)
+    const sendShared = sharedDraftDirty
+    sharedDraftDirty = false
+    const writes: Promise<boolean>[] = []
+    if (sendShared) writes.push(syncStateRecords(game.value, records.value))
+    void Promise.all(writes).catch(() => false)
+  }, 80)
 }
 
 async function completeFinalCorrection() {
@@ -455,12 +490,6 @@ function exitFinalCorrection() {
 }
 
 watch([records, homeScore, awayScore, () => game.value.subs], queueDraftSave, { deep: true })
-watch(() => game.value.cards, () => {
-  if (applyingRemoteDraft) return
-  cardsDirty = true
-  markLocalCards(game.value)
-  queueDraftSave()
-}, { deep: true })
 
 // 입력 중인 팀. TeamSelection 에서 team 쿼리로 넘어온다.
 const team = computed(() => (route.query.team === 'away' ? 'away' : 'home'))
@@ -1044,6 +1073,7 @@ const cardType = ref<'Y' | 'R'>('Y')
 // 카드가 cardByPlayer(→ isSentOff → onFieldSlots)에 계속 반영되어, 확정되지 않은
 // 퇴장 처리 때문에 선수가 그라운드/벤치 목록에서 사라진 채로 남는다.
 const cardQueue = ref<CardRecord[]>([])
+const cardAddedInPanel = ref(false)
 const cardByPlayer = computed(() => groupCardsByPlayer(game.value.cards, cardQueue.value))
 // 히스토리에서 "경고 · 퇴장"으로 같이 보여줄 두 번째 경고 카드들
 const secondYellows = computed(() => secondYellowCards([...game.value.cards, ...cardQueue.value]))
@@ -1062,6 +1092,7 @@ const cardHistory = computed(() => {
 function resetCardDraft() {
   cardPlayer.value = null
   cardQueue.value = []
+  cardAddedInPanel.value = false
   cardPlayerEditTarget.value = null
   cardEditSnapshot.value = null
 }
@@ -1077,13 +1108,34 @@ function openCardPanel() {
   cardType.value = 'Y'
   resetCardDraft()
 }
-// 카드 시각은 스테퍼로 미리 정해두는 게 아니라, 실제로 선수를 큐에 담는 이 순간의
-// 흘러가는 시계(seconds)값을 그대로 쓴다 — 패널을 열어둔 시간과 실제 입력 시각이 다를 수 있어서다.
-function queueCard() { if (cardPlayer.value === null) return; cardQueue.value.push({ half: halfCode.value, seconds: seconds.value, player: cardPlayer.value, card: cardType.value }); cardPlayer.value = null }
-function submitCards() { queueCard(); game.value.cards.push(...cardQueue.value); cardOpen.value = false; resetCardDraft() }
+// 카드 시각은 스테퍼로 미리 정해두는 게 아니라, 실제로 목록에 넣는 이 순간의
+// 흘러가는 시계(seconds)값을 그대로 쓴다. 목록 추가는 임시 큐가 아니라 즉시
+// 공유 Draft 이벤트를 만든다. Submit은 패널을 닫는 명령일 뿐이다.
+function queueCard() {
+  if (cardPlayer.value === null) return false
+  const card: CardRecord = {
+    id: crypto.randomUUID(), half: halfCode.value, seconds: seconds.value,
+    player: cardPlayer.value, card: cardType.value,
+  }
+  cardPlayer.value = null
+  cardAddedInPanel.value = true
+  game.value.cards.push(card)
+  // "목록 추가" is the card commit action. It uses the same ordered event
+  // path as substitutions and never waits for Submit or a reactive watcher.
+  void persistCards()
+  return true
+}
+function submitCards() {
+  queueCard()
+  cardOpen.value = false
+  resetCardDraft()
+}
 function cancelCards() { cardOpen.value = false; resetCardDraft() }
 function removeQueuedCard(index: number) { cardQueue.value.splice(index, 1) }
-function removeCard(index: number) { game.value.cards.splice(index, 1) }
+function removeCard(index: number) {
+  game.value.cards.splice(index, 1)
+  void persistCards()
+}
 
 // 카드 히스토리 행의 "수정" 버튼을 누르면 새 창 없이, 이미 떠 있는 선수 목록/시각 스테퍼가
 // 그 카드의 값으로 채워지고 — 거기서 선수를 다시 고르거나 시각을 바꾸면 바로 반영된다.
@@ -1104,7 +1156,12 @@ function openCardPlayerEdit(queue: boolean, index: number) {
     cardEditSnapshot.value = { player: rec.player, seconds: rec.seconds }
   }
 }
-function applyCardPlayerEdit() { cardPlayerEditTarget.value = null; cardEditSnapshot.value = null }
+function applyCardPlayerEdit() {
+  const target = cardPlayerEditTarget.value
+  cardPlayerEditTarget.value = null
+  cardEditSnapshot.value = null
+  if (target && !target.queue) void persistCards()
+}
 function cancelCardPlayerEdit() {
   const target = cardPlayerEditTarget.value
   const snap = cardEditSnapshot.value
@@ -1146,7 +1203,10 @@ function setCardType(t: 'Y' | 'R') {
   const target = cardPlayerEditTarget.value
   if (!target) { cardType.value = t; return }
   const rec = (target.queue ? cardQueue.value : game.value.cards)[target.index]
-  if (rec) rec.card = t
+  if (rec) {
+    rec.card = t
+    if (!target.queue) void persistCards()
+  }
 }
 function selectCardPlayer(playerId: string) {
   const target = cardPlayerEditTarget.value
@@ -1352,10 +1412,13 @@ function insertSubSorted(list: SubRecord[], sub: SubRecord): SubRecord[] {
 }
 
 function persistSubstitutionSetup() {
-  // Assistants contribute event records, while the primary remains owner of
-  // the shared lineup configuration. Their screen receives the new snapshot
-  // through the collaboration poll immediately after this write.
-  if (isPrimary.value) void saveSetup(game.value).catch(() => false)
+  // 교체 이력은 이벤트 ID 단위로 병합한다. 주·부 분석관 모두 입력할 수 있고,
+  // 초기 포메이션/진영 설정과는 별도의 협업 변경이다.
+  void syncSetup(game.value, 'substitutions').catch(() => {
+    // Keep the locally entered event visible after a transient transport
+    // failure; the next successful setup echo clears this guard.
+    return false
+  })
 }
 
 function submitSub() {
@@ -1369,7 +1432,13 @@ function submitSub() {
   const index = editingSubIndex.value
   // 수정할 때는 원래 교체가 있던 half 를 유지한다(지금 보고 있는 half 로 바뀌면 안 된다).
   const recordHalf = index !== null ? (game.value.subs[index]?.half ?? halfCode.value) : halfCode.value
-  const record: SubRecord = { half: recordHalf, seconds: subTotalSeconds.value, outPlayer, inPlayer }
+  const record: SubRecord = {
+    id: index !== null ? (game.value.subs[index]?.id ?? crypto.randomUUID()) : crypto.randomUUID(),
+    half: recordHalf,
+    seconds: subTotalSeconds.value,
+    outPlayer,
+    inPlayer,
+  }
 
   if (index !== null) {
     // 수정 확정. 지금 배치는 index 번째 교체 직전 상태다.
@@ -2313,7 +2382,7 @@ async function finishHalf() {
               <button class="subCancel" @click="cancelCards">Close</button>
               <button v-if="!cardPlayerEditTarget" class="subQueue" :disabled="cardPlayer === null"
                 @click="queueCard">목록추가</button>
-              <button class="subSubmit" :disabled="cardPlayer === null && !cardQueue.length"
+              <button class="subSubmit" :disabled="cardPlayer === null && !cardAddedInPanel"
                 @click="submitCards">Submit</button>
             </div>
           </div>

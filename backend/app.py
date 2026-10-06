@@ -5,6 +5,7 @@ import logging
 import socket
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response
@@ -58,9 +59,23 @@ app.add_middleware(
 
 @app.exception_handler(BackendError)
 async def backend_error_handler(_: Request, exc: BackendError) -> JSONResponse:
+    logger.warning("Backend request rejected: code=%s message=%s", exc.code, exc.message)
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": exc.code, "message": exc.message}},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # Live Draft writes used to surface only an HTTP 422 access-log line. Keep
+    # the API response compact, but log the exact invalid field so a malformed
+    # browser snapshot cannot silently stall both analysts' collaboration.
+    errors = exc.errors()
+    logger.warning("Request validation failed: %s %s errors=%s", request.method, request.url.path, errors)
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": "request_validation_failed", "message": "Request data is invalid", "details": errors}},
     )
 
 
