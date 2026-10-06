@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
-from backend.temporary.build_legacy_import import _half, _integer, _number, _string, _tuple_values, legacy_record_sort_key
+from backend.temporary.build_legacy_import import SOURCE_ROW_INDEX, _half, _integer, _number, _string, _tuple_values, legacy_record_sort_key
 
 
 TEAM_COLUMNS = {
@@ -92,6 +92,7 @@ def _stream_rows(path: Path):
     current_table: str | None = None
     columns: list[str] = []
     values_text = ""
+    row_indexes: dict[str, int] = defaultdict(int)
     with path.open("r", encoding="utf-8-sig", errors="replace") as input_file:
         for line in input_file:
             if current_table is None:
@@ -107,7 +108,10 @@ def _stream_rows(path: Path):
                 continue
             if current_table in SQL_TABLES:
                 for values in _tuple_stream(values_text):
-                    yield current_table, dict(zip(columns, values))
+                    row = dict(zip(columns, values))
+                    row[SOURCE_ROW_INDEX] = row_indexes[current_table]
+                    row_indexes[current_table] += 1
+                    yield current_table, row
             current_table, columns, values_text = None, [], ""
 
 

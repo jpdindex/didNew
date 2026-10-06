@@ -41,6 +41,8 @@ class LegacyImportResult:
 ImportProgress = Callable[[str, int, int, int, int], None]
 CHECKPOINT_DIRECTORY = Path(__file__).resolve().parents[1] / "data" / "legacy-import"
 MAX_MATCH_ATTEMPTS = 3
+IMPORTER_CHECKPOINT_VERSION = "legacy-source-order-v2"
+SOURCE_ROW_INDEX = "__legacy_source_index"
 
 # Competition documents remain in the existing ``leagues`` collection.  The
 # importer only accepts this controlled registry; an arbitrary value in an old
@@ -156,8 +158,13 @@ def _half(value: Any) -> str:
     return {"1": "H1", "H1": "H1", "2": "H2", "H2": "H2", "3": "H3", "H3": "H3"}.get(str(value), "H4")
 
 
-def legacy_record_sort_key(row: dict[str, Any], recording: tuple[str, str] | None) -> tuple[str, str, int, int, str, str]:
-    """Use source values, never SQL INSERT order, for repeatable record sequencing."""
+def _source_row_index(row: dict[str, Any]) -> int:
+    value = row.get(SOURCE_ROW_INDEX)
+    return value if isinstance(value, int) else 0
+
+
+def legacy_record_sort_key(row: dict[str, Any], recording: tuple[str, str] | None) -> tuple[str, str, int, int, int]:
+    """Order raw events by the SQL dump's legacy row order within each clock bucket."""
     gm_id, side = recording or ("", "")
     half = _half(row.get("gr_half"))
     return (
@@ -165,8 +172,7 @@ def legacy_record_sort_key(row: dict[str, Any], recording: tuple[str, str] | Non
         side,
         {"H1": 1, "H2": 2, "H3": 3, "H4": 4}[half],
         _integer(row.get("gr_half_seconds")),
-        _string(row.get("gr_regdt")),
-        _string(row.get("gr_id")),
+        _source_row_index(row),
     )
 
 
@@ -268,7 +274,12 @@ def parse_sql_dump(sql: str) -> dict[str, ParsedTable]:
 def _rows(table: ParsedTable | None) -> list[dict[str, Any]]:
     if not table or not table.columns:
         return []
-    return [dict(zip(table.columns, row)) for row in table.rows]
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(table.rows):
+        item = dict(zip(table.columns, row))
+        item[SOURCE_ROW_INDEX] = index
+        rows.append(item)
+    return rows
 
 
 def _merge_document_values(target: dict[str, Any], update: dict[str, Any]) -> None:
@@ -279,6 +290,16 @@ def _merge_document_values(target: dict[str, Any], update: dict[str, Any]) -> No
             _merge_document_values(existing, value)
         else:
             target[key] = value
+
+
+def _firestore_values_equal(expected: Any, actual: Any) -> bool:
+    if isinstance(expected, datetime) and isinstance(actual, datetime):
+        return expected == actual
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        return expected.keys() == actual.keys() and all(_firestore_values_equal(expected[key], actual[key]) for key in expected)
+    if isinstance(expected, list) and isinstance(actual, list):
+        return len(expected) == len(actual) and all(_firestore_values_equal(left, right) for left, right in zip(expected, actual))
+    return type(expected) is type(actual) and expected == actual
 
 
 class BuildLegacyImport:
@@ -308,7 +329,7 @@ class BuildLegacyImport:
         expected_by_match: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         for path, document in expected_documents.items():
             expected_by_match[path.split("/")[1]][path] = document
-        dump_hash = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+        dump_hash = hashlib.sha256(f"{IMPORTER_CHECKPOINT_VERSION}\n{sql}".encode("utf-8")).hexdigest()
         self._preflight_import(expected_documents)
         completed_gm_ids, global_complete = self._load_checkpoint(dump_hash, set(ordered_gm_ids))
         completed_document_count = sum(len(expected_by_match[gm_id]) for gm_id in completed_gm_ids)
@@ -554,19 +575,28 @@ class BuildLegacyImport:
 
     def _verify_written_match(self, gm_id: str, expected_documents: dict[str, dict[str, Any]]) -> None:
         missing: list[str] = []
+        mismatched: list[str] = []
         paths = sorted(expected_documents)
         for offset in range(0, len(paths), 300):
-            references = [self.db.document(path) for path in paths[offset:offset + 300]]
-            actual_paths = {
-                snapshot.reference.path
+            batch_paths = paths[offset:offset + 300]
+            references = [self.db.document(path) for path in batch_paths]
+            actual_documents = {
+                snapshot.reference.path: snapshot.to_dict() or {}
                 for snapshot in self.db.get_all(references, retry=None, timeout=30)
                 if snapshot.exists
             }
-            missing.extend(path for path in paths[offset:offset + 300] if path not in actual_paths)
-        if missing:
-            preview = ", ".join(missing[:3])
+            for path in batch_paths:
+                actual = actual_documents.get(path)
+                if actual is None:
+                    missing.append(path)
+                elif not _firestore_values_equal(expected_documents[path], actual):
+                    mismatched.append(path)
+        if missing or mismatched:
+            preview_items = [*(f"missing {path}" for path in missing[:3]), *(f"mismatch {path}" for path in mismatched[:3])]
+            preview = ", ".join(preview_items[:6])
             raise BackendError(
-                f"SQL import write verification failed for {gm_id}: {len(missing)} documents missing ({preview})",
+                f"SQL import write verification failed for {gm_id}: "
+                f"{len(missing)} documents missing, {len(mismatched)} documents mismatched ({preview})",
                 status_code=500,
                 code="legacy_import_write_incomplete",
             )
