@@ -42,8 +42,8 @@ const { request } = useBackendApi()
 const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
 const { saveLocal, save: saveDraft, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
 const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards } = useMatchCollaboration()
-const isPrimary = computed(() => game.value.lifecycleControl)
 const requestedRole = route.query.role === 'assistant' || route.query.role === 'manager' ? route.query.role : 'primary'
+const isPrimary = computed(() => game.value.lifecycleControl || game.value.participantRole === 'primary' || requestedRole === 'primary')
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
 // "수정"으로 들어온 경우(이미 끝난 half를 고치러 옴)와 실시간으로 기록 중인 경우를
 // 구분한다. 수정 화면은 시계가 멈춰 있고, 우상단 버튼도 "{half} 종료"가 아니라
@@ -107,6 +107,15 @@ const clock = computed(() => {
   const s = String(seconds.value % 60).padStart(2, '0')
   return `${m}:${s}`
 })
+function commitClockState(status = game.value.halfStatus) {
+  const currentSeconds = Math.max(0, seconds.value)
+  seconds.value = currentSeconds
+  game.value.seconds = currentSeconds
+  if (half.value === '전반') game.value.h1Seconds = currentSeconds
+  else game.value.h2Seconds = currentSeconds
+  game.value.halfStatus = status
+  game.value.clockStartedAt = paused.value ? null : tickStartedAt - tickBaseSeconds * 1000
+}
 // 시계 양옆 화살표로 시간을 수동 보정한다. ◀ 는 1초 줄이고 ▶ 는 1초 늘린다(0초 아래로는 안 내려간다).
 function stepSeconds(delta: number) {
   // 기록 수정 중이면 경기 시계 대신 그 기록의 시간(아래 수정 바의 초)을 움직인다.
@@ -125,10 +134,7 @@ function stepSeconds(delta: number) {
   // 수동 시계 보정도 일시정지와 같은 공유 경기 상태다. 실행 중에는
   // 보정된 초를 기준으로 시작 시각을 다시 만들고, 정지 중에는 초 자체를
   // 확정값으로 보낸다. 그래야 보조 분석관도 앞으로/뒤로 정확히 따른다.
-  game.value.seconds = seconds.value
-  if (half.value === '전반') game.value.h1Seconds = seconds.value
-  else game.value.h2Seconds = seconds.value
-  if (!paused.value) game.value.clockStartedAt = tickStartedAt - tickBaseSeconds * 1000
+  commitClockState()
   void syncState(game.value).catch(() => false)
 }
 
@@ -261,7 +267,14 @@ onMounted(async () => {
       // their own subcollection, so an ACT correction never replaces the list.
       const previousClockStartedAt = game.value.clockStartedAt
       const previousSeconds = game.value.seconds
+      const previousParticipantRole = game.value.participantRole
+      const previousLifecycleControl = game.value.lifecycleControl
       Object.assign(game.value, state)
+      // Participant authority belongs to this browser session, not the shared
+      // Draft state. Late remote snapshots must never disable the primary's
+      // clock and lifecycle controls.
+      game.value.participantRole = previousParticipantRole
+      game.value.lifecycleControl = previousLifecycleControl
       // 시계가 이 화면에서 이미 돌거나 멈춰 있으면 주 분석관 화면이 시계의 주인이다.
       // 일시정지 직전에 보낸 폴링 응답이 늦게 도착해 clockStartedAt 을 되살리면
       // 이후 저장·대기방 이동 때 멈춘 시계가 다시 흐르게 되므로 덮어쓰지 않는다.
@@ -381,8 +394,11 @@ function togglePause() {
   } else {
     startTicking()
   }
-  game.value.seconds = seconds.value
-  game.value.clockStartedAt = paused.value ? null : game.value.clockStartedAt
+  if (!paused.value) {
+    tickBaseSeconds = seconds.value
+    tickStartedAt = Date.now()
+  }
+  commitClockState()
   void syncState(game.value).catch(() => false)
 }
 
@@ -434,10 +450,26 @@ let draftSaveTimer: ReturnType<typeof setTimeout> | undefined
 // 카드는 이 화면에서 실제로 바뀌었을 때만 서버에 보낸다. 기록 저장(흐르는 초로 매초 발생)
 // 때마다 같이 보내면, 카드가 옛 상태인 다른 화면이 매초 그 목록으로 덮어써 카드가 깜빡인다.
 let sharedDraftDirty = false
+const dirtyRecordIds = new Set<string>()
+const clearedRecordPlayerIds = new Set<string>()
 // Card mutations are independent events, but they still need one browser-side
 // order. Without this chain a watcher write and a "목록 추가" write can race,
 // making an otherwise saved card appear only after refresh.
 let cardSaveChain: Promise<unknown> = Promise.resolve()
+
+function markRecordDirty(recordId: string) {
+  dirtyRecordIds.add(recordId)
+}
+
+function markRecordPlayerSet(recordId: string) {
+  dirtyRecordIds.add(recordId)
+  clearedRecordPlayerIds.delete(recordId)
+}
+
+function markRecordPlayerClear(recordId: string) {
+  dirtyRecordIds.add(recordId)
+  clearedRecordPlayerIds.add(recordId)
+}
 
 function persistCards() {
   markLocalCards(game.value)
@@ -452,16 +484,26 @@ function queueDraftSave(shared = true) {
   if (applyingRemoteDraft) return
   sharedDraftDirty = sharedDraftDirty || shared
   // Offline/reload protection is immediate. Only the network write is debounced.
-  markLocalRecords(records.value)
+  const localDirtyRecords = records.value.filter(record => dirtyRecordIds.has(record.id))
+  markLocalRecords(localDirtyRecords)
   saveToStore()
   void saveLocal(game.value).catch(() => false)
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
   draftSaveTimer = setTimeout(() => {
     const sendShared = sharedDraftDirty
     sharedDraftDirty = false
-    const writes: Promise<boolean>[] = []
-    if (sendShared) writes.push(syncStateRecords(game.value, records.value))
-    void Promise.all(writes).catch(() => false)
+    if (!sendShared) return
+    const changedIds = new Set(dirtyRecordIds)
+    const clearedPlayerIds = [...clearedRecordPlayerIds].filter(id => changedIds.has(id))
+    const changedRecords = records.value.filter(record => changedIds.has(record.id))
+    const save = changedRecords.length || clearedPlayerIds.length
+      ? syncStateRecords(game.value, changedRecords, clearedPlayerIds)
+      : syncState(game.value)
+    void save.then((ok) => {
+      if (!ok) return
+      for (const id of changedIds) dirtyRecordIds.delete(id)
+      for (const id of clearedPlayerIds) clearedRecordPlayerIds.delete(id)
+    }).catch(() => false)
   }, 80)
 }
 
@@ -604,6 +646,7 @@ const editedTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const recentlyEditedIds = reactive(new Set<string>())
 function markEdited(rec: { id: string; edited?: boolean }) {
   rec.edited = true
+  markRecordDirty(rec.id)
   recentlyEditedIds.add(rec.id)
   const prev = editedTimers.get(rec.id)
   if (prev) clearTimeout(prev)
@@ -705,7 +748,10 @@ watch(editPlayerEligible, eligible => {
   const path = result.paths.find(p => p.recordIds.includes(editingId.value!))
   const affected = new Set(path?.recordIds ?? [editingId.value])
   for (const rec of records.value) {
-    if (affected.has(rec.id)) rec.playerId = undefined
+    if (affected.has(rec.id)) {
+      rec.playerId = undefined
+      markRecordPlayerClear(rec.id)
+    }
   }
   if (playerPickFor.value === editingId.value) playerPickFor.value = null
 })
@@ -849,6 +895,7 @@ function applyEdit() {
     }
     if (!editPlayerEligible.value) {
       rec.playerId = undefined
+      markRecordPlayerClear(rec.id)
       if (playerPickFor.value === rec.id) playerPickFor.value = null
     }
     // 시간을 바꿨으면 목록도 그 시간 순서에 맞게 다시 정렬한다 — 가장 늦은 시간으로
@@ -859,6 +906,9 @@ function applyEdit() {
     // 오게 된 진행중(res:'O') 액트가 있는지 다시 찾아 그 액트도 이 결과로 마감한다.
     if (!rec.act && (rec.res === 'X' || rec.res === 'B')) {
       closePrecedingOpenAct(records.value, rec.id)
+      const recIndex = records.value.findIndex(record => record.id === rec.id)
+      const previous = recIndex > 0 ? records.value[recIndex - 1] : null
+      if (previous) markRecordDirty(previous.id)
     }
     game.value.records = records.value
     // 시간을 앞으로 당기면 그 줄은 위쪽(화면 밖)으로 옮겨가서 사라진 것처럼 보인다.
@@ -1793,6 +1843,7 @@ function clickAct(actKey: string, isShot: boolean) {
     { posX: pendingPos.value.x, posY: pendingPos.value.y, half: halfCode.value }
   )
   records.value.push(rec)
+  markRecordDirty(rec.id)
   if (isShot) {
     pendingShot.value = {
       id: rec.id,
@@ -1836,11 +1887,14 @@ function clickResult(res: 'X' | 'B') {
   if (!pendingPos.value) return
   const last = records.value[records.value.length - 1]
   if (last && last.res === 'O') {
+    const beforeIds = new Set(records.value.map(record => record.id))
     applyResult(records.value, last.id, res, {
       seconds: draftSeconds.value,
       area: Number(areaFromPos(pendingPos.value)),
       pos: { x: pendingPos.value.x, y: pendingPos.value.y },
     })
+    markRecordDirty(last.id)
+    for (const record of records.value) if (!beforeIds.has(record.id)) markRecordDirty(record.id)
     // 골 존 결과를 기다리던 슛이 여기(킥 패널 X/B)로 먼저 마감되면(골문 도달 전 저지),
     // 그 레코드는 이미 끝난 것이므로 골 존을 또 눌러 덮어쓰지 못하게 참조를 지운다.
     if (pendingShot.value?.id === last.id) pendingShot.value = null
@@ -1852,7 +1906,11 @@ function clickResult(res: 'X' | 'B') {
       posX: pendingPos.value.x, posY: pendingPos.value.y, half: halfCode.value,
     })
     records.value.push(rec)
+    markRecordDirty(rec.id)
     closePrecedingOpenAct(records.value, rec.id)
+    const recIndex = records.value.findIndex(record => record.id === rec.id)
+    const previous = recIndex > 0 ? records.value[recIndex - 1] : null
+    if (previous) markRecordDirty(previous.id)
   }
   pendingPos.value = null
   pendingCell.value = null
@@ -1895,6 +1953,7 @@ function recordGoalResult(zone: Exclude<ResCode, 'O' | ''>, point?: { x: number;
     shootPos: point,
     shootDspRange: point ? isWithinGoalOneMeter(point) : undefined,
   })
+  markRecordDirty(pendingShot.value.id)
   pendingShot.value = null
 }
 
@@ -2009,6 +2068,7 @@ function submitPlayer() {
   const rec = records.value.find(r => r.id === playerPickFor.value)
   if (rec) {
     rec.playerId = pickedPlayerId.value
+    markRecordPlayerSet(rec.id)
     game.value.records = records.value
   }
   cancelPlayerPick()
@@ -2041,6 +2101,7 @@ function resetPlayerPick() {
   const rec = records.value.find(r => r.id === playerPickFor.value)
   if (rec?.playerId) {
     rec.playerId = undefined
+    markRecordPlayerClear(rec.id)
     game.value.records = records.value
   }
   cancelPlayerPick()
@@ -2099,17 +2160,21 @@ async function finishHalf() {
 
   halfFinishBusy.value = true
   if (timer) clearInterval(timer)
+  timer = undefined
   // 아직 나가지 않은 자동 저장은 진행 중 상태(H1/H2)를 담고 있으므로 취소한다.
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
   draftSaveTimer = undefined
+  paused.value = true
+  commitClockState(doneStatus)
   saveToStore()
-  game.value.clockStartedAt = null
-  game.value.halfStatus = doneStatus
 
   try {
-    // 전/후반 종료 시점에는 해당 상태의 Draft가 Firestore에 저장된 것이 확인된 뒤에만
-    // 대기방으로 이동한다. RAW 승격은 여기서 하지 않는다.
-    if (!await saveDraft(game.value)) {
+    // Half completion is one shared mutation: lifecycle + the locally pending
+    // ACT records commit together. The old checkpoint helper bypassed the
+    // live state channel, so assistants could remain in the input screen even
+    // though the primary had already left it.
+    await saveLocal(game.value)
+    if (!await syncStateRecords(game.value, records.value)) {
       throw new Error(`${half.value} Draft를 Firestore에 저장하지 못했습니다. 네트워크 연결을 확인하고 다시 종료해 주세요.`)
     }
     // 종료 전에 대기열에 있던 H1/H2 상태 쓰기가 늦게 도착해도 서버(save_input_draft)가
@@ -2435,8 +2500,8 @@ async function finishHalf() {
               <div class="subHistHead">
                 <span class="hHalf">Half</span>
                 <span class="hTime">Time</span>
-                <span class="hP">Out</span>
                 <span class="hP">In</span>
+                <span class="hP">Out</span>
                 <span class="hAct"></span>
               </div>
               <div v-if="!game.subs.length" class="subHistEmpty">교체 기록이 없습니다.</div>
@@ -2444,10 +2509,10 @@ async function finishHalf() {
                 :class="{ editing: editingSubIndex === i }" @click="onSubHistRowClick(i)">
                 <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
                 <span class="hTime">{{ fmtTime(s.seconds) }}</span>
-                <span class="hP outP histPlayer"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
-                  findPlayer(s.outPlayer)!.no }}</b>{{ findPlayer(s.outPlayer)?.name ?? '-' }}</span>
                 <span class="hP inP histPlayer"><b v-if="findPlayer(s.inPlayer)" class="histNo">{{
                   findPlayer(s.inPlayer)!.no }}</b>{{ findPlayer(s.inPlayer)?.name ?? '-' }}</span>
+                <span class="hP outP histPlayer"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
+                  findPlayer(s.outPlayer)!.no }}</b>{{ findPlayer(s.outPlayer)?.name ?? '-' }}</span>
                 <span class="hAct">
                   <button v-if="editingSubIndex === i" class="subUndo subEditCancel"
                     @click.stop="cancelEditSub">취소</button>

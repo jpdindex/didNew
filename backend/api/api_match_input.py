@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections import defaultdict
 from contextlib import contextmanager
 from threading import Lock
@@ -15,6 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData, NotFoundError, RequiredUser, ensure_firebase_app, get_settings, utc_now
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
 from backend.system.system_schema import Half, InputMode, Side
+
+
+logger = logging.getLogger(__name__)
 
 
 class InputLineup(BaseModel):
@@ -134,6 +138,7 @@ class DraftWriteRequest(BaseModel):
     syncScope: Literal["checkpoint", "state", "records", "state_records", "cards"] = "checkpoint"
     deletedRecordIds: list[str] = Field(default_factory=list)
     deletedCardIds: list[str] = Field(default_factory=list)
+    clearedRecordPlayerIds: list[str] = Field(default_factory=list)
 
 
 class InputSetupWriteRequest(BaseModel):
@@ -301,6 +306,9 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
         await websocket.send_json({"type": "ready", "gmId": gm_id, "side": side})
         while True:
             message = json.loads(await websocket.receive_text())
+            if isinstance(message, dict) and message.get("type") == "heartbeat":
+                await draft_sockets.send(gm_id, side, websocket, {"type": "pong"})
+                continue
             if not isinstance(message, dict) or message.get("type") != "command":
                 continue
             command_id = str(message.get("commandId") or "")
@@ -340,16 +348,17 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
                     await draft_sockets.send(gm_id, side, websocket, {"type": "error", "commandId": command_id, "message": "unknown mutation"})
             except Exception as exc:
                 await draft_sockets.send(gm_id, side, websocket, {"type": "error", "commandId": command_id, "message": str(exc)})
-    except (WebSocketDisconnect, asyncio.TimeoutError, ValueError, RuntimeError):
+    except WebSocketDisconnect as exc:
+        logger.info("Draft live socket disconnected: %s/%s code=%s", gm_id, side, exc.code)
+    except (asyncio.TimeoutError, ValueError, RuntimeError) as exc:
         # Refresh, route changes and a browser retry can close the transport
         # between accept/authentication/receive. That is a normal disconnect,
         # not an application error and must never trigger a second close.
-        pass
+        logger.warning("Draft live socket stopped: %s/%s (%s)", gm_id, side, exc)
     except Exception:
-        # The peer may already have sent websocket.disconnect. Returning lets
-        # Starlette complete the close handshake safely; calling close() here
-        # caused a second-close RuntimeError and delayed the next connection.
-        pass
+        # Do not swallow an unexpected transport failure. Its traceback is the
+        # only reliable way to distinguish a client close from a server error.
+        logger.exception("Draft live socket crashed: %s/%s", gm_id, side)
     finally:
         draft_sockets.disconnect(gm_id, side, websocket)
 
@@ -359,6 +368,29 @@ def _publish_draft_response(response: DraftResponse, command_id: str | None = No
     if command_id:
         message["commandId"] = command_id
     draft_sockets.publish(response.gmId, response.side, message)
+
+
+def _publish_cards_response(response: DraftResponse) -> None:
+    """Publish only card state after a card-only HTTP mutation.
+
+    Card mutations intentionally omit the records subcollection from their
+    response to keep the write small. Publishing that response as a complete
+    Draft makes subscribers interpret the omitted records list as an empty
+    record table. Cards have their own merge authority, so emit only that
+    authority's event.
+    """
+    draft_sockets.publish(response.gmId, response.side, {
+        "type": "cards", "gmId": response.gmId, "side": response.side,
+        "cards": response.payload.cards, "revision": response.revision,
+    })
+
+
+def _publish_state_response(response: DraftResponse) -> None:
+    """Publish state-only mutations without replacing the records stream."""
+    draft_sockets.publish(response.gmId, response.side, {
+        "type": "state", "gmId": response.gmId, "side": response.side,
+        "sharedState": response.sharedState, "revision": response.revision,
+    })
 
 
 def _display_name(document: dict, fallback: str) -> str:
@@ -798,7 +830,7 @@ def _save_draft_mutation(gm_id: str, side: Side, request: DraftWriteRequest, use
         document = data.save_input_draft(
             gm_id, side, payload=request.payload.model_dump(mode="python"), client_state=request.clientState,
             user_id=user.uid, sync_scope=request.syncScope, deleted_record_ids=request.deletedRecordIds,
-            deleted_card_ids=request.deletedCardIds,
+            deleted_card_ids=request.deletedCardIds, cleared_record_player_ids=request.clearedRecordPlayerIds,
             include_events=request.syncScope not in {"state", "cards"},
         )
         input_setup = None if request.syncScope in {"state", "cards"} else data.get_input_setup(gm_id).get(side)
@@ -824,7 +856,15 @@ def _save_setup_mutation(gm_id: str, side: Side, request: InputSetupWriteRequest
 @router.put("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse, include_in_schema=False)
 def save_draft(gm_id: str, side: Side, request: DraftWriteRequest, user: RequiredUser = None) -> DraftResponse:
     response = _save_draft_mutation(gm_id, side, request, user)
-    _publish_draft_response(response)
+    # A card-only mutation response does not include the Draft's record
+    # subcollection. Never broadcast it as a complete Draft or connected
+    # analysts will replace their ACT list with that intentionally empty list.
+    if request.syncScope == "cards":
+        _publish_cards_response(response)
+    elif request.syncScope == "state":
+        _publish_state_response(response)
+    else:
+        _publish_draft_response(response)
     return response
 
 

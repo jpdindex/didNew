@@ -1,4 +1,5 @@
-from backend.api.api_match_input import DraftSocketHub, DraftWriteRequest, InputPreviewRequest, MatchInputCommit, calculate_input_preview, router
+from backend.api import api_match_input
+from backend.api.api_match_input import DraftResponse, DraftSocketHub, DraftWriteRequest, InputPreviewRequest, MatchInputCommit, calculate_input_preview, router
 from backend.app import app
 from pydantic_core import PydanticUndefined
 
@@ -37,11 +38,53 @@ def test_draft_write_contract_supports_backend_record_merge() -> None:
         "halves": {"H1": {"seconds": 12}, "H2": {"seconds": 0}}, "lineup": [], "records": [], "cards": [],
     }
     request = DraftWriteRequest.model_validate({
-        "payload": payload, "clientState": {"seconds": 12}, "syncScope": "state_records", "deletedRecordIds": ["old-record"],
+        "payload": payload, "clientState": {"seconds": 12}, "syncScope": "state_records",
+        "deletedRecordIds": ["old-record"], "clearedRecordPlayerIds": ["r1"],
     })
 
     assert request.syncScope == "state_records"
     assert request.deletedRecordIds == ["old-record"]
+    assert request.clearedRecordPlayerIds == ["r1"]
+
+
+def test_card_mutation_broadcasts_only_cards_not_an_incomplete_draft(monkeypatch) -> None:
+    payload = {
+        "gmId": "sample-match", "side": "H", "inputMode": "분석", "fieldSide": "left",
+        "formationKey": "4-3-3", "homeScore": 0, "awayScore": 0, "status": "H1",
+        "halves": {"H1": {"seconds": 12}, "H2": {"seconds": 0}}, "lineup": [], "records": [],
+        "cards": [{"id": "card-1", "playerId": "player-1", "half": "H1", "halfSeconds": 12, "card": "Y"}],
+    }
+    request = DraftWriteRequest.model_validate({"payload": payload, "clientState": {}, "syncScope": "cards"})
+    response = DraftResponse.model_validate({"status": "ok", "gmId": "sample-match", "side": "H", "payload": payload, "clientState": {}})
+    published: list[str] = []
+
+    monkeypatch.setattr(api_match_input, "_save_draft_mutation", lambda *_: response)
+    monkeypatch.setattr(api_match_input, "_publish_cards_response", lambda _: published.append("cards"))
+    monkeypatch.setattr(api_match_input, "_publish_draft_response", lambda _: published.append("draft"))
+
+    assert api_match_input.save_draft("sample-match", "H", request) is response
+    assert published == ["cards"]
+
+
+def test_state_mutation_broadcasts_only_state_not_an_incomplete_draft(monkeypatch) -> None:
+    payload = {
+        "gmId": "sample-match", "side": "H", "inputMode": "분석", "fieldSide": "left",
+        "formationKey": "4-3-3", "homeScore": 0, "awayScore": 0, "status": "H1",
+        "halves": {"H1": {"seconds": 12}, "H2": {"seconds": 0}}, "lineup": [], "records": [], "cards": [],
+    }
+    request = DraftWriteRequest.model_validate({"payload": payload, "clientState": {"seconds": 12}, "syncScope": "state"})
+    response = DraftResponse.model_validate({
+        "status": "ok", "gmId": "sample-match", "side": "H", "payload": payload,
+        "clientState": {"seconds": 12}, "sharedState": {"seconds": 12},
+    })
+    published: list[str] = []
+
+    monkeypatch.setattr(api_match_input, "_save_draft_mutation", lambda *_: response)
+    monkeypatch.setattr(api_match_input, "_publish_state_response", lambda _: published.append("state"))
+    monkeypatch.setattr(api_match_input, "_publish_draft_response", lambda _: published.append("draft"))
+
+    assert api_match_input.save_draft("sample-match", "H", request) is response
+    assert published == ["state"]
 
 
 def test_input_preview_returns_kpi_and_per_record_flags() -> None:

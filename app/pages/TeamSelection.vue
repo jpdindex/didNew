@@ -328,8 +328,13 @@ const benchIds = BENCH_IDS
 const menuOpen = ref(false)
 const activeSlot = ref<string | null>(null)
 const matchInfoEditMode = ref(false)
-const isLiveLobby = computed(() => game.value.halfStatus === 'H1' || game.value.halfStatus === 'H2')
-const matchInfoEditable = computed(() => !isLiveLobby.value || matchInfoEditMode.value)
+const matchInfoLockedByStatus = computed(() => game.value.halfStatus !== 'ready')
+const canToggleMatchInfoEdit = computed(() =>
+  game.value.lifecycleControl && game.value.halfStatus !== 'ready'
+)
+const matchInfoEditable = computed(() =>
+  game.value.lifecycleControl && (!matchInfoLockedByStatus.value || matchInfoEditMode.value)
+)
 let formationSaveTimer: ReturnType<typeof setTimeout> | undefined
 let lobbyClockTimer: ReturnType<typeof setInterval> | undefined
 
@@ -1117,6 +1122,7 @@ const grassPanelRef = ref<HTMLElement | null>(null)
 const playerPanelRef = ref<HTMLElement | null>(null)
 const grassBg = computed(() => grassBackground(game.value.grassPattern, game.value.grassLines))
 function openGrass() {
+  if (!matchInfoEditable.value) return
   grassOpen.value = !grassOpen.value
 }
 // 잔디 팝업/선수교체 패널 바깥을 누르면 각각 닫는다. 선수교체 토글 버튼도 toolPanel
@@ -1201,6 +1207,7 @@ watch(() => pendingSubs.value.length, (next, prev) => {
 })
 
 function openSub() {
+  if (!matchInfoEditable.value) return
   if (subOpen.value) { closeSub(); return }
   // 다른 팝업/슬롯 선택 상태를 닫고 교체 패널을 최상위 입력 상태로 연다.
   grassOpen.value = false
@@ -1432,7 +1439,10 @@ function undoSub(index: number) {
                   }}</div>
                 </div>
               </div>
-              <div class="pitch">
+              <div class="pitch" :class="{ locked: !matchInfoEditable }">
+                <div v-if="!matchInfoEditable" class="lockBadge">
+                  {{ game.halfStatus === 'final' ? '최종 갱신 완료' : '경기 정보 변경 잠금' }}
+                </div>
                 <div class="halfway" />
                 <div class="centerCircle" />
                 <div class="penaltyArc" />
@@ -1459,7 +1469,7 @@ function undoSub(index: number) {
               <div v-if="game.formationKey" class="benchHeader">
                 <span>후보</span><b>{{ benchFilledCount }} / {{ BENCH_COUNT }}</b>
               </div>
-              <div v-if="game.formationKey" class="bench" :class="{ dragging: benchDragging }"
+              <div v-if="game.formationKey" class="bench" :class="{ dragging: benchDragging, locked: !matchInfoEditable }"
                 @wheel.prevent="scrollBenchHorizontally" @pointerdown="startBenchDrag" @pointermove="moveBenchDrag"
                 @pointerup="endBenchDrag" @pointercancel="endBenchDrag" @click.capture="suppressBenchClickAfterDrag">
                 <button v-for="id in benchIds" :key="id" class="slot benchSlot"
@@ -1534,8 +1544,8 @@ function undoSub(index: number) {
                   <div class="subHistHead">
                     <span class="hHalf">Half</span>
                     <span class="hTime">Time</span>
-                    <span class="hP">Out</span>
                     <span class="hP">In</span>
+                    <span class="hP">Out</span>
                     <span class="hAct"></span>
                   </div>
                   <div ref="subHistBody" class="subHistBody">
@@ -1543,19 +1553,19 @@ function undoSub(index: number) {
                     <div v-for="(s, i) in game.subs" :key="`saved${i}`" class="subHistRow">
                       <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
                       <span class="hTime">{{ fmtTime(s.seconds) }}</span>
-                      <span class="hP outP"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
-                        findPlayer(s.outPlayer)!.no }}</b>{{ findPlayer(s.outPlayer)?.name ?? '-' }}</span>
                       <span class="hP inP"><b v-if="findPlayer(s.inPlayer)" class="histNo">{{
                         findPlayer(s.inPlayer)!.no }}</b>{{ findPlayer(s.inPlayer)?.name ?? '-' }}</span>
+                      <span class="hP outP"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
+                        findPlayer(s.outPlayer)!.no }}</b>{{ findPlayer(s.outPlayer)?.name ?? '-' }}</span>
                       <span class="hAct"><button class="subUndo" @click="undoSub(i)">취소</button></span>
                     </div>
                     <div v-for="(s, i) in pendingSubs" :key="`pending${i}`" class="subHistRow pending">
                       <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
                       <span class="hTime">{{ fmtTime(s.seconds) }}</span>
-                      <span class="hP outP"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
-                        findPlayer(s.outPlayer)!.no }}</b>{{ findPlayer(s.outPlayer)?.name ?? '-' }}</span>
                       <span class="hP inP"><b v-if="findPlayer(s.inPlayer)" class="histNo">{{
                         findPlayer(s.inPlayer)!.no }}</b>{{ findPlayer(s.inPlayer)?.name ?? '-' }}</span>
+                      <span class="hP outP"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
+                        findPlayer(s.outPlayer)!.no }}</b>{{ findPlayer(s.outPlayer)?.name ?? '-' }}</span>
                       <span class="hAct"><button class="subUndo" @click="cancelPendingSub(i)">취소</button></span>
                     </div>
                   </div>
@@ -1587,11 +1597,11 @@ function undoSub(index: number) {
             </section>
             <section class="toolPanel" ref="grassPanelRef">
               <div class="toolGrid">
-                <button class="toolBtn" :class="{ on: grassOpen }" @click="openGrass">
+                <button class="toolBtn" :class="{ on: grassOpen }" :disabled="!matchInfoEditable" @click="openGrass">
                   <span class="toolIcon grassIcon" :style="{ background: grassBg }" />
                   <span class="toolLabel">잔디선택</span>
                 </button>
-                <button type="button" class="toolBtn" :class="{ on: subOpen }" @click.stop="openSub" @pointerup.stop>
+                <button type="button" class="toolBtn" :class="{ on: subOpen }" :disabled="!matchInfoEditable" @click.stop="openSub" @pointerup.stop>
                   <span class="toolIcon subIcon">⇄</span>
                   <span class="toolLabel">선수교체</span>
                 </button>
@@ -1633,17 +1643,23 @@ function undoSub(index: number) {
               <template v-else-if="game.halfStatus === 'H1_done'">
                 <p>전반 기록을 확인하세요<br><b>기록을 수정하거나 후반전을 시작할 수 있습니다.</b></p>
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">BASIC 주 분석관 기록은 제출 후 관리자 승인 전까지 Draft에만 저장됩니다.</p>
+                <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
                 <div class="halfActions">
-                  <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
-                  <button v-if="game.lifecycleControl" class="startBtn" :disabled="lifecycleBusy" @click="startSecondHalf">후반전 시작</button>
+                  <button v-if="canToggleMatchInfoEdit" class="editBtn" :disabled="lifecycleBusy"
+                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? '변경 완료' : '경기 정보 변경' }}</button>
+                  <button class="editBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="editHalf">수정</button>
+                  <button v-if="game.lifecycleControl" class="startBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="startSecondHalf">후반전 시작</button>
                 </div>
               </template>
               <template v-else-if="game.halfStatus === 'H2_done'">
                 <p>후반 기록을 확인하세요<br><b>{{ game.lifecycleControl ? '기록을 수정하거나 처리할 수 있습니다.' : '전반 또는 후반 기록을 수정할 수 있습니다.' }}</b></p>
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">제출하면 관리자 승인 대기 Draft로 유지됩니다.</p>
+                <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
                 <div class="halfActions">
-                  <button class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
-                  <button v-if="game.lifecycleControl" class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">{{ game.recorderLevel ===
+                  <button v-if="canToggleMatchInfoEdit" class="editBtn" :disabled="lifecycleBusy"
+                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? '변경 완료' : '경기 정보 변경' }}</button>
+                  <button class="editBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="editHalf">수정</button>
+                  <button v-if="game.lifecycleControl" class="startBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="finishMatch">{{ game.recorderLevel ===
                     'basic' ? '제출' : '최종 갱신' }}</button>
                 </div>
               </template>
@@ -1660,7 +1676,12 @@ function undoSub(index: number) {
               <template v-else>
                 <p>{{ !game.lifecycleControl ? '분석 협업 종료' : (game.recorderLevel === 'basic' ? '관리자 승인 대기' : statusLabel) }}</p>
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">관리자 페이지에서 RAW 승격 전까지 Draft만 유지됩니다.</p>
-                <button class="editBtn" :disabled="lifecycleBusy" @click="editFinal">{{ !game.lifecycleControl ? '전반/후반 수정' : '수정' }}</button>
+                <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
+                <div class="halfActions">
+                  <button v-if="canToggleMatchInfoEdit" class="editBtn" :disabled="lifecycleBusy"
+                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? '변경 완료' : '경기 정보 변경' }}</button>
+                  <button class="editBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="editFinal">{{ !game.lifecycleControl ? '전반/후반 수정' : '수정' }}</button>
+                </div>
               </template>
               <p v-if="lifecycleError" class="lifecycleError">{{ lifecycleError }}</p>
               <small v-if="matchId">matchId: {{ matchId }}</small>
@@ -2254,6 +2275,26 @@ button {
   border: 1px solid rgba(255, 255, 255, .1)
 }
 
+.pitch.locked {
+  filter: saturate(.45) brightness(.72)
+}
+
+.lockBadge {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 4;
+  padding: 5px 10px;
+  border: 1px solid rgba(240, 180, 41, .5);
+  border-radius: 5px;
+  background: rgba(15, 17, 21, .86);
+  color: #f0b429;
+  font-size: 11px;
+  font-weight: 900;
+  pointer-events: none
+}
+
 .halfway {
   position: absolute;
   left: 0;
@@ -2426,8 +2467,13 @@ button {
   opacity: .78
 }
 
+.bench.locked {
+  opacity: .55
+}
+
 .player:disabled {
-  cursor: not-allowed
+  cursor: not-allowed;
+  opacity: .42
 }
 
 .miniBox.locked {
@@ -2592,6 +2638,12 @@ button {
 .toolBtn:hover {
   border-color: #f0b429;
   background: rgba(240, 180, 41, .12)
+}
+
+.toolBtn:disabled {
+  cursor: not-allowed;
+  opacity: .42;
+  filter: grayscale(.85)
 }
 
 .toolBtn:active {

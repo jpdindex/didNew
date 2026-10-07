@@ -1343,6 +1343,7 @@ class JpdDidData:
         sync_scope: Literal["checkpoint", "state", "records", "state_records", "cards"] = "checkpoint",
         deleted_record_ids: list[str] | None = None,
         deleted_card_ids: list[str] | None = None,
+        cleared_record_player_ids: list[str] | None = None,
         include_events: bool = True,
     ) -> dict[str, Any]:
         reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
@@ -1355,7 +1356,12 @@ class JpdDidData:
         # Only the primary analyst can advance shared match lifecycle/clock.
         # An assistant's record sync must never pause, restart or reopen a half.
         primary_uid = str(previous.get("primaryUid") or "")
-        can_write_live_state = not primary_uid or primary_uid == user_id
+        participants = previous.get("participants") if isinstance(previous.get("participants"), dict) else {}
+        participant = participants.get(user_id) if isinstance(participants.get(user_id), dict) else {}
+        is_participant_primary = participant.get("role") == "primary"
+        can_write_live_state = not primary_uid or primary_uid == user_id or is_participant_primary
+        if is_participant_primary and primary_uid != user_id:
+            primary_uid = user_id
         if sync_scope in {"state", "state_records"} and can_write_live_state:
             # A live state write queued before "half end" can reach the server after
             # the H1_done/H2_done checkpoint. It must never reopen a finished half.
@@ -1408,14 +1414,19 @@ class JpdDidData:
         records_reference = reference.collection("records")
         records_batch = None
         record_mutation_count = 0
+        cleared_player_ids = {str(value) for value in cleared_record_player_ids or [] if value}
         if sync_scope in {"checkpoint", "records", "state_records"}:
             records_batch = self.db.batch()
             for index, record in enumerate(payload.get("records", [])):
                 if not isinstance(record, dict):
                     continue
                 record_id = str(record.get("id") or uuid4())
+                record_update = {
+                    key: value for key, value in record.items()
+                    if value is not None or (key == "playerId" and record_id in cleared_player_ids)
+                }
                 records_batch.set(records_reference.document(record_id), {
-                    **record, "id": record_id, "half": record.get("half") or "H1",
+                    **record_update, "id": record_id, "half": record.get("half") or "H1",
                     "deleted": False, "updatedAt": now, "updatedBy": user_id,
                 }, merge=True)
                 record_mutation_count += 1
@@ -1458,9 +1469,17 @@ class JpdDidData:
         # Persist recovery-safe clock data without allowing a record-only sync
         # to replace the rest of another analyst's client snapshot.
         if sync_scope in {"state", "state_records"} and can_write_live_state:
+            payload_halves = payload.get("halves", {}) if isinstance(payload.get("halves"), dict) else {}
+            h1_payload = payload_halves.get("H1", {}) if isinstance(payload_halves.get("H1"), dict) else {}
+            h2_payload = payload_halves.get("H2", {}) if isinstance(payload_halves.get("H2"), dict) else {}
             next_client_state = {
                 **previous_client,
                 **{key: client_state[key] for key in ("seconds", "h1Seconds", "h2Seconds", "clockStartedAt", "halfStatus", "homeScore", "awayScore") if key in client_state},
+                "halfStatus": client_state.get("halfStatus", payload.get("status", previous_client.get("halfStatus", "ready"))),
+                "seconds": client_state.get("seconds", previous_client.get("seconds", 0)),
+                "h1Seconds": client_state.get("h1Seconds", h1_payload.get("seconds", previous_client.get("h1Seconds", 0))),
+                "h2Seconds": client_state.get("h2Seconds", h2_payload.get("seconds", previous_client.get("h2Seconds", 0))),
+                "clockStartedAt": client_state.get("clockStartedAt"),
             }
         elif sync_scope in {"records", "cards"}:
             next_client_state = previous_client or client_state
@@ -1480,8 +1499,8 @@ class JpdDidData:
             "createdAt": previous.get("createdAt", now) if current.exists else now,
             # Collaboration metadata is deliberately retained when lifecycle saves
             # replace the validated payload snapshot.
-            "participants": previous.get("participants", {}),
-            "primaryUid": previous.get("primaryUid"),
+            "participants": participants,
+            "primaryUid": primary_uid or previous.get("primaryUid"),
             "collaboration": previous.get("collaboration", {}),
             "sharedState": shared_state,
         }
@@ -1545,6 +1564,26 @@ class JpdDidData:
         # this UID instead of treating its own re-entry as a conflict.
         if existing_role in {"primary", "assistant", "manager"}:
             role = existing_role
+            # Older local sessions could retain a legacy primaryUid while the
+            # participant record had already moved to the authenticated UID.
+            # That made the UI correctly display "primary" but disabled every
+            # lifecycle control because server ownership still pointed at the
+            # orphaned legacy participant. Repair only that unambiguous legacy
+            # case; a real different primary remains a conflict.
+            if role == "primary" and primary_uid != user_id:
+                legacy_primary = participants.get(primary_uid) if isinstance(participants.get(primary_uid), dict) else {}
+                if (
+                    primary_uid == "local-did-input"
+                    and display_name
+                    and legacy_primary.get("name") == display_name
+                ):
+                    participants.pop(primary_uid, None)
+                    current["participants"] = participants
+                    primary_uid = user_id
+                elif legacy_primary.get("role") != "primary":
+                    primary_uid = user_id
+                else:
+                    raise BackendError("Draft primary ownership is inconsistent", status_code=409, code="primary_owner_conflict")
         else:
             shared = current.get("sharedState") if isinstance(current.get("sharedState"), dict) else {}
             payload = current.get("payload") if isinstance(current.get("payload"), dict) else {}
