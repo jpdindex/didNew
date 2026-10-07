@@ -35,8 +35,13 @@ const dashboardKpis = ref<{ H: Record<'all' | 'H1' | 'H2', DashboardKpi>; A: Rec
   H: { all: emptyDashboardKpi(), H1: emptyDashboardKpi(), H2: emptyDashboardKpi() },
   A: { all: emptyDashboardKpi(), H1: emptyDashboardKpi(), H2: emptyDashboardKpi() },
 })
+const dashboardKpiLoaded = reactive<Record<'all' | 'H1' | 'H2', boolean>>({
+  all: false,
+  H1: false,
+  H2: false,
+})
 let dashboardKpiTimer: ReturnType<typeof setInterval> | undefined
-let dashboardKpiLoading = false
+const dashboardKpiLoading = new Set<'all' | 'H1' | 'H2'>()
 let appliedSetupFingerprint = ''
 let appliedSetupRevision = -1
 let pendingSetupFingerprint = ''
@@ -151,24 +156,40 @@ function applyInputSetup(setup: InputSetup | null | undefined) {
 }
 
 function startLobbyCollaboration() {
+  const targetMatchId = game.value.matchId
+  const targetTeam = game.value.team
+  const targetRole = game.value.participantRole
+  const targetLifecycleControl = game.value.lifecycleControl
+  const isCurrentLobbySession = () => game.value.matchId === targetMatchId && game.value.team === targetTeam
+
   return startCollaboration(game.value, {
     applyState: (state) => {
+      if (!isCurrentLobbySession()) return
       // Draft shared state contains only lifecycle, score and timer fields.
       // Keep route-selected team/role and the loaded squads local to this lobby.
       Object.assign(game.value, state)
+      game.value.matchId = targetMatchId
+      game.value.team = targetTeam
+      game.value.participantRole = targetRole
+      game.value.lifecycleControl = targetLifecycleControl
     },
     applyRecords: (records) => {
+      if (!isCurrentLobbySession()) return
       game.value.records = records
       // The lobby has a server KPI view. Refresh it after a peer event instead
       // of waiting for its recovery timer.
       void loadDashboardKpis(kpiHalf.value).catch(() => false)
     },
-    applyCards: (cards) => { game.value.cards = cards },
+    applyCards: (cards) => {
+      if (!isCurrentLobbySession()) return
+      game.value.cards = cards
+    },
     applySetup: (setup) => {
+      if (!isCurrentLobbySession()) return
       applyInputSetup(setup)
       applySetupFieldSides({
-        H: game.value.team === 'home' ? setup : null,
-        A: game.value.team === 'away' ? setup : null,
+        H: targetTeam === 'home' ? setup : null,
+        A: targetTeam === 'away' ? setup : null,
       })
     },
   })
@@ -218,6 +239,7 @@ function applyBootstrap(payload: InputBootstrap) {
   game.value.matchSnapshot = payload.matchSnapshot
   inputStatus.value = payload.inputStatus
   dashboardKpis.value = payload.dashboardKpis
+  dashboardKpiLoaded.all = true
 
   const selectedTeam = game.value.team
   const selectedStatus = selectedTeam === 'home' ? payload.inputStatus.H : payload.inputStatus.A
@@ -254,21 +276,22 @@ async function loadSquads() {
 }
 
 async function loadDashboardKpis(half: 'all' | 'H1' | 'H2' = kpiHalf.value) {
-  if (!matchId.value || dashboardKpiLoading) return
-  dashboardKpiLoading = true
+  if (!matchId.value || dashboardKpiLoading.has(half)) return
+  dashboardKpiLoading.add(half)
   try {
   const payload = await request<{ kpis: { H: DashboardKpi; A: DashboardKpi }; inputSetup?: { H: InputSetup | null; A: InputSetup | null } }>(
     `/api/v1/match-input/matches/${encodeURIComponent(matchId.value)}/dashboard-kpis?half=${half}`,
   )
   dashboardKpis.value.H[half] = payload.kpis.H
   dashboardKpis.value.A[half] = payload.kpis.A
+  dashboardKpiLoaded[half] = true
   const setups = payload.inputSetup ?? { H: null, A: null }
   applySetupFieldSides(setups)
   const setup = game.value.team === 'away' ? setups.A : setups.H
   if (setup) applyInputSetup(setup)
   if (game.value.halfStatus === 'ready') applyOpponentFieldSideDefault(game.value.team)
   } finally {
-    dashboardKpiLoading = false
+    dashboardKpiLoading.delete(half)
   }
 }
 
@@ -440,8 +463,8 @@ function fillTestData() {
   game.value.side = Math.random() < 0.5 ? 'left' : 'right'
 }
 
-// H1/H2 종료 뒤에도 반대 팀은 별도의 입력 세션으로 계속 시작할 수 있어야 한다.
-// pickTeam()이 현재 팀 상태를 먼저 Draft/IndexedDB에 보존하므로 전환 자체는 항상 허용한다.
+// 입력 팀은 경기 선택 화면에서 역할 검증을 거쳐 확정한다. 대기실에서는 상대 팀 KPI만
+// 참고하고, 팀 카드 클릭으로 다른 팀 입력 세션으로 전환하지 않는다.
 const canSwitchInputTeam = computed(() => true)
 
 function resetForInputTeam(team: 'home' | 'away') {
@@ -483,9 +506,11 @@ function resetForInputTeam(team: 'home' | 'away') {
 }
 
 async function pickTeam(team: 'home' | 'away') {
+  if (game.value.team !== team) return
   if (!canSwitchInputTeam.value || game.value.team === team || lifecycleBusy.value) return
   lifecycleBusy.value = true
   lifecycleError.value = ''
+  stopCollaboration()
   const squads = game.value.squads
   const snapshot = game.value.matchSnapshot
   const previousTeam = game.value.team
@@ -521,8 +546,10 @@ async function pickTeam(team: 'home' | 'away') {
     subOpen.value = false
     menuOpen.value = false
     activeSlot.value = game.value.halfStatus === 'ready' && game.value.formationKey ? firstEmptyLineupSlot() : null
+    void startLobbyCollaboration().catch(() => false)
   } catch (error) {
     lifecycleError.value = error instanceof Error ? error.message : '입력 팀 상태를 전환하지 못했습니다.'
+    void startLobbyCollaboration().catch(() => false)
   } finally {
     lifecycleBusy.value = false
   }
@@ -1036,9 +1063,14 @@ const kpiRecords = computed(() => {
 const currentPreview = computed(() => previewInput(
   kpiRecords.value,
   kpiHalf.value === 'all' ? undefined : kpiHalf.value,
+  `${matchId.value}:${game.value.team === 'home' ? 'H' : 'A'}`,
 ))
-watch([kpiRecords, kpiHalf], () => {
-  scheduleInputPreview(kpiRecords.value, kpiHalf.value === 'all' ? undefined : kpiHalf.value)
+watch([kpiRecords, kpiHalf, () => game.value.team, matchId], () => {
+  scheduleInputPreview(
+    kpiRecords.value,
+    kpiHalf.value === 'all' ? undefined : kpiHalf.value,
+    `${matchId.value}:${game.value.team === 'home' ? 'H' : 'A'}`,
+  )
 }, { deep: true, immediate: true })
 const kpiValues = computed(() => {
   const values = currentPreview.value.kpis
@@ -1055,6 +1087,12 @@ const kpiValues = computed(() => {
 })
 const displayedKpis = computed(() => {
   const selectedSide = game.value.team === 'home' ? 'H' : 'A'
+  if (kpiHalf.value !== 'all') {
+    return {
+      H: dashboardKpiLoaded[kpiHalf.value] ? dashboardKpis.value.H[kpiHalf.value] : emptyDashboardKpi(),
+      A: dashboardKpiLoaded[kpiHalf.value] ? dashboardKpis.value.A[kpiHalf.value] : emptyDashboardKpi(),
+    }
+  }
   const selectedIsFinal = inputStatus.value[selectedSide].completed
   const selectedValues = selectedIsFinal ? dashboardKpis.value[selectedSide][kpiHalf.value] : kpiValues.value
   return {

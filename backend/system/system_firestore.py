@@ -1541,8 +1541,9 @@ class JpdDidData:
     ) -> dict[str, Any]:
         """Register a recorder on the existing Draft root without touching records.
 
-        Seats: one primary, one assistant. Once both are taken, or once the team
-        input is finished, only an advanced analyst can join, as a manager.
+        Seats: one primary, one assistant. Once both are taken, managers may
+        join when allowed. A finished team still accepts its original primary or
+        assistant under the same role, plus manager entry.
 
         The browser writes live state/records directly under this same Draft. This
         server endpoint only establishes the durable role assignment used by rules
@@ -1559,6 +1560,21 @@ class JpdDidData:
         participants = current.get("participants") if isinstance(current.get("participants"), dict) else {}
         existing_participant = participants.get(user_id) if isinstance(participants.get(user_id), dict) else {}
         existing_role = existing_participant.get("role")
+
+        def raw_roster_role_for_user() -> str | None:
+            heads = self.get_recording_heads_many([gm_id]).get(gm_id, {}).get(side, {})
+            recorders = heads.get("recorders") if isinstance(heads.get("recorders"), dict) else {}
+            rank_roles = {"main": "primary", "sub": "assistant", "manager": "manager"}
+            direct = recorders.get(user_id) if isinstance(recorders.get(user_id), dict) else {}
+            direct_role = rank_roles.get(direct.get("rank"))
+            if direct_role:
+                return direct_role
+            if not display_name:
+                return None
+            legacy = recorders.get("local-did-input") if isinstance(recorders.get("local-did-input"), dict) else {}
+            return rank_roles.get(legacy.get("rank")) if legacy.get("name") == display_name else None
+
+        finished_role_reentry = False
         # Re-entry never changes a role. The schedule can carry an old/default
         # role query after a refresh, so return the role already assigned to
         # this UID instead of treating its own re-entry as a conflict.
@@ -1591,7 +1607,10 @@ class JpdDidData:
                 self.get_recording_statuses(gm_id)[side] == "final"
                 or (shared.get("halfStatus") or payload.get("status") or current.get("status")) == "final"
             )
-            if role == "manager":
+            raw_role = raw_roster_role_for_user() if finished else None
+            if finished and role != "manager" and raw_role == role:
+                finished_role_reentry = True
+            elif role == "manager":
                 if recorder_level != "advanced":
                     raise BackendError("Only an advanced analyst can join as a manager", status_code=403, code="manager_requires_advanced")
                 if not finished and not primary_uid:
@@ -1610,10 +1629,12 @@ class JpdDidData:
                 if primary_uid == "local-did-input" and display_name and legacy_primary.get("name") == display_name:
                     participants.pop(primary_uid, None)
                     current["participants"] = participants
+                elif finished_role_reentry:
+                    pass
                 else:
                     raise BackendError("A primary analyst is already assigned for this team", status_code=409, code="primary_already_assigned")
             primary_uid = user_id
-        elif role == "assistant" and not primary_uid:
+        elif role == "assistant" and not primary_uid and not finished_role_reentry:
             raise BackendError("The primary analyst must join before an assistant", status_code=409, code="primary_required")
 
         participants[user_id] = {

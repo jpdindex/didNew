@@ -556,9 +556,10 @@ const visibleRecords = computed(() => records.value.filter(r => (r.half ?? 'H1')
 // 진행 중인 루트도 매번 판정한다. 그래야 DAP 존(구역 1~6)에 찍는 순간
 // 그 루트가 UTP 로 확정되어 진입 레코드 + 직전 2개에 선수 입력 버튼이 바로 뜬다.
 // (DAP 존에 못 들어갔고 슛도 없으면 여전히 UPP 라 뜨지 않는다)
-const analysis = computed(() => previewInput(visibleRecords.value, halfCode.value))
-watch([visibleRecords, halfCode], () => {
-  scheduleInputPreview(visibleRecords.value, halfCode.value)
+const previewScope = computed(() => `${String(route.query.matchId ?? '')}:${team.value === 'away' ? 'A' : 'H'}`)
+const analysis = computed(() => previewInput(visibleRecords.value, halfCode.value, previewScope.value))
+watch([visibleRecords, halfCode, previewScope], () => {
+  scheduleInputPreview(visibleRecords.value, halfCode.value, previewScope.value)
 }, { deep: true, immediate: true })
 
 // 가안 행 시간: 기본은 위치를 찍은 순간에 멈춘다. '흐르는 초' 버튼을 켜면 경기 시계를 그대로 따라간다.

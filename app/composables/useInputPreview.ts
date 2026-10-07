@@ -34,16 +34,17 @@ type CachedPreview = { fingerprint: string; result: InputPreviewResult }
 
 const PREVIEW_DEBOUNCE_MS = 120
 
-function scopeKey(half: Half | undefined) {
-  return half ?? 'all'
+function scopeKey(half: Half | undefined, scope = '') {
+  return `${scope || 'default'}:${half ?? 'all'}`
 }
 
 function scopedRecords(records: DidRecord[], half: Half | undefined) {
   return half ? records.filter(record => (record.half ?? 'H1') === half) : records
 }
 
-function fingerprint(records: DidRecord[], half: Half | undefined) {
+function fingerprint(records: DidRecord[], half: Half | undefined, scope = '') {
   return JSON.stringify({
+    scope,
     half: half ?? 'all',
     records: scopedRecords(records, half).map(record => ({
       id: record.id, half: record.half ?? 'H1', seconds: record.seconds, seq: record.seq ?? 0,
@@ -159,17 +160,17 @@ export function useInputPreview() {
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
   const requestVersions = new Map<string, number>()
 
-  function preview(records: DidRecord[], half?: Half): InputPreviewResult {
-    const key = scopeKey(half)
-    const currentFingerprint = fingerprint(records, half)
+  function preview(records: DidRecord[], half?: Half, scope = ''): InputPreviewResult {
+    const key = scopeKey(half, scope)
+    const currentFingerprint = fingerprint(records, half, scope)
     const server = cached[key]
     return server?.fingerprint === currentFingerprint ? server.result : fallbackPreview(records, half)
   }
 
-  function schedule(records: DidRecord[], half?: Half) {
-    const key = scopeKey(half)
+  function schedule(records: DidRecord[], half?: Half, scope = '') {
+    const key = scopeKey(half, scope)
     const currentRecords = scopedRecords(records, half)
-    const currentFingerprint = fingerprint(records, half)
+    const currentFingerprint = fingerprint(records, half, scope)
     const nextVersion = (requestVersions.get(key) ?? 0) + 1
     requestVersions.set(key, nextVersion)
     const timer = timers.get(key)

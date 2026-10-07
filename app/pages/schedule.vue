@@ -222,7 +222,8 @@ const selectedSummary = computed(() => (
   selectedMatch.value && selectedTeam.value ? teamCollaboration(selectedMatch.value, selectedTeam.value) : null
 ))
 
-// 팀 입력이 끝나면(RAW 확정 또는 BASIC 제출) 매니저만 들어갈 수 있다.
+// 팀 입력이 끝나도 기존 참여자는 자기 역할로 다시 들어갈 수 있고,
+// 매니저 입장은 별도로 유지한다.
 const selectedTeamFinished = computed(() => {
   if (!selectedMatch.value || !selectedTeam.value) return false
   return selectedMatch.value.inputStatus[selectedTeam.value === 'home' ? 'H' : 'A'].lifecycleStatus === 'final'
@@ -246,8 +247,6 @@ const selectedParticipantRole = computed<ParticipantRole | null>(() => {
   const isRole = (role?: string): role is ParticipantRole => role === 'primary' || role === 'assistant' || role === 'manager'
 
   const direct = summary.participants?.find(item => item.uid === $auth.currentUser?.uid)
-  // 끝난 경기의 주/부 기록은 명단으로만 남는다. 다시 들어오려면 매니저로 입장한다.
-  if (selectedTeamFinished.value) return direct?.role === 'manager' ? 'manager' : null
   if (isRole(direct?.role)) return direct.role
 
   // Legacy local Drafts used a shared UID. Until the backend migrates one,
@@ -273,22 +272,23 @@ const roleState = computed(() => {
   const mine = selectedParticipantRole.value
   const finished = selectedTeamFinished.value
 
-  const primary = finished ? { disabled: true, label: '주 분석관으로 분석 진행' }
-    : mine === 'primary' ? { disabled: false, label: '주 분석관으로 재입장' }
+  const primary = mine === 'primary' ? { disabled: false, label: '주 분석관으로 재입장' }
+    : finished ? { disabled: true, label: '주 분석관으로 분석 진행' }
     : mine ? { disabled: true, label: '주 분석관으로 분석 진행' }
     : selectedTeamHasOtherPrimary.value ? { disabled: true, label: '주 분석관이 이미 입장했습니다' }
     : { disabled: false, label: '주 분석관으로 분석 진행' }
 
-  const assistant = finished ? { disabled: true, label: '부 분석관으로 분석 진행' }
-    : mine === 'assistant' ? { disabled: false, label: '부 분석관으로 재입장' }
+  const assistant = mine === 'assistant' ? { disabled: false, label: '부 분석관으로 재입장' }
+    : finished ? { disabled: true, label: '부 분석관으로 분석 진행' }
     : mine ? { disabled: true, label: '부 분석관으로 분석 진행' }
     : !selectedTeamHasPrimary.value ? { disabled: true, label: '주 분석관 입장 후 참여할 수 있습니다' }
     : selectedTeamHasOtherAssistant.value ? { disabled: true, label: '부 분석관이 이미 입장했습니다' }
     : { disabled: false, label: '부 분석관으로 분석 진행' }
 
   const manager = mine === 'manager' ? { disabled: false, label: '매니저로 재입장' }
-    : mine ? { disabled: true, label: '매니저 권한으로 입장' }
     : recorderLevel.value !== 'advanced' ? { disabled: true, label: '매니저 권한(ADVANCED)이 필요합니다' }
+    : finished ? { disabled: false, label: '매니저 권한으로 입장' }
+    : mine ? { disabled: true, label: '매니저 권한으로 입장' }
     : !finished && !selectedTeamHasPrimary.value ? { disabled: true, label: '주 분석관 입장 후 참여할 수 있습니다' }
     : { disabled: false, label: '매니저 권한으로 입장' }
 
@@ -479,7 +479,8 @@ function onCancel() {
               <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" /></svg>
             </button>
           </div>
-          <p v-if="selectedTeamFinished">분석이 종료된 경기입니다. 매니저 권한으로만 입장할 수 있습니다.</p>
+          <p v-if="selectedTeamFinished && selectedParticipantRole">분석이 종료된 경기입니다. 기존 참여 역할 또는 매니저 권한으로 입장할 수 있습니다.</p>
+          <p v-else-if="selectedTeamFinished">분석이 종료된 경기입니다. 매니저 권한으로 입장할 수 있습니다.</p>
           <p v-else-if="selectedParticipantRole">이미 {{ ROLE_NAMES[selectedParticipantRole] }}로 참여 중이라 같은 역할로만 재입장할 수 있습니다.</p>
           <p v-else>{{ selectedTeam === 'home' ? selectedMatch?.home.name : selectedMatch?.away.name }} 입력 역할을 선택하세요.</p>
           <button
