@@ -29,10 +29,11 @@ function unlock(key: 'H1' | 'H2') {
     <div class="bg" />
 
     <div class="frame">
-      <div class="topBar">
-        <div class="title">기록 잠금 관리</div>
-        <NuxtLink class="backBtn" to="/manage">← 데이터 관리로</NuxtLink>
-      </div>
+      <header class="topBar">
+        <NuxtLink class="backBtn" to="/manage">← 데이터 관리</NuxtLink>
+        <h1>기록 잠금 관리</h1>
+        <div class="headerAction" aria-hidden="true" />
+      </header>
 
       <p class="matchInfo">
         <template v-if="game.matchId">현재 진행 중인 경기: <b>{{ game.matchId }}</b></template>
@@ -88,15 +89,18 @@ function unlock(key: 'H1' | 'H2') {
   padding: 24px;
 }
 .topBar {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: space-between;
-  padding-bottom: 16px;
-  margin-bottom: 20px;
-  border-bottom: 1px solid rgba(255,255,255,0.06);
+  gap: 20px;
+  padding-bottom: 18px;
+  margin: 0 28px 16px;
+  border-bottom: 1px solid #29313b;
+  padding-bottom: 18px;
 }
-.title { color: rgba(255,255,255,0.85); font-weight: 700; letter-spacing: 0.02em; }
-.backBtn { color: rgba(255,255,255,0.55); font-size: 13px; text-decoration: none; }
+.topBar h1 { margin: 0; color: #eee; text-align: center; font-size: 26px; }
+.backBtn { justify-self: start; height: 34px; display: inline-flex; align-items: center; color: #9da7b3; font-size: 14px; font-weight: 600; text-decoration: none; }
+.headerAction { justify-self: end; }
 .backBtn:hover { color: #fff; }
 
 .matchInfo { color: rgba(255,255,255,0.6); font-size: 13px; margin: 0 0 20px; }

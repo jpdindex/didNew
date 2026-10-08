@@ -709,8 +709,39 @@ def get_final_raw_input_state(gm_id: str, side: Side, _: RequiredUser = None) ->
 
 @router.get("/match-input/approvals", include_in_schema=False)
 def list_approvals(_: RequiredUser = None) -> dict:
-    drafts = JpdDidData().list_input_drafts(recorder_level="basic", status="final")
-    return {"status": "ok", "drafts": [{"gmId": item["gmId"], "side": item["side"], "updatedAt": item.get("updatedAt"), "payload": item["payload"]} for item in drafts]}
+    data = JpdDidData()
+    drafts = data.list_input_drafts(recorder_level="basic", status="final")
+    gm_ids = {str(item.get("gmId") or "") for item in drafts}
+    matches = data.get_documents_by_ids("matches", gm_ids)
+
+    match_by_draft: dict[str, dict] = {}
+    team_ids: set[str] = set()
+    for item in drafts:
+        gm_id = str(item.get("gmId") or "")
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        snapshot = payload.get("matchSnapshot") if isinstance(payload.get("matchSnapshot"), dict) else {}
+        match = matches.get(gm_id) or snapshot
+        match_by_draft[gm_id] = match
+        team_ids.update(str(match.get(key) or "") for key in ("homeTeamId", "awayTeamId"))
+
+    teams = data.get_documents_by_ids("teams", team_ids)
+    result = []
+    for item in drafts:
+        gm_id = str(item.get("gmId") or "")
+        side = item.get("side")
+        match = match_by_draft.get(gm_id, {})
+        team_id = str((match.get("awayTeamId") if side == "A" else match.get("homeTeamId")) or "")
+        team = teams.get(team_id, {})
+        team_name = str(team.get("nameKr") or team.get("name") or team.get("nameShort") or team_id or "팀 정보 없음")
+        result.append({
+            "gmId": gm_id,
+            "side": side,
+            "teamId": team_id,
+            "teamName": team_name,
+            "updatedAt": item.get("updatedAt"),
+            "payload": item["payload"],
+        })
+    return {"status": "ok", "drafts": result}
 
 
 @router.post("/match-input/preview", include_in_schema=False)

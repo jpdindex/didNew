@@ -68,13 +68,12 @@ onMounted(loadRecorders)
 <template>
   <div class="page">
     <div class="frame">
-      <header>
-        <div>
-          <h1>분석관 계정 관리</h1>
-          <p>로그인한 계정이 자동 등록됩니다. 여기서 입력 화면의 분석관 등급을 관리합니다.</p>
-        </div>
+      <header class="manageHeader">
         <NuxtLink to="/manage" class="back">← 데이터 관리</NuxtLink>
+        <h1>분석관 계정 관리</h1>
+        <div class="headerAction" aria-hidden="true" />
       </header>
+      <p class="pageDescription">로그인한 계정이 자동 등록됩니다. 여기서 입력 화면의 분석관 등급을 관리합니다.</p>
 
       <p v-if="error" class="error">{{ error }}</p>
       <div v-if="loading" class="empty">계정을 불러오는 중입니다.</div>
@@ -110,9 +109,9 @@ onMounted(loadRecorders)
 <style scoped>
 .page { min-height: 100vh; background: #0b0f17; color: #eef2f7; padding: 40px; box-sizing: border-box; }
 .frame { max-width: 1120px; margin: 0 auto; }
-header { display: flex; justify-content: space-between; align-items: flex-start; padding-bottom: 18px; border-bottom: 1px solid rgba(255,255,255,.1); }
-h1 { margin: 0; font-size: 24px; } p { color: rgba(255,255,255,.6); margin: 8px 0 0; }
-.back { color: #8ce6f5; text-decoration: none; }
+header.manageHeader { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 20px; margin: 0 -28px 16px; padding-bottom: 18px; border-bottom: 1px solid #29313b; }
+h1 { margin: 0; text-align: center; font-size: 26px; }.pageDescription { color: rgba(255,255,255,.6); margin: 0; font-size: 13px; }
+.back { justify-self: start; height: 34px; display: inline-flex; align-items: center; color: #9da7b3; font-size: 14px; font-weight: 600; text-decoration: none; }.headerAction { justify-self: end; }
 .filters { display: flex; align-items: center; gap: 10px; margin-top: 24px; }
 .filters .search { flex: 0 1 360px; height: 40px; padding: 0 12px; }.filters select { width: 150px; height: 40px; }
 .count { margin-left: auto; color: rgba(255,255,255,.55); font-size: 13px; font-weight: 700; }

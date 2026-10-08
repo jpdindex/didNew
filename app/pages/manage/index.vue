@@ -30,7 +30,6 @@ const dataMenus = [
 
       <div class="sectionTitle firstSection">
         <span>경기 입력 준비</span>
-        <small>경기 기록 전에 필요한 기준 정보</small>
       </div>
       <div class="grid twoColumnGrid">
         <template v-for="menu in inputMenus" :key="menu.label">
@@ -48,7 +47,6 @@ const dataMenus = [
 
       <div class="sectionTitle">
         <span>경기 기록 운영</span>
-        <small>입력된 기록과 분석관 업무 관리</small>
       </div>
       <div class="grid twoColumnGrid">
         <NuxtLink
@@ -74,7 +72,6 @@ const dataMenus = [
 
       <div class="sectionTitle">
         <span>데이터 점검·이관</span>
-        <small>원본 데이터 조회와 시스템 관리</small>
       </div>
       <div class="grid threeColumnGrid">
         <NuxtLink
@@ -142,7 +139,12 @@ const dataMenus = [
   margin-bottom: 17px;
   border-bottom: 1px solid rgba(255,255,255,0.06);
 }
-.title { color: rgba(255,255,255,0.85); font-weight: 700; letter-spacing: 0.02em; }
+.title {
+  color: #67cce1;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
 
 .backBtn {
   color: rgba(255,255,255,0.55);
@@ -172,12 +174,6 @@ const dataMenus = [
   font-size: 14px;
   font-weight: 800;
   letter-spacing: .04em;
-}
-.sectionTitle small {
-  color: rgba(255,255,255,0.34);
-  font-size: 11.5px;
-  font-weight: 500;
-  letter-spacing: 0;
 }
 .firstSection {
   margin-top: 0;
