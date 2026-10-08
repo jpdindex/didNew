@@ -803,7 +803,11 @@ async function startFirstHalf() {
     game.value.clockStartedAt = Date.now()
     if (!await saveDraft(game.value)) throw new Error('전반 시작 상태를 Firestore Draft에 저장하지 못했습니다.')
   } catch (error) {
-    lifecycleError.value = error instanceof Error ? error.message : '협업 Draft 참여에 실패했습니다.'
+    const message = error instanceof Error ? error.message : ''
+    // 주 분석관 자리는 시작 시점에 확정되므로, 로비에 함께 있던 다른 분석관이 먼저 시작했을 수 있다.
+    lifecycleError.value = message.includes('primary_already_assigned')
+      ? '다른 분석관이 먼저 주 분석관으로 경기를 시작했습니다. 일정 화면에서 부 분석관으로 참여하세요.'
+      : message || '협업 Draft 참여에 실패했습니다.'
     game.value.halfStatus = previousStatus
     game.value.seconds = previousSeconds
     game.value.clockStartedAt = previousClockStartedAt
@@ -943,7 +947,9 @@ onMounted(async () => {
 
   const selectedState = game.value.team === 'home' ? inputStatus.value.H : inputStatus.value.A
   // 끝난 팀 입력에는 매니저만 들어온다. 수정 Draft의 제어 권한을 받으려면 여기서도 join한다.
-  if (selectedState.rawStatus !== 'final' || requestedRole === 'manager') {
+  // 시작 전 로비에는 어떤 역할로 들어와도 등록하지 않는다. 분석관 명단은 "전반전 시작"에서 확정된다.
+  const lobby = (selectedState.lifecycleStatus ?? 'ready') === 'ready' && game.value.halfStatus === 'ready'
+  if (!lobby && (selectedState.rawStatus !== 'final' || requestedRole === 'manager')) {
     // Participation writes must not hold back the player list, formation or KPI paint.
     void joinCollaboration(game.value, requestedRole).catch(error => {
       lifecycleError.value = error instanceof Error
@@ -3485,6 +3491,11 @@ button {
   border-color: #f0b429;
   color: #161200;
   cursor: pointer
+}
+
+/* 버튼이 3개라 아랫줄로 내려간 시작 버튼은 윗줄 두 버튼 폭에 맞춰 가로로 꽉 채운다. */
+.halfActions > .startBtn:nth-child(3) {
+  grid-column: 1 / -1
 }
 
 .refreshBtn {

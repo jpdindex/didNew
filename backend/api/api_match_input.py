@@ -578,6 +578,9 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
         # analyst roster so the schedule can still show who worked it. A later
         # correction Draft only adds people (e.g. a manager) to that roster.
         for side in ("H", "A"):
+            # 전반전 시작 전 Draft의 참여자는 확정된 명단이 아니다(예전 로비 입장 기록 등).
+            if heads[side].get("status") != "final" and (collaboration[side].get("status") or "ready") == "ready":
+                collaboration[side] = {**collaboration[side], "participants": []}
             recorders = heads[side].get("recorders") or {}
             if not recorders:
                 continue

@@ -123,6 +123,13 @@ function stepSeconds(delta: number) {
     stepEditSecond(delta)
     return
   }
+  // 수정 화면에서 기록을 눌러 기준 시각을 잡아둔 상태면, 그 기준 시각(새로 끼워 넣을 기록의
+  // 시간)을 움직인다. 확정된 half 종료 시각(seconds)은 건드리지 않는다.
+  if (isEditMode && anchorSeconds.value !== null) {
+    anchorSeconds.value = Math.max(0, anchorSeconds.value + delta)
+    if (pendingSeconds.value !== null) pendingSeconds.value = anchorSeconds.value
+    return
+  }
   if (!isPrimary.value) return
   seconds.value = Math.max(0, seconds.value + delta)
   // 실행 중인 타이머가 다음 tick에서 이전 기준값으로 되돌리지 않도록
@@ -146,6 +153,7 @@ function selectHalf(target: '전반' | '후반') {
   else game.value.h2Seconds = seconds.value
   half.value = target
   seconds.value = target === '전반' ? game.value.h1Seconds : game.value.h2Seconds
+  anchorSeconds.value = null
 }
 let timer: ReturnType<typeof setInterval> | undefined
 // onMounted awaits several requests. If the screen is left meanwhile, the rest
@@ -566,9 +574,28 @@ watch([visibleRecords, halfCode, previewScope], () => {
 // 확정되는 레코드의 시간도 가안 행에 보이던 값과 같게 draftSeconds 를 쓴다.
 const liveDraftTime = ref(false)
 const pendingSeconds = ref<number | null>(null)
+// 수정 화면 전용: 기록표에서 누른 기록의 시각. 시계에 이 시각을 보여주고, 새로 입력하는
+// 기록도 이 시각으로 만들어 그 행 바로 뒤에 끼워 넣는다(예: 00:01 기록은 가장 가까운 00:09
+// 행을 눌러 넣은 뒤 시간만 고친다). null 이면 확정된 half 종료 시각(seconds)을 쓴다.
+const anchorSeconds = ref<number | null>(null)
+const clockSeconds = computed(() => (isEditMode && anchorSeconds.value !== null ? anchorSeconds.value : seconds.value))
 const draftSeconds = computed(() =>
-  liveDraftTime.value || pendingSeconds.value === null ? seconds.value : pendingSeconds.value
+  liveDraftTime.value || pendingSeconds.value === null ? clockSeconds.value : pendingSeconds.value
 )
+// 수정 화면에서 기존 기록 사이에 끼워 넣은 레코드를 시간 자리로 정렬한다. 같은 초의 기존 기록
+// 뒤에 오도록 seq 를 지금까지 가장 큰 값 다음으로 준다 — didLogic 의 seq 카운터는 화면을 새로
+// 열면 0 부터 다시 세므로, 불러온 기록보다 작은 seq 가 나와 앞쪽으로 끼어들 수 있다.
+function placeInsertedRecords(ids: string[]) {
+  let maxSeq = records.value.reduce((max, r) => Math.max(max, r.seq ?? 0), 0)
+  for (const id of ids) {
+    const rec = records.value.find(r => r.id === id)
+    if (rec) rec.seq = ++maxSeq
+  }
+  records.value.sort((a, b) => (a.seconds - b.seconds) || ((a.seq ?? 0) - (b.seq ?? 0)))
+  lastInsertedId.value = ids[ids.length - 1] ?? null
+}
+// 수정 화면에서 마지막으로 끼워 넣은 기록. 표를 맨 아래가 아니라 이 행으로 스크롤한다.
+const lastInsertedId = ref<string | null>(null)
 
 function fmtTime(sec: number) {
   return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
@@ -601,11 +628,17 @@ const rows = computed(() => {
   // 슛(S/H/R)은 클릭 즉시 records 에 실제 레코드로 들어가므로(res:'O') 위 .map() 에서
   // 이미 표시된다 — C/P/K/F 가 결과를 기다리는 동안 그대로 보이는 것과 같다.
   if (!editingId.value && pendingPos.value) {
-    list.push({
-      id: '__draft__', no: list.length + 1, time: fmtTime(draftSeconds.value),
+    // 수정 화면에서는 새 기록이 그 시각 자리에 끼워지므로, 가안 행도 같은 자리(같은 초의
+    // 기존 기록 뒤)에 보여준다. 번호는 그 뒤 행들까지 하나씩 밀어서 다시 매긴다.
+    const at = isEditMode
+      ? visibleRecords.value.filter(r => r.seconds <= draftSeconds.value).length
+      : list.length
+    list.splice(at, 0, {
+      id: '__draft__', no: at + 1, time: fmtTime(draftSeconds.value),
       act: '', result: '', area: areaFromPos(pendingPos.value),
       isDap: false, playerName: '', draft: true,
     })
+    for (let i = at + 1; i < list.length; i++) list[i]!.no = i + 1
   }
   return list
 })
@@ -812,11 +845,14 @@ function clickRecord(id: string) {
     cancelEdit()
   }
   clearPendingEntry()
+  lastInsertedId.value = null
   peekId.value = peekId.value === id ? null : id
+  if (isEditMode) anchorSeconds.value = peekId.value ? records.value.find(r => r.id === id)?.seconds ?? null : null
 }
 function openEdit(id: string) {
   if (editingId.value && editingId.value !== id) cancelEdit()
   clearPendingEntry()
+  lastInsertedId.value = null
   peekId.value = null
   const rec = records.value.find(r => r.id === id)
   if (!rec) return
@@ -1018,7 +1054,15 @@ const pendingShot = ref<PendingShot | null>(null)
 // rows.length 를 봐야 한다 — 가안(draft) 행은 records 에 아직 안 들어가서
 // visibleRecords.length 만 보면 경기장을 찍은 직후(액트를 고르기 전)엔 스크롤이 안 따라간다.
 // (rows 가 pendingPos/pendingShot 을 참조하므로, 이 둘이 선언된 뒤에 watch 를 걸어야 한다.)
-watch(() => rows.value.length, async () => {
+watch(() => rows.value.length, async (len, prevLen) => {
+  // 수정 화면에서는 기록을 중간에 끼워 넣으므로 맨 아래로 내리지 않고, 지금 입력 중인
+  // 가안 행이나 방금 넣은 기록이 있는 자리를 보여준다. 삭제 등으로 줄어들 때는 그대로 둔다.
+  if (isEditMode) {
+    if (len < prevLen) return
+    if (!editingId.value && pendingPos.value) void scrollRowIntoView('__draft__')
+    else if (lastInsertedId.value) void scrollRowIntoView(lastInsertedId.value)
+    return
+  }
   await nextTick()
   if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
 })
@@ -1165,7 +1209,7 @@ function openCardPanel() {
 function queueCard() {
   if (cardPlayer.value === null) return false
   const card: CardRecord = {
-    id: crypto.randomUUID(), half: halfCode.value, seconds: seconds.value,
+    id: crypto.randomUUID(), half: halfCode.value, seconds: clockSeconds.value,
     player: cardPlayer.value, card: cardType.value,
   }
   cardPlayer.value = null
@@ -1654,9 +1698,9 @@ const editingRecord = computed(() => records.value.find(r => r.id === editingId.
 const infoRecord = computed(() => editingRecord.value ?? peekRecord.value)
 
 // 길게 눌러 수정 중인 레코드가 있으면, 위쪽 시계는 진행 시각 대신 그 레코드의 시간을
-// 보여준다. 짧게 눌러 보기(peek)만 할 때는 진행 시각을 그대로 둔다. seconds.value(전/후반
-// 종료 시각, 나가기 시 저장되는 값)는 그대로 유지되므로 화면 표시만 바뀐다.
-const displayClock = computed(() => (editingRecord.value ? fmtTime(editSeconds.value) : clock.value))
+// 보여준다. 수정 화면에서 짧게 눌러 기준 시각을 잡았으면 그 시각을 보여준다(clockSeconds).
+// seconds.value(전/후반 종료 시각, 나가기 시 저장되는 값)는 그대로 유지되므로 화면 표시만 바뀐다.
+const displayClock = computed(() => (editingRecord.value ? fmtTime(editSeconds.value) : fmtTime(clockSeconds.value)))
 
 // Kick/Shooting 패널에 "채워서" 보여줄 레코드. 레코드를 클릭/롱프레스해서 보고 있는
 // 중이면 그 레코드를 그대로 보여준다. 아무것도 안 보고 있을 때는 마지막 레코드가
@@ -1794,7 +1838,7 @@ function clickPitch(e: MouseEvent) {
 
   const nextCell = cellFromPos({ x, y })
   pendingPos.value = { x, y }
-  pendingSeconds.value = seconds.value
+  pendingSeconds.value = clockSeconds.value
   pendingCell.value = nextCell
   flashCell.value = nextCell
   if (flashTimer) clearTimeout(flashTimer)
@@ -1845,6 +1889,7 @@ function clickAct(actKey: string, isShot: boolean) {
   )
   records.value.push(rec)
   markRecordDirty(rec.id)
+  if (isEditMode) placeInsertedRecords([rec.id])
   if (isShot) {
     pendingShot.value = {
       id: rec.id,
@@ -1886,7 +1931,11 @@ function clickResult(res: 'X' | 'B') {
     return
   }
   if (!pendingPos.value) return
-  const last = records.value[records.value.length - 1]
+  // 수정 화면에서는 기록 사이에 끼워 넣으므로 맨 끝이 아니라, 새 결과가 놓일 시각 바로 앞의
+  // 기록이 마감 대상이다(같은 초면 기존 기록 뒤에 놓이므로 <=).
+  const last = isEditMode
+    ? [...visibleRecords.value].reverse().find(r => r.seconds <= draftSeconds.value)
+    : records.value[records.value.length - 1]
   if (last && last.res === 'O') {
     const beforeIds = new Set(records.value.map(record => record.id))
     applyResult(records.value, last.id, res, {
@@ -1896,6 +1945,10 @@ function clickResult(res: 'X' | 'B') {
     })
     markRecordDirty(last.id)
     for (const record of records.value) if (!beforeIds.has(record.id)) markRecordDirty(record.id)
+    if (isEditMode) {
+      const resultRec = records.value[records.value.findIndex(r => r.id === last.id) + 1]
+      if (resultRec) placeInsertedRecords([resultRec.id])
+    }
     // 골 존 결과를 기다리던 슛이 여기(킥 패널 X/B)로 먼저 마감되면(골문 도달 전 저지),
     // 그 레코드는 이미 끝난 것이므로 골 존을 또 눌러 덮어쓰지 못하게 참조를 지운다.
     if (pendingShot.value?.id === last.id) pendingShot.value = null
@@ -1908,6 +1961,7 @@ function clickResult(res: 'X' | 'B') {
     })
     records.value.push(rec)
     markRecordDirty(rec.id)
+    if (isEditMode) placeInsertedRecords([rec.id])
     closePrecedingOpenAct(records.value, rec.id)
     const recIndex = records.value.findIndex(record => record.id === rec.id)
     const previous = recIndex > 0 ? records.value[recIndex - 1] : null
