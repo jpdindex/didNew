@@ -2083,23 +2083,39 @@ class JpdDidData:
             result[side] = calculated(scoped)
         return result
 
-    def read_match_dashboard_kpis_bootstrap(self, gm_id: str) -> dict[Side, dict[str, dict[str, int | float]]]:
-        """Return only the initially visible all-match KPI view.
+    def read_match_dashboard_kpis_bootstrap(
+        self,
+        gm_id: str,
+        halves: list[Literal["H1", "H2"]],
+    ) -> dict[Side, dict[str, dict[str, int | float]]]:
+        """Return only the half KPI views that are immediately useful in lobby.
 
-        H1/H2 are lazy-loaded when the user selects those tabs. This avoids two
-        full RAW scans per team before the lobby can render.
+        All-match KPI remains lazy-loaded. During H1/H1_done the lobby needs H1;
+        during H2/H2_done it needs H1 and H2. Ready/final states do not preload
+        KPI here, keeping the initial lobby payload light.
         """
         fields = ("TAP", "DAP", "DTP", "Shoot", "Goal", "SSR", "BAP", "ASR")
         empty = {field: 0 for field in fields}
-        all_match = self.read_match_dashboard_kpis(gm_id, half="all")
-        return {
+        result = {
             side: {
-                "all": all_match[side],
+                "all": dict(empty),
                 "H1": dict(empty),
                 "H2": dict(empty),
             }
             for side in ("H", "A")
         }
+        for half in halves:
+            half_kpis = self.read_match_dashboard_kpis(gm_id, half=half)
+            for side in ("H", "A"):
+                result[side][half] = half_kpis[side]
+        return result
+
+    def input_bootstrap_kpi_halves(self, lifecycle: str | None) -> list[Literal["H1", "H2"]]:
+        if lifecycle in {"H1", "H1_done"}:
+            return ["H1"]
+        if lifecycle in {"H2", "H2_done"}:
+            return ["H1", "H2"]
+        return []
 
     def build_input_bootstrap(self, gm_id: str, side: Side) -> dict[str, Any]:
         """Return the lobby-critical data in one response with parallel independent reads."""
@@ -2107,14 +2123,15 @@ class JpdDidData:
         with ThreadPoolExecutor(max_workers=4, thread_name_prefix="input-bootstrap") as executor:
             squads_future = executor.submit(self.get_or_create_input_squads, gm_id, match)
             status_future = executor.submit(self.get_recording_input_states, gm_id)
-            kpi_future = executor.submit(self.read_match_dashboard_kpis_bootstrap, gm_id)
             setup_future = executor.submit(self.get_input_setup, gm_id)
-            squads, cached = squads_future.result()
             input_status = status_future.result()
+            selected_status = input_status[side]
+            bootstrap_kpi_halves = self.input_bootstrap_kpi_halves(selected_status.get("lifecycleStatus"))
+            kpi_future = executor.submit(self.read_match_dashboard_kpis_bootstrap, gm_id, bootstrap_kpi_halves)
+            squads, cached = squads_future.result()
             dashboard_kpis = kpi_future.result()
             input_setup = setup_future.result()
 
-        selected_status = input_status[side]
         if selected_status["rawStatus"] == "final":
             # Reuse the already-read final recording state where possible, but do
             # not stream event rows just to paint the lobby.
@@ -2168,6 +2185,7 @@ class JpdDidData:
             },
             "inputSetup": input_setup,
             "session": session,
+            "dashboardKpiHalves": bootstrap_kpi_halves,
             "dashboardKpis": dashboard_kpis,
         }
 

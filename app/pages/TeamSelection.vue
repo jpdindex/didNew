@@ -123,6 +123,7 @@ type InputBootstrap = {
   inputStatus: { H: InputSideStatus; A: InputSideStatus }
   inputSetup: { H: InputSetup | null; A: InputSetup | null }
   session: InputBootstrapSession
+  dashboardKpiHalves?: Array<'all' | 'H1' | 'H2'>
   dashboardKpis: { H: Record<'all' | 'H1' | 'H2', DashboardKpi>; A: Record<'all' | 'H1' | 'H2', DashboardKpi> }
 }
 
@@ -239,7 +240,12 @@ function applyBootstrap(payload: InputBootstrap) {
   game.value.matchSnapshot = payload.matchSnapshot
   inputStatus.value = payload.inputStatus
   dashboardKpis.value = payload.dashboardKpis
-  dashboardKpiLoaded.all = true
+  dashboardKpiLoaded.all = false
+  dashboardKpiLoaded.H1 = false
+  dashboardKpiLoaded.H2 = false
+  for (const half of payload.dashboardKpiHalves ?? []) {
+    dashboardKpiLoaded[half] = true
+  }
 
   const selectedTeam = game.value.team
   const selectedStatus = selectedTeam === 'home' ? payload.inputStatus.H : payload.inputStatus.A
@@ -933,6 +939,7 @@ onMounted(async () => {
     }
   }
   bootstrapApplied.value = true
+  if (!dashboardKpiLoaded[kpiHalf.value]) void loadDashboardKpis(kpiHalf.value).catch(() => false)
 
   const selectedState = game.value.team === 'home' ? inputStatus.value.H : inputStatus.value.A
   // 끝난 팀 입력에는 매니저만 들어온다. 수정 Draft의 제어 권한을 받으려면 여기서도 join한다.
