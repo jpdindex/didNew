@@ -6,12 +6,13 @@
 // 통째로 깨뜨리고, 같은 gm_id로 다시 저장하면 Firestore가 말없이 덮어쓰므로
 // (1) 형식 검증 (2) 같은 리그 기존 gm_id와의 패턴 비교 (3) 중복 확인을 반드시 거친다.
 
-import { collection, deleteDoc, deleteField, doc, getDoc, getDocs, orderBy, query, setDoc, Timestamp, writeBatch, type Firestore } from 'firebase/firestore'
+import { collection, deleteDoc, deleteField, doc, getDoc, getDocs, orderBy, query, setDoc, Timestamp, type Firestore } from 'firebase/firestore'
 import * as XLSX from 'xlsx'
 import type { MatchDoc, StadiumDoc, TeamDoc, TeamSeasonEntry } from '~/types/schema'
 
 const { $db } = useNuxtApp()
 const db = $db as Firestore
+const { request } = useBackendApi()
 
 type MatchRow = MatchDoc & { id: string }
 type TeamRow = TeamDoc & { id: string }
@@ -493,6 +494,7 @@ async function submitAdd() {
   for (const row of bulkRows.value) row.error = ''
   const rows = activeBulkRows.value
   if (!rows.length) { formError.value = '입력된 경기가 없습니다.'; return }
+  if (rows.length > 100) { formError.value = '한 번에 최대 100개 경기를 저장할 수 있습니다.'; return }
 
   const gmIds: string[] = []
   let anyError = false
@@ -522,7 +524,6 @@ async function submitAdd() {
     })
     if (anyError) { formError.value = '이미 등록된 gm_id가 있습니다. 빨간 표시된 칸을 확인하세요.'; return }
 
-    const batch = writeBatch(db)
     const newRows: MatchRow[] = []
     rows.forEach((row, i) => {
       const gmId = gmIds[i]!
@@ -540,10 +541,18 @@ async function submitAdd() {
       }
       if (row.kickoffTime) data.kickoffTime = row.kickoffTime
       if (row.round) data.round = Number(row.round)
-      batch.set(doc(db, 'matches', gmId), data)
       newRows.push({ id: gmId, ...data })
     })
-    await batch.commit()
+    // One backend commit publishes these new fixtures, squad snapshots and
+    // schedule summaries together. Existing season/import backfill is separate.
+    await request('/api/v1/match-input/schedules', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ matches: newRows.map(row => ({
+        gmId: row.id, date: row.date, kickoffTime: row.kickoffTime,
+        leagueId: row.leagueId, seasonId: row.seasonId, round: row.round,
+        stadiumId: row.stadiumId, homeTeamId: row.homeTeamId, awayTeamId: row.awayTeamId,
+      })) }),
+    })
     matches.value = [...matches.value, ...newRows]
     // 방금 추가한 경기들이 바로 보이도록 — 지금 보고 있던 리그/시즌 필터가 다르면 맞춰준다.
     if (newRows[0]) {

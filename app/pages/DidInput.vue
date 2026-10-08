@@ -27,6 +27,7 @@ import {
 } from '~/utils/goalCoordinates'
 import { canPickForCard, groupCardsByPlayer, isSentOff, secondYellowCards, type CardRecord } from '~/utils/card'
 import type { HalfStatus, MatchSquadPlayer, SubRecord } from '~/composables/useMatchState'
+import type { DraftResponse } from '~/composables/useMatchCollaboration'
 import { FORMATIONS, GK_SLOT, assignmentsFromLineup } from '~/utils/formationLayout'
 
 const route = useRoute()
@@ -40,8 +41,8 @@ const inputMode = computed(() => (route.query.mode === '실시간' ? '실시간'
 const game = useMatchState()
 const { request } = useBackendApi()
 const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
-const { saveLocal, save: saveDraft, finalizeAdvanced, recover: recoverDraft } = useMatchDraft()
-const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards } = useMatchCollaboration()
+const { saveLocal, save: saveDraft, finalizeAdvanced, recover: recoverDraft, hydrate: hydrateDraft } = useMatchDraft()
+const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards } = useMatchCollaboration()
 const requestedRole = route.query.role === 'assistant' || route.query.role === 'manager' ? route.query.role : 'primary'
 const isPrimary = computed(() => game.value.lifecycleControl || game.value.participantRole === 'primary' || requestedRole === 'primary')
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
@@ -211,7 +212,44 @@ onMounted(async () => {
   game.value.participantRole = requestedRole
   game.value.lifecycleControl = requestedRole === 'primary'
 
+  let enterSucceeded = false
+  let initialDraft: DraftResponse | null = null
+  let enteredDraft: DraftResponse | null = null
+  let enteredSetup: InputSetup | null = null
+  const preparedInput = usePreparedInput()
+  const preparedEntry = preparedInput.value
+  preparedInput.value = null
+  const canUsePreparedEntry = Boolean(
+    hasActiveClientState && !isEditMode && preparedEntry?.gmId === matchId &&
+    preparedEntry.side === (requestedTeam === 'away' ? 'A' : 'H') &&
+    preparedEntry.participant.role === requestedRole && preparedEntry.draft.status === 'ok' &&
+    preparedEntry.draft.payload.status === game.value.halfStatus
+  )
   if (matchId) {
+    try {
+      const entry = canUsePreparedEntry && preparedEntry
+        ? preparedEntry
+        : await enterCollaboration(game.value, requestedRole)
+      enterSucceeded = true
+      if (!game.value.squads.home.length || !game.value.squads.away.length) {
+        game.value.squads = { home: entry.squads.H, away: entry.squads.A }
+      }
+      enteredSetup = requestedTeam === 'away' ? entry.inputSetup.A : entry.inputSetup.H
+      if (entry.draft.status === 'ok') {
+        initialDraft = entry.draft
+        if (!hasActiveClientState) {
+          hydrateDraft(game.value, entry.draft.payload, entry.draft.clientState)
+          enteredDraft = entry.draft
+        }
+      }
+    } catch {
+      // Keep the existing per-route sequence as a recovery path while the new
+      // combined entry endpoint is unavailable.
+    }
+    if (disposed) return
+  }
+
+  if (matchId && !enterSucceeded) {
     try {
       await joinCollaboration(game.value, requestedRole)
     } catch {
@@ -222,7 +260,7 @@ onMounted(async () => {
   }
 
   let recoveredDraft = false
-  if (matchId && !hasActiveClientState) {
+  if (matchId && !hasActiveClientState && !enteredDraft) {
     game.value.inputMode = inputMode.value
     recoveredDraft = await recoverDraft(game.value).catch(() => false)
     if (disposed) return
@@ -231,7 +269,7 @@ onMounted(async () => {
     records.value = [...game.value.records]
   }
 
-  if (matchId) {
+  if (matchId && !enterSucceeded) {
     try {
       const payload = await request<{
         H: MatchSquadPlayer[]
@@ -247,6 +285,11 @@ onMounted(async () => {
       // 개발·오프라인 입력은 기존 임시 명단으로도 화면을 열 수 있다.
     }
     if (disposed) return
+  }
+  if (enteredSetup) applyInputSetup(enteredSetup)
+  if (enteredDraft) {
+    recoveredDraft = true
+    records.value = [...game.value.records]
   }
   // A running clock is never restored from an old seconds snapshot. Rejoin it
   // from the durable start timestamp; only a paused clock uses saved seconds.
@@ -349,7 +392,7 @@ onMounted(async () => {
       applyInputSetup(setup)
       nextTick(() => { applyingRemoteDraft = false })
     },
-  }).catch(() => false)
+  }, initialDraft).catch(() => false)
   // 시작 도중 화면을 나갔으면 여기서 끝낸다. 이후의 기록 저장·시계 시작이 다음 화면의
   // game 상태(다른 경기일 수 있음)에 대해 실행되면 안 된다.
   if (disposed) {

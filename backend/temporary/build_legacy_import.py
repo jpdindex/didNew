@@ -368,6 +368,12 @@ class BuildLegacyImport:
             def replace_match() -> int:
                 match_written = self._write_documents(match_documents, on_progress=report_match)
                 self._verify_written_match(gm_id, match_documents)
+                # A fixture exists as soon as its schedule row is imported.
+                # Pre-warm its roster and schedule/lobby read model now, before
+                # anyone starts an input Draft.
+                match = self.data.get_match(gm_id)
+                self.data.refresh_input_squads(gm_id, match)
+                self.data.refresh_input_summary(gm_id, match)
                 return match_written
 
             match_written = self._run_with_retry("match write and verification", gm_id, replace_match)
@@ -692,7 +698,10 @@ class BuildLegacyImport:
             gm_id = _string(row.get("gm_id"))
             if not gm_id:
                 continue
-            match = {"home": _string(row.get("gm_h_t_code")), "away": _string(row.get("gm_a_t_code")), "date": _string(row.get("gm_date")), "realtime": _string(row.get("is_realtime")).upper() == "Y" or _integer(row.get("is_realtime")) == 1}
+            raw_date = _string(row.get("gm_date"))
+            date_digits = re.sub(r"\D", "", raw_date)
+            match_date = f"{date_digits[:4]}.{date_digits[4:6]}.{date_digits[6:8]}" if len(date_digits) == 8 else raw_date
+            match = {"home": _string(row.get("gm_h_t_code")), "away": _string(row.get("gm_a_t_code")), "date": match_date, "realtime": _string(row.get("is_realtime")).upper() == "Y" or _integer(row.get("is_realtime")) == 1}
             matches[gm_id] = match
             append((f"matches/{gm_id}", {"date": match["date"], "kickoffTime": _string(row.get("gm_time")) or None, "leagueId": _string(row.get("gm_league")), "seasonId": gm_id[:8], "matchType": "league", "round": _integer(row.get("gm_round")) if row.get("gm_round") is not None else None, "group": _string(row.get("gm_sub_league")) or None, "stadiumId": _string(row.get("gm_s_code")), "homeTeamId": match["home"], "awayTeamId": match["away"], "score": {"home": _integer(row.get("gi_goal_home")), "away": _integer(row.get("gi_goal_away"))}, "createdAt": now, "updatedAt": now}, False))
             competition_id = _string(row.get("gm_league"))
@@ -754,7 +763,12 @@ class BuildLegacyImport:
             gm_id, side, player_id, team_id = *recording, _string(row.get("p_id")), _string(row.get("t_code"))
             candidates = contracts.get(f"{player_id}_{team_id}", [])
             date = matches[gm_id]["date"]
-            contract = next((item for item in candidates if item["from"] <= date and (not item["to"] or date <= item["to"])), candidates[0] if candidates else {"no": "", "pos": ""})
+            date_key = re.sub(r"\D", "", date)
+            contract = next((
+                item for item in candidates
+                if re.sub(r"\D", "", item["from"]) <= date_key
+                and (not item["to"] or date_key <= re.sub(r"\D", "", item["to"]))
+            ), candidates[0] if candidates else {"no": "", "pos": ""})
             player_type = "BENCH" if _string(row.get("gp_type")) == "ST" else "START"
             position = _normalize_position(contract["pos"])
             lineups[f"{gm_id}:{side}"][player_id] = {

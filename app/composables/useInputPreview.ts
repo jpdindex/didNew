@@ -159,6 +159,7 @@ export function useInputPreview() {
   const cached = reactive<Record<string, CachedPreview | undefined>>({})
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
   const requestVersions = new Map<string, number>()
+  const pendingFingerprints = new Map<string, string>()
 
   function preview(records: DidRecord[], half?: Half, scope = ''): InputPreviewResult {
     const key = scopeKey(half, scope)
@@ -171,14 +172,17 @@ export function useInputPreview() {
     const key = scopeKey(half, scope)
     const currentRecords = scopedRecords(records, half)
     const currentFingerprint = fingerprint(records, half, scope)
+    if (cached[key]?.fingerprint === currentFingerprint || pendingFingerprints.get(key) === currentFingerprint) return
     const nextVersion = (requestVersions.get(key) ?? 0) + 1
     requestVersions.set(key, nextVersion)
     const timer = timers.get(key)
     if (timer) clearTimeout(timer)
     if (!currentRecords.length) {
       cached[key] = undefined
+      pendingFingerprints.delete(key)
       return
     }
+    pendingFingerprints.set(key, currentFingerprint)
     timers.set(key, setTimeout(() => {
       void request<ServerPreview>('/api/v1/match-input/preview', {
         method: 'POST',
@@ -196,8 +200,10 @@ export function useInputPreview() {
             paths: response.paths,
           },
         }
+        if (pendingFingerprints.get(key) === currentFingerprint) pendingFingerprints.delete(key)
       }).catch(() => {
         // IndexedDB and the local calculation remain available offline.
+        if (pendingFingerprints.get(key) === currentFingerprint) pendingFingerprints.delete(key)
       })
     }, PREVIEW_DEBOUNCE_MS))
   }

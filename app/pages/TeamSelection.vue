@@ -3,6 +3,7 @@ import { useInputPreview } from '~/composables/useInputPreview'
 import type { HalfStatus, MatchSnapshot, MatchSquadPlayer, MatchState, SubRecord } from '~/composables/useMatchState'
 import type { Half } from '~/types/schema'
 import type { InputPayload } from '~/composables/useMatchDraft'
+import { cloneState, payloadFromState } from '~/composables/useMatchDraft'
 import {
   BENCH_COUNT,
   BENCH_IDS,
@@ -55,7 +56,9 @@ const game = useMatchState()
 const { request } = useBackendApi()
 const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
 const { saveLocal, save: saveDraft, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover: recoverDraft, hydrate } = useMatchDraft()
-const { join: joinCollaboration, start: startCollaboration, stop: stopCollaboration, syncSetup } = useMatchCollaboration()
+const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncSetup, syncState } = useMatchCollaboration()
+const preparedInput = usePreparedInput()
+const savedEntryFingerprint = ref('')
 const lifecycleBusy = ref(false)
 const lifecycleError = ref('')
 const bootstrapApplied = ref(false)
@@ -196,6 +199,20 @@ function startLobbyCollaboration() {
   })
 }
 
+function ensureLobbyParticipant(role = game.value.participantRole) {
+  if (joinedLobbyRole === role) return Promise.resolve()
+  if (lobbyJoinPromise) return lobbyJoinPromise
+  const join = joinCollaboration(game.value, role)
+    .then(() => {
+      joinedLobbyRole = game.value.participantRole
+    })
+    .finally(() => {
+      if (lobbyJoinPromise === join) lobbyJoinPromise = undefined
+    })
+  lobbyJoinPromise = join
+  return join
+}
+
 function setupFingerprint(setup: Pick<InputSetup, 'formationKey' | 'fieldSide' | 'lineup' | 'subs' | 'inputMode'>) {
   return JSON.stringify({
     formationKey: setup.formationKey,
@@ -256,6 +273,12 @@ function applyBootstrap(payload: InputBootstrap) {
     hydrate(game.value, payload.session.payload, payload.session.clientState)
   } else if (selectedStatus.lifecycleStatus === 'ready') {
     resetForInputTeam(selectedTeam)
+  } else if (selectedStatus.lifecycleStatus === 'final') {
+    // Final-match lobby bootstrap deliberately avoids RAW hydration.  The
+    // recording head already establishes the only lifecycle fact this screen
+    // needs; RAW is loaded later only for an explicit correction action.
+    game.value.halfStatus = 'final'
+    game.value.clockStartedAt = null
   } else if (selectedStatus.lifecycleStatus && selectedStatus.lifecycleStatus !== 'final') {
     game.value.halfStatus = selectedStatus.lifecycleStatus
   }
@@ -362,10 +385,13 @@ const canToggleMatchInfoEdit = computed(() =>
   game.value.lifecycleControl && game.value.halfStatus !== 'ready'
 )
 const matchInfoEditable = computed(() =>
-  game.value.lifecycleControl && (!matchInfoLockedByStatus.value || matchInfoEditMode.value)
+  !lifecycleBusy.value && game.value.lifecycleControl && (!matchInfoLockedByStatus.value || matchInfoEditMode.value)
 )
 let formationSaveTimer: ReturnType<typeof setTimeout> | undefined
 let lobbyClockTimer: ReturnType<typeof setInterval> | undefined
+let pendingSetupSave: Promise<boolean> | undefined
+let lobbyJoinPromise: Promise<void> | undefined
+let joinedLobbyRole: 'primary' | 'assistant' | 'manager' | undefined
 
 const outfieldSlots = computed(() => (game.value.formationKey ? formations[game.value.formationKey].slots : []))
 
@@ -651,6 +677,11 @@ function recordFormationChange() {
   // response from the old server snapshot must not erase a just-picked player.
   pendingSetupFingerprint = currentSetupFingerprint()
   if (formationSaveTimer) clearTimeout(formationSaveTimer)
+  // Before either half, the visible save button owns setup persistence.
+  if (game.value.halfStatus === 'ready' || game.value.halfStatus === 'H1_done') {
+    formationSaveTimer = undefined
+    return
+  }
   formationSaveTimer = setTimeout(() => {
     const fingerprint = currentSetupFingerprint()
     if (!game.value.formationKey || fingerprint === appliedSetupFingerprint && !pendingSetupFingerprint) return
@@ -666,12 +697,33 @@ function recordFormationChange() {
     }
     // Setup only changes when a formation/lineup action happens. Timer and
     // record autosaves must not rewrite this durable lobby snapshot.
-    void syncSetup(game.value).catch(() => {
+    void persistCurrentSetup(fingerprint)
+  }, 300)
+}
+
+function persistCurrentSetup(fingerprint = currentSetupFingerprint()): Promise<boolean> {
+  if (!game.value.formationKey) return Promise.resolve(false)
+  if (pendingSetupFingerprint === fingerprint && pendingSetupSave) return pendingSetupSave
+  pendingSetupFingerprint = fingerprint
+  const save = syncSetup(game.value)
+    .then(saved => {
+      if (saved && pendingSetupFingerprint === fingerprint) {
+        appliedSetupFingerprint = fingerprint
+        pendingSetupFingerprint = ''
+      }
+      return saved
+    })
+    .catch(() => {
       // Keep the visible local lineup intact; the next explicit lineup action
       // retries it instead of allowing an old remote snapshot to wipe it.
       if (pendingSetupFingerprint === fingerprint) appliedSetupFingerprint = ''
+      return false
     })
-  }, 300)
+  pendingSetupSave = save
+  void save.finally(() => {
+    if (pendingSetupSave === save) pendingSetupSave = undefined
+  })
+  return save
 }
 
 watch([() => game.value.formationKey, () => game.value.assigned, () => game.value.side], recordFormationChange, { deep: true })
@@ -736,6 +788,58 @@ const starterCount = computed(() => outfieldSlots.value.filter((_, index) => gam
 // 후보는 선택 사항이다. 포메이션의 필드 10명과 GK만 확정되면 시작할 수 있다.
 const canStart = computed(() => !!game.value.formationKey && !!game.value.side && starterCount.value === outfieldSlots.value.length + 1)
 
+const entryFingerprint = computed(() => JSON.stringify({
+  matchId: game.value.matchId, team: game.value.team, status: game.value.halfStatus,
+  role: game.value.participantRole, control: game.value.lifecycleControl,
+  setup: currentSetupFingerprint(), grass: game.value.grassPattern, lines: game.value.grassLines,
+}))
+const setupSaved = computed(() => savedEntryFingerprint.value === entryFingerprint.value && !!preparedInput.value)
+watch(entryFingerprint, () => {
+  savedEntryFingerprint.value = ''
+  preparedInput.value = null
+}, { flush: 'sync' })
+
+function lifecycleErrorMessage(error: unknown, fallback: string) {
+  const message = error instanceof Error ? error.message : ''
+  return message.includes('primary_already_assigned')
+    ? '다른 분석관이 먼저 세팅을 저장해 주 분석관으로 확정되었습니다. 일정 화면에서 부 분석관으로 참여하세요.'
+    : message || fallback
+}
+
+async function saveEntrySetup() {
+  if (lifecycleBusy.value || !bootstrapApplied.value || !canStart.value || matchInfoEditMode.value) return
+  if (game.value.halfStatus !== 'ready' && game.value.halfStatus !== 'H1_done') return
+  lifecycleBusy.value = true
+  lifecycleError.value = ''
+  savedEntryFingerprint.value = ''
+  preparedInput.value = null
+  try {
+    // Viewing the lobby never claims a seat. This explicit save confirms it.
+    await ensureLobbyParticipant(requestedRole)
+    if (!game.value.lifecycleControl) throw new Error('주 분석관만 세팅을 저장할 수 있습니다.')
+    if (formationSaveTimer) {
+      clearTimeout(formationSaveTimer)
+      formationSaveTimer = undefined
+    }
+    const fingerprint = entryFingerprint.value
+    if (!await persistCurrentSetup()) throw new Error('포메이션과 명단을 저장하지 못했습니다. 다시 시도하세요.')
+    // Save the waiting status: preparation must not start the match clock.
+    if (!await saveDraft(game.value)) throw new Error('세팅을 서버에 저장하지 못했습니다. 다시 시도하세요.')
+    const entry = await enterCollaboration(game.value, requestedRole)
+    if (!game.value.lifecycleControl) throw new Error('주 분석관의 입장 권한을 확인하지 못했습니다.')
+    if (entry.draft.status !== 'ok') throw new Error('저장된 세팅을 확인하지 못했습니다. 다시 시도하세요.')
+    // Fetch the input page chunk while the user is preparing, before navigation.
+    await preloadRouteComponents('/DidInput')
+    if (entryFingerprint.value !== fingerprint) throw new Error('세팅이 변경되었습니다. 다시 저장하세요.')
+    preparedInput.value = entry
+    savedEntryFingerprint.value = fingerprint
+  } catch (error) {
+    lifecycleError.value = lifecycleErrorMessage(error, '세팅 저장에 실패했습니다.')
+  } finally {
+    lifecycleBusy.value = false
+  }
+}
+
 function removeFromSlot(slotId: string) {
   if (!matchInfoEditable.value || game.value.assigned[slotId] === undefined) return
   delete game.value.assigned[slotId]
@@ -783,41 +887,51 @@ function closeConfirm(ok: boolean) {
   dialog?.resolve(ok)
 }
 
-async function startFirstHalf() {
-  if (!canStart.value) return
-  if (!await askConfirm('전반전을 시작하시겠습니까?', '시작하면 경기 시간이 흐르기 시작합니다.', '전반전 시작')) return
-  lifecycleBusy.value = true
+async function enterPreparedHalf(target: 'H1' | 'H2') {
+  if (lifecycleBusy.value || !setupSaved.value || !canStart.value || matchInfoEditMode.value) return
+  const entry = preparedInput.value
+  if (!entry || entry.draft.status !== 'ok') return
   const previousStatus = game.value.halfStatus
+  if (previousStatus !== (target === 'H1' ? 'ready' : 'H1_done')) return
   const previousSeconds = game.value.seconds
   const previousClockStartedAt = game.value.clockStartedAt
+  lifecycleBusy.value = true
+  lifecycleError.value = ''
   try {
-    await joinCollaboration(game.value, requestedRole)
-    if (!game.value.lifecycleControl) throw new Error('주 분석관만 전반전을 시작할 수 있습니다.')
-    // Create the durable setup before the first live Draft checkpoint. An
-    // assistant can therefore render formation and lineup on its first poll.
-    if (!await syncSetup(game.value)) throw new Error('포메이션과 명단 스냅샷을 저장하지 못했습니다.')
-    // This checkpoint is the single source of the running-clock timestamp.
-    // Do not navigate until the Draft contains formation, lineup and H1 time.
-    game.value.halfStatus = 'H1'
+    if (!game.value.lifecycleControl) throw new Error('주 분석관만 입장할 수 있습니다.')
+    game.value.halfStatus = target
     game.value.seconds = 0
     game.value.clockStartedAt = Date.now()
-    if (!await saveDraft(game.value)) throw new Error('전반 시작 상태를 Firestore Draft에 저장하지 못했습니다.')
+    // Setup, records and entry reads are already complete. Only acknowledge
+    // the lifecycle/clock mutation over the live channel before navigation.
+    if (!await syncState(game.value)) throw new Error('경기 시작 상태를 저장하지 못했습니다. 세팅 저장 후 다시 입장하세요.')
+    void saveLocal(game.value).catch(() => false)
+    preparedInput.value = {
+      ...entry,
+      draft: {
+        ...entry.draft,
+        payload: payloadFromState(game.value),
+        clientState: cloneState(game.value),
+        sharedState: {
+          ...entry.draft.sharedState,
+          halfStatus: target, seconds: 0, clockStartedAt: game.value.clockStartedAt,
+        },
+      },
+    }
+    await navigateTo({ path: '/DidInput', query: didInputQuery(target === 'H2' ? '후반' : undefined) })
   } catch (error) {
-    const message = error instanceof Error ? error.message : ''
-    // 주 분석관 자리는 시작 시점에 확정되므로, 로비에 함께 있던 다른 분석관이 먼저 시작했을 수 있다.
-    lifecycleError.value = message.includes('primary_already_assigned')
-      ? '다른 분석관이 먼저 주 분석관으로 경기를 시작했습니다. 일정 화면에서 부 분석관으로 참여하세요.'
-      : message || '협업 Draft 참여에 실패했습니다.'
     game.value.halfStatus = previousStatus
     game.value.seconds = previousSeconds
     game.value.clockStartedAt = previousClockStartedAt
-    return
+    lifecycleError.value = lifecycleErrorMessage(error, '입장에 실패했습니다.')
   } finally {
     lifecycleBusy.value = false
   }
-  navigateTo({ path: '/DidInput', query: didInputQuery() })
 }
 
+function startFirstHalf() {
+  return setupSaved.value ? enterPreparedHalf('H1') : saveEntrySetup()
+}
 function roleLabel(role: 'primary' | 'assistant' | 'manager') {
   return role === 'primary' ? '주 분석관' : role === 'manager' ? '매니저' : '부 분석관'
 }
@@ -827,7 +941,7 @@ async function enterAsAssistant() {
   lifecycleError.value = ''
   try {
     game.value.participantRole = requestedRole === 'manager' ? 'manager' : 'assistant'
-    await joinCollaboration(game.value, game.value.participantRole)
+    await ensureLobbyParticipant(game.value.participantRole)
     // The shared Draft subscription in DidInput replaces this local shell with
     // the primary analyst's current clock, lineup, and records.
     navigateTo({ path: '/DidInput', query: didInputQuery() })
@@ -888,32 +1002,8 @@ function editHalf() {
   game.value.halfStatus = prevStatus === 'H2_done' ? 'H2' : 'H1'
   navigateTo({ path: '/DidInput', query: didInputQuery(game.value.halfStatus === 'H2' ? '후반' : '전반', true, prevStatus) })
 }
-async function startSecondHalf() {
-  if (!await askConfirm('후반전을 시작하시겠습니까?', '시작하면 경기 시간이 흐르기 시작합니다.', '후반전 시작')) return
-  lifecycleBusy.value = true
-  lifecycleError.value = ''
-  const previousStatus = game.value.halfStatus
-  const previousSeconds = game.value.seconds
-  const previousClockStartedAt = game.value.clockStartedAt
-  // The lifecycle checkpoint is H2 itself. Saving H1_done first and changing
-  // locally afterwards left the schedule temporarily reporting the old half.
-  game.value.halfStatus = 'H2'
-  game.value.seconds = 0
-  game.value.clockStartedAt = Date.now()
-  try {
-    if (!game.value.lifecycleControl) throw new Error('주 분석관만 후반전을 시작할 수 있습니다.')
-    // H1 종료는 Draft 확인점일 뿐이며, 이 시점에 RAW를 만들지 않는다.
-    if (!await saveDraft(game.value)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 저장되었습니다.')
-  } catch (error) {
-    game.value.halfStatus = previousStatus
-    game.value.seconds = previousSeconds
-    game.value.clockStartedAt = previousClockStartedAt
-    lifecycleError.value = error instanceof Error ? error.message : '전반 Draft 처리에 실패했습니다.'
-    return
-  } finally {
-    lifecycleBusy.value = false
-  }
-  navigateTo({ path: '/DidInput', query: didInputQuery('후반') })
+function startSecondHalf() {
+  return setupSaved.value ? enterPreparedHalf('H2') : saveEntrySetup()
 }
 
 onMounted(async () => {
@@ -947,11 +1037,11 @@ onMounted(async () => {
 
   const selectedState = game.value.team === 'home' ? inputStatus.value.H : inputStatus.value.A
   // 끝난 팀 입력에는 매니저만 들어온다. 수정 Draft의 제어 권한을 받으려면 여기서도 join한다.
-  // 시작 전 로비에는 어떤 역할로 들어와도 등록하지 않는다. 분석관 명단은 "전반전 시작"에서 확정된다.
+  // 시작 전 로비 방문은 등록하지 않는다. 주 분석관은 "세팅 저장"에서 확정된다.
   const lobby = (selectedState.lifecycleStatus ?? 'ready') === 'ready' && game.value.halfStatus === 'ready'
   if (!lobby && (selectedState.rawStatus !== 'final' || requestedRole === 'manager')) {
     // Participation writes must not hold back the player list, formation or KPI paint.
-    void joinCollaboration(game.value, requestedRole).catch(error => {
+    void ensureLobbyParticipant(requestedRole).catch(error => {
       lifecycleError.value = error instanceof Error
         ? error.message
         : `${roleLabel(requestedRole)} 참여 상태를 확인하지 못했습니다.`
@@ -960,7 +1050,7 @@ onMounted(async () => {
   // Lobby and input screen subscribe to the same per-team Draft channel.
   // Formation, field side and substitutions therefore do not wait for the
   // dashboard polling interval to appear after the other analyst changes them.
-  void startLobbyCollaboration().catch(() => false)
+  if (selectedState.rawStatus !== 'final') void startLobbyCollaboration().catch(() => false)
   // 현재 팀에 저장된 세션이 없는 신규 입력이라면, 이미 RAW가 있는 상대 팀의
   // 진영을 기준으로 자동 반대 진영을 지정한다. 저장된 세션의 값은 절대 덮지 않는다.
   if (!recovered && game.value.halfStatus === 'ready') applyOpponentFieldSideDefault(game.value.team)
@@ -975,9 +1065,11 @@ onMounted(async () => {
   // The selected team is calculated locally for instant feedback. Refresh the
   // server's two-sided view while either side is live so the opposite team's
   // KPI does not remain at the value from lobby entry.
-  dashboardKpiTimer = setInterval(() => {
-    void loadDashboardKpis(kpiHalf.value).catch(() => false)
-  }, 1200)
+  if (selectedState.rawStatus !== 'final') {
+    dashboardKpiTimer = setInterval(() => {
+      void loadDashboardKpis(kpiHalf.value).catch(() => false)
+    }, 1200)
+  }
 })
 
 onUnmounted(() => {
@@ -1682,13 +1774,13 @@ function undoSub(index: number) {
             <section class="startPanel">
               <template v-if="game.halfStatus === 'ready'">
                 <div v-if="game.recorderLevel === 'advanced' && game.lifecycleControl" class="modeToggle">
-                  <button class="modeBtn" :class="{ on: game.inputMode === '분석' }"
+                  <button class="modeBtn" :class="{ on: game.inputMode === '분석' }" :disabled="lifecycleBusy"
                     @click="game.inputMode = '분석'">분석<small>정지 가능</small></button>
-                  <button class="modeBtn" :class="{ on: game.inputMode === '실시간' }"
+                  <button class="modeBtn" :class="{ on: game.inputMode === '실시간' }" :disabled="lifecycleBusy"
                     @click="game.inputMode = '실시간'">실시간<small>정지 불가</small></button>
                 </div>
-                <p>아래의 버튼을 터치하시면<br><b>경기데이터 입력이 시작됩니다.</b></p>
-                <button v-if="game.lifecycleControl" class="startBtn" :disabled="!canStart" @click="startFirstHalf">전반전 시작</button>
+                <p>세팅 저장 시 주 분석관으로 확정됩니다.<br><b>입장하면 경기 시간이 흐르기 시작합니다.</b></p>
+                <button v-if="game.lifecycleControl" class="startBtn" :disabled="!bootstrapApplied || !canStart || lifecycleBusy" @click="startFirstHalf">{{ lifecycleBusy ? '처리 중…' : setupSaved ? '전반전 입장' : '세팅 저장' }}</button>
                 <button v-else class="startBtn" :disabled="lifecycleBusy" @click="enterAsAssistant">{{ roleLabel(game.participantRole) }} 참여</button>
               </template>
               <template v-else-if="game.halfStatus === 'H1_done'">
@@ -1699,7 +1791,7 @@ function undoSub(index: number) {
                   <button v-if="canToggleMatchInfoEdit" class="editBtn" :disabled="lifecycleBusy"
                     @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? '변경 완료' : '경기 정보 변경' }}</button>
                   <button class="editBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="editHalf">수정</button>
-                  <button v-if="game.lifecycleControl" class="startBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="startSecondHalf">후반전 시작</button>
+                  <button v-if="game.lifecycleControl" class="startBtn" :disabled="!bootstrapApplied || !canStart || matchInfoEditMode || lifecycleBusy" @click="startSecondHalf">{{ lifecycleBusy ? '처리 중…' : setupSaved ? '후반전 입장' : '세팅 저장' }}</button>
                 </div>
               </template>
               <template v-else-if="game.halfStatus === 'H2_done'">

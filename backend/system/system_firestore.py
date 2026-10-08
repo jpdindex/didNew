@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 from threading import Event, Lock, Thread
+from time import monotonic
 from typing import Annotated, Any, Callable, Literal
 
 import firebase_admin
@@ -21,6 +22,8 @@ from fastapi.security import APIKeyHeader
 from firebase_admin import auth, credentials, firestore
 from google.cloud.firestore_v1 import Client
 from google.cloud.firestore_v1.base_query import FieldFilter
+from google.api_core.exceptions import NotFound as FirestoreDocumentNotFound
+from google.api_core.exceptions import AlreadyExists
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -33,6 +36,12 @@ PLAYER_RATING_FIELDS = {
     "scoreRel", "scoreAbs", "score", "jmx", "apx", "apxGrade",
     "tpx", "tpxGrade", "fpx", "fpxGrade", "ratingBasedOn",
 }
+
+
+def _summary_display_name(document: dict[str, Any], fallback: str) -> str:
+    # The schedule has always presented Korean names when source metadata has
+    # them. Keep that presentation contract in the materialized read model.
+    return str(document.get("nameKr") or document.get("name") or document.get("nameFull") or document.get("nameEn") or fallback)
 
 
 @dataclass(slots=True)
@@ -295,15 +304,31 @@ def _validate_document(model_type: Any, data: dict[str, Any], *, path: str):
 class JpdDidData:
     """JPD-DID match reads and recording-level derived writes."""
 
+    # Match identity changes far less often than an input command.  Keeping a
+    # short process-local cache removes repeated match reads made by enter,
+    # socket authentication, and draft saves without changing Firestore's role
+    # as the durable source of truth.
+    _match_cache: dict[str, tuple[float, MatchDoc]] = {}
+    _match_cache_lock = Lock()
+    _MATCH_CACHE_TTL_SECONDS = 30.0
+
     def __init__(self) -> None:
         self.db = get_firestore_client()
 
     def get_match(self, gm_id: str) -> MatchDoc:
+        now = monotonic()
+        with self._match_cache_lock:
+            cached = self._match_cache.get(gm_id)
+            if cached and cached[0] > now:
+                return cached[1].model_copy(deep=True)
         reference = self.db.collection("matches").document(gm_id)
         snapshot = reference.get(retry=None, timeout=10)
         if not snapshot.exists:
             raise NotFoundError(f"Match not found: {gm_id}")
-        return _validate_document(MatchDoc, snapshot.to_dict() or {}, path=reference.path)
+        match = _validate_document(MatchDoc, snapshot.to_dict() or {}, path=reference.path)
+        with self._match_cache_lock:
+            self._match_cache[gm_id] = (now + self._MATCH_CACHE_TTL_SECONDS, match)
+        return match.model_copy(deep=True)
 
     def list_matches(
         self,
@@ -376,6 +401,225 @@ class JpdDidData:
                     result[snapshot.id] = snapshot.to_dict() or {}
         return result
 
+    @staticmethod
+    def _normalise_match_date(value: Any) -> str:
+        """Keep every fixture date in the single sortable YYYY.MM.DD form."""
+        raw = str(value or "").strip()
+        parts = re.search(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})", raw)
+        if parts is None:
+            digits = re.sub(r"\D", "", raw)
+            if len(digits) < 8:
+                raise BackendError("Match date must contain a calendar day", status_code=422, code="match_date_invalid")
+            year, month, day = int(digits[:4]), int(digits[4:6]), int(digits[6:8])
+        else:
+            year, month, day = (int(item) for item in parts.groups())
+        try:
+            datetime(year, month, day)
+        except ValueError as exc:
+            raise BackendError("Match date must contain a valid calendar day", status_code=422, code="match_date_invalid") from exc
+        return f"{year:04d}.{month:02d}.{day:02d}"
+
+    @staticmethod
+    def _normalise_season_id(value: Any) -> str:
+        """Store a season consistently as YYYYYYYY (for example 20232024)."""
+        digits = re.sub(r"\D", "", str(value or ""))
+        if len(digits) != 8:
+            raise BackendError("Season must contain two four-digit years", status_code=422, code="season_id_invalid")
+        return digits
+
+    def _input_summary_reference(self, gm_id: str):
+        return self.db.collection("matches").document(gm_id).collection("inputSummaries").document("current")
+
+    def _input_summary_backfill_reference(self, season_id: str):
+        return self.db.collection("inputSummaryBackfills").document(season_id)
+
+    def _input_summary_month_reference(self, year: int, month: int):
+        return self.db.collection("inputSummaryBackfillMonths").document(f"{year}.{month:02d}")
+
+    def input_summary_backfill_complete_for_month(self, year: int, month: int) -> bool:
+        snapshot = self._input_summary_month_reference(year, month).get(retry=None, timeout=10)
+        return snapshot.exists and (snapshot.to_dict() or {}).get("complete") is True
+
+    def invalidate_input_summary_month(self, match: MatchDoc) -> None:
+        date = self._normalise_match_date(match.date)
+        self._input_summary_month_reference(int(date[:4]), int(date[5:7])).delete(retry=None, timeout=20)
+
+    @staticmethod
+    def _summary_participants(values: dict[str, Any]) -> list[dict[str, Any]]:
+        participants = values.get("participants")
+        # Draft roots store a UID-keyed map. The schedule batch reader returns
+        # the same information as an array. Accept both so backfill cannot
+        # silently retain primaryUid while dropping the visible roster.
+        if isinstance(participants, dict):
+            return [
+                {"uid": uid, "role": item.get("role"), "name": item.get("name")}
+                for uid, item in participants.items() if isinstance(item, dict)
+            ]
+        if isinstance(participants, list):
+            return [
+                {"uid": str(item.get("uid")), "role": item.get("role"), "name": item.get("name")}
+                for item in participants if isinstance(item, dict) and isinstance(item.get("uid"), str) and item.get("uid")
+            ]
+        return []
+
+    def refresh_input_summary(self, gm_id: str, match: MatchDoc | None = None, *, write_batch: Any = None) -> dict[str, Any]:
+        """Refresh the compact schedule/lobby read model for one fixture.
+
+        It deliberately lives beside recordings as ``inputSummaries/current`` so
+        a collection-group query can list a month without opening Drafts or RAW
+        for every match.
+        """
+        match = match or self.get_match(gm_id)
+        # Backfill/import is the one place where we resolve presentation data.
+        # Never retain a stale English or blank value from an earlier summary.
+        teams = self.get_documents_by_ids("teams", {match.homeTeamId, match.awayTeamId})
+        stadiums = self.get_documents_by_ids("stadiums", {match.stadiumId} if match.stadiumId else set())
+        home_name = _summary_display_name(teams.get(match.homeTeamId, {}), match.homeTeamId)
+        away_name = _summary_display_name(teams.get(match.awayTeamId, {}), match.awayTeamId)
+        stadium_name = _summary_display_name(stadiums.get(match.stadiumId, {}), match.stadiumId)
+        heads = self.get_recording_heads_many([gm_id]).get(gm_id, {"H": {}, "A": {}})
+        drafts = self.get_input_draft_participants_many([gm_id]).get(gm_id, {"H": {}, "A": {}})
+        sides: dict[str, dict[str, Any]] = {}
+        primary_uids: dict[str, str | None] = {}
+        live_score = None
+        for side in ("H", "A"):
+            draft = drafts.get(side, {})
+            raw = heads.get(side, {})
+            raw_status = raw.get("status")
+            recorders = raw.get("recorders") if isinstance(raw.get("recorders"), dict) else {}
+            # Active Draft collaboration is authoritative. RAW personnel become
+            # visible only after its Draft is gone at final promotion; merging
+            # them creates a schedule primary that cannot actually enter.
+            if draft:
+                participants = self._summary_participants(draft)
+                primary_uid = draft.get("primaryUid") if isinstance(draft.get("primaryUid"), str) else None
+                status = draft.get("status") or ("final" if raw_status == "final" else "ready")
+            else:
+                participants = [
+                    {"uid": uid, "role": {"main": "primary", "sub": "assistant", "manager": "manager"}.get(item.get("rank"), "assistant"), "name": item.get("name")}
+                    for uid, item in recorders.items() if isinstance(item, dict)
+                ]
+                primary_uid = next((item["uid"] for item in participants if item.get("role") == "primary"), None)
+                status = "final" if raw_status == "final" else "ready"
+            primary_uids[side] = primary_uid
+            sides[side] = {"rawStatus": raw_status, "completed": status == "final", "lifecycleStatus": status, "participants": participants}
+            if live_score is None and isinstance(draft.get("score"), dict):
+                live_score = draft["score"]
+        values = {
+            "gmId": gm_id,
+            "date": self._normalise_match_date(match.date),
+            "kickoffTime": match.kickoffTime,
+            "leagueId": match.leagueId,
+            "seasonId": self._normalise_season_id(match.seasonId),
+            "round": match.round,
+            "stadiumId": match.stadiumId,
+            "stadiumName": stadium_name,
+            "home": {"teamId": match.homeTeamId, "name": home_name},
+            "away": {"teamId": match.awayTeamId, "name": away_name},
+            "score": live_score or {"home": match.score.home, "away": match.score.away},
+            "inputStatus": sides,
+            "collaboration": {
+                side: {
+                    "status": sides[side]["lifecycleStatus"],
+                    "participants": sides[side]["participants"],
+                    "primaryUid": primary_uids[side],
+                }
+                for side in ("H", "A")
+            },
+            "updatedAt": utc_now(),
+        }
+        if write_batch is not None:
+            write_batch.set(self._input_summary_reference(gm_id), values)
+        else:
+            self._input_summary_reference(gm_id).set(values, retry=None, timeout=20)
+        return values
+
+    def create_schedule_matches(self, matches: dict[str, MatchDoc]) -> None:
+        """Publish only explicitly submitted fixtures and their read models atomically."""
+        batch = self.db.batch()
+        for gm_id, match in matches.items():
+            reference = self.db.collection("matches").document(gm_id)
+            if reference.get(retry=None, timeout=10).exists:
+                raise BackendError(f"이미 등록된 gm_id입니다: {gm_id}", status_code=409, code="match_exists")
+            batch.create(reference, match.model_dump(mode="python", exclude_none=True))
+            # New fixtures have no imported RAW. Do not invoke season migration.
+            self.refresh_input_squads(gm_id, match, legacy_recordings={}, write_batch=batch)
+            self.refresh_input_summary(gm_id, match, write_batch=batch)
+        try:
+            batch.commit(retry=None, timeout=60)
+        except AlreadyExists as exc:
+            raise BackendError("이미 등록된 경기가 있습니다. 목록을 새로고침하세요.", status_code=409, code="match_exists") from exc
+        with self._match_cache_lock:
+            for gm_id in matches:
+                self._match_cache.pop(gm_id, None)
+
+    def _update_input_summary_side(self, gm_id: str, side: Side, *, input_state: dict[str, Any], collaboration: dict[str, Any], score: dict[str, int] | None = None) -> None:
+        """Update only one team's schedule fields without rereading either Draft.
+
+        H and A analysts can save concurrently. Field-path updates prevent one
+        side from replacing the other's participant roster.
+        """
+        values: dict[str, Any] = {
+            f"inputStatus.{side}": input_state,
+            f"collaboration.{side}": collaboration,
+            "updatedAt": utc_now(),
+        }
+        if score is not None:
+            values["score"] = score
+        reference = self._input_summary_reference(gm_id)
+        try:
+            reference.update(values, retry=None, timeout=20)
+        except FirestoreDocumentNotFound:
+            # Only un-migrated fixtures take this exceptional path. Build the
+            # full static document once, then apply the exact accepted state.
+            self.refresh_input_summary(gm_id)
+            reference.update(values, retry=None, timeout=20)
+
+    def sync_input_summary_from_draft(self, gm_id: str, side: Side, draft: dict[str, Any]) -> None:
+        """Mirror the accepted Draft ownership/state directly into the schedule."""
+        payload = draft.get("payload") if isinstance(draft.get("payload"), dict) else {}
+        shared = draft.get("sharedState") if isinstance(draft.get("sharedState"), dict) else {}
+        lifecycle = shared.get("halfStatus") or payload.get("status") or draft.get("status") or "ready"
+        participants = self._summary_participants(draft)
+        primary_uid = draft.get("primaryUid") if isinstance(draft.get("primaryUid"), str) else None
+        score = None
+        score_source = shared if "homeScore" in shared or "awayScore" in shared else payload
+        if isinstance(score_source.get("homeScore"), int) and isinstance(score_source.get("awayScore"), int):
+            score = {"home": score_source["homeScore"], "away": score_source["awayScore"]}
+        self._update_input_summary_side(
+            gm_id,
+            side,
+            input_state={"rawStatus": "final" if lifecycle == "final" else None, "completed": lifecycle == "final", "lifecycleStatus": lifecycle, "participants": participants},
+            collaboration={"status": lifecycle, "primaryUid": primary_uid, "participants": participants},
+            score=score,
+        )
+
+    def sync_input_summary_from_recording(self, gm_id: str, side: Side, *, recorders: dict[str, Any], score: dict[str, int]) -> None:
+        """Replace a promoted Draft's collaborators with its final RAW roster."""
+        participants = [
+            {"uid": uid, "role": {"main": "primary", "sub": "assistant", "manager": "manager"}.get(values.get("rank"), "assistant"), "name": values.get("name")}
+            for uid, values in recorders.items() if isinstance(values, dict)
+        ]
+        primary_uid = next((item["uid"] for item in participants if item.get("role") == "primary"), None)
+        self._update_input_summary_side(
+            gm_id,
+            side,
+            input_state={"rawStatus": "final", "completed": True, "lifecycleStatus": "final", "participants": participants},
+            collaboration={"status": "final", "primaryUid": primary_uid, "participants": participants},
+            score=score,
+        )
+
+    def list_input_summaries_for_month(self, year: int, month: int) -> list[dict[str, Any]]:
+        if month == 12:
+            next_year, next_month = year + 1, 1
+        else:
+            next_year, next_month = year, month + 1
+        start, end = f"{year}.{month:02d}.01", f"{next_year}.{next_month:02d}.01"
+        documents = self.db.collection_group("inputSummaries").where(
+            filter=FieldFilter("date", ">=", start)
+        ).where(filter=FieldFilter("date", "<", end)).stream(retry=None, timeout=30)
+        return [snapshot.to_dict() or {} for snapshot in documents]
+
     def get_recording(self, gm_id: str, side: Side) -> RecordingDoc:
         reference = self.db.collection("matches").document(gm_id).collection("recordings").document(side)
         snapshot = reference.get(retry=None, timeout=10)
@@ -405,31 +649,45 @@ class JpdDidData:
             "H": {"rawStatus": None, "completed": False, "fieldSide": None, "lifecycleStatus": "ready"},
             "A": {"rawStatus": None, "completed": False, "fieldSide": None, "lifecycleStatus": "ready"},
         }
-        collection = self.db.collection("matches").document(gm_id).collection("recordings")
-        refs = [collection.document("H"), collection.document("A")]
-        for snapshot in self.db.get_all(refs, retry=None, timeout=20):
-            if not snapshot.exists or snapshot.id not in {"H", "A"}:
+        recordings = self.db.collection("matches").document(gm_id).collection("recordings")
+        recording_refs = {side: recordings.document(side) for side in ("H", "A")}
+        snapshots = {snapshot.reference.path: snapshot for snapshot in self.db.get_all(list(recording_refs.values()), retry=None, timeout=20)}
+
+        for side in ("H", "A"):
+            snapshot = snapshots.get(recording_refs[side].path)
+            if snapshot is None or not snapshot.exists:
                 continue
             document = snapshot.to_dict() or {}
             raw_status = document.get("status")
             field_side = document.get("fieldSide")
-            states[snapshot.id] = {
+            states[side] = {
                 "rawStatus": str(raw_status) if raw_status is not None else None,
                 "completed": raw_status == "final",
                 "fieldSide": field_side if field_side in {"left", "right"} else None,
                 "lifecycleStatus": "final" if raw_status == "final" else "ready",
             }
         # A live Draft is the shared lifecycle source until its RAW is final.
+        # Read Draft roots only for unfinished sides.  Final-match lobbies use
+        # the immutable recording head and must not pay for missing Draft reads.
+        active_sides = [side for side in ("H", "A") if not states[side]["completed"]]
+        draft_refs = {side: self._input_setup_reference(gm_id, side) for side in active_sides}
+        draft_snapshots = {
+            snapshot.reference.path: snapshot
+            for snapshot in self.db.get_all(list(draft_refs.values()), retry=None, timeout=20)
+        } if draft_refs else {}
         # IndexedDB is intentionally excluded: it belongs to one device only.
-        for side in ("H", "A"):
-            if states[side]["completed"]:
+        for side in active_sides:
+            snapshot = draft_snapshots.get(draft_refs[side].path)
+            if snapshot is None or not snapshot.exists:
                 continue
-            try:
-                draft = self.get_input_draft(gm_id, side)
-            except NotFoundError:
-                continue
+            draft = snapshot.to_dict() or {}
+            payload = draft.get("payload")
+            if draft.get("gmId") not in {None, gm_id} or (
+                isinstance(payload, dict) and (payload.get("gmId") != gm_id or payload.get("side") != side)
+            ):
+                raise BackendError("Input draft root identity does not match its path", status_code=409, code="draft_identity_mismatch")
             shared = draft.get("sharedState") if isinstance(draft.get("sharedState"), dict) else {}
-            payload = draft.get("payload") if isinstance(draft.get("payload"), dict) else {}
+            payload = payload if isinstance(payload, dict) else {}
             setup = self._normalise_input_setup(draft.get("setup"))
             if states[side]["fieldSide"] is None and setup and setup.get("fieldSide") in {"left", "right"}:
                 states[side]["fieldSide"] = setup["fieldSide"]
@@ -757,14 +1015,24 @@ class JpdDidData:
         }
 
     def get_input_setup(self, gm_id: str) -> dict[Side, dict[str, Any] | None]:
+        references = {side: self._input_setup_reference(gm_id, side) for side in ("H", "A")}
+        snapshots = {snapshot.reference.path: snapshot for snapshot in self.db.get_all(list(references.values()), retry=None, timeout=20)}
+        base: dict[Side, tuple[Any, dict[str, Any]] | None] = {"H": None, "A": None}
+        for side, reference in references.items():
+            snapshot = snapshots.get(reference.path)
+            if snapshot is not None and snapshot.exists:
+                setup = self._normalise_input_setup((snapshot.to_dict() or {}).get("setup"))
+                if setup is not None:
+                    base[side] = (reference, setup)
+
         result: dict[Side, dict[str, Any] | None] = {"H": None, "A": None}
-        for side in ("H", "A"):
-            document = self._input_setup_reference(gm_id, side).get(retry=None, timeout=10)
-            if document.exists:
-                result[side] = self._with_input_setup_subs(
-                    document.reference,
-                    self._normalise_input_setup((document.to_dict() or {}).get("setup")),
-                )
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="input-setup") as executor:
+            futures = {
+                side: executor.submit(self._with_input_setup_subs, value[0], value[1])
+                for side, value in base.items() if value is not None
+            }
+            for side, future in futures.items():
+                result[side] = future.result()
         return result
 
     def save_input_setup(
@@ -1036,6 +1304,15 @@ class JpdDidData:
 
     def get_or_create_input_squads(self, gm_id: str, match: MatchDoc) -> tuple[dict[str, list[dict[str, str]]], bool]:
         """Return a fixture roster snapshot without re-querying contracts once cached."""
+        squads, cached, _ = self._get_or_create_input_squads_snapshot(gm_id, match)
+        return squads, cached
+
+    def _get_or_create_input_squads_snapshot(
+        self,
+        gm_id: str,
+        match: MatchDoc,
+    ) -> tuple[dict[str, list[dict[str, str]]], bool, dict[str, Any]]:
+        """Return squads and their backing snapshot for the lobby fast path."""
         reference = self._input_squads_reference(gm_id)
         existing = reference.get(retry=None, timeout=10)
         document = existing.to_dict() or {}
@@ -1047,11 +1324,128 @@ class JpdDidData:
             and isinstance(home, list)
             and isinstance(away, list)
         ):
-            return {"H": home, "A": away}, True
+            return {"H": home, "A": away}, True, document
         seed_squads = {"H": home, "A": away} if (
             document.get("source") == source and isinstance(home, list) and isinstance(away, list)
         ) else None
-        return self.refresh_input_squads(gm_id, match, seed_squads=seed_squads), False
+        squads = self.refresh_input_squads(gm_id, match, seed_squads=seed_squads)
+        # A cache miss is exceptional. Read back once so the caller receives
+        # the same normalized legacy lineup that subsequent lobby opens reuse.
+        refreshed = reference.get(retry=None, timeout=10).to_dict() or {}
+        return squads, False, refreshed
+
+    @staticmethod
+    def _final_lobby_snapshot_values(
+        match: MatchDoc,
+        side: Side,
+        *,
+        input_mode: str,
+        field_side: str | None,
+        formation_key: str,
+        lineup: list[dict[str, Any]],
+        halves: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Small, display-only final state kept beside the squad snapshot."""
+        if field_side not in {"left", "right"} or not formation_key or not isinstance(lineup, list):
+            return None
+        return {
+            "status": "final",
+            "inputMode": input_mode if input_mode in {"분석", "실시간"} else "분석",
+            "fieldSide": field_side,
+            "formationKey": formation_key,
+            "lineup": lineup,
+            "halves": halves,
+            "homeScore": match.score.home,
+            "awayScore": match.score.away,
+            "updatedAt": utc_now(),
+        }
+
+    @classmethod
+    def _final_lobby_session_from_snapshot(
+        cls,
+        gm_id: str,
+        side: Side,
+        match: MatchDoc,
+        field_side: str | None,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Build a display-only final lobby shell from a cached snapshot."""
+        lobby = snapshot.get("lobby") if isinstance(snapshot.get("lobby"), dict) else {}
+        stored = lobby.get(side) if isinstance(lobby.get(side), dict) else None
+        if stored is None:
+            # Imported fixtures already carry this normalized lineup under the
+            # old name. Convert it in memory so historic snapshots are fast
+            # even before the Swagger backfill rewrites them.
+            if field_side not in {"left", "right"}:
+                return None
+            legacy = snapshot.get("legacyLineup") if isinstance(snapshot.get("legacyLineup"), dict) else {}
+            lineup_snapshot = legacy.get(side) if isinstance(legacy.get(side), dict) else {}
+            stored = cls._final_lobby_snapshot_values(
+                match,
+                side,
+                input_mode="분석",
+                field_side=field_side,
+                formation_key=str(lineup_snapshot.get("formationKey") or ""),
+                lineup=lineup_snapshot.get("lineup") if isinstance(lineup_snapshot.get("lineup"), list) else [],
+                halves={"H1": {"seconds": 0}, "H2": {"seconds": 0}},
+            )
+        if stored is None:
+            return None
+        formation_key = stored.get("formationKey")
+        lineup = stored.get("lineup")
+        stored_side = stored.get("fieldSide")
+        if not isinstance(formation_key, str) or not formation_key or not isinstance(lineup, list) or stored_side not in {"left", "right"}:
+            return None
+        return {
+            "status": "ok",
+            "gmId": gm_id,
+            "side": side,
+            "payload": {
+                "gmId": gm_id,
+                "side": side,
+                "inputMode": stored.get("inputMode") if stored.get("inputMode") in {"분석", "실시간"} else "분석",
+                "fieldSide": stored_side,
+                "formationKey": formation_key,
+                "homeScore": int(stored.get("homeScore") or match.score.home),
+                "awayScore": int(stored.get("awayScore") or match.score.away),
+                "status": "final",
+                "halves": stored.get("halves") if isinstance(stored.get("halves"), dict) else {"H1": {"seconds": 0}, "H2": {"seconds": 0}},
+                "lineup": lineup,
+                "records": [],
+                "cards": [],
+                "recorderLevel": "advanced",
+                "matchSnapshot": {
+                    "leagueId": match.leagueId, "seasonId": match.seasonId, "round": match.round,
+                    "date": match.date, "kickoffTime": match.kickoffTime, "stadiumId": match.stadiumId,
+                    "matchType": match.matchType, "homeTeamId": match.homeTeamId, "awayTeamId": match.awayTeamId,
+                },
+                "formationChanges": [],
+            },
+            "clientState": {"restoredFromRaw": True, "summaryOnly": True, "fromInputSnapshot": True},
+            "updatedAt": stored.get("updatedAt") or snapshot.get("updatedAt"),
+        }
+
+    def save_final_input_lobby_snapshot(
+        self,
+        gm_id: str,
+        side: Side,
+        match: MatchDoc,
+        payload: dict[str, Any],
+    ) -> None:
+        """Persist final lineup display data with the reusable squad snapshot."""
+        lineup = [item for item in payload.get("lineup", []) if isinstance(item, dict)]
+        summary = self._final_lobby_snapshot_values(
+            match,
+            side,
+            input_mode=str(payload.get("inputMode") or "분석"),
+            field_side=payload.get("fieldSide"),
+            formation_key=str(payload.get("formationKey") or ""),
+            lineup=lineup,
+            halves=payload.get("halves") if isinstance(payload.get("halves"), dict) else {},
+        )
+        if summary is None:
+            return
+        self._input_squads_reference(gm_id).set({"lobby": {side: summary}}, merge=True, retry=None, timeout=20)
 
     def refresh_input_squads(
         self,
@@ -1060,25 +1454,50 @@ class JpdDidData:
         *,
         legacy_recordings: dict[Side, RecordingDoc] | None = None,
         seed_squads: dict[str, list[dict[str, Any]]] | None = None,
+        write_batch: Any = None,
     ) -> dict[str, list[dict[str, str]]]:
         """Rebuild squad + imported-lineup snapshot after source data is corrected."""
         reference = self._input_squads_reference(gm_id)
         existing = reference.get(retry=None, timeout=10)
+        existing_document = existing.to_dict() or {}
         legacy_recordings = legacy_recordings if legacy_recordings is not None else self._legacy_recordings(gm_id)
         if legacy_recordings:
             squads, legacy_lineups = self._build_legacy_input_snapshot(match, legacy_recordings, seed_squads=seed_squads)
         else:
             squads, legacy_lineups = self._build_input_squads(match), {}
+        final_lobby: dict[str, dict[str, Any]] = {}
+        for side, recording in legacy_recordings.items():
+            legacy = legacy_lineups.get(side, {})
+            lineup = legacy.get("lineup") if isinstance(legacy.get("lineup"), list) else []
+            summary = self._final_lobby_snapshot_values(
+                match,
+                side,
+                input_mode=recording.inputMode,
+                field_side=recording.fieldSide,
+                formation_key=recording.formationKey,
+                lineup=lineup,
+                halves={half: {"seconds": values.seconds} for half, values in recording.halves.items() if half in {"H1", "H2"}},
+            )
+            if summary is not None:
+                final_lobby[side] = summary
         now = utc_now()
-        reference.set({
+        values = {
             "schemaVersion": 3,
             "source": self._input_squad_source(match),
             "H": squads["H"],
             "A": squads["A"],
             "legacyLineup": legacy_lineups,
-            "createdAt": (existing.to_dict() or {}).get("createdAt", now) if existing.exists else now,
+            "createdAt": existing_document.get("createdAt", now) if existing.exists else now,
             "updatedAt": now,
-        }, retry=None, timeout=30)
+        }
+        if final_lobby:
+            values["lobby"] = final_lobby
+        elif isinstance(existing_document.get("lobby"), dict):
+            values["lobby"] = existing_document["lobby"]
+        if write_batch is not None:
+            write_batch.set(reference, values)
+        else:
+            reference.set(values, retry=None, timeout=30)
         return squads
 
     def _read_legacy_snapshot_lineup(
@@ -1146,7 +1565,7 @@ class JpdDidData:
         from_gm_id: str | None = None,
         to_gm_id: str | None = None,
     ) -> dict[str, int]:
-        """Count usable imported-match snapshots for an explicit legacy scope."""
+        """Count usable fast lobby snapshots for an explicit season scope."""
         counts = {"matched": 0, "legacy": 0, "ready": 0, "missing": 0}
         matches = self._legacy_snapshot_matches(
             season_id=season_id, from_gm_id=from_gm_id, to_gm_id=to_gm_id,
@@ -1155,11 +1574,17 @@ class JpdDidData:
         for gm_id, match in matches:
             counts["matched"] += 1
             recordings = recordings_by_match.get(gm_id, {})
-            if not recordings:
-                continue
-            counts["legacy"] += 1
             snapshot = snapshots_by_match.get(gm_id, {})
-            ready = self._legacy_input_snapshot_ready(match, recordings, snapshot)
+            if recordings:
+                counts["legacy"] += 1
+                ready = self._legacy_input_snapshot_ready(match, recordings, snapshot)
+            else:
+                ready = (
+                    snapshot.get("schemaVersion") == 3
+                    and snapshot.get("source") == self._input_squad_source(match)
+                    and isinstance(snapshot.get("H"), list)
+                    and isinstance(snapshot.get("A"), list)
+                )
             counts["ready" if ready else "missing"] += 1
         return counts
 
@@ -1170,6 +1595,7 @@ class JpdDidData:
         snapshot: dict[str, Any],
     ) -> bool:
         lineups = snapshot.get("legacyLineup") if isinstance(snapshot.get("legacyLineup"), dict) else {}
+        lobby = snapshot.get("lobby") if isinstance(snapshot.get("lobby"), dict) else {}
         return (
             snapshot.get("schemaVersion") == 3
             and snapshot.get("source") == self._input_squad_source(match)
@@ -1177,6 +1603,10 @@ class JpdDidData:
                 isinstance(lineups.get(side), dict)
                 and lineups[side].get("fingerprint") == self._legacy_lineup_fingerprint(recording)
                 and isinstance(lineups[side].get("lineup"), list)
+                and isinstance(lobby.get(side), dict)
+                and lobby[side].get("formationKey") == recording.formationKey
+                and lobby[side].get("fieldSide") == recording.fieldSide
+                and isinstance(lobby[side].get("lineup"), list)
                 for side, recording in recordings.items()
             )
         )
@@ -1223,7 +1653,12 @@ class JpdDidData:
         limit: int | None = None,
         on_progress: Callable[[dict[str, int]], None] | None = None,
     ) -> dict[str, int]:
-        """Create v3 imported-match snapshots without mutating RAW recordings."""
+        """Backfill one season's fast input read models without touching RAW.
+
+        The Swagger job deliberately owns the one-time migration as well:
+        canonical match date/season fields, reusable squad snapshots, and the
+        schedule/lobby summary document are created together.
+        """
         matches = self._legacy_snapshot_matches(
             season_id=season_id, from_gm_id=from_gm_id, to_gm_id=to_gm_id, limit=limit,
         )
@@ -1231,22 +1666,63 @@ class JpdDidData:
         recordings_by_match, snapshots_by_match = self._legacy_snapshot_state(matches)
         for gm_id, match in matches:
             try:
+                normalised_date = self._normalise_match_date(match.date)
+                normalised_season = self._normalise_season_id(match.seasonId)
+                if normalised_date != match.date or normalised_season != match.seasonId:
+                    self.db.collection("matches").document(gm_id).update({
+                        "date": normalised_date, "seasonId": normalised_season, "updatedAt": utc_now(),
+                    }, retry=None, timeout=20)
+                    with self._match_cache_lock:
+                        self._match_cache.pop(gm_id, None)
+                    match = match.model_copy(update={"date": normalised_date, "seasonId": normalised_season})
                 recordings = recordings_by_match.get(gm_id, {})
+                current = snapshots_by_match.get(gm_id, {})
                 if recordings:
                     counts["scanned"] += 1
-                    current = snapshots_by_match.get(gm_id, {})
-                    if self._legacy_input_snapshot_ready(match, recordings, current):
-                        counts["unchanged"] += 1
-                    else:
-                        self.refresh_input_squads(gm_id, match, legacy_recordings=recordings)
-                        counts["created"] += 1
+                regular_snapshot_ready = (
+                    current.get("schemaVersion") == 3
+                    and current.get("source") == self._input_squad_source(match)
+                    and isinstance(current.get("H"), list)
+                    and isinstance(current.get("A"), list)
+                )
+                if (recordings and self._legacy_input_snapshot_ready(match, recordings, current)) or (not recordings and regular_snapshot_ready):
+                    counts["unchanged"] += 1
+                else:
+                    # This includes never-started fixtures. Their squad snapshot
+                    # lets a fresh waiting room open without contract/roster I/O.
+                    self.refresh_input_squads(gm_id, match, legacy_recordings=recordings)
+                    counts["created"] += 1
+                self.refresh_input_summary(gm_id, match)
             except Exception:
-                logger.exception("Legacy input snapshot backfill failed for %s", gm_id)
+                logger.exception("Legacy input snapshot backfill failed for %s (date=%r)", gm_id, match.date)
                 counts["failed"] += 1
             finally:
                 counts["processed"] += 1
                 if on_progress is not None:
                     on_progress(dict(counts))
+        if not from_gm_id and not to_gm_id and limit is None and counts["failed"] == 0:
+            self._input_summary_backfill_reference(season_id).set({
+                "seasonId": season_id,
+                "complete": True,
+                "completedAt": utc_now(),
+                "matched": counts["matched"],
+            }, retry=None, timeout=20)
+            months: dict[tuple[int, int], set[str]] = defaultdict(set)
+            for gm_id, match in matches:
+                date = self._normalise_match_date(match.date)
+                months[(int(date[:4]), int(date[5:7]))].add(gm_id)
+            for (year, month), migrated_ids in months.items():
+                # Mark a calendar month complete only when this full-season job
+                # covered every fixture in it. Season IDs in historical data do
+                # not reliably correspond to calendar years.
+                all_ids = {gm_id for gm_id, _ in self.list_matches_for_month(year, month)}
+                if all_ids and all_ids <= migrated_ids:
+                    self._input_summary_month_reference(year, month).set({
+                        "complete": True,
+                        "seasonId": season_id,
+                        "completedAt": utc_now(),
+                        "matchCount": len(all_ids),
+                    }, retry=None, timeout=20)
         return counts
 
     @staticmethod
@@ -1309,7 +1785,14 @@ class JpdDidData:
             next_payload["records"] = records
         card_documents = list(reference.collection("cards").stream(retry=None, timeout=20))
         if card_documents:
-            next_payload["cards"] = self._draft_cards(reference)
+            cards = [
+                normalised for item in card_documents
+                if isinstance((values := item.to_dict()), dict)
+                if not values.get("deleted")
+                if (normalised := self._normalise_draft_card(item.id, values)) is not None
+            ]
+            cards.sort(key=lambda item: (str(item.get("half", "H1")), int(item.get("halfSeconds", 0)), str(item.get("id"))))
+            next_payload["cards"] = cards
         return {**document, "payload": next_payload}
 
     @staticmethod
@@ -1524,6 +2007,23 @@ class JpdDidData:
             # just before a substitution wrote a newer setup revision.
             reference.set(document, merge=True, retry=None, timeout=20)
         saved = reference.get(retry=None, timeout=10).to_dict() or {}
+        # Clock ticks are frequent and never affect a schedule card. Refresh
+        # only when its visible lifecycle/score changes (or a full checkpoint
+        # is written), keeping the read model from becoming another live-load
+        # source. It is always derived after the Draft write commits.
+        visible_summary_changed = (
+            sync_scope == "checkpoint"
+            or (
+                sync_scope in {"state", "state_records"}
+                and can_write_live_state
+                and any(
+                    root_payload.get(key) != previous_payload.get(key)
+                    for key in ("status", "homeScore", "awayScore")
+                )
+            )
+        )
+        if visible_summary_changed:
+            self.sync_input_summary_from_draft(gm_id, side, saved)
         if include_events:
             return self._with_draft_records(reference, saved)
         if sync_scope == "cards" and isinstance(saved.get("payload"), dict):
@@ -1539,6 +2039,29 @@ class JpdDidData:
         role: Literal["primary", "assistant", "manager"],
         display_name: str | None = None,
     ) -> dict[str, Any]:
+        # Two analysts can press setup save together, including on different
+        # backend workers. The Draft read and seat claim must commit together.
+        @firestore.transactional
+        def claim(transaction):
+            return self._join_input_draft_participant(
+                gm_id, side, user_id=user_id, role=role,
+                display_name=display_name, transaction=transaction,
+            )
+
+        document = claim(self.db.transaction())
+        self.sync_input_summary_from_draft(gm_id, side, document)
+        return document
+
+    def _join_input_draft_participant(
+        self,
+        gm_id: str,
+        side: Side,
+        *,
+        user_id: str,
+        role: Literal["primary", "assistant", "manager"],
+        display_name: str | None = None,
+        transaction: Any,
+    ) -> dict[str, Any]:
         """Register a recorder on the existing Draft root without touching records.
 
         Seats: one primary, one assistant. Once both are taken, managers may
@@ -1550,7 +2073,7 @@ class JpdDidData:
         and by final RAW promotion.
         """
         reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
-        snapshot = reference.get(retry=None, timeout=10)
+        snapshot = reference.get(transaction=transaction, retry=None, timeout=10)
         now = utc_now()
         current = snapshot.to_dict() or {}
         profile_snapshot = self.db.collection("recorders").document(user_id).get(retry=None, timeout=10)
@@ -1655,8 +2178,9 @@ class JpdDidData:
         }
         # A participant refresh must not overwrite setup with a stale document
         # read. Merge only collaboration metadata into the Draft root.
-        reference.set(updates, merge=True, retry=None, timeout=20)
-        return {**current, **updates}
+        transaction.set(reference, updates, merge=True)
+        document = {**current, **updates}
+        return document
 
     def ensure_recorder_profile(self, user_id: str, *, name: str | None = None) -> dict[str, Any]:
         """Create/update the minimal operational profile after Firebase Auth login."""
@@ -2094,21 +2618,21 @@ class JpdDidData:
         during H2/H2_done it needs H1 and H2. Ready/final states do not preload
         KPI here, keeping the initial lobby payload light.
         """
-        fields = ("TAP", "DAP", "DTP", "Shoot", "Goal", "SSR", "BAP", "ASR")
-        empty = {field: 0 for field in fields}
-        result = {
-            side: {
-                "all": dict(empty),
-                "H1": dict(empty),
-                "H2": dict(empty),
-            }
-            for side in ("H", "A")
-        }
+        result = self._empty_input_dashboard_kpis()
         for half in halves:
             half_kpis = self.read_match_dashboard_kpis(gm_id, half=half)
             for side in ("H", "A"):
                 result[side][half] = half_kpis[side]
         return result
+
+    @staticmethod
+    def _empty_input_dashboard_kpis() -> dict[Side, dict[str, dict[str, int | float]]]:
+        fields = ("TAP", "DAP", "DTP", "Shoot", "Goal", "SSR", "BAP", "ASR")
+        empty = {field: 0 for field in fields}
+        return {
+            side: {"all": dict(empty), "H1": dict(empty), "H2": dict(empty)}
+            for side in ("H", "A")
+        }
 
     def input_bootstrap_kpi_halves(self, lifecycle: str | None) -> list[Literal["H1", "H2"]]:
         if lifecycle in {"H1", "H1_done"}:
@@ -2120,46 +2644,75 @@ class JpdDidData:
     def build_input_bootstrap(self, gm_id: str, side: Side) -> dict[str, Any]:
         """Return the lobby-critical data in one response with parallel independent reads."""
         match = self.get_match(gm_id)
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="input-bootstrap") as executor:
-            squads_future = executor.submit(self.get_or_create_input_squads, gm_id, match)
-            status_future = executor.submit(self.get_recording_input_states, gm_id)
-            setup_future = executor.submit(self.get_input_setup, gm_id)
-            input_status = status_future.result()
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="input-bootstrap") as executor:
+            squads_future = executor.submit(self._get_or_create_input_squads_snapshot, gm_id, match)
+            summary_future = executor.submit(lambda: self._input_summary_reference(gm_id).get(retry=None, timeout=10))
+            summary_snapshot = summary_future.result()
+            summary = summary_snapshot.to_dict() or {} if summary_snapshot.exists else {}
+            summary_status = summary.get("inputStatus") if isinstance(summary.get("inputStatus"), dict) else {}
+            input_status = summary_status if all(isinstance(summary_status.get(item), dict) for item in ("H", "A")) else self.get_recording_input_states(gm_id)
             selected_status = input_status[side]
-            bootstrap_kpi_halves = self.input_bootstrap_kpi_halves(selected_status.get("lifecycleStatus"))
-            kpi_future = executor.submit(self.read_match_dashboard_kpis_bootstrap, gm_id, bootstrap_kpi_halves)
-            squads, cached = squads_future.result()
-            dashboard_kpis = kpi_future.result()
-            input_setup = setup_future.result()
+            squads, cached, squad_snapshot = squads_future.result()
 
-        if selected_status["rawStatus"] == "final":
-            # Reuse the already-read final recording state where possible, but do
-            # not stream event rows just to paint the lobby.
-            recording = self.get_recording(gm_id, side)
-            session: dict[str, Any] = {
-                "status": "ok",
-                **self.read_input_state_from_raw(
-                    gm_id,
-                    side,
-                    include_records=False,
-                    match=match,
-                    recording=recording,
-                ),
-            }
-        else:
-            try:
-                draft = self.get_input_draft(gm_id, side)
-            except NotFoundError:
-                session = {"status": "missing", "gmId": gm_id, "side": side}
-            else:
+        # A completed recording has no live collaboration state.  The lobby
+        # only needs the cached squads and the compact RAW lineup shell to
+        # render; Draft, setup, KPI, and RAW event rows are deferred until the
+        # user asks for an action that needs them.
+        is_final_lobby = selected_status["rawStatus"] == "final"
+        bootstrap_kpi_halves = [] if is_final_lobby else self.input_bootstrap_kpi_halves(selected_status.get("lifecycleStatus"))
+        if is_final_lobby:
+            input_setup: dict[Side, dict[str, Any] | None] = {"H": None, "A": None}
+            dashboard_kpis = self._empty_input_dashboard_kpis()
+            # The completed lobby still renders the final formation.  Read the
+            # compact recording root and rebuild only its lineup/order, score,
+            # clock, and field-side shell; records and cards remain deferred
+            # to an explicit correction action.
+            session = self._final_lobby_session_from_snapshot(
+                gm_id, side, match, selected_status.get("fieldSide"), squad_snapshot,
+            )
+            if session is None:
+                # Modern final recordings do not yet have a display snapshot.
+                # Keep their existing compact RAW fallback; records/cards are
+                # still excluded from this lobby read.
+                recording = self.get_recording(gm_id, side)
                 session = {
                     "status": "ok",
-                    "gmId": gm_id,
-                    "side": side,
-                    "payload": draft.get("payload"),
-                    "clientState": draft.get("clientState") or {},
-                    "updatedAt": draft.get("updatedAt"),
-                } if draft.get("payload") else {"status": "missing", "gmId": gm_id, "side": side}
+                    **self.read_input_state_from_raw(
+                        gm_id,
+                        side,
+                        include_records=False,
+                        match=match,
+                        recording=recording,
+                    ),
+                }
+        elif selected_status.get("lifecycleStatus") == "ready":
+            # Fresh scheduled fixtures have no Draft, setup, or KPI data. The
+            # prebuilt summary + roster snapshot are enough for the waiting
+            # room, so do not spend reads proving that those documents miss.
+            input_setup = {"H": None, "A": None}
+            dashboard_kpis = self._empty_input_dashboard_kpis()
+            session = {"status": "missing", "gmId": gm_id, "side": side}
+        else:
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="input-bootstrap-live") as executor:
+                setup_future = executor.submit(self.get_input_setup, gm_id)
+                kpi_future = executor.submit(self.read_match_dashboard_kpis_bootstrap, gm_id, bootstrap_kpi_halves)
+                draft_future = executor.submit(self.get_input_draft, gm_id, side)
+                input_setup = setup_future.result()
+                dashboard_kpis = kpi_future.result()
+                try:
+                    draft = draft_future.result()
+                except NotFoundError:
+                    session = {"status": "missing", "gmId": gm_id, "side": side}
+                else:
+                    session = {
+                        "status": "ok",
+                        "gmId": gm_id,
+                        "side": side,
+                        "payload": draft.get("payload"),
+                        "clientState": draft.get("clientState") or {},
+                        "updatedAt": draft.get("updatedAt"),
+                    } if draft.get("payload") else {"status": "missing", "gmId": gm_id, "side": side}
+
         # Existing active Drafts predate the dedicated setup field. Copy their
         # completed configuration once; later record/timer writes never touch it.
         if input_setup[side] is None and isinstance(session.get("payload"), dict):

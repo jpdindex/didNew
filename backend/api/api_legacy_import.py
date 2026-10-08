@@ -499,7 +499,7 @@ def repair_legacy_metadata(_: RequiredUser = None) -> LegacyMetadataRepairStatus
     return _metadata_repair_response(job)
 
 
-@router.post("/legacy-import/snapshot-backfill", response_model=LegacySnapshotStatusResponse, status_code=202, summary="Start imported lineup snapshot backfill")
+@router.post("/legacy-import/snapshot-backfill", response_model=LegacySnapshotStatusResponse, status_code=202, summary="Backfill fixture roster, schedule summary, and imported lineup snapshots")
 def backfill_legacy_snapshots(
     season: str = Form(..., min_length=1, max_length=32),
     from_gm_id: str | None = Form(default=None, max_length=128),

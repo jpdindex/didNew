@@ -4,21 +4,49 @@ import asyncio
 import json
 import logging
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import date
 from threading import Lock
 from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from firebase_admin import auth
+from google.api_core.exceptions import FailedPrecondition
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData, NotFoundError, RequiredUser, ensure_firebase_app, get_settings, utc_now
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
-from backend.system.system_schema import Half, InputMode, Side
+from backend.system.system_schema import Half, InputMode, Side, MatchDoc
 
 
 logger = logging.getLogger(__name__)
+
+
+class ScheduleMatchCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    gmId: str = Field(min_length=15, pattern=r"^[0-9]{8}[A-Za-z0-9]+[0-9]{4}$")
+    date: str
+    kickoffTime: str | None = Field(default=None, pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+    leagueId: str = Field(min_length=1)
+    seasonId: str = Field(pattern=r"^[0-9]{8}$")
+    round: int | None = Field(default=None, ge=1)
+    stadiumId: str = Field(min_length=1)
+    homeTeamId: str = Field(min_length=1)
+    awayTeamId: str = Field(min_length=1)
+
+    @field_validator("date")
+    @classmethod
+    def validate_date(cls, value: str) -> str:
+        if date.fromisoformat(value).isoformat() != value:
+            raise ValueError("날짜를 YYYY-MM-DD 형식으로 입력하세요.")
+        return value
+
+
+class ScheduleMatchesCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    matches: list[ScheduleMatchCreate] = Field(min_length=1, max_length=100)
 
 
 class InputLineup(BaseModel):
@@ -185,6 +213,18 @@ class ParticipantJoinRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     role: Literal["primary", "assistant", "manager"]
     displayName: str | None = Field(default=None, max_length=100)
+
+
+class DraftEnterResponse(BaseModel):
+    """Everything the input screen needs after a durable participant join."""
+
+    status: Literal["ok"] = "ok"
+    gmId: str
+    side: Side
+    participant: dict[str, Any]
+    draft: DraftResponse | DraftMissingResponse
+    squads: dict[Side, list[dict[str, Any]]]
+    inputSetup: dict[Side, dict[str, Any] | None]
 
 
 class RecorderProfileRequest(BaseModel):
@@ -539,17 +579,69 @@ def _promote(
         payload.gmId, payload.side, recording=recording, records=records, cards=cards,
         score={"home": payload.homeScore, "away": payload.awayScore},
     )
+    if status == "final":
+        # The completed-match lobby reads this compact display snapshot instead
+        # of reopening RAW merely to reconstruct formation and player order.
+        data.save_final_input_lobby_snapshot(
+            payload.gmId, payload.side, match, payload.model_dump(mode="python"),
+        )
     if delete_draft:
         data.delete_input_draft(payload.gmId, payload.side)
+    data.sync_input_summary_from_recording(
+        payload.gmId,
+        payload.side,
+        recorders=recording["recorders"],
+        score={"home": payload.homeScore, "away": payload.awayScore},
+    )
     return PromotionResponse(
         status="ok", gmId=payload.gmId, side=payload.side,
         recordsSaved=len(records), cardsSaved=len(cards), draftDeleted=delete_draft,
     )
 
 
+@router.post("/match-input/schedules", include_in_schema=False, status_code=201)
+def create_schedule_matches(request: ScheduleMatchesCreateRequest, _: RequiredUser = None) -> dict:
+    now = utc_now()
+    matches: dict[str, MatchDoc] = {}
+    for item in request.matches:
+        if item.gmId in matches:
+            raise BackendError("gm_id가 중복됩니다.", status_code=422, code="duplicate_match_id")
+        if item.gmId[:8] != item.seasonId or int(item.seasonId[4:]) != int(item.seasonId[:4]) + 1:
+            raise BackendError("gm_id와 시즌을 확인하세요.", status_code=422, code="invalid_match_season")
+        if item.homeTeamId == item.awayTeamId:
+            raise BackendError("홈팀과 원정팀이 같을 수 없습니다.", status_code=422, code="invalid_match_teams")
+        matches[item.gmId] = MatchDoc(
+            **item.model_dump(exclude={"gmId"}), matchType="league",
+            score={"home": 0, "away": 0}, createdAt=now, updatedAt=now,
+        )
+    JpdDidData().create_schedule_matches(matches)
+    return {"status": "ok", "gmIds": list(matches)}
+
+
 @router.get("/match-input/matches", include_in_schema=False)
 def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Query(..., ge=1, le=12), _: RequiredUser = None) -> dict:
     data = JpdDidData()
+    try:
+        summaries = data.list_input_summaries_for_month(year, month)
+    except FailedPrecondition:
+        # A newly deployed collection-group index can take a short time to
+        # become queryable. Keep the schedule available during that window.
+        logger.info("Schedule summary index is still building; using legacy monthly query")
+        summaries = []
+    if data.input_summary_backfill_complete_for_month(year, month):
+        # The schedule read model carries every card's participant roster and
+        # state. Once a season migration is complete this is the normal path:
+        # one collection-group range query, not a per-match source walk.
+        return {"status": "ok", "matches": sorted(summaries, key=lambda item: (item.get("date", ""), item.get("kickoffTime") or "", item.get("gmId", "")))}
+
+    # During a partial migration, keep every fixture visible. The legacy
+    # assembler supplies missing summaries; already-backfilled rows replace
+    # their legacy copy below so their display and authority stay in sync.
+    summaries_by_gm = {
+        str(item.get("gmId")): item
+        for item in summaries
+        if isinstance(item.get("gmId"), str) and item.get("gmId")
+    }
     month_matches = data.list_matches_for_month(year, month)
     if not month_matches:
         return {"status": "ok", "matches": []}
@@ -578,9 +670,6 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
         # analyst roster so the schedule can still show who worked it. A later
         # correction Draft only adds people (e.g. a manager) to that roster.
         for side in ("H", "A"):
-            # 전반전 시작 전 Draft의 참여자는 확정된 명단이 아니다(예전 로비 입장 기록 등).
-            if heads[side].get("status") != "final" and (collaboration[side].get("status") or "ready") == "ready":
-                collaboration[side] = {**collaboration[side], "participants": []}
             recorders = heads[side].get("recorders") or {}
             if not recorders:
                 continue
@@ -623,7 +712,8 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
             },
             "collaboration": collaboration,
         })
-    return {"status": "ok", "matches": sorted(matches, key=lambda item: (item["date"], item["kickoffTime"] or "", item["gmId"]))}
+    merged = [summaries_by_gm.get(item["gmId"], item) for item in matches]
+    return {"status": "ok", "matches": sorted(merged, key=lambda item: (item["date"], item["kickoffTime"] or "", item["gmId"]))}
 
 
 @router.get("/match-input/analyst-dashboard", include_in_schema=False)
@@ -657,13 +747,21 @@ def read_match_dashboard_kpis(
 ) -> dict:
     data = JpdDidData()
     data.get_match(gm_id)
+    input_status = data.get_recording_input_states(gm_id)
+    # Final-match dashboards do not edit formation or substitutions. Avoid two
+    # guaranteed-missing inputDraft reads when their deferred KPI request runs.
+    input_setup = (
+        {"H": None, "A": None}
+        if all(input_status[item]["rawStatus"] == "final" for item in ("H", "A"))
+        else data.get_input_setup(gm_id)
+    )
     return {
         "status": "ok", "gmId": gm_id, "half": half,
         "kpis": data.read_match_dashboard_kpis(gm_id, half=half),
         # The lobby already polls this lightweight response for live KPI. Keep
         # the durable setup in the same response so it never falls back to a
         # transient Draft just to paint formation or player placement.
-        "inputSetup": data.get_input_setup(gm_id),
+        "inputSetup": input_setup,
     }
 
 
@@ -803,6 +901,51 @@ def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinReque
         # manager in a correction Draft has no primary above it, so it owns it.
         "control": not document.get("primaryUid") or document.get("primaryUid") == user.uid,
     }
+
+
+@router.post("/match-input/drafts/{gm_id}/{side}/enter", response_model=DraftEnterResponse, include_in_schema=False)
+def enter_draft(gm_id: str, side: Side, request: ParticipantJoinRequest, user: RequiredUser = None) -> DraftEnterResponse:
+    """Join once, then load the input screen's independent data in parallel.
+
+    The existing participant, draft, squads, and setup routes remain available
+    as recovery paths.  This route removes their sequential round trips from
+    the normal DidInput entry path.
+    """
+    data = JpdDidData()
+    match = data.get_match(gm_id)
+    participant_document = data.join_input_draft_participant(
+        gm_id, side, user_id=user.uid, role=request.role, display_name=request.displayName,
+    )
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="input-enter") as executor:
+        squads_future = executor.submit(data.get_or_create_input_squads, gm_id, match)
+        setup_future = executor.submit(data.get_input_setup, gm_id)
+        draft_future = executor.submit(data.get_input_draft, gm_id, side)
+        squads, _ = squads_future.result()
+        input_setup = setup_future.result()
+        try:
+            document = draft_future.result()
+        except NotFoundError:
+            draft: DraftResponse | DraftMissingResponse = DraftMissingResponse(status="missing", gmId=gm_id, side=side)
+        else:
+            draft = (
+                _draft_response(document, input_setup.get(side))
+                if document.get("payload")
+                else DraftMissingResponse(status="missing", gmId=gm_id, side=side)
+            )
+    participants = participant_document.get("participants", {})
+    return DraftEnterResponse(
+        gmId=gm_id,
+        side=side,
+        participant={
+            "primaryUid": participant_document.get("primaryUid"),
+            "participants": participants,
+            "role": (participants.get(user.uid) or {}).get("role"),
+            "control": not participant_document.get("primaryUid") or participant_document.get("primaryUid") == user.uid,
+        },
+        draft=draft,
+        squads=squads,
+        inputSetup=input_setup,
+    )
 
 
 @router.post("/match-input/drafts/{gm_id}/{side}/restore-raw", response_model=DraftResponse, include_in_schema=False)

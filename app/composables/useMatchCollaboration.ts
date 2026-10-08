@@ -1,5 +1,5 @@
 import type { DidRecord } from '~/utils/didLogic'
-import type { MatchState } from '~/composables/useMatchState'
+import type { MatchState, MatchSquadPlayer } from '~/composables/useMatchState'
 import type { CardRecord } from '~/utils/card'
 import { cloneState, payloadFromState, type InputPayload } from '~/composables/useMatchDraft'
 
@@ -133,7 +133,7 @@ function sortRecords(records: DidRecord[]): DidRecord[] {
   )
 }
 
-interface DraftResponse {
+export interface DraftResponse {
   status: string
   gmId: string
   side: 'H' | 'A'
@@ -151,6 +151,21 @@ interface DraftResponse {
     inputMode: '분석' | '실시간'
     revision: number
   } | null
+}
+
+export interface DraftEnterResponse {
+  status: 'ok'
+  gmId: string
+  side: 'H' | 'A'
+  participant: {
+    role?: ParticipantRole
+    control?: boolean
+    participants: Record<string, { name?: string; role?: ParticipantRole }>
+    primaryUid?: string
+  }
+  draft: DraftResponse | { status: 'missing'; gmId: string; side: 'H' | 'A' }
+  squads: { H: MatchSquadPlayer[]; A: MatchSquadPlayer[] }
+  inputSetup: { H: DraftResponse['inputSetup']; A: DraftResponse['inputSetup'] }
 }
 
 type SyncScope = 'state' | 'records' | 'state_records' | 'cards'
@@ -274,6 +289,18 @@ export function useMatchCollaboration() {
     return response
   }
 
+  async function enter(game: MatchState, role: ParticipantRole): Promise<DraftEnterResponse> {
+    const user = await currentIdentity()
+    const response = await request<DraftEnterResponse>(
+      `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${sideFor(game)}/enter`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role, displayName: user?.displayName || user?.email || undefined }) },
+    )
+    game.participantRole = response.participant.role ?? role
+    game.lifecycleControl = response.participant.control ?? game.participantRole === 'primary'
+    game.participantName = user?.displayName || user?.email || ''
+    return response
+  }
+
   // Polling is a recovery read only. A healthy socket is the collaboration
   // transport; this timer starts only while the socket is unavailable.
   function followParticipants(count: number | undefined) {
@@ -318,7 +345,7 @@ export function useMatchCollaboration() {
     applyRecords: (records: DidRecord[]) => void
     applyCards?: (cards: CardRecord[]) => void
     applySetup?: (setup: NonNullable<DraftResponse['inputSetup']>) => void
-  }) {
+  }, initial?: DraftResponse | null) {
     stop()
     const current = session
     const { $auth, $authReady } = useNuxtApp()
@@ -537,12 +564,13 @@ export function useMatchCollaboration() {
         reconnectTimer = setTimeout(() => { void connectSocket() }, delay)
       }
     }
-    // Start the live channel immediately, but do not report this screen ready
-    // until one durable Draft read has applied. This prevents a refresh from
-    // enabling a primary's timer against an empty local state while the old
-    // session is still being recovered.
+    // The enter response is already a durable Draft read. Reusing it avoids a
+    // second complete Firestore read during normal screen entry. Fallback and
+    // legacy callers still establish the boundary through poll().
+    const hasInitialDraft = Boolean(initial && initial.status === 'ok')
+    if (initial) applyDraftResponse(initial)
     void connectSocket()
-    await poll()
+    if (!hasInitialDraft) await poll()
     return current === session
   }
 
@@ -757,5 +785,5 @@ export function useMatchCollaboration() {
     })
   }
 
-  return { join, start, stop, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards }
+  return { join, enter, start, stop, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards }
 }
