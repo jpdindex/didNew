@@ -168,10 +168,149 @@ def read_snapshot(data, gm_id, side, *, include_setup=True):
             time.sleep(0.05 * (attempt + 1))
 
 
+def _newer_edit(incoming, previous):
+    if not previous:
+        return True
+    if incoming['at'] != previous['at']:
+        return incoming['at'] > previous['at']
+    # A lower same-device sequence stays old even if another device became
+    # the winner in between. Retain sequence heads for this exact time tie.
+    if incoming['sequence'] < (previous.get('seen') or {}).get(incoming['device'], -1):
+        return False
+    if incoming['device'] == previous['device'] and incoming['sequence'] != previous['sequence']:
+        return incoming['sequence'] > previous['sequence']
+    return incoming['received'] >= previous['received']
+
+
+def _edit_order(stamp, previous=None):
+    seen = {}
+    if previous and previous['at'] == stamp['at']:
+        seen.update(previous.get('seen') or {previous['device']: previous['sequence']})
+    seen[stamp['device']] = max(seen.get(stamp['device'], -1), stamp['sequence'])
+    return {**stamp, 'seen': seen}
+
+
+def _ordered_fields(previous, incoming, before, versions, stamp):
+    """Merge actual edits only; stale full-row echoes never undo peer fields."""
+    result, orders = deepcopy(previous), deepcopy(versions)
+    for field, value in incoming.items():
+        if before is not None and before.get(field) == value:
+            continue
+        if _newer_edit(stamp, orders.get(field)):
+            result[field] = deepcopy(value)
+            orders[field] = _edit_order(stamp, orders.get(field))
+    return result, orders
+
+
+def _merge_command_order(data, store, root, current, body, kind, scope, control, revision, previous_writes):
+    """Keep the existing write pipeline; replace only its conflict decision.
+
+    All comparisons use documents already read by the command transaction.
+    A fresh revision is also the durable first-admission tie breaker, including
+    ignored edits. A repeated command uses its original receipt before here.
+    """
+    edit = body.get('edit') or {}
+    stamp = {'at': int(edit.get('changedAtMs', int(utc_now().timestamp() * 1000))),
+             'device': edit.get('deviceId', 'legacy'), 'sequence': int(edit.get('sequence', 0)),
+             'received': revision + 1}
+    before = edit.get('before') or {}
+    acknowledged_paths = set()
+    for collection, field, deleted, prefix in [('records', 'records', 'deletedRecordIds', 'record'),
+                                             ('cards', 'cards', 'deletedCardIds', 'card'),
+                                             ('substitutions', 'subs', 'deletedSubIds', 'sub')]:
+        if collection == 'records' and not (kind == 'draft' and scope in {'records', 'state_records', 'checkpoint'}):
+            continue
+        if collection == 'cards' and not (kind == 'draft' and scope == 'cards'):
+            continue
+        if collection == 'substitutions' and kind != 'setup':
+            continue
+        source = body['clientState'] if field == 'subs' else body['payload']
+        rows = {str(row['id']): row for row in source.get(field, []) if row.get('id')}
+        deletions = set(body.get(deleted, []))
+        for key in rows.keys() | deletions:
+            reference = root.collection(collection).document(key)
+            old = deepcopy(previous_writes[reference.path][1] if reference.path in previous_writes else store.cache.get(reference.path) or {})
+            versions = old.get('_editVersions') or {}
+            if key in deletions:
+                # A late deletion cannot remove a more recently edited record.
+                merged, orders = deepcopy(old), deepcopy(versions)
+                if all(_newer_edit(stamp, version) for version in versions.values()):
+                    merged['deleted'] = True
+                    orders['deleted'] = _edit_order(stamp, orders.get('deleted'))
+            elif versions.get('deleted') and not _newer_edit(stamp, versions.get('deleted')):
+                merged, orders = old, versions
+            else:
+                wanted = {name: value for name, value in rows[key].items() if name != 'id' and
+                          (value is not None or (name == 'playerId' and key in body.get('clearedRecordPlayerIds', [])))}
+                baseline = None if old.get('deleted') else before.get(f'{prefix}:{key}')
+                merged, orders = _ordered_fields(old, wanted, baseline, versions, stamp)
+                if not old or old.get('deleted'):
+                    merged['deleted'] = False
+                    orders['deleted'] = _edit_order(stamp, orders.get('deleted'))
+            merged.update(id=key, _editVersions=orders)
+            store.writes[reference.path] = (reference.raw, merged)
+            acknowledged_paths.add(reference.path)
+
+    saved = deepcopy(store.writes[root.path][1])
+    root_orders = deepcopy(current.get('_editVersions') or {})
+    if kind == 'draft' and scope in {'state', 'state_records', 'checkpoint'} and control:
+        old = current.get('sharedState') or {}
+        wanted = saved.get('sharedState') or {}
+        # These clock/lifecycle values form one coherent state, not separate
+        # independently mixable timestamps and elapsed-second values.
+        clock_keys = ('halfStatus', 'seconds', 'h1Seconds', 'h2Seconds', 'clockStartedAt')
+        grouped = {'clock': {key: wanted.get(key) for key in clock_keys},
+                   **{key: wanted.get(key) for key in ('homeScore', 'awayScore')}}
+        prior = {'clock': {key: old.get(key) for key in clock_keys},
+                 **{key: old.get(key) for key in ('homeScore', 'awayScore')}}
+        baseline = before.get('state')
+        if baseline is not None:
+            baseline = {'clock': {key: baseline.get(key) for key in clock_keys},
+                        **{key: baseline.get(key) for key in ('homeScore', 'awayScore')}}
+        combined, root_orders['state'] = _ordered_fields(prior, grouped, baseline, root_orders.get('state') or {}, stamp)
+        shared = {**old, **combined['clock'], **{key: combined[key] for key in ('homeScore', 'awayScore')}}
+        # Preserve the existing lifecycle rule: a delayed write cannot reopen
+        # a finished half, even if its device reports a later edit time.
+        if data._lifecycle_rank(shared.get('halfStatus')) < data._lifecycle_rank(old.get('halfStatus')):
+            shared.update({key: old.get(key) for key in clock_keys})
+        saved['sharedState'] = shared
+        saved['clientState'] = {**saved.get('clientState', {}), **shared}
+        saved['payload'] = {**saved.get('payload', {}), 'status': shared.get('halfStatus'),
+                            **{key: shared[key] for key in ('homeScore', 'awayScore')}}
+        halves = deepcopy(saved['payload'].get('halves') or {})
+        for half, key in [('H1', 'h1Seconds'), ('H2', 'h2Seconds')]:
+            if shared.get(key) is not None:
+                halves[half] = {**halves.get(half, {}), 'seconds': shared[key]}
+        saved['payload']['halves'] = halves
+    if kind == 'setup' and scope == 'setup' and saved.get('setup'):
+        names = ('formationKey', 'fieldSide', 'lineup', 'inputMode')
+        old = current.get('setup') or {}
+        wanted = saved.get('setup') or {}
+        # Keep the stabilized lineup/formation setup as one coherent unit.
+        baseline = before.get('setup')
+        baseline = None if baseline is None else {'configuration': {key: baseline.get(key) for key in names}}
+        combined, root_orders['setup'] = _ordered_fields(
+            {'configuration': {key: old.get(key) for key in names}},
+            {'configuration': {key: wanted.get(key) for key in names}}, baseline, root_orders.get('setup') or {}, stamp)
+        saved['setup'] = {**wanted, **combined['configuration']}
+        if combined['configuration'] == {key: old.get(key) for key in names}:
+            saved['setup']['baseLineup'] = old.get('baseLineup', old.get('lineup', []))
+        else:
+            saved['setup']['baseLineup'] = saved['setup'].get('lineup') or []
+    saved['_editVersions'] = root_orders
+    store.writes[root.path] = (root.raw, saved)
+    return acknowledged_paths
+
+
 def _execute_in_store(data, store, gm_id, side, kind, request, user_id, batch_versions=()):
     body = request.model_dump(mode='json')
     command_id = body.pop('commandId')
     base_revision = body.pop('baseRevision')
+    # Keep digests compatible with receipts created before dependency metadata.
+    if not body.get('predecessorCommands'):
+        body.pop('predecessorCommands', None)
+    if not body.get('edit'):
+        body.pop('edit', None)
     digest = sha256(json.dumps({'kind': kind, 'body': body}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     root = store.collection('inputDrafts').document(data._input_draft_id(gm_id, side))
@@ -210,32 +349,32 @@ def _execute_in_store(data, store, gm_id, side, kind, request, user_id, batch_ve
     if base_revision is None:
         raise BackendError('A server revision is required', status_code=422, code='base_revision_required')
     if base_revision > revision:
-        raise BackendError('Draft revision changed', status_code=409, code='draft_conflict')
+        raise BackendError('요청의 기준 버전이 서버보다 앞섭니다.', status_code=409, code='draft_version_ahead')
     targets = []
     if kind == 'draft':
         if scope in {'state', 'state_records', 'checkpoint'} and control:
-            targets.append((int(current.get('stateRevision') or 0), current.get('stateUpdatedBy')))
+            targets.append(('state', int(current.get('stateRevision') or 0), current.get('stateUpdatedBy'), current.get('stateCommandId')))
         if scope in {'records', 'state_records', 'checkpoint'}:
             ids = {str(item['id']) for item in payload['records'] if item.get('id')} | set(body.get('deletedRecordIds', []))
             for key in ids:
                 values = root.collection('records').document(key).get().to_dict() or {}
-                targets.append((int(values.get('commandRevision') or 0), values.get('updatedBy')))
+                targets.append((f'record:{key}', int(values.get('commandRevision') or 0), values.get('updatedBy'), values.get('lastCommandId')))
         if scope == 'cards':
             ids = {str(item['id']) for item in payload['cards'] if item.get('id')} | set(body.get('deletedCardIds', []))
             for key in ids:
                 values = root.collection('cards').document(key).get().to_dict() or {}
-                targets.append((int(values.get('commandRevision') or 0), values.get('updatedBy')))
+                targets.append((f'card:{key}', int(values.get('commandRevision') or 0), values.get('updatedBy'), values.get('lastCommandId')))
     else:
         if scope == 'setup':
-            targets.append((int(current.get('setupCommandRevision') or 0), current.get('setupUpdatedBy')))
+            targets.append(('setup', int(current.get('setupCommandRevision') or 0), current.get('setupUpdatedBy'), current.get('setupCommandId')))
         for item in body['clientState'].get('subs', []):
             values = root.collection('substitutions').document(item['id']).get().to_dict() or {}
-            targets.append((int(values.get('commandRevision') or 0), values.get('updatedBy')))
+            targets.append((f"sub:{item['id']}", int(values.get('commandRevision') or 0), values.get('updatedBy'), values.get('lastCommandId')))
         for key in body.get('deletedSubIds', []):
             values = root.collection('substitutions').document(key).get().to_dict() or {}
-            targets.append((int(values.get('commandRevision') or 0), values.get('updatedBy')))
-    if any(version > base_revision and version not in batch_versions for version, owner in targets):
-        raise BackendError('The same input was edited by another analyst; reload the server Draft', status_code=409, code='draft_conflict')
+            targets.append((f'sub:{key}', int(values.get('commandRevision') or 0), values.get('updatedBy'), values.get('lastCommandId')))
+    # Older base revisions are normal collaboration, not a reason to stop.
+    # The affected documents above stay point reads for ordered field merging.
     previous_writes = {path: (ref, deepcopy(values)) for path, (ref, values) in store.writes.items()}
     working = copy(data)
     working.db = store
@@ -245,16 +384,19 @@ def _execute_in_store(data, store, gm_id, side, kind, request, user_id, batch_ve
             sync_scope=scope, deleted_record_ids=body.get('deletedRecordIds'), deleted_card_ids=body.get('deletedCardIds'),
             cleared_record_player_ids=body.get('clearedRecordPlayerIds'), include_events=False, delta_only=True)
         if scope in {'state', 'state_records', 'checkpoint'} and control:
-            root.set({'stateRevision': revision + 1, 'stateUpdatedBy': user_id}, merge=True)
+            root.set({'stateRevision': revision + 1, 'stateUpdatedBy': user_id, 'stateCommandId': command_id}, merge=True)
     else:
         working.save_input_setup(gm_id, side, payload=payload, client_state=body['clientState'],
             deleted_sub_ids=body.get('deletedSubIds'), merge_substitutions=scope == 'substitutions', delta_only=True)
-        root.set({'revision': revision + 1, 'updatedAt': utc_now(), 'setupCommandRevision': revision + 1, 'setupUpdatedBy': user_id}, merge=True)
+        root.set({'revision': revision + 1, 'updatedAt': utc_now()}, merge=True)
+        if scope == 'setup':
+            root.set({'setupCommandRevision': revision + 1, 'setupUpdatedBy': user_id, 'setupCommandId': command_id}, merge=True)
         document = root.get().to_dict()
-    changed_writes = {path: item for path, item in store.writes.items() if path not in previous_writes or item[1] != previous_writes[path][1]}
+    acknowledged_paths = _merge_command_order(data, store, root, current, body, kind, scope, control, revision, previous_writes)
+    changed_writes = {path: item for path, item in store.writes.items() if path in acknowledged_paths or path not in previous_writes or item[1] != previous_writes[path][1]}
     for path, (reference, values) in list(changed_writes.items()):
         if path.rsplit('/', 2)[-2] in {'records', 'cards', 'substitutions'}:
-            values.update(commandRevision=revision + 1, updatedBy=user_id)
+            values.update(commandRevision=revision + 1, updatedBy=user_id, lastCommandId=command_id)
     event = {'type': 'delta', 'gmId': gm_id, 'side': side, 'revision': revision + 1,
              'roomEpoch': int(current.get('roomEpoch') or 0)}
     for collection, field, deleted_field in [('records', 'records', 'deletedRecordIds'), ('cards', 'cards', 'deletedCardIds'), ('substitutions', 'subs', 'deletedSubIds')]:
@@ -282,7 +424,7 @@ def _execute_in_store(data, store, gm_id, side, kind, request, user_id, batch_ve
     before = current.get('sharedState') or current.get('payload') or {}
     after = saved_root.get('sharedState') or saved_root.get('payload') or {}
     summary_changed = any(before.get(key) != after.get(key) for key in ('halfStatus', 'homeScore', 'awayScore'))
-    return receipt, document if summary_changed else None
+    return receipt, saved_root if summary_changed else None
 
 
 
@@ -384,7 +526,8 @@ def execute_batch(data, gm_id, side, commands, user_id):
     results, event, summary = execute(data.db.transaction())
     if summary:
         _queue_summary(data, gm_id, side)
-    return {'results': [{key: value for key, value in item.items() if key not in {'uid', 'digest', 'savedAt'}} for item in results], 'event': event}
+    return {'results': [{key: value for key, value in item.items() if key not in {'uid', 'digest', 'savedAt'}} for item in results], 'event': event,
+            'serverTimeMs': int(utc_now().timestamp() * 1000)}
 
 
 def update_presence(data, gm_id, side, uid, session_id, connected):

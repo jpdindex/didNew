@@ -187,6 +187,7 @@ export function useMatchCollaboration() {
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined
   let reconnectAttempts = 0
   let lastSocketActivityAt = 0
+  let lastHeartbeatTickAt = 0
   let stopped = true
   // stop() can run while start() is still awaiting auth or its first read
   // (the screen was left early). Each start owns one session number, and a
@@ -665,17 +666,25 @@ export function useMatchCollaboration() {
           socket.send({ type: 'subscribe', revision: latestRevision, roomEpoch: roomStatus.value?.roomEpoch || 0 })
           reconnectAttempts = 0
           lastSocketActivityAt = Date.now()
+          lastHeartbeatTickAt = lastSocketActivityAt
           if (heartbeatTimer) clearInterval(heartbeatTimer)
           heartbeatTimer = setInterval(() => {
             if (stopped || current !== session || !sendSocket) return
             // A half-open browser socket does not always emit onclose when a
             // network device drops it. Force a normal reconnect instead of
             // letting subscriptions silently stop forever.
-            if (Date.now() - lastSocketActivityAt > 15_000) {
+            const now = Date.now()
+            // Background tabs may suspend timers. Give the connection a fresh
+            // heartbeat opportunity after resuming instead of closing it
+            // solely because the browser stopped scheduling callbacks.
+            if (now - lastHeartbeatTickAt > 10_000) lastSocketActivityAt = now
+            lastHeartbeatTickAt = now
+            if (now - lastSocketActivityAt > 30_000) {
               closeSocket?.()
               return
             }
-            sendSocket({ type: 'heartbeat' })
+            try { sendSocket({ type: 'heartbeat' }) }
+            catch { closeSocket?.() }
           }, 5_000)
           if (pollTimer) clearInterval(pollTimer)
           pollTimer = undefined
@@ -870,8 +879,8 @@ export function useMatchCollaboration() {
     return await sync(game, includeState && game.lifecycleControl ? 'state_records' : 'records', [], clearedRecordPlayerIds, records)
   }
 
-  async function removeRecord(game: MatchState, recordId: string) {
-    return await sync(game, 'records', [recordId])
+  async function removeRecord(game: MatchState, recordId: string, includeState = false) {
+    return await sync(game, includeState && game.lifecycleControl ? 'state_records' : 'records', [recordId])
   }
 
   async function syncCards(game: MatchState) {
@@ -937,6 +946,9 @@ export function useMatchCollaboration() {
   async function acceptServer() {
     if (gameForRoom) await liveRoom.acceptServer(gameForRoom.matchId, sideFor(gameForRoom))
   }
+  async function keepLocal() {
+    if (gameForRoom) await liveRoom.keepLocal(gameForRoom.matchId, sideFor(gameForRoom))
+  }
   let gameForRoom: MatchState | undefined
-  return { join, enter, start: async (...args: Parameters<typeof start>) => { gameForRoom = args[0]; return await start(...args) }, stop, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards, roomStatus, acceptServer }
+  return { join, enter, start: async (...args: Parameters<typeof start>) => { gameForRoom = args[0]; return await start(...args) }, stop, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards, roomStatus, acceptServer, keepLocal }
 }

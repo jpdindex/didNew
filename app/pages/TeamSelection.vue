@@ -61,7 +61,7 @@ const game = useMatchState()
 const { request } = useBackendApi()
 const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
 const { saveLocal, save: saveDraft, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover: recoverDraft, hydrate } = useMatchDraft()
-const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncSetup, syncState, roomStatus, acceptServer } = useMatchCollaboration()
+const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncSetup, syncState, roomStatus, acceptServer, keepLocal } = useMatchCollaboration()
 const preparedInput = usePreparedInput()
 const savedEntryFingerprint = ref('')
 const lifecycleBusy = ref(false)
@@ -1565,7 +1565,7 @@ function undoSub(index: number) {
 
 <template>
   <div class="page">
-    <LiveRoomStatus :status="roomStatus" @accept-server="acceptServer" />
+    <LiveRoomStatus :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
     <div class="bg" />
     <button type="button" class="topBack" @click="returnTo('/schedule')">← 경기 선택</button>
     <div class="frame">

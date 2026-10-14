@@ -106,6 +106,139 @@ function environment(transport, indexedDB = fakeIndexedDB(), nativeBatch = false
 
 async function settle() { for (let i = 0; i < 40; i++) await Promise.resolve() }
 
+function socketEnvironment() {
+  const sockets = [], timers = []
+  class Socket {
+    static OPEN = 1
+    constructor() { this.readyState = 1; this.closes = 0; sockets.push(this) }
+    send() {}
+    close() { this.closes++; this.readyState = 3; this.onclose?.() }
+  }
+  const { useBackendApi } = load('composables/useBackendApi.ts', {
+    WebSocket: Socket, useRuntimeConfig: () => ({ public: {} }), useState: () => ({ value: 'http://backend' }),
+    useNuxtApp: () => ({ $auth: { currentUser: { uid: 'p', getIdToken: async () => 'token' } }, $authReady: Promise.resolve() }),
+    window: { setTimeout: (callback, delay) => { const timer = { callback, delay }; timers.push(timer); return timer }, clearTimeout: timer => { const index = timers.indexOf(timer); if (index >= 0) timers.splice(index, 1) } },
+  })
+  return { api: useBackendApi(), sockets, timers }
+}
+
+test('socket authentication tolerates a delayed ready response and closes a failed handshake', async () => {
+  const env = socketEnvironment()
+  const opened = env.api.openSocket('/live', () => {})
+  await settle()
+  assert.equal(env.timers[0].delay, 12_000)
+  env.sockets[0].onmessage({ data: JSON.stringify({ type: 'ready' }) })
+  const transport = await opened
+  assert.equal(env.timers.length, 0)
+  transport.close()
+  const failed = env.api.openSocket('/live', () => {})
+  const rejected = assert.rejects(failed, /초과/)
+  await settle()
+  env.timers[0].callback()
+  await rejected
+  assert.equal(env.sockets[1].closes, 1)
+  env.sockets[1].onmessage({ data: JSON.stringify({ type: 'ready' }) })
+  assert.equal(env.sockets[1].closes, 1)
+})
+
+test('rapid same-record edits retain their time, order and local previous values', async () => {
+  const gate = deferred(), sent = []
+  const env = environment(async (url, options) => {
+    const body = JSON.parse(options.body)
+    sent.push(body)
+    if (sent.length === 1) await gate.promise
+    return { commandId: body.commandId, savedRevision: sent.length }
+  })
+  await env.room.seed('m', 'H', { revision: 0, roomEpoch: 0 })
+  const first = env.room.submit('m', 'H', 'draft', { syncScope: 'records', payload: { records: [{ id: 'r', playerId: 'one' }] } })
+  await settle()
+  const second = env.room.submit('m', 'H', 'draft', { syncScope: 'records', payload: { records: [{ id: 'r', playerId: 'two' }] } })
+  await settle()
+  gate.resolve()
+  assert.deepEqual(await Promise.all([first, second]), [true, true])
+  assert.equal(sent[1].baseRevision, 0)
+  assert.equal(sent[1].edit.before['record:r'].playerId, 'one')
+  assert.ok(sent[1].edit.sequence > sent[0].edit.sequence)
+  assert.ok(sent[1].edit.changedAtMs >= sent[0].edit.changedAtMs)
+})
+
+test('server clock correction and edit metadata survive ACK loss and browser reload unchanged', async () => {
+  const sent = [], db = fakeIndexedDB()
+  const first = environment(async (url, options) => {
+    sent.push(JSON.parse(options.body))
+    throw new Error('saved but ACK lost')
+  }, db)
+  const serverTime = Date.now() + 60_000
+  await first.room.seed('m', 'H', { revision: 5, roomEpoch: 0, serverTimeMs: serverTime })
+  assert.equal(await first.room.submit('m', 'H', 'draft', { syncScope: 'records', payload: { records: [{ id: 'r', playerId: 'mine' }] } }), false)
+  assert.ok(Math.abs(sent[0].edit.changedAtMs - serverTime) < 1_000)
+  const reloaded = environment(async (url, options) => {
+    const body = JSON.parse(options.body); sent.push(body)
+    return { commandId: body.commandId, savedRevision: 6 }
+  }, db)
+  await reloaded.room.seed('m', 'H', { revision: 5, roomEpoch: 0, serverTimeMs: serverTime + 10_000 })
+  assert.equal(await reloaded.room.flush('m', 'H'), true)
+  assert.deepEqual(sent[0], sent[1])
+  assert.equal(db.rows.size, 0)
+})
+
+test('unrelated own ACK cannot rebase a queued edit over a peer change', async () => {
+  const gate = deferred(), sent = []
+  const env = environment(async (url, options) => {
+    const body = JSON.parse(options.body)
+    sent.push(body)
+    if (sent.length === 1) await gate.promise
+    return { commandId: body.commandId, savedRevision: 10 + sent.length }
+  })
+  await env.room.seed('m', 'H', { revision: 5, roomEpoch: 0 })
+  const first = env.room.submit('m', 'H', 'draft', { syncScope: 'records', payload: { records: [{ id: 'other' }] } })
+  await settle()
+  const second = env.room.submit('m', 'H', 'draft', { syncScope: 'records', payload: { records: [{ id: 'peer-edited' }] } })
+  await settle()
+  gate.resolve()
+  await Promise.all([first, second])
+  assert.equal(sent[1].baseRevision, 5)
+  assert.equal(sent[1].edit.before['record:peer-edited'], null)
+})
+
+test('persisted old conflict resumes with the original immutable command', async () => {
+  const sent = [], env = environment(async (url, options = {}) => {
+    if (!options.method) return { status: 'ok', revision: 7, roomEpoch: 0, payload: { records: [{ id: 'r', playerId: 'peer' }] } }
+    const body = JSON.parse(options.body); sent.push(body)
+    return { commandId: body.commandId, savedRevision: 8 }
+  })
+  const storage = new env.storage.LiveCommandStore()
+  await storage.add({ commandId: 'old', key: 'p:m:H', uid: 'p', gmId: 'm', side: 'H', kind: 'draft', blocked: 'draft_conflict', attempted: true,
+    request: { commandId: 'old', baseRevision: 5, roomEpoch: 0, syncScope: 'records', payload: { records: [{ id: 'r', playerId: 'mine' }] } } })
+  const attached = await env.room.attach('m', 'H', () => {})
+  await env.room.flush('m', 'H')
+  assert.equal(attached.status.phase, 'saved')
+  assert.equal(sent[0].commandId, 'old')
+  assert.equal(sent[0].baseRevision, 5)
+  assert.equal(sent[0].payload.records[0].playerId, 'mine')
+  assert.equal(env.indexedDB.rows.size, 0)
+})
+
+test('ignored older input acknowledges the canonical server values without dropping newer pending edits', async () => {
+  let revision = 7, writes = 0
+  const env = environment(async (url, options = {}) => {
+    if (!options.method) return { status: 'ok', revision, roomEpoch: 0, payload: { records: [{ id: 'r', playerId: `peer-${revision}` }] } }
+    writes++
+    const body = JSON.parse(options.body)
+    return { commandId: body.commandId, savedRevision: revision + 1, event: { type: 'delta', revision: revision + 1, roomEpoch: 0,
+      records: [{ id: 'r', playerId: `peer-${revision}` }] } }
+  })
+  const storage = new env.storage.LiveCommandStore()
+  await storage.add({ commandId: 'old', key: 'p:m:H', uid: 'p', gmId: 'm', side: 'H', kind: 'draft', blocked: 'draft_conflict', attempted: true,
+    request: { commandId: 'old', baseRevision: 5, roomEpoch: 0, syncScope: 'records', payload: { records: [{ id: 'r', playerId: 'mine' }] } } })
+  const attached = await env.room.attach('m', 'H', () => {})
+  await env.room.flush('m', 'H')
+  assert.equal(writes, 1)
+  assert.equal(env.indexedDB.rows.size, 0)
+  assert.equal(attached.status.phase, 'saved')
+  assert.equal((await env.room.changedRecords('m', 'H', [{ id: 'r', playerId: 'peer-7' }])).length, 0)
+})
+
 test('socket batch ACK loss falls back to HTTP with identical persisted commands', async () => {
   let bridge, frame, httpBody
   const env = environment(async (url, options) => {
@@ -176,14 +309,12 @@ test('lost batch ACK retains all commands and retry preserves every ID and reque
   assert.equal(env.indexedDB.rows.size, 0)
 })
 
-test('batch conflict retains dependent edits while later independent ACTs can still save', async () => {
+test('same-record and independent queued requests all drain without conflict', async () => {
   const sent = []
   const env = environment(async (url, options = {}) => {
     if (!options.method) return { status: 'ok', revision: 7, roomEpoch: 0, payload: { records: [] } }
     const body = JSON.parse(options.body)
-    if (body.commands) return { results: body.commands.map((item, i) => i < 2
-      ? { status: 'error', commandId: item.request.commandId, code: i ? 'dependency_blocked' : 'draft_conflict', httpStatus: 409, message: 'same record changed' }
-      : { status: 'ack', commandId: item.request.commandId, savedRevision: 7 }) }
+    if (body.commands) return { results: body.commands.map((item, i) => ({ status: 'ack', commandId: item.request.commandId, savedRevision: 6 + i })) }
     sent.push(body)
     return { commandId: body.commandId, savedRevision: 8 }
   }, fakeIndexedDB(), true)
@@ -191,11 +322,11 @@ test('batch conflict retains dependent edits while later independent ACTs can st
   for (let i = 0; i < 3; i++) await storage.add({ commandId: `c${i}`, key: 'p:m:H', uid: 'p', gmId: 'm', side: 'H', kind: 'draft',
     request: { commandId: `c${i}`, baseRevision: 5, roomEpoch: 0, syncScope: 'records', payload: { records: [{ id: i < 2 ? 'same' : 'independent' }] } } })
   await env.room.seed('m', 'H', { revision: 5, roomEpoch: 0 })
-  assert.equal(await env.room.flush('m', 'H'), false)
-  assert.equal(env.indexedDB.rows.size, 2)
+  assert.equal(await env.room.flush('m', 'H'), true)
+  assert.equal(env.indexedDB.rows.size, 0)
   assert.equal(await env.room.submit('m', 'H', 'draft', { syncScope: 'records', payload: { records: [{ id: 'later-independent' }] } }), true)
   assert.equal(sent[0].payload.records[0].id, 'later-independent')
-  assert.equal(env.indexedDB.rows.size, 2)
+  assert.equal(env.indexedDB.rows.size, 0)
 })
 
 test('rejected event-free state cannot block later ACTs or erase their queue', async () => {
@@ -301,11 +432,12 @@ test('outbox keeps lost ACKs, retries the same ID, and preserves edit order', as
     return { commandId: command.commandId, savedRevision: receipts.get(command.commandId), revision }
   })
   const attached = await env.room.attach('m', 'H', () => {})
-  assert.equal(await env.room.submit('m', 'H', 'draft', { edit: 'first' }), false)
+  assert.equal(await env.room.submit('m', 'H', 'draft', { label: 'first' }), false)
   assert.equal(env.indexedDB.rows.size, 1)
   assert.equal(attached.status.phase, 'offline')
-  assert.equal(await env.room.submit('m', 'H', 'draft', { edit: 'second' }), true)
-  assert.deepEqual(sent.map(item => item.edit), ['first', 'first', 'second'])
+  assert.equal(await env.room.submit('m', 'H', 'draft', { label: 'second' }), true)
+  assert.deepEqual(sent.map(item => item.label), ['first', 'first', 'second'])
+  assert.deepEqual(sent[0].edit, sent[1].edit)
   assert.equal(sent[0].commandId, sent[1].commandId)
   assert.equal(sent[0].baseRevision, sent[1].baseRevision)
   assert.equal(revision, 2)
@@ -358,12 +490,12 @@ test('failed head prevents later edits from being sent out of order', async () =
   const sent = []
   const env = environment(async (url, options = {}) => {
     if (!options.method) return { status: 'ok', revision: 0 }
-    sent.push(JSON.parse(options.body).edit)
+    sent.push(JSON.parse(options.body).label)
     throw new Error('network offline')
   })
   const result = await Promise.all([
-    env.room.submit('m', 'H', 'draft', { edit: 'one' }),
-    env.room.submit('m', 'H', 'draft', { edit: 'two' }),
+    env.room.submit('m', 'H', 'draft', { label: 'one' }),
+    env.room.submit('m', 'H', 'draft', { label: 'two' }),
   ])
   assert.deepEqual(result, [false, false])
   assert.ok(sent.length >= 1 && sent.every(edit => edit === 'one'))
@@ -375,6 +507,8 @@ function collaborationEnvironment(queued = [], snapshotReader) {
   let receiveRoom
   const commands = []
   const recoveryTimers = []
+  const intervals = []
+  const socketState = { opens: 0, closes: 0, frames: [] }
   let now = 0
   const game = { matchId: 'm', team: 'home', records: [], cards: [], subs: [], participantRole: 'primary', lifecycleControl: true }
   const initial = { status: 'ok', gmId: 'm', side: 'H', revision: 5, roomEpoch: 0,
@@ -384,11 +518,15 @@ function collaborationEnvironment(queued = [], snapshotReader) {
     shallowRef: value => ({ value }),
     Date: class extends Date { static now() { return now } },
     setTimeout: (callback, delay) => { const timer = { callback, delay }; recoveryTimers.push(timer); return timer },
-    clearTimeout: timer => { const index = recoveryTimers.indexOf(timer); if (index >= 0) recoveryTimers.splice(index, 1) }, setInterval: () => 1, clearInterval() {},
+    clearTimeout: timer => { const index = recoveryTimers.indexOf(timer); if (index >= 0) recoveryTimers.splice(index, 1) },
+    setInterval: (callback, delay) => { const timer = { callback, delay }; intervals.push(timer); return timer },
+    clearInterval: timer => { const index = intervals.indexOf(timer); if (index >= 0) intervals.splice(index, 1) },
     useNuxtApp: () => ({ $auth: { currentUser: { uid: 'p' } }, $authReady: Promise.resolve() }),
-    useBackendApi: () => ({ request: async () => initial, openSocket: async (url, callback) => {
+    useBackendApi: () => ({ request: async () => initial, openSocket: async (url, callback, onClose) => {
       receive = callback
-      return { close() {}, send() {} }
+      socketState.opens++
+      let closed = false
+      return { close() { if (!closed) { closed = true; socketState.closes++; onClose?.() } }, send(frame) { socketState.frames.push(frame) } }
     } }),
     useLiveRoom: () => ({ pending: async () => queued, readSnapshot: async () => snapshotReader ? await snapshotReader(initial) : initial, observe() {}, seed() {}, observeDelta() {},
       bindSocket: async () => ({ receive: () => false, detach() {} }), attach: async (id, side, listener) => {
@@ -401,6 +539,7 @@ function collaborationEnvironment(queued = [], snapshotReader) {
   }
   const draft = { cloneState: value => structuredClone(value), payloadFromState: value => ({
     ...initial.payload, formationKey: '4-3-3', fieldSide: 'left', inputMode: '분석', lineup: [],
+    homeScore: value.homeScore, awayScore: value.awayScore,
     records: value.records.map(record => ({ ...record, halfSeconds: record.seconds })),
     cards: value.cards.map(card => ({ id: card.id, playerId: card.player, half: card.half, halfSeconds: card.seconds, card: card.card })),
   }) }
@@ -413,8 +552,38 @@ function collaborationEnvironment(queued = [], snapshotReader) {
     applyCards: cards => { game.cards = cards },
     applySetup: setup => { game.subs = setup.subs; game.assigned = formation.assignmentsFromLineup(setup.formationKey, setup.lineup) },
   }
-  return { game, initial, collaboration, handlers, commands, recoveryTimers, advance: ms => { now += ms }, receive: event => receive(event), receiveRoom: event => receiveRoom(event) }
+  return { game, initial, collaboration, handlers, commands, recoveryTimers, intervals, socketState, advance: ms => { now += ms }, receive: event => receive(event), receiveRoom: event => receiveRoom(event) }
 }
+
+test('idle input keeps its socket alive through heartbeats without ACT writes', async () => {
+  const env = collaborationEnvironment()
+  await env.collaboration.start(env.game, env.handlers, env.initial); await settle()
+  for (let i = 0; i < 120; i++) {
+    env.advance(5_000)
+    env.intervals.find(timer => timer.delay === 5_000).callback()
+    env.receive({ type: 'pong' })
+  }
+  assert.equal(env.socketState.closes, 0)
+  assert.equal(env.commands.length, 0)
+  assert.equal(env.socketState.frames.filter(frame => frame.type === 'heartbeat').length, 120)
+  env.collaboration.stop()
+})
+
+test('background timer suspension gets a heartbeat grace period, then a dead socket reconnects automatically', async () => {
+  const env = collaborationEnvironment()
+  await env.collaboration.start(env.game, env.handlers, env.initial); await settle()
+  const heartbeat = env.intervals.find(timer => timer.delay === 5_000)
+  env.advance(60_000); heartbeat.callback()
+  assert.equal(env.socketState.closes, 0)
+  assert.equal(env.socketState.frames.at(-1).type, 'heartbeat')
+  for (let i = 0; i < 7; i++) { env.advance(5_000); heartbeat.callback() }
+  assert.equal(env.socketState.closes, 1)
+  const retry = env.recoveryTimers.find(timer => timer.delay === 250)
+  assert.ok(retry)
+  retry.callback(); await settle()
+  assert.equal(env.socketState.opens, 2)
+  env.collaboration.stop()
+})
 
 test('transient snapshot failure preserves clock and records and retries online without duplicate reads', async () => {
   let reads = 0
@@ -472,7 +641,7 @@ test('real page debounce sends assistant ACTs without lifecycle and skips empty 
   const dirty = new Set()
   const context = vm.createContext({ game: { value: env.game }, records: { value: env.game.records },
     applyingRemoteDraft: false, disposed: false, draftReady: true, isEditMode: false,
-    sharedDraftDirty: false, dirtyRecordIds: dirty, clearedRecordPlayerIds: new Set(), recordSavesInFlight: new Map(), draftSaveTimer: null,
+    sharedDraftDirty: false, sharedScoreDirty: false, scoreEditRevision: 0, dirtyRecordIds: dirty, clearedRecordPlayerIds: new Set(), recordSavesInFlight: new Map(), draftSaveTimer: null,
     markLocalRecords: env.collaboration.markLocalRecords, saveToStore() {}, saveLocal: async () => true,
     syncState: env.collaboration.syncState, syncStateRecords: env.collaboration.syncStateRecords,
     setTimeout: fn => { timer = fn; return 1 }, clearTimeout() {} })
@@ -484,6 +653,34 @@ test('real page debounce sends assistant ACTs without lifecycle and skips empty 
   assert.equal(env.commands.length, 1)
   assert.equal(env.commands[0].request.syncScope, 'records')
   assert.equal(env.commands[0].request.payload.records[0].id, 'r')
+  env.collaboration.stop()
+})
+
+test('ordinary primary ACT edits omit state but goal changes still save their score with the record', async () => {
+  const env = collaborationEnvironment()
+  await env.collaboration.start(env.game, env.handlers, env.initial); await settle()
+  env.game.homeScore = 0; env.game.awayScore = 0
+  const source = fs.readFileSync(path.resolve(__dirname, '../pages/DidInput.vue'), 'utf8')
+  const dirty = new Set(), homeScore = { value: 0 }, awayScore = { value: 0 }
+  let timer
+  const context = vm.createContext({ game: { value: env.game }, records: { value: env.game.records }, homeScore, awayScore, team: { value: 'home' },
+    applyingRemoteDraft: false, disposed: false, draftReady: true, isEditMode: false,
+    sharedDraftDirty: false, sharedScoreDirty: false, scoreEditRevision: 0, dirtyRecordIds: dirty, clearedRecordPlayerIds: new Set(), recordSavesInFlight: new Map(), draftSaveTimer: null,
+    markLocalRecords: env.collaboration.markLocalRecords,
+    saveToStore() { env.game.homeScore = homeScore.value; env.game.awayScore = awayScore.value }, saveLocal: async () => true,
+    syncStateRecords: env.collaboration.syncStateRecords, setTimeout: callback => { timer = callback; return callback }, clearTimeout() {} })
+  const functions = [source.match(/function queueDraftSave\([\s\S]*?\n}/)[0], source.match(/function syncOwnScore\([\s\S]*?\n}/)[0]].join('\n')
+  vm.runInContext(transformSync(functions, { loader: 'ts', format: 'cjs' }).code, context)
+  for (const [result, scope, score] of [['O', 'records', 0], ['GOAL', 'state_records', 1], ['X', 'state_records', 0]]) {
+    env.game.records[0].res = result
+    dirty.add('r'); context.queueDraftSave(); context.syncOwnScore(); timer(); await settle()
+    assert.equal(env.commands.at(-1).request.syncScope, scope)
+    assert.equal(env.commands.at(-1).request.payload.homeScore, score)
+  }
+  env.game.records = []; env.game.homeScore = 0
+  await env.collaboration.removeRecord(env.game, 'r', true)
+  assert.equal(env.commands.at(-1).request.syncScope, 'state_records')
+  assert.deepEqual(Array.from(env.commands.at(-1).request.deletedRecordIds), ['r'])
   env.collaboration.stop()
 })
 
@@ -518,7 +715,7 @@ for (const primary of [false, true]) test(`finished-half editor stays idle acros
   const source = fs.readFileSync(path.resolve(__dirname, '../pages/DidInput.vue'), 'utf8')
   const records = vue.ref(env.game.records), dirty = new Set(), timers = []
   const context = vm.createContext({ records, game: { value: env.game }, disposed: false, draftReady: false,
-    applyingRemoteDraft: false, isEditMode: true, sharedDraftDirty: false,
+    applyingRemoteDraft: false, isEditMode: true, sharedDraftDirty: false, sharedScoreDirty: false, scoreEditRevision: 0,
     dirtyRecordIds: dirty, clearedRecordPlayerIds: new Set(), recordSavesInFlight: new Map(), draftSaveTimer: null,
     markLocalRecords: env.collaboration.markLocalRecords, saveToStore() { env.game.records = JSON.parse(JSON.stringify(records.value)) },
     saveLocal: async () => true, syncStateRecords: env.collaboration.syncStateRecords,
@@ -549,7 +746,7 @@ test('snapshot echo during a pending record save cannot enqueue the same edit ag
   let timer, writes = 0
   const records = { value: [{ id: 'r', playerId: 'one' }] }
   const context = vm.createContext({ records, game: { value: {} }, disposed: false, draftReady: true,
-    applyingRemoteDraft: false, isEditMode: true, sharedDraftDirty: false,
+    applyingRemoteDraft: false, isEditMode: true, sharedDraftDirty: false, sharedScoreDirty: false, scoreEditRevision: 0,
     dirtyRecordIds: dirty, clearedRecordPlayerIds: new Set(), recordSavesInFlight: new Map(), draftSaveTimer: null,
     markLocalRecords() {}, saveToStore() {}, saveLocal: async () => true,
     syncStateRecords: async () => { writes++; return gate.promise },

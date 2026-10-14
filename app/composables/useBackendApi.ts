@@ -89,19 +89,20 @@ export function useBackendApi() {
         if (settled || ready) return
         settled = true
         window.clearTimeout(timeout)
+        socket.close()
         reject(error)
       }
       const timeout = window.setTimeout(() => {
         if (!ready && !settled) {
-          socket.close()
           failBeforeReady(new Error('실시간 협업 연결 시간이 초과되었습니다.'))
         }
-      }, 3_000)
+      }, 12_000)
       socket.onopen = () => socket.send(JSON.stringify({ type: 'authenticate', token, uid: user?.uid }))
       socket.onerror = () => failBeforeReady(new Error('실시간 협업 연결에 실패했습니다.'))
       socket.onmessage = (event) => {
         try {
           const data = JSON.parse(String(event.data)) as T & { type?: string }
+          if (settled && !ready) return
           if (data.type === 'ready') {
             ready = true
             settled = true

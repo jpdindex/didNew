@@ -10,6 +10,7 @@ interface RoomStatus {
   pending: number
   error: string
   participants: Record<string, { role?: string; name?: string; online?: boolean }>
+  conflict?: { commandId: string; local: string; server: string; revision: number }
 }
 interface Room {
   status: RoomStatus
@@ -21,7 +22,6 @@ interface Room {
   listeners: Set<(response: any) => void>
   waiters: Map<string, (saved: boolean) => void>
   idle: Set<() => void>
-  ownRevision: number
   completed: Set<string>
   cancelled: Set<string>
   initialized: boolean
@@ -31,9 +31,38 @@ interface Room {
   confirmedRecords: Map<string, string>
   recordVersions: Map<string, number>
   snapshotRevision: number
+  acknowledgedTargets: Map<string, { commandId: string; revision: number }>
+  inputs: Map<string, any>
+  inputVersions: Map<string, number>
+  clockOffset: number
+  lastEditAt: number
+  pendingInputs: Map<string, { commandId: string; value: any }>
 }
 const rooms = new Map<string, Room>()
 const store = new LiveCommandStore()
+let deviceId: string | undefined
+function editingDevice() {
+  if (deviceId) return deviceId
+  try {
+    deviceId = localStorage.getItem('did-live-edit-device') || crypto.randomUUID()
+    localStorage.setItem('did-live-edit-device', deviceId)
+  } catch { deviceId = crypto.randomUUID() }
+  return deviceId
+}
+
+function commandInputs(command: LiveCommand) {
+  const body = command.request, values = new Map<string, any>()
+  for (const target of commandTargets(command)) {
+    if (target === 'state') values.set(target, { ...body.clientState, halfStatus: body.payload?.status, homeScore: body.payload?.homeScore, awayScore: body.payload?.awayScore })
+    else if (target === 'setup') values.set(target, { formationKey: body.payload?.formationKey, fieldSide: body.payload?.fieldSide, inputMode: body.payload?.inputMode, lineup: body.payload?.lineup })
+    else {
+      const split = target.indexOf(':'), kind = target.slice(0, split), id = target.slice(split + 1)
+      const rows = kind === 'record' ? body.payload?.records : kind === 'card' ? body.payload?.cards : body.clientState?.subs
+      values.set(target, rows?.find((row: any) => row.id === id) || null)
+    }
+  }
+  return values
+}
 const fingerprint = (record: Record<string, unknown>) => JSON.stringify(Object.fromEntries(Object.entries({
   posX: null, posY: null, shootPosX: null, shootPosY: null, shootDspRange: null, isShot: null, playerId: null, ...record,
 }).sort(([a], [b]) => a.localeCompare(b))))
@@ -70,6 +99,37 @@ function isEmptyState(command: LiveCommand) {
   return command.kind === 'draft' && body.syncScope === 'state' &&
     !body.payload?.records?.length && !body.payload?.cards?.length && !body.clientState?.subs?.length &&
     !body.deletedRecordIds?.length && !body.deletedCardIds?.length && !body.clearedRecordPlayerIds?.length
+}
+
+function describeInput(command: LiveCommand, baseline?: any) {
+  const body = command.request
+  const rows = baseline?.payload || body.payload || {}
+  const targets = commandTargets(command)
+  const labels: string[] = []
+  for (const target of targets) {
+    const separator = target.indexOf(':')
+    const kind = separator < 0 ? target : target.slice(0, separator)
+    const id = target.slice(separator + 1)
+    if (kind === 'record' || kind === 'card') {
+      const row = (rows[kind === 'record' ? 'records' : 'cards'] || []).find((item: any) => item.id === id)
+      labels.push(row ? `${kind === 'record' ? '행동' : '카드'} ${id}: ${row.half || ''} ${row.halfSeconds ?? row.seconds ?? 0}초 / ${row.act || row.card || ''} ${row.res || ''} / 선수 ${row.playerId ?? '미지정'} / 구역 ${row.area ?? ''}` : `${kind === 'record' ? '행동' : '카드'} ${id}: 없음(삭제)`)
+      if (row && kind === 'record') {
+        if (row.posX != null || row.posY != null) labels.push(`입력 위치: ${row.posX ?? '미지정'}, ${row.posY ?? '미지정'}`)
+        if (row.shootPosX != null || row.shootPosY != null) labels.push(`슈팅 위치: ${row.shootPosX ?? '미지정'}, ${row.shootPosY ?? '미지정'}`)
+      }
+    } else if (kind === 'sub') {
+      const subs = baseline ? baseline.inputSetup?.subs : body.clientState?.subs
+      const row = (subs || []).find((item: any) => item.id === id)
+      labels.push(row ? `교체 ${id}: ${row.outPlayer} → ${row.inPlayer}` : `교체 ${id}: 없음(삭제)`)
+    } else if (kind === 'state') {
+      const state = baseline?.sharedState || body.clientState || {}
+      labels.push(`경기 상태: ${state.halfStatus || rows.status || ''}, ${state.seconds ?? 0}초, 점수 ${state.homeScore ?? rows.homeScore ?? 0}:${state.awayScore ?? rows.awayScore ?? 0}`)
+    } else if (kind === 'setup') {
+      const setup = baseline?.inputSetup || rows
+      labels.push(`세팅: ${setup.formationKey || ''}, ${setup.fieldSide || ''}, 선수 ${(setup.lineup || []).map((item: any) => item.playerId).join(', ')}`)
+    }
+  }
+  return labels.join('\n')
 }
 
 function isUnchangedSetup(command: LiveCommand, baseline: any) {
@@ -124,7 +184,7 @@ export function useLiveRoom() {
       let reading: Promise<any> | undefined
       room = {
         status: reactive({ connection: 'connecting', phase: 'loading', revision: 0, roomEpoch: 0, savedCommandId: null, pending: 0, error: '', participants: {} }),
-        running: false, initialized: false, needsRecovery: false, confirmedRecords: new Map(), recordVersions: new Map(), snapshotRevision: 0, ownRevision: 0, completed: new Set(), cancelled: new Set(), enqueue: Promise.resolve(), listeners: new Set(), waiters: new Map(), idle: new Set(),
+        running: false, initialized: false, needsRecovery: false, confirmedRecords: new Map(), recordVersions: new Map(), snapshotRevision: 0, acknowledgedTargets: new Map(), inputs: new Map(), inputVersions: new Map(), clockOffset: 0, lastEditAt: 0, pendingInputs: new Map(), completed: new Set(), cancelled: new Set(), enqueue: Promise.resolve(), listeners: new Set(), waiters: new Map(), idle: new Set(),
         read: () => {
           if (!reading) reading = request<any>(`/api/v1/match-input/drafts/${encodeURIComponent(gmId)}/${side}`, {
             expectedUid: uid, signal: AbortSignal.timeout(10_000),
@@ -150,11 +210,20 @@ export function useLiveRoom() {
     const confirmCommand = async (command: LiveCommand, response: any) => {
       const ack = response.inputSetup || response
       if (ack?.commandId !== command.commandId || typeof ack.savedRevision !== 'number') throw new Error('서버 저장 확인이 누락되었습니다.')
+      if (typeof response.serverTimeMs === 'number') room.clockOffset = response.serverTimeMs - Date.now()
+      for (const target of commandTargets(command)) {
+        if (ack.savedRevision > (room.acknowledgedTargets.get(target)?.revision || 0)) {
+          room.acknowledgedTargets.set(target, { commandId: command.commandId, revision: ack.savedRevision })
+        }
+      }
       await store.remove(command.order!)
       room.status.revision = Math.max(room.status.revision, ack.savedRevision, Number(response.revision || 0))
-      room.ownRevision = Math.max(room.ownRevision, ack.savedRevision)
       room.status.savedCommandId = command.commandId
+      if (room.status.conflict?.commandId === command.commandId) room.status.conflict = undefined
       if (response.event) rememberDelta(room, response.event)
+      for (const target of commandTargets(command)) {
+        if (room.pendingInputs.get(target)?.commandId === command.commandId) room.pendingInputs.delete(target)
+      }
       if (command.kind === 'finalize') room.status.roomEpoch += 1
       room.status.pending -= 1
       if (!room.status.pending) { room.status.phase = 'saved'; room.status.error = '' }
@@ -168,6 +237,12 @@ export function useLiveRoom() {
     }
     try {
       let commands = await store.list(key)
+      for (const item of commands) {
+        if (item.blocked === 'draft_conflict' && (item.kind === 'draft' || item.kind === 'setup')) {
+          item.blocked = undefined
+          await store.update(item)
+        }
+      }
       room.status.pending = commands.length
       if (!commands.length) { room.status.phase = 'saved'; room.status.error = ''; return }
       // Prepared entry data is already a durable baseline. Read only when it
@@ -209,13 +284,19 @@ export function useLiveRoom() {
         if (command.blocked) {
           room.status.phase = command.blocked === 'draft_conflict' ? 'conflict' : 'error'
           room.status.error = command.blocked
+          if (command.blocked === 'draft_conflict' && room.status.conflict?.commandId !== command.commandId) {
+            try {
+              const baseline = await room.read()
+              room.status.conflict = { commandId: command.commandId, local: describeInput(command), server: describeInput(command, baseline), revision: Number(baseline.revision || 0) }
+            } catch { /* comparison can be retried; keep the rejected request */ }
+          }
           break
         }
         room.status.phase = 'saving'
         if (selected.length > 1) {
           for (const item of selected) {
             if (item.request.baseRevision == null) { item.request.baseRevision = room.status.revision; item.request.roomEpoch = room.status.roomEpoch }
-            if (!item.attempted) { item.request.baseRevision = Math.max(item.request.baseRevision, room.ownRevision); item.attempted = true; await store.update(item) }
+            if (!item.attempted) { if (item.request.edit) item.request.edit.sequence = item.order; item.attempted = true; await store.update(item) }
           }
           const sendHttp = () => request<any>(`/api/v1/match-input/drafts/${encodeURIComponent(command.gmId)}/${command.side}/commands`, {
             expectedUid: command.uid, method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -225,6 +306,7 @@ export function useLiveRoom() {
           try { response = room.socketBatch ? await room.socketBatch(selected) : await sendHttp() }
           catch (error: any) { if (!error?.transportFailure) throw error; response = await sendHttp() }
           const results = response.results
+          if (typeof response.serverTimeMs === 'number') room.clockOffset = response.serverTimeMs - Date.now()
           if (!Array.isArray(results) || results.length !== selected.length || results.some((result: any, index: number) => result.commandId !== selected[index]!.commandId || (result.status === 'ack' ? typeof result.savedRevision !== 'number' : result.status !== 'error' || !result.code))) throw new Error('배치 저장 확인이 누락되었습니다.')
           let transient: any, rejected = false
           for (let index = 0; index < selected.length; index++) {
@@ -237,7 +319,12 @@ export function useLiveRoom() {
             }
           }
           if (rejected) {
-            try { const baseline = await room.read(); if (baseline.status === 'ok') notifyRoom(room, baseline) } catch { /* rejected commands remain durable */ }
+            try {
+              const baseline = await room.read()
+              const conflict = selected.find(item => item.blocked === 'draft_conflict')
+              if (conflict) room.status.conflict = { commandId: conflict.commandId, local: describeInput(conflict), server: describeInput(conflict, baseline), revision: Number(baseline.revision || 0) }
+              if (baseline.status === 'ok') notifyRoom(room, baseline)
+            } catch { /* rejected commands remain durable */ }
           }
           if (transient) { activeCommand = transient.command; throw Object.assign(new Error(transient.message), transient) }
           continue
@@ -250,7 +337,7 @@ export function useLiveRoom() {
           await store.update(command)
         }
         if (!command.attempted) {
-          command.request.baseRevision = Math.max(command.request.baseRevision, room.ownRevision)
+          if (command.request.edit) command.request.edit.sequence = command.order
           command.attempted = true
           await store.update(command)
         }
@@ -289,6 +376,7 @@ export function useLiveRoom() {
         await store.update(failed)
         try {
           const baseline = await room.read()
+          if (code === 'draft_conflict') room.status.conflict = { commandId: failed.commandId, local: describeInput(failed), server: describeInput(failed, baseline), revision: Number(baseline.revision || 0) }
           if (baseline.status === 'ok') notifyRoom(room, baseline)
         } catch { /* The queue stays durable until the user resolves it. */ }
       }
@@ -306,19 +394,40 @@ export function useLiveRoom() {
   }
 
   async function submit(gmId: string, side: 'H' | 'A', kind: LiveCommand['kind'], body: Record<string, unknown>) {
+    const localEditedAt = Date.now()
     const { room, key, uid } = await roomFor(gmId, side)
     const commandId = crypto.randomUUID()
+    const changedAtMs = room.lastEditAt = Math.max(room.lastEditAt, localEditedAt + room.clockOffset)
     const command: LiveCommand = { commandId, key, uid, gmId, side, kind,
       request: JSON.parse(JSON.stringify({ ...body, commandId, baseRevision: room.status.phase === 'loading' ? null : room.status.revision,
         roomEpoch: room.status.phase === 'loading' ? null : room.status.roomEpoch })) }
+    const targets = commandTargets(command)
+    const pendingAtCreation = new Set(room.pendingInputs.keys())
+    const before = JSON.parse(JSON.stringify(Object.fromEntries([...targets].map(target =>
+      [target, room.pendingInputs.has(target) ? room.pendingInputs.get(target)!.value : room.inputs.get(target) ?? null]))))
+    if (kind === 'draft' || kind === 'setup') {
+      for (const [target, value] of commandInputs(command)) room.pendingInputs.set(target, { commandId, value: JSON.parse(JSON.stringify(value)) })
+    }
     const added = room.enqueue.then(async () => {
+      if (kind === 'draft' || kind === 'setup') {
+        for (const earlier of await store.list(key)) {
+          if (earlier.request.roomEpoch !== command.request.roomEpoch) continue
+          for (const [target, value] of commandInputs(earlier)) {
+            if (targets.has(target) && !pendingAtCreation.has(target)) before[target] = value
+          }
+        }
+        command.request.edit = { changedAtMs, deviceId: editingDevice(), sequence: 0, before }
+      }
       await store.add(command)
       room.status.pending += 1
       if (room.status.phase !== 'conflict' && room.status.phase !== 'error') room.status.phase = 'saving'
       notifyRoom(room, { pendingCommand: command })
     })
     room.enqueue = added.catch(() => undefined)
-    await added
+    try { await added } catch (error) {
+      for (const target of targets) if (room.pendingInputs.get(target)?.commandId === commandId) room.pendingInputs.delete(target)
+      throw error
+    }
     if (room.running) await new Promise<void>(resolve => room.idle.add(resolve))
     if (room.cancelled.delete(commandId)) return false
     if (room.completed.delete(commandId)) return true
@@ -343,6 +452,7 @@ export function useLiveRoom() {
   }
 
   function seedRoom(room: Room, response: any) {
+    if (typeof response.serverTimeMs === 'number') room.clockOffset = response.serverTimeMs - Date.now()
     if (Number(response.revision || 0) < room.status.revision && Number(response.roomEpoch || 0) === room.status.roomEpoch) return
     room.status.revision = Math.max(room.status.revision, Number(response.revision || 0))
     room.status.roomEpoch = Number(response.roomEpoch || 0)
@@ -353,11 +463,30 @@ export function useLiveRoom() {
       room.confirmedRecords = new Map(response.payload.records.map((record: any) => [record.id, fingerprint(record)]))
       room.snapshotRevision = Number(response.revision || 0)
       room.recordVersions.clear()
+      room.inputs.clear(); room.inputVersions.clear()
+      for (const [prefix, rows] of [['record', response.payload.records], ['card', response.payload.cards], ['sub', response.inputSetup?.subs]] as const) {
+        for (const row of rows || []) room.inputs.set(`${prefix}:${row.id}`, row)
+      }
+      room.inputs.set('state', response.sharedState || { ...response.clientState, halfStatus: response.payload.status, homeScore: response.payload.homeScore, awayScore: response.payload.awayScore })
+      if (response.inputSetup) room.inputs.set('setup', response.inputSetup)
     }
   }
 
   function rememberDelta(room: Room, event: any) {
     const revision = Number(event.revision || 0)
+    for (const [prefix, rows, deleted] of [['record', event.records, event.deletedRecordIds], ['card', event.cards, event.deletedCardIds], ['sub', event.subs, event.deletedSubIds]] as const) {
+      for (const row of rows || []) {
+        const key = `${prefix}:${row.id}`
+        if (revision > Math.max(room.snapshotRevision, room.inputVersions.get(key) || 0)) { room.inputs.set(key, row); room.inputVersions.set(key, revision) }
+      }
+      for (const id of deleted || []) {
+        const key = `${prefix}:${id}`
+        if (revision > Math.max(room.snapshotRevision, room.inputVersions.get(key) || 0)) { room.inputs.delete(key); room.inputVersions.set(key, revision) }
+      }
+    }
+    for (const [key, value] of [['state', event.sharedState], ['setup', event.setup]] as const) {
+      if (value && revision > Math.max(room.snapshotRevision, room.inputVersions.get(key) || 0)) { room.inputs.set(key, value); room.inputVersions.set(key, revision) }
+    }
     for (const record of event.records || []) {
       if (revision <= Math.max(room.snapshotRevision, room.recordVersions.get(record.id) || 0)) continue
       room.recordVersions.set(record.id, revision); room.confirmedRecords.set(record.id, fingerprint(record))
@@ -436,10 +565,40 @@ export function useLiveRoom() {
     if (!commands[0]?.blocked) return
     const baseline = await room.read()
     await store.remove(commands[0].order!)
-    room.status.revision = Number(baseline.revision || 0)
+    seedRoom(room, baseline)
     const remaining = await store.list(key)
     notifyRoom(room, { ...baseline, acceptServer: true, replayCommands: remaining })
     room.status.phase = remaining.length ? 'loading' : 'saved'
+    room.status.error = ''
+    room.status.conflict = undefined
+    await pump(key, room)
+  }
+
+  // Explicitly chosen overwrite creates a NEW request. Never alter an
+  // attempted request and retry it under its original command ID.
+  async function keepLocal(gmId: string, side: 'H' | 'A') {
+    const { room, key } = await roomFor(gmId, side)
+    if (room.running) return
+    const commands = await store.list(key)
+    const head = commands[0]
+    if (head?.blocked !== 'draft_conflict' || !['draft', 'setup'].includes(head.kind)) return
+    const baseline = await room.read()
+    if (baseline.status !== 'ok' || Number(baseline.roomEpoch || 0) !== head.request.roomEpoch) {
+      room.status.error = '입력 회차가 변경되어 덮어쓸 수 없습니다. 서버 상태를 확인하세요.'
+      return
+    }
+    if (room.status.conflict?.commandId !== head.commandId || room.status.conflict.revision !== Number(baseline.revision || 0)) {
+      room.status.conflict = { commandId: head.commandId, local: describeInput(head), server: describeInput(head, baseline), revision: Number(baseline.revision || 0) }
+      room.status.error = '서버 내용이 바뀌었습니다. 갱신된 비교 내용을 확인한 뒤 다시 선택하세요.'
+      return
+    }
+    const commandId = crypto.randomUUID()
+    const replacement: LiveCommand = { ...head, commandId, attempted: false, blocked: undefined,
+      request: { ...head.request, commandId, baseRevision: Number(baseline.revision || 0), predecessorCommands: {} } }
+    await store.update(replacement)
+    notifyRoom(room, { pendingCommand: replacement })
+    room.status.conflict = undefined
+    room.status.phase = 'saving'
     room.status.error = ''
     await pump(key, room)
   }
@@ -462,5 +621,5 @@ export function useLiveRoom() {
     return await room.read()
   }
 
-  return { submit, attach, observe, seed, observeDelta, changedRecords, bindSocket, acceptServer, flush, pending, readSnapshot }
+  return { submit, attach, observe, seed, observeDelta, changedRecords, bindSocket, acceptServer, keepLocal, flush, pending, readSnapshot }
 }

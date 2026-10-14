@@ -22,6 +22,9 @@ __pycache__
 # Generated backend KPI artifacts
 backend/data/
 
+# Local Firestore mapping audit outputs (shared notes live in one Markdown file)
+docs/aifootballx/*.json
+
 # Misc
 .DS_Store
 .fleet

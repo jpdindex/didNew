@@ -133,21 +133,78 @@ def test_duplicate_id_with_different_content_is_rejected(data):
     assert caught.value.code == 'command_id_reused'
 
 
-def test_independent_peer_records_merge_but_same_record_conflicts(data):
+def test_independent_and_same_record_peer_edits_continue_without_conflict(data):
     live.execute_command(data, 'm', 'H', 'draft', command('primary', [record('p')]), 'p')
     live.execute_command(data, 'm', 'H', 'draft', command('assistant', [record('a')], scope='records'), 'a')
     assert {item['id'] for item in data.get_input_draft('m', 'H')['payload']['records']} == {'p', 'a'}
-    with pytest.raises(BackendError) as caught:
-        live.execute_command(data, 'm', 'H', 'draft', command('conflict', [record('p', 'other')], scope='records'), 'a')
-    assert caught.value.code == 'draft_conflict'
-    assert data.get_input_draft('m', 'H')['revision'] == 2
+    live.execute_command(data, 'm', 'H', 'draft', command('next', [record('p', 'other')], scope='records'), 'a')
+    assert data.get_input_draft('m', 'H')['revision'] == 3
+    assert next(row for row in data.get_input_draft('m', 'H')['payload']['records'] if row['id'] == 'p')['playerId'] == 'other'
 
 
-def test_same_uid_in_another_tab_still_conflicts(data):
+def test_same_uid_in_another_tab_saves_in_order(data):
     live.execute_command(data, 'm', 'H', 'draft', command('first', [record()]), 'p')
-    with pytest.raises(BackendError) as caught:
-        live.execute_command(data, 'm', 'H', 'draft', command('second', [record(player='new')]), 'p')
-    assert caught.value.code == 'draft_conflict'
+    live.execute_command(data, 'm', 'H', 'draft', command('second', [record(player='new')]), 'p')
+    assert data.get_input_draft('m', 'H')['payload']['records'][0]['playerId'] == 'new'
+
+
+def test_queued_edit_follows_exact_predecessor_across_transactions(data):
+    first = command('first', [record()], scope='records')
+    following = command('following', [record(player='two')], scope='records',
+                        predecessorCommands={'record:r': 'first'})
+    live.execute_command(data, 'm', 'H', 'draft', first, 'p')
+    receipt = live.execute_command(data, 'm', 'H', 'draft', following, 'p')
+    assert receipt['savedRevision'] == 2
+    assert receipt['event']['records'][0]['playerId'] == 'two'
+    assert 'lastCommandId' not in receipt['event']['records'][0]
+    assert live.execute_command(data, 'm', 'H', 'draft', following, 'p') == receipt
+
+
+@pytest.mark.parametrize('peer', ['a', 'p'])
+@pytest.mark.parametrize('base', [0, 2])
+def test_legacy_predecessor_does_not_block_ordered_collaboration(data, peer, base):
+    live.execute_command(data, 'm', 'H', 'draft', command('first', [record()], scope='records'), 'p')
+    live.execute_command(data, 'm', 'H', 'draft', command('peer', [record(player='peer')], scope='records', base=1), peer)
+    live.execute_command(data, 'm', 'H', 'draft', command('following', [record(player='mine')], scope='records',
+        base=base, predecessorCommands={'record:r': 'first'}), 'p')
+    assert data.get_input_draft('m', 'H')['payload']['records'][0]['playerId'] == 'mine'
+
+
+def test_another_users_legacy_predecessor_does_not_change_authority(data):
+    live.execute_command(data, 'm', 'H', 'draft', command('peer', [record()], scope='records'), 'a')
+    live.execute_command(data, 'm', 'H', 'draft', command('mine', [record(player='mine')], scope='records',
+        predecessorCommands={'record:r': 'peer'}), 'p')
+    assert data.get_input_draft('m', 'H')['payload']['records'][0]['playerId'] == 'mine'
+
+
+def test_state_and_card_can_follow_own_pending_command(data):
+    for scope, target, fields in [('state', 'state', {}), ('cards', 'card:c', {
+        'cards': [{'id': 'c', 'half': 'H1', 'halfSeconds': 1, 'playerId': 'one', 'card': 'Y'}]})]:
+        live.execute_command(data, 'm', 'H', 'draft', command(scope, scope=scope, **fields), 'p')
+        request = command(scope + '-next', scope=scope, predecessorCommands={target: scope}, **fields)
+        live.execute_command(data, 'm', 'H', 'draft', request, 'p')
+
+
+def test_substitution_does_not_advance_lineup_edit_conflict_version(data):
+    setup = InputSetupWriteRequest(commandId='setup', baseRevision=0, roomEpoch=0, payload=payload(), clientState={}, syncScope='setup')
+    live.execute_command(data, 'm', 'H', 'setup', setup, 'p')
+    sub = {'id': 's', 'half': 'H1', 'seconds': 1, 'outPlayer': 'one', 'inPlayer': 'two'}
+    request = InputSetupWriteRequest(commandId='sub', baseRevision=1, roomEpoch=0, payload=payload(), clientState={'subs': [sub]}, syncScope='substitutions')
+    live.execute_command(data, 'm', 'H', 'setup', request, 'a')
+    root = data.db.documents['inputDrafts/m_H']
+    assert root['setupCommandRevision'] == 1
+    assert root['setupCommandId'] == 'setup'
+
+
+def test_fifty_chained_same_record_edits_cross_batch_boundaries(data):
+    for offset in range(0, 50, 20):
+        commands = []
+        for index in range(offset, min(50, offset + 20)):
+            commands.append(('draft', command(f'c{index}', [record(player=str(index))], scope='records',
+                predecessorCommands={'record:r': f'c{index - 1}'} if index else {})))
+        result = live.execute_batch(data, 'm', 'H', commands, 'p')
+        assert all(item['status'] == 'ack' for item in result['results'])
+    assert data.get_input_draft('m', 'H')['payload']['records'][0]['playerId'] == '49'
 
 
 def test_cards_do_not_erase_act_and_tombstone_survives_retry(data):
@@ -478,7 +535,7 @@ def test_batch_preserves_create_player_edit_delete_order_and_event_revisions(dat
     assert data.db.documents['inputDrafts/m_H/records/same']['commandRevision'] == 3
 
 
-def test_batch_conflict_blocks_dependents_but_saves_unrelated_act_and_card(data, monkeypatch):
+def test_batch_concurrent_edits_and_unrelated_act_and_card_all_continue(data, monkeypatch):
     monkeypatch.setattr(live, '_queue_summary', lambda *args: None)
     live.execute_command(data, 'm', 'H', 'draft', command('peer', [record('same')], scope='records'), 'a')
     card = {'id': 'card', 'half': 'H1', 'halfSeconds': 1, 'playerId': 'one', 'card': 'Y'}
@@ -488,11 +545,117 @@ def test_batch_conflict_blocks_dependents_but_saves_unrelated_act_and_card(data,
         ('draft', command('independent', [record('new')], scope='records')),
         ('draft', command('card', scope='cards', cards=[card])),
     ], 'p')
-    assert [item.get('code', item['status']) for item in response['results']] == ['draft_conflict', 'dependency_blocked', 'ack', 'ack']
+    assert [item.get('code', item['status']) for item in response['results']] == ['ack', 'ack', 'ack', 'ack']
     assert set(item['id'] for item in data.get_input_draft('m', 'H')['payload']['records']) == {'same', 'new'}
-    assert len(response['event']['events']) == 2
-    assert response['event']['events'][0]['records'][0]['id'] == 'new'
-    assert 'records' not in response['event']['events'][1]
+    assert len(response['event']['events']) == 4
+    assert response['event']['events'][2]['records'][0]['id'] == 'new'
+    assert 'records' not in response['event']['events'][3]
+
+
+def edit(at, device='device-one', sequence=1, before=None):
+    return {'changedAtMs': at, 'deviceId': device, 'sequence': sequence, 'before': before or {}}
+
+
+def test_late_offline_edit_is_acknowledged_with_newer_server_record(data):
+    live.execute_command(data, 'm', 'H', 'draft', command('new', [record(player='new')], scope='records', edit=edit(300)), 'p')
+    older = command('old', [record(player='old')], scope='records', edit=edit(100, 'offline'))
+    receipt = live.execute_command(data, 'm', 'H', 'draft', older, 'a')
+    assert receipt['event']['records'][0]['playerId'] == 'new'
+    assert receipt['savedRevision'] == 2
+    assert live.execute_command(data, 'm', 'H', 'draft', older, 'a') == receipt
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+def test_independent_fields_of_same_record_merge_in_any_delivery_order(data, reverse):
+    original = record()
+    live.execute_command(data, 'm', 'H', 'draft', command('initial', [original], scope='records', edit=edit(100)), 'p')
+    edits = [('player', {**original, 'playerId': 'two'}, 200, 'p'), ('area', {**original, 'area': 8}, 300, 'a')]
+    for key, row, at, uid in reversed(edits) if reverse else edits:
+        live.execute_command(data, 'm', 'H', 'draft', command(key, [row], scope='records',
+            edit=edit(at, key, before={'record:r': original})), uid)
+    stored = data.get_input_draft('m', 'H')['payload']['records'][0]
+    assert (stored['playerId'], stored['area']) == ('two', 8)
+
+
+def test_equal_times_use_device_sequence_then_first_server_admission(data):
+    live.execute_command(data, 'm', 'H', 'draft', command('second', [record(player='two')], scope='records', edit=edit(100, sequence=2)), 'p')
+    live.execute_command(data, 'm', 'H', 'draft', command('first', [record(player='one')], scope='records', edit=edit(100, sequence=1)), 'p')
+    assert data.get_input_draft('m', 'H')['payload']['records'][0]['playerId'] == 'two'
+    peer = command('peer', [record(player='peer')], scope='records', edit=edit(100, 'other-device'))
+    receipt = live.execute_command(data, 'm', 'H', 'draft', peer, 'a')
+    assert receipt['event']['records'][0]['playerId'] == 'peer'
+    live.execute_command(data, 'm', 'H', 'draft', command('later', [record(player='later')], scope='records', edit=edit(100, 'third-device')), 'p')
+    assert live.execute_command(data, 'm', 'H', 'draft', peer, 'a') == receipt
+    assert data.get_input_draft('m', 'H')['payload']['records'][0]['playerId'] == 'later'
+
+
+def test_equal_time_older_device_sequence_stays_old_across_peer_write(data):
+    for key, player, device, sequence, uid in [('a2', 'a2', 'a', 2, 'p'), ('b', 'b', 'b', 1, 'a'), ('a1', 'a1', 'a', 1, 'p')]:
+        live.execute_command(data, 'm', 'H', 'draft', command(key, [record(player=player)], scope='records', edit=edit(100, device, sequence)), uid)
+    assert data.get_input_draft('m', 'H')['payload']['records'][0]['playerId'] == 'b'
+
+
+def test_ordered_sdk_edits_keep_point_reads_and_hide_merge_metadata(sdk_data):
+    rpc = sdk_data.db._firestore_api_internal
+    for key, at in [('new', 300), ('late', 100)]:
+        receipt = live.execute_command(sdk_data, 'm', 'H', 'draft', command(key, [record(player=key)], scope='records', edit=edit(at)), 'p')
+    assert receipt['event']['records'][0]['playerId'] == 'new'
+    assert '_editVersions' not in receipt['event']['records'][0]
+    assert rpc.queries == []
+    assert rpc.read_calls == 6
+
+
+def test_late_state_cannot_rewind_clock_or_reopen_finished_half(data):
+    newer = command('new-state', scope='state', edit=edit(300))
+    newer.payload.status = 'H1_done'
+    newer.clientState = {'seconds': 2700, 'clockStartedAt': None, 'h1Seconds': 2700}
+    live.execute_command(data, 'm', 'H', 'draft', newer, 'p')
+    for key, at in [('old-state', 100), ('wrong-reopen', 400)]:
+        live.execute_command(data, 'm', 'H', 'draft', command(key, scope='state', edit=edit(at)), 'p')
+    shared = data.db.documents['inputDrafts/m_H']['sharedState']
+    assert shared['halfStatus'] == 'H1_done'
+    assert shared['seconds'] == 2700
+
+
+def test_newer_time_does_not_grant_assistant_setup_or_state_authority(data):
+    with pytest.raises(BackendError) as caught:
+        live.execute_command(data, 'm', 'H', 'draft', command('state', scope='state', edit=edit(999999)), 'a')
+    assert caught.value.code == 'primary_required'
+    setup = InputSetupWriteRequest(commandId='setup', baseRevision=0, roomEpoch=0, payload=payload(), clientState={}, edit=edit(999999))
+    with pytest.raises(BackendError) as caught:
+        live.execute_command(data, 'm', 'H', 'setup', setup, 'a')
+    assert caught.value.code == 'primary_required'
+
+
+def test_late_delete_or_edit_does_not_remove_or_resurrect_newer_record(data):
+    live.execute_command(data, 'm', 'H', 'draft', command('new', [record()], scope='records', edit=edit(300)), 'p')
+    receipt = live.execute_command(data, 'm', 'H', 'draft', command('old-delete', scope='records', deletedRecordIds=['r'], edit=edit(200)), 'a')
+    assert receipt['event']['records'][0]['id'] == 'r'
+    live.execute_command(data, 'm', 'H', 'draft', command('new-delete', scope='records', deletedRecordIds=['r'], edit=edit(400)), 'p')
+    receipt = live.execute_command(data, 'm', 'H', 'draft', command('old-edit', [record()], scope='records', edit=edit(350)), 'a')
+    assert receipt['event']['deletedRecordIds'] == ['r']
+    assert data.get_input_draft('m', 'H')['payload']['records'] == []
+
+
+def test_late_edit_does_not_overwrite_a_newer_explicit_recreation(data):
+    original = record()
+    live.execute_command(data, 'm', 'H', 'draft', command('create', [original], scope='records', edit=edit(100)), 'p')
+    live.execute_command(data, 'm', 'H', 'draft', command('delete', scope='records', deletedRecordIds=['r'], edit=edit(300)), 'p')
+    live.execute_command(data, 'm', 'H', 'draft', command('recreate', [record(player='new')], scope='records',
+        edit=edit(500, before={'record:r': original})), 'p')
+    receipt = live.execute_command(data, 'm', 'H', 'draft', command('late', [record(player='late')], scope='records', edit=edit(400)), 'a')
+    assert receipt['event']['records'][0]['playerId'] == 'new'
+
+
+def test_late_setup_preserves_newer_formation_and_saved_baseline(data):
+    for key, at, formation in [('new', 300, '4-3-3'), ('old', 100, '4-4-2')]:
+        values = payload()
+        values['formationKey'] = formation
+        request = InputSetupWriteRequest(commandId=key, baseRevision=0, roomEpoch=0, payload=values, clientState={}, edit=edit(at))
+        live.execute_command(data, 'm', 'H', 'setup', request, 'p')
+    setup = data.db.documents['inputDrafts/m_H']['setup']
+    assert setup['formationKey'] == '4-3-3'
+    assert setup['baseLineup'] == []
 
 
 def test_failed_batch_commit_persists_no_partial_events_or_receipts(data):

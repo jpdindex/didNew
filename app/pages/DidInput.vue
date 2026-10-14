@@ -42,7 +42,7 @@ const game = useMatchState()
 const { request } = useBackendApi()
 const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
 const { saveLocal, save: saveDraft, finalizeAdvanced, recover: recoverDraft, hydrate: hydrateDraft } = useMatchDraft()
-const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards, roomStatus, acceptServer } = useMatchCollaboration()
+const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards, roomStatus, acceptServer, keepLocal } = useMatchCollaboration()
 const requestedRole = route.query.role === 'assistant' || route.query.role === 'manager' ? route.query.role : 'primary'
 const isPrimary = computed(() => game.value.lifecycleControl || game.value.participantRole === 'primary' || requestedRole === 'primary')
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
@@ -316,6 +316,8 @@ onMounted(async () => {
       dirtyRecordIds.clear()
       clearedRecordPlayerIds.clear()
       sharedDraftDirty = false
+      sharedScoreDirty = false
+      scoreEditRevision += 1
       recordSavesInFlight.clear()
       if (draftSaveTimer) clearTimeout(draftSaveTimer)
     },
@@ -519,6 +521,8 @@ let draftSaveTimer: ReturnType<typeof setTimeout> | undefined
 // 카드는 이 화면에서 실제로 바뀌었을 때만 서버에 보낸다. 기록 저장(흐르는 초로 매초 발생)
 // 때마다 같이 보내면, 카드가 옛 상태인 다른 화면이 매초 그 목록으로 덮어써 카드가 깜빡인다.
 let sharedDraftDirty = false
+let sharedScoreDirty = false
+let scoreEditRevision = 0
 const dirtyRecordIds = new Set<string>()
 const clearedRecordPlayerIds = new Set<string>()
 const recordSavesInFlight = new Map<string, string>()
@@ -573,9 +577,15 @@ function queueDraftSave(shared = true) {
     const sentFingerprints = new Map(changedRecords.map(record => [record.id, JSON.stringify(record)]))
     if (!changedRecords.length && !clearedPlayerIds.length) return
     for (const [id, fingerprint] of sentFingerprints) recordSavesInFlight.set(id, fingerprint)
-    const save = syncStateRecords(game.value, changedRecords, clearedPlayerIds, !isEditMode)
+    // Ordinary ACTs do not carry clock/lifecycle. A local goal/result change
+    // still saves its derived score atomically with the affected record.
+    const sendScore = sharedScoreDirty && !isEditMode
+    const sentScoreRevision = scoreEditRevision
+    saveToStore()
+    const save = syncStateRecords(game.value, changedRecords, clearedPlayerIds, sendScore)
     void save.then((ok) => {
       if (!ok) return
+      if (sendScore && scoreEditRevision === sentScoreRevision) sharedScoreDirty = false
       for (const id of changedIds) {
         const current = records.value.find(record => record.id === id)
         if (current && JSON.stringify(current) === sentFingerprints.get(id)) {
@@ -623,8 +633,13 @@ const team = computed(() => (route.query.team === 'away' ? 'away' : 'home'))
 // 하면 기록을 삭제하거나 결과를 B/X/선방 등으로 고쳤을 때 점수가 내려가지 않는다.
 function syncOwnScore() {
   const goals = records.value.filter(r => r.res === 'GOAL').length
+  const previous = team.value === 'away' ? awayScore.value : homeScore.value
   if (team.value === 'away') awayScore.value = goals
   else homeScore.value = goals
+  if (previous !== goals && !applyingRemoteDraft && dirtyRecordIds.size) {
+    sharedScoreDirty = true
+    scoreEditRevision += 1
+  }
 }
 watch(records, syncOwnScore, { deep: true })
 const squad = computed<MatchSquadPlayer[]>(() => {
@@ -781,7 +796,10 @@ function deleteRangeRecords() {
   if (!ids.size) return
   if (!confirm(`선택한 기록 ${ids.size}개를 삭제하시겠습니까?`)) return
 
+  const deletesGoal = records.value.some(rec => ids.has(rec.id) && rec.res === 'GOAL')
   records.value = records.value.filter(rec => !ids.has(rec.id))
+  syncOwnScore()
+  saveToStore()
   game.value.records = records.value
   for (const id of ids) {
     const timer = editedTimers.get(id)
@@ -792,7 +810,7 @@ function deleteRangeRecords() {
   if (peekId.value && ids.has(peekId.value)) peekId.value = null
   if (playerPickFor.value && ids.has(playerPickFor.value)) playerPickFor.value = null
   if (pendingShot.value && ids.has(pendingShot.value.id)) pendingShot.value = null
-  void Promise.all([...ids].map(id => removeRecord(game.value, id))).catch(() => false)
+  void Promise.all([...ids].map(id => removeRecord(game.value, id, deletesGoal && !isEditMode))).catch(() => false)
   toggleRangeMode()
 }
 
@@ -1055,8 +1073,9 @@ function deleteEdit() {
     }
   }
   records.value = records.value.filter(r => r.id !== deletedId)
-  game.value.records = records.value
-  void removeRecord(game.value, deletedId).catch(() => false)
+  syncOwnScore()
+  saveToStore()
+  void removeRecord(game.value, deletedId, deleted?.res === 'GOAL' && !isEditMode).catch(() => false)
   editingId.value = null
 }
 function cancelEdit() {
@@ -2711,7 +2730,7 @@ async function finishHalf() {
               </div>
 
               <div class="liveRoomGap">
-                <LiveRoomStatus compact :status="roomStatus" @accept-server="acceptServer" />
+                <LiveRoomStatus compact :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
               </div>
 
               <div class="goal" :class="{ active: pendingShot !== null || isEditingShoot }">

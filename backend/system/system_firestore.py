@@ -1773,7 +1773,7 @@ class JpdDidData:
         """Accept both the old browser record shape and the API payload shape."""
         if values.get("deleted"):
             return None
-        record = {key: value for key, value in values.items() if key not in {"deleted", "updatedAt", "updatedBy", "edited", "commandRevision"}}
+        record = {key: value for key, value in values.items() if key not in {"deleted", "updatedAt", "updatedBy", "edited", "commandRevision", "lastCommandId", "_editVersions"}}
         record["id"] = str(record.get("id") or record_id)
         if "halfSeconds" not in record and "seconds" in record:
             record["halfSeconds"] = record.pop("seconds")

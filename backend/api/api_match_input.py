@@ -154,11 +154,21 @@ class MatchInputPayload(BaseModel):
 MatchInputCommit = MatchInputPayload
 
 
+class CommandEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    changedAtMs: int = Field(ge=0)
+    deviceId: str = Field(min_length=1, max_length=128)
+    sequence: int = Field(default=0, ge=0)
+    before: dict[str, dict[str, Any] | None] = Field(default_factory=dict)
+
+
 class DraftWriteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     commandId: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     baseRevision: int | None = Field(default=None, ge=0)
     roomEpoch: int | None = Field(default=None, ge=0)
+    predecessorCommands: dict[str, str] = Field(default_factory=dict)
+    edit: CommandEdit | None = None
     payload: MatchInputPayload
     clientState: dict[str, Any]
     # One endpoint serves durable checkpoints and the two lightweight live-sync
@@ -180,6 +190,8 @@ class InputSetupWriteRequest(BaseModel):
     commandId: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     baseRevision: int | None = Field(default=None, ge=0)
     roomEpoch: int | None = Field(default=None, ge=0)
+    predecessorCommands: dict[str, str] = Field(default_factory=dict)
+    edit: CommandEdit | None = None
     payload: MatchInputPayload
     clientState: dict[str, Any]
     deletedSubIds: list[str] = Field(default_factory=list)
@@ -187,6 +199,7 @@ class InputSetupWriteRequest(BaseModel):
 
 
 class DraftResponse(BaseModel):
+    serverTimeMs: int = Field(default_factory=lambda: int(utc_now().timestamp() * 1000))
     status: str
     gmId: str
     side: Side
@@ -214,6 +227,7 @@ class DraftMissingResponse(BaseModel):
 
 
 class LiveCommandAck(BaseModel):
+    serverTimeMs: int = Field(default_factory=lambda: int(utc_now().timestamp() * 1000))
     status: Literal['ack'] = 'ack'
     gmId: str
     side: Side
