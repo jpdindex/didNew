@@ -210,19 +210,34 @@ async function applyEditMatch(m: MatchRow) {
   }
 }
 
-// 시즌 목록은 하드코딩하지 않는다 — gm_id 앞 8자리(seasonId)가 실제로 들어와 있는 값 기준.
-// 리그를 바꾸면 그 리그에 있는 시즌만 남도록 다시 계산한다.
+// 빈 시즌도 일정 등록 대상으로 선택할 수 있다. 기존 데이터 밖의 연도는 직접 추가한다.
+const currentYear = new Date().getFullYear()
+const additionalSeasons = ref<string[]>([])
+const newSeasonYear = ref('')
+const seasonError = ref('')
 const seasonsInLeague = computed(() => {
   const set = new Set(matches.value.filter(m => m.leagueId === selectedLeague.value).map(m => m.seasonId))
+  for (let year = 2000; year <= currentYear + 5; year++) set.add(`${year}${year + 1}`)
+  for (const season of additionalSeasons.value) set.add(season)
   return [...set].sort().reverse()
 })
 function seasonLabel(seasonId: string) {
   return `${seasonId.slice(0, 4)}-${seasonId.slice(6, 8)}`
 }
-const selectedSeason = ref('')
-watch(seasonsInLeague, list => {
-  if (!list.includes(selectedSeason.value)) selectedSeason.value = list[0] ?? ''
-}, { immediate: true })
+const selectedSeason = ref(`${currentYear}${currentYear + 1}`)
+function addSeason() {
+  seasonError.value = ''
+  const value = newSeasonYear.value.trim()
+  const year = Number(value)
+  if (!/^\d{4}$/.test(value) || year < 1000 || year > 9998) {
+    seasonError.value = '시즌 시작 연도를 네 자리로 입력하세요 (예: 2027).'
+    return
+  }
+  const season = `${year}${year + 1}`
+  if (!additionalSeasons.value.includes(season)) additionalSeasons.value.push(season)
+  selectedSeason.value = season
+  newSeasonYear.value = ''
+}
 
 const filteredMatches = computed(() => matches.value
   .filter(m => m.leagueId === selectedLeague.value && m.seasonId === selectedSeason.value)
@@ -352,6 +367,15 @@ function makeBulkRow(serial: number): BulkRow {
   }
 }
 const bulkRows = ref<BulkRow[]>([])
+
+watch([selectedLeague, selectedSeason], () => {
+  formError.value = ''
+  const base = Number(nextSerial.value || 1)
+  bulkRows.value.forEach((row, index) => {
+    row.error = ''
+    if (!bulkGmIdOverride.value) row.serial = String(base + index).padStart(4, '0')
+  })
+})
 
 // 새 시즌 등으로 gm_id를 처음부터 끝까지 직접 쳐야 할 때 켜는 "수정" — 칸마다 따로 켜는 게
 // 아니라 GM_ID 헤더 옆 버튼 하나로 전체 칸을 한 번에 수동 입력 모드로 바꾼다(10칸을 하나씩
@@ -584,6 +608,27 @@ async function submitAdd() {
 
       <p v-if="loadError" class="errBanner">{{ loadError }}</p>
 
+      <div class="toolbar">
+        <div class="filters">
+          <label>리그
+            <select v-model="selectedLeague" :disabled="saving">
+              <option v-for="l in LEAGUES" :key="l.id" :value="l.id">{{ l.label }}</option>
+            </select>
+          </label>
+          <label>시즌
+            <select v-model="selectedSeason" :disabled="saving">
+              <option v-for="s in seasonsInLeague" :key="s" :value="s">{{ seasonLabel(s) }}</option>
+            </select>
+          </label>
+          <form class="newSeason" @submit.prevent="addSeason">
+            <input v-model="newSeasonYear" :disabled="saving" aria-label="새 시즌 시작 연도" inputmode="numeric" maxlength="4" placeholder="시작 연도 (예: 2027)">
+            <button type="submit" :disabled="saving">시즌 추가</button>
+          </form>
+        </div>
+        <span>{{ loading ? '불러오는 중...' : `${filteredMatches.length}개 경기` }}</span>
+      </div>
+      <p v-if="seasonError" class="formErrorMsg">{{ seasonError }}</p>
+
       <div v-if="addOpen" class="bulkAddPanel">
         <div class="bulkHeader">
           <span class="leagueFixed">리그: {{ leagueLabel(selectedLeague) }} · 시즌: {{ seasonLabel(selectedSeason) }} (현재 목록 기준) · {{ bulkRows.length }}칸</span>
@@ -642,22 +687,6 @@ async function submitAdd() {
           <button :disabled="saving" class="applyBtn" @click="submitAdd">{{ activeBulkRows.length || 0 }}개 저장</button>
           <button @click="cancelAdd">취소</button>
         </div>
-      </div>
-
-      <div class="toolbar">
-        <div class="filters">
-          <label>리그
-            <select v-model="selectedLeague">
-              <option v-for="l in LEAGUES" :key="l.id" :value="l.id">{{ l.label }}</option>
-            </select>
-          </label>
-          <label>시즌
-            <select v-model="selectedSeason">
-              <option v-for="s in seasonsInLeague" :key="s" :value="s">{{ seasonLabel(s) }}</option>
-            </select>
-          </label>
-        </div>
-        <span>{{ loading ? '불러오는 중...' : `${filteredMatches.length}개 경기` }}</span>
       </div>
 
       <div class="matchTable">
@@ -719,6 +748,7 @@ async function submitAdd() {
 .headerActions{justify-self:end;display:flex;gap:8px}
 .excelAdd{background:transparent!important;border:1px solid #f0b429!important;color:#f0b429!important}
 .hiddenFileInput{display:none}
+.newSeason{display:flex;gap:8px;align-items:center}.newSeason input{width:150px;padding:8px;border:1px solid #46515f;border-radius:4px;background:#202731;color:#eee}.newSeason button{padding:8px 12px;border:1px solid #f0b429;border-radius:4px;background:transparent;color:#f0b429;cursor:pointer}.newSeason button:disabled{opacity:.4;cursor:not-allowed}
 .errBanner{margin:12px 0 0;padding:8px 12px;background:rgba(241,106,106,.12);border:1px solid rgba(241,106,106,.4);border-radius:4px;color:#f16a6a;font-size:12px}
 .bulkAddPanel{margin-top:12px;padding:14px;border:1px solid rgba(240,180,41,.4);border-radius:6px;background:rgba(240,180,41,.05)}
 .bulkHeader{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
