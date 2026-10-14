@@ -1686,6 +1686,7 @@ function playerLabel(playerId: string | null) {
 // 버튼은 항상 활성 상태로 둔다. 블락/실책이 언제 나올지 알 수 없기 때문에
 // 상황에 따라 흐려지면 안 된다. 유효하지 않은 클릭은 각 핸들러에서 무시한다.
 const flashCell = ref<{ col: number; row: number } | null>(null)
+const flashKey = ref(0)
 let flashTimer: ReturnType<typeof setTimeout> | undefined
 
 const kickActs = [
@@ -1882,6 +1883,9 @@ function clickPitch(e: MouseEvent) {
   pendingPos.value = { x, y }
   pendingSeconds.value = clockSeconds.value
   pendingCell.value = nextCell
+  // 연속으로 빠르게 위치를 찍어도 하이라이트 DOM을 새로 만들어
+  // zoneFlash 애니메이션이 매번 첫 프레임부터 다시 시작되게 한다.
+  flashKey.value += 1
   flashCell.value = nextCell
   if (flashTimer) clearTimeout(flashTimer)
   flashTimer = setTimeout(() => { flashCell.value = null }, 420)
@@ -2384,10 +2388,11 @@ async function finishHalf() {
             <div class="corner cornerBL" />
             <div class="corner cornerTR" />
             <div class="corner cornerBR" />
-            <div v-if="cellRect" class="zoneHighlight" :style="cellRect" />
+            <div v-if="cellRect" :key="flashKey" class="zoneHighlight" :style="cellRect" />
             <div v-if="infoCellRect" class="zoneHighlight editZoneHighlight" :style="infoCellRect" />
             <div v-if="infoMarkerPos" class="marker editMarker" :style="infoMarkerPos" />
-            <div v-if="pendingPos" class="marker" :style="{ left: pendingPos.x + '%', top: pendingPos.y + '%' }" />
+            <div v-if="pendingPos" :key="flashKey" class="marker pendingMarker"
+              :style="{ left: pendingPos.x + '%', top: pendingPos.y + '%' }" />
           </div>
 
           <div v-if="isEditMode" class="tableBar">
@@ -3560,14 +3565,32 @@ button {
 
 .marker {
   position: absolute;
-  width: 14px;
-  height: 14px;
-  margin: -7px;
+  width: 9px;
+  height: 9px;
+  margin: -4.5px;
   border-radius: 50%;
   background: rgba(235, 235, 235, .72);
   border: 2px solid rgba(255, 255, 255, .9);
-  box-shadow: 0 0 0 4px rgba(210, 210, 210, .22);
+  box-shadow: 0 0 0 5px rgba(210, 210, 210, .4);
   pointer-events: none
+}
+
+.pendingMarker {
+  animation: markerPulse .34s ease-out both
+}
+
+@keyframes markerPulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(210, 210, 210, .55)
+  }
+
+  55% {
+    box-shadow: 0 0 0 8px rgba(210, 210, 210, .28)
+  }
+
+  100% {
+    box-shadow: 0 0 0 5px rgba(210, 210, 210, .4)
+  }
 }
 
 .zoneHighlight {
@@ -3846,7 +3869,20 @@ button {
 .pickGroup {
   display: flex;
   flex-direction: column;
-  gap: 12px
+  gap: 12px;
+  animation: pickGroupSlideIn .28s cubic-bezier(.22, .8, .3, 1) both
+}
+
+@keyframes pickGroupSlideIn {
+  from {
+    opacity: 0;
+    transform: translateX(100%)
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0)
+  }
 }
 
 .pickField {
