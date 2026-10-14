@@ -61,7 +61,7 @@ const game = useMatchState()
 const { request } = useBackendApi()
 const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
 const { saveLocal, save: saveDraft, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover: recoverDraft, hydrate } = useMatchDraft()
-const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncSetup, syncState } = useMatchCollaboration()
+const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncSetup, syncState, roomStatus, acceptServer } = useMatchCollaboration()
 const preparedInput = usePreparedInput()
 const savedEntryFingerprint = ref('')
 const lifecycleBusy = ref(false)
@@ -122,6 +122,7 @@ type InputSetup = {
   subs: SubRecord[]
   inputMode: '분석' | '실시간'
   revision: number
+  forceApply?: boolean
 }
 
 type InputBootstrap = {
@@ -137,25 +138,30 @@ type InputBootstrap = {
 
 function applyInputSetup(setup: InputSetup | null | undefined) {
   if (!setup || !FORMATIONS[setup.formationKey]) return
+  const assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
+  if (!Object.keys(assigned).length) return
   const revision = Number(setup.revision || 0)
   const fingerprint = setupFingerprint(setup)
   // A delayed bootstrap/KPI/socket response is allowed to fill an empty
   // lobby, but it must never replace a lineup the analyst has just placed and
   // not yet received an acknowledgement for.
   if (revision < appliedSetupRevision) return
-  if (pendingSetupFingerprint && fingerprint !== pendingSetupFingerprint) return
+  if (pendingSetupFingerprint && fingerprint !== pendingSetupFingerprint && !setup.forceApply) return
   appliedSetupRevision = Math.max(appliedSetupRevision, revision)
   appliedSetupFingerprint = fingerprint
   if (pendingSetupFingerprint === fingerprint) pendingSetupFingerprint = ''
   applyingRemoteSetup = true
   game.value.formationKey = setup.formationKey
   if (setup.fieldSide === 'left' || setup.fieldSide === 'right') game.value.side = setup.fieldSide
-  const assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
   if (setup.lineupIsBaseline) {
     for (const sub of [...setup.subs].sort((a, b) => HALF_ORDER[a.half]! * 100000 + a.seconds - (HALF_ORDER[b.half]! * 100000 + b.seconds))) {
       const outSlot = Object.entries(assigned).find(([, playerId]) => playerId === sub.outPlayer)?.[0]
       const inSlot = Object.entries(assigned).find(([, playerId]) => playerId === sub.inPlayer)?.[0]
-      if (outSlot && inSlot) [assigned[outSlot], assigned[inSlot]] = [assigned[inSlot], assigned[outSlot]]
+      // A saved pre-half lineup can already contain the substitution. Replay
+      // only while OUT is on the field and IN is still on the bench.
+      if (outSlot && inSlot && !outSlot.startsWith('b') && inSlot.startsWith('b')) {
+        [assigned[outSlot], assigned[inSlot]] = [assigned[inSlot], assigned[outSlot]]
+      }
     }
   }
   game.value.assigned = assigned
@@ -172,6 +178,10 @@ function startLobbyCollaboration() {
   const isCurrentLobbySession = () => game.value.matchId === targetMatchId && game.value.team === targetTeam
 
   return startCollaboration(game.value, {
+    resetPending: () => {
+      pendingSetupFingerprint = ''
+      if (formationSaveTimer) clearTimeout(formationSaveTimer)
+    },
     applyState: (state) => {
       if (!isCurrentLobbySession()) return
       // Draft shared state contains only lifecycle, score and timer fields.
@@ -228,7 +238,9 @@ function setupFingerprint(setup: Pick<InputSetup, 'formationKey' | 'fieldSide' |
       inHalf: item.inHalf ?? null, inSeconds: item.inSeconds ?? null,
       outHalf: item.outHalf ?? null, outSeconds: item.outSeconds ?? null,
     })).sort((a, b) => String(a.slot).localeCompare(String(b.slot))),
-    subs: [...setup.subs].sort((a, b) => `${a.half}:${a.seconds}:${a.outPlayer}`.localeCompare(`${b.half}:${b.seconds}:${b.outPlayer}`)),
+    subs: setup.subs.map(sub => ({ id: sub.id, half: sub.half, seconds: sub.seconds,
+      outPlayer: sub.outPlayer, inPlayer: sub.inPlayer,
+    })).sort((a, b) => `${a.half}:${a.seconds}:${a.outPlayer}:${a.inPlayer}:${a.id}`.localeCompare(`${b.half}:${b.seconds}:${b.outPlayer}:${b.inPlayer}:${b.id}`)),
   })
 }
 
@@ -683,6 +695,7 @@ function onDragStart(playerId: string) {
 
 function recordFormationChange() {
   if (applyingRemoteSetup) return
+  if (!bootstrapApplied.value || !matchInfoEditable.value) return
   if (!game.value.matchId) return
   setupEpoch++
   // Lock the local lineup immediately, before the debounce starts. A late
@@ -695,6 +708,7 @@ function recordFormationChange() {
     return
   }
   formationSaveTimer = setTimeout(() => {
+    if (!game.value.lifecycleControl || !matchInfoEditable.value) return
     const fingerprint = currentSetupFingerprint()
     if (!game.value.formationKey || fingerprint === appliedSetupFingerprint && !pendingSetupFingerprint) return
     if (pendingSetupFingerprint !== fingerprint) return
@@ -714,6 +728,7 @@ function recordFormationChange() {
 }
 
 function persistCurrentSetup(fingerprint = currentSetupFingerprint()): Promise<boolean> {
+  if (!game.value.lifecycleControl) return Promise.resolve(false)
   if (!game.value.formationKey) return Promise.resolve(false)
   if (pendingSetupFingerprint === fingerprint && pendingSetupSave) return pendingSetupSave
   pendingSetupFingerprint = fingerprint
@@ -802,12 +817,28 @@ const starterCount = computed(() => outfieldSlots.value.filter((_, index) => gam
 // 후보는 선택 사항이다. 포메이션의 필드 10명과 GK만 확정되면 시작할 수 있다.
 const canStart = computed(() => !!game.value.formationKey && !!game.value.side && starterCount.value === outfieldSlots.value.length + 1)
 
+function entrySetupSnapshot() {
+  // Compare visible input choices, not server lineup metadata or JSON key
+  // order. Baseline and already-replayed lineups may represent the same view.
+  return JSON.stringify({ formationKey: game.value.formationKey, fieldSide: game.value.side,
+    inputMode: game.value.inputMode, assigned: Object.entries(game.value.assigned).sort(([a], [b]) => a.localeCompare(b)),
+    subs: game.value.subs.map(sub => ({ id: sub.id, half: sub.half, seconds: sub.seconds,
+      outPlayer: sub.outPlayer, inPlayer: sub.inPlayer,
+    })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    grass: game.value.grassPattern, lines: game.value.grassLines,
+  })
+}
+const entrySetupFingerprint = computed(entrySetupSnapshot)
+let entryEditRevision = 0
+watch(entrySetupFingerprint, () => {
+  if (!applyingRemoteSetup) entryEditRevision += 1
+}, { flush: 'sync' })
 const entryFingerprint = computed(() => JSON.stringify({
   matchId: game.value.matchId, team: game.value.team, status: game.value.halfStatus,
-  role: game.value.participantRole, control: game.value.lifecycleControl,
-  setup: currentSetupFingerprint(), grass: game.value.grassPattern, lines: game.value.grassLines,
+  setup: entrySetupFingerprint.value,
 }))
-const setupSaved = computed(() => savedEntryFingerprint.value === entryFingerprint.value && !!preparedInput.value)
+const setupSaved = computed(() => savedEntryFingerprint.value === entryFingerprint.value && !!preparedInput.value &&
+  game.value.lifecycleControl && preparedInput.value.participant.role === game.value.participantRole)
 watch(entryFingerprint, () => {
   savedEntryFingerprint.value = ''
   preparedInput.value = null
@@ -827,24 +858,32 @@ async function saveEntrySetup() {
   lifecycleError.value = ''
   savedEntryFingerprint.value = ''
   preparedInput.value = null
+  const editRevision = entryEditRevision
+  const fingerprint = entryFingerprint.value
   try {
     // Viewing the lobby never claims a seat. This explicit save confirms it.
+    const inputChunk = preloadRouteComponents('/DidInput').catch(() => undefined)
     await ensureLobbyParticipant(requestedRole)
     if (!game.value.lifecycleControl) throw new Error('주 분석관만 세팅을 저장할 수 있습니다.')
     if (formationSaveTimer) {
       clearTimeout(formationSaveTimer)
       formationSaveTimer = undefined
     }
-    const fingerprint = entryFingerprint.value
+    if (entryEditRevision !== editRevision || entryFingerprint.value !== fingerprint) throw new Error('세팅이 변경되었습니다. 다시 저장하세요.')
     if (!await persistCurrentSetup()) throw new Error('포메이션과 명단을 저장하지 못했습니다. 다시 시도하세요.')
+    if (entryEditRevision !== editRevision || entryFingerprint.value !== fingerprint) throw new Error('세팅이 변경되었습니다. 다시 저장하세요.')
     // Save the waiting status: preparation must not start the match clock.
     if (!await saveDraft(game.value)) throw new Error('세팅을 서버에 저장하지 못했습니다. 다시 시도하세요.')
     const entry = await enterCollaboration(game.value, requestedRole)
+    if (entryEditRevision !== editRevision || entryFingerprint.value !== fingerprint) throw new Error('세팅이 변경되었습니다. 다시 저장하세요.')
     if (!game.value.lifecycleControl) throw new Error('주 분석관의 입장 권한을 확인하지 못했습니다.')
     if (entry.draft.status !== 'ok') throw new Error('저장된 세팅을 확인하지 못했습니다. 다시 시도하세요.')
+    if (entry.gmId !== game.value.matchId || entry.side !== (game.value.team === 'away' ? 'A' : 'H')) throw new Error('입력할 경기나 팀이 변경되었습니다. 다시 확인하세요.')
+    const selectedSetup = (game.value.team === 'away' ? entry.inputSetup.A : entry.inputSetup.H) || entry.draft.inputSetup
+    if (selectedSetup) applyInputSetup(selectedSetup)
     // Fetch the input page chunk while the user is preparing, before navigation.
-    await preloadRouteComponents('/DidInput')
-    if (entryFingerprint.value !== fingerprint) throw new Error('세팅이 변경되었습니다. 다시 저장하세요.')
+    await inputChunk
+    if (entryEditRevision !== editRevision || entryFingerprint.value !== fingerprint) throw new Error('세팅이 변경되었습니다. 다시 저장하세요.')
     preparedInput.value = entry
     savedEntryFingerprint.value = fingerprint
   } catch (error) {
@@ -916,9 +955,9 @@ async function enterPreparedHalf(target: 'H1' | 'H2') {
     game.value.halfStatus = target
     game.value.seconds = 0
     game.value.clockStartedAt = Date.now()
-    // Setup, records and entry reads are already complete. Only acknowledge
-    // the lifecycle/clock mutation over the live channel before navigation.
-    if (!await syncState(game.value)) throw new Error('경기 시작 상태를 저장하지 못했습니다. 세팅 저장 후 다시 입장하세요.')
+    // Reuse prepared entry immediately. The durable outbox confirms the start
+    // in the background; DidInput displays its pending/error status.
+    void syncState(game.value).catch(() => false)
     void saveLocal(game.value).catch(() => false)
     preparedInput.value = {
       ...entry,
@@ -1526,6 +1565,7 @@ function undoSub(index: number) {
 
 <template>
   <div class="page">
+    <LiveRoomStatus :status="roomStatus" @accept-server="acceptServer" />
     <div class="bg" />
     <button type="button" class="topBack" @click="returnTo('/schedule')">← 경기 선택</button>
     <div class="frame">

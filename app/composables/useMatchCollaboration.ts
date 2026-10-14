@@ -1,10 +1,10 @@
 import type { DidRecord } from '~/utils/didLogic'
 import type { MatchState, MatchSquadPlayer } from '~/composables/useMatchState'
 import type { CardRecord } from '~/utils/card'
-import { cloneState, payloadFromState, type InputPayload } from '~/composables/useMatchDraft'
+import { payloadFromState, type InputPayload } from '~/composables/useMatchDraft'
+import { assignmentsFromLineup } from '~/utils/formationLayout'
 
 type ParticipantRole = 'primary' | 'assistant' | 'manager'
-const PENDING_RECORD_PROTECT_MS = 1_500
 
 function sideFor(game: MatchState) {
   return game.team === 'away' ? 'A' : 'H'
@@ -12,6 +12,11 @@ function sideFor(game: MatchState) {
 
 function plain<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
+}
+
+function liveState(value: Partial<MatchState>): Partial<MatchState> {
+  const keys = new Set(['halfStatus', 'seconds', 'h1Seconds', 'h2Seconds', 'clockStartedAt', 'homeScore', 'awayScore'])
+  return Object.fromEntries(Object.entries(value).filter(([key]) => keys.has(key)))
 }
 
 function numberOrUndefined(value: unknown) {
@@ -53,17 +58,6 @@ function recordsToPayload(records: DidRecord[]) {
     shootPosX: record.shootPosX ?? null, shootPosY: record.shootPosY ?? null,
     shootDspRange: record.shootDspRange ?? null, isShot: record.isShot ?? null, playerId: record.playerId ?? null,
   }))
-}
-
-function mergeRecordFields(remote: DidRecord, local: DidRecord | undefined): DidRecord {
-  if (!local) return remote
-  // A stale payload for the same log row can omit fields another device has
-  // already filled. Keep existing non-empty user input unless this browser has
-  // an explicit pending mutation for that row.
-  return {
-    ...remote,
-    playerId: remote.playerId ?? local.playerId,
-  }
 }
 
 function cardsFromPayload(cards: Array<Record<string, unknown>>): CardRecord[] {
@@ -113,7 +107,9 @@ function setupFingerprint(setup: Pick<NonNullable<DraftResponse['inputSetup']>, 
       inHalf: item.inHalf ?? null, inSeconds: item.inSeconds ?? null,
       outHalf: item.outHalf ?? null, outSeconds: item.outSeconds ?? null,
     })).sort((a, b) => String(a.slot).localeCompare(String(b.slot))),
-    subs: [...setup.subs].sort((a, b) => `${a.half}:${a.seconds}:${a.outPlayer}:${a.inPlayer}:${a.id}`.localeCompare(`${b.half}:${b.seconds}:${b.outPlayer}:${b.inPlayer}:${b.id}`)),
+    subs: setup.subs.map(sub => ({ id: sub.id, half: sub.half, seconds: sub.seconds,
+      outPlayer: sub.outPlayer, inPlayer: sub.inPlayer,
+    })).sort((a, b) => `${a.half}:${a.seconds}:${a.outPlayer}:${a.inPlayer}:${a.id}`.localeCompare(`${b.half}:${b.seconds}:${b.outPlayer}:${b.inPlayer}:${b.id}`)),
   })
 }
 
@@ -141,6 +137,7 @@ export interface DraftResponse {
   clientState: Partial<MatchState>
   sharedState?: Partial<MatchState>
   revision: number
+  roomEpoch?: number
   participantCount?: number
   inputSetup?: {
     formationKey: string
@@ -150,6 +147,7 @@ export interface DraftResponse {
     subs: Array<{ id: string; half: 'H1' | 'H2'; seconds: number; outPlayer: string; inPlayer: string }>
     inputMode: '분석' | '실시간'
     revision: number
+    forceApply?: boolean
   } | null
 }
 
@@ -176,7 +174,12 @@ type SyncScope = 'state' | 'records' | 'state_records' | 'cards'
  */
 export function useMatchCollaboration() {
   const { request, openSocket } = useBackendApi()
+  const liveRoom = useLiveRoom()
+  const roomStatus = shallowRef<Awaited<ReturnType<typeof liveRoom.attach>>['status'] | null>(null)
+  let detachRoom: (() => void) | undefined
+  let socketBridge: Awaited<ReturnType<typeof liveRoom.bindSocket>> | undefined
   let pollTimer: ReturnType<typeof setInterval> | undefined
+  let recoveryTimer: ReturnType<typeof setTimeout> | undefined
   let pollOnce: (() => Promise<void>) | undefined
   let closeSocket: (() => void) | undefined
   let sendSocket: ((data: unknown) => void) | undefined
@@ -184,7 +187,6 @@ export function useMatchCollaboration() {
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined
   let reconnectAttempts = 0
   let lastSocketActivityAt = 0
-  let pendingSocketCommands = new Map<string, (saved: boolean) => void>()
   let stopped = true
   // stop() can run while start() is still awaiting auth or its first read
   // (the screen was left early). Each start owns one session number, and a
@@ -198,8 +200,9 @@ export function useMatchCollaboration() {
   // replacement that briefly removes a just-entered event from the screen.
   let confirmedRecordFingerprints = new Map<string, string>()
   let pendingRecordFingerprints = new Map<string, string>()
-  let pendingRecordTouchedAt = new Map<string, number>()
   let pendingDeletedRecordIds = new Set<string>()
+  let recordCommands = new Map<string, string>()
+  let deletedRecordCommands = new Map<string, string>()
   // Cards and substitutions are independent shared events. Never use a
   // whole-list fingerprint here: two analysts can legitimately save A and B
   // at the same time, and the server's [A, B] response must be accepted by
@@ -207,20 +210,23 @@ export function useMatchCollaboration() {
   let confirmedCardFingerprints = new Map<string, string>()
   let pendingCardFingerprints = new Map<string, string>()
   let pendingDeletedCardIds = new Set<string>()
+  let cardCommands = new Map<string, string>()
+  let deletedCardCommands = new Map<string, string>()
   let confirmedSubFingerprints = new Map<string, string>()
   let pendingSubFingerprints = new Map<string, string>()
   let pendingDeletedSubIds = new Set<string>()
+  let subCommands = new Map<string, string>()
+  let deletedSubCommands = new Map<string, string>()
   let confirmedSetupFingerprint = ''
   let pendingSetupFingerprint = ''
-  let setupWriteChain: Promise<unknown> = Promise.resolve()
+  let setupCommandId = ''
 
   function markPendingRecords(records: DidRecord[]) {
-    const now = Date.now()
     for (const record of records) {
       const fingerprint = recordFingerprint(record)
       if (confirmedRecordFingerprints.get(record.id) !== fingerprint) {
+        if (pendingRecordFingerprints.get(record.id) !== fingerprint) recordCommands.delete(record.id)
         pendingRecordFingerprints.set(record.id, fingerprint)
-        pendingRecordTouchedAt.set(record.id, now)
       }
       pendingDeletedRecordIds.delete(record.id)
     }
@@ -236,37 +242,13 @@ export function useMatchCollaboration() {
     }
   }
 
-  function acknowledgeServerRecords(records: DidRecord[]) {
-    const responseById = new Map(records.map(record => [record.id, recordFingerprint(record)]))
-    confirmedRecordFingerprints = responseById
-    for (const [recordId, fingerprint] of pendingRecordFingerprints) {
-      if (responseById.get(recordId) === fingerprint) {
-        pendingRecordFingerprints.delete(recordId)
-        pendingRecordTouchedAt.delete(recordId)
-      }
-    }
-    for (const recordId of pendingDeletedRecordIds) {
-      if (!responseById.has(recordId)) pendingDeletedRecordIds.delete(recordId)
-    }
-  }
-
   function mergeRemoteRecords(remoteRecords: DidRecord[], localRecords: DidRecord[]): DidRecord[] {
-    const localById = new Map(localRecords.map(record => [record.id, record]))
-    const remoteById = new Map(remoteRecords.map(record => [record.id, record]))
-    const merged = new Map(remoteRecords.map(record => [record.id, mergeRecordFields(record, localById.get(record.id))]))
+    const merged = new Map(remoteRecords.map(record => [record.id, record]))
     for (const recordId of pendingDeletedRecordIds) merged.delete(recordId)
     for (const record of localRecords) {
       const pendingFingerprint = pendingRecordFingerprints.get(record.id)
       if (pendingFingerprint !== recordFingerprint(record)) continue
-      const remote = remoteById.get(record.id)
-      const remotePlayerChanged = typeof remote?.playerId === 'string' && remote.playerId !== record.playerId
-      const pendingAge = Date.now() - (pendingRecordTouchedAt.get(record.id) ?? 0)
-      if (remotePlayerChanged && pendingAge > PENDING_RECORD_PROTECT_MS) {
-        pendingRecordFingerprints.delete(record.id)
-        pendingRecordTouchedAt.delete(record.id)
-      } else {
-        merged.set(record.id, record)
-      }
+      merged.set(record.id, record)
     }
     return sortRecords([...merged.values()])
   }
@@ -279,13 +261,14 @@ export function useMatchCollaboration() {
 
   async function join(game: MatchState, role: ParticipantRole) {
     const user = await currentIdentity()
-    const response = await request<{ role?: ParticipantRole; control?: boolean; participants: Record<string, { name?: string; role?: ParticipantRole }> }>(
+    const response = await request<{ role?: ParticipantRole; control?: boolean; revision?: number; roomEpoch?: number; participants: Record<string, { name?: string; role?: ParticipantRole }> }>(
       `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${sideFor(game)}/participants`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role, displayName: user?.displayName || user?.email || undefined }) },
     )
     game.participantRole = response.role ?? role
     game.lifecycleControl = response.control ?? game.participantRole === 'primary'
     game.participantName = user?.displayName || user?.email || ''
+    if (typeof response.revision === 'number') await liveRoom.observe(game.matchId, sideFor(game), response.revision, response.roomEpoch || 0)
     return response
   }
 
@@ -311,20 +294,35 @@ export function useMatchCollaboration() {
 
   function stop() {
     stopped = true
+    socketBridge?.detach()
+    socketBridge = undefined
     session += 1
+    detachRoom?.()
+    detachRoom = undefined
+    roomStatus.value = null
     pollOnce = undefined
+    if (recoveryTimer) clearTimeout(recoveryTimer)
+    recoveryTimer = undefined
     latestRevision = 0
+    latestSetupRevision = 0
+    confirmedSetupFingerprint = ''
+    pendingSetupFingerprint = ''
     confirmedRecordFingerprints = new Map()
     pendingRecordFingerprints = new Map()
-    pendingRecordTouchedAt = new Map()
     pendingDeletedRecordIds = new Set()
+    recordCommands.clear()
+    deletedRecordCommands.clear()
     confirmedCardFingerprints = new Map()
     pendingCardFingerprints = new Map()
     pendingDeletedCardIds = new Set()
+    cardCommands.clear()
+    deletedCardCommands.clear()
     confirmedSubFingerprints = new Map()
     pendingSubFingerprints = new Map()
     pendingDeletedSubIds = new Set()
-    setupWriteChain = Promise.resolve()
+    subCommands.clear()
+    deletedSubCommands.clear()
+    setupCommandId = ''
     closeSocket?.()
     closeSocket = undefined
     sendSocket = undefined
@@ -334,8 +332,6 @@ export function useMatchCollaboration() {
     heartbeatTimer = undefined
     reconnectAttempts = 0
     lastSocketActivityAt = 0
-    for (const resolve of pendingSocketCommands.values()) resolve(false)
-    pendingSocketCommands = new Map()
     if (pollTimer) clearInterval(pollTimer)
     pollTimer = undefined
   }
@@ -345,6 +341,7 @@ export function useMatchCollaboration() {
     applyRecords: (records: DidRecord[]) => void
     applyCards?: (cards: CardRecord[]) => void
     applySetup?: (setup: NonNullable<DraftResponse['inputSetup']>) => void
+    resetPending?: () => void
   }, initial?: DraftResponse | null) {
     stop()
     const current = session
@@ -356,26 +353,68 @@ export function useMatchCollaboration() {
     // match; this session must keep reading only the Draft it was started for.
     const gmId = game.matchId
     const side = sideFor(game)
-    // Direct re-entry can begin with an IndexedDB checkpoint before the first
-    // server poll. Protect it until its idempotent record sync is acknowledged.
-    markPendingRecords(game.records)
+    // Only durable commands are pending. A device checkpoint must never make
+    // already saved rows immune to legitimate remote edits/deletions.
+    const queued = await liveRoom.pending(gmId, side)
+    if (current !== session || stopped) return false
+    function restorePendingCommands(commands: typeof queued) {
+      for (const command of commands) {
+        if (initial && command.request.roomEpoch != null && command.request.roomEpoch !== (initial.roomEpoch || 0)) continue
+        const body = command.request
+        if (command.kind === 'draft') {
+          if (['records', 'state_records', 'checkpoint'].includes(body.syncScope || 'checkpoint')) {
+            const changed = body.payload.records.map(recordFromPayload)
+            const merged = new Map(game.records.map(record => [record.id, record]))
+            for (const record of changed) merged.set(record.id, record)
+            for (const id of body.deletedRecordIds || []) { merged.delete(id); pendingDeletedRecordIds.add(id) }
+            game.records = sortRecords([...merged.values()])
+            markPendingRecords(changed)
+            for (const record of changed) recordCommands.set(record.id, command.commandId)
+            for (const id of body.deletedRecordIds || []) deletedRecordCommands.set(id, command.commandId)
+          }
+          if (body.syncScope === 'cards') {
+            const cards = cardsFromPayload(body.payload.cards)
+            const merged = new Map(game.cards.map(card => [card.id, card]))
+            for (const card of cards) { merged.set(card.id, card); pendingCardFingerprints.set(card.id, cardFingerprint(card)) }
+            for (const id of body.deletedCardIds || []) { merged.delete(id); pendingDeletedCardIds.add(id) }
+            game.cards = sortCards([...merged.values()])
+            for (const card of cards) cardCommands.set(card.id, command.commandId)
+            for (const id of body.deletedCardIds || []) deletedCardCommands.set(id, command.commandId)
+          }
+        } else if (command.kind === 'setup') {
+          if (body.syncScope === 'setup') pendingSetupFingerprint = setupFingerprintFromPayload(body.payload, body.clientState.subs || [])
+          const merged = new Map(game.subs.map(sub => [sub.id, sub]))
+          for (const sub of body.clientState.subs || []) { merged.set(sub.id, sub); pendingSubFingerprints.set(sub.id, subFingerprint(sub)) }
+          for (const id of body.deletedSubIds || []) { merged.delete(id); pendingDeletedSubIds.add(id) }
+          game.subs = sortSubs([...merged.values()])
+          for (const sub of body.clientState.subs || []) subCommands.set(sub.id, command.commandId)
+          for (const id of body.deletedSubIds || []) deletedSubCommands.set(id, command.commandId)
+          if (body.syncScope === 'setup') {
+            setupCommandId = command.commandId
+            handlers.applySetup?.({ formationKey: body.payload.formationKey, fieldSide: body.payload.fieldSide,
+              inputMode: body.payload.inputMode, lineup: body.payload.lineup, subs: game.subs,
+              revision: latestSetupRevision, forceApply: true })
+          }
+        }
+      }
+      handlers.applyRecords(game.records)
+      handlers.applyCards?.(game.cards)
+    }
+    restorePendingCommands(queued)
+
+    let serverRecords = new Map<string, DidRecord>()
+    let serverCards = new Map<string, CardRecord>()
+    let serverSetup: NonNullable<DraftResponse['inputSetup']> | undefined
+    let snapshotRevision = 0
+    let stateRevision = 0
+    const recordVersions = new Map<string, number>()
+    const cardVersions = new Map<string, number>()
+    const subVersions = new Map<string, number>()
 
     const observeServerCards = (cards: CardRecord[]) => {
       const server = new Map(cards.map(card => [card.id, cardFingerprint(card)]))
       for (const [id, fingerprint] of server) {
         if (pendingCardFingerprints.get(id) !== fingerprint) confirmedCardFingerprints.set(id, fingerprint)
-      }
-      for (const [id, fingerprint] of pendingCardFingerprints) {
-        if (server.get(id) === fingerprint) {
-          pendingCardFingerprints.delete(id)
-          confirmedCardFingerprints.set(id, fingerprint)
-        }
-      }
-      for (const id of pendingDeletedCardIds) {
-        if (!server.has(id)) {
-          pendingDeletedCardIds.delete(id)
-          confirmedCardFingerprints.delete(id)
-        }
       }
     }
 
@@ -395,16 +434,31 @@ export function useMatchCollaboration() {
       if (response.gmId !== gmId || response.side !== side || response.payload.gmId !== gmId || response.payload.side !== side) return
       if (response.status !== 'ok' || stopped || response.revision < latestRevision) return
       latestRevision = response.revision
+      void liveRoom.seed(gmId, side, response)
+      snapshotRevision = response.revision
+      stateRevision = response.revision
       followParticipants(response.participantCount)
-      if (response.sharedState && Object.keys(response.sharedState).length) handlers.applyState(plain(response.sharedState))
-      if (response.inputSetup) applySetup(response.inputSetup)
+      if (response.sharedState && Object.keys(response.sharedState).length) handlers.applyState(liveState(response.sharedState))
+      const setup = response.inputSetup
+      if (setup && Object.keys(assignmentsFromLineup(setup.formationKey, setup.lineup)).length) {
+        applySetup(setup)
+      } else if (!Object.keys(game.assigned || {}).length && Object.keys(assignmentsFromLineup(response.payload.formationKey, response.payload.lineup)).length) {
+        // Repair a screen already cleared by an empty setup using the same
+        // response's durable lineup; no additional fetch or inferred starters.
+        applySetup({ ...setup, formationKey: response.payload.formationKey, fieldSide: response.payload.fieldSide,
+          lineup: response.payload.lineup, lineupIsBaseline: false, inputMode: response.payload.inputMode,
+          subs: setup?.subs || [], revision: setup?.revision ?? latestSetupRevision, forceApply: true })
+      }
       const records = sortRecords(response.payload.records.map(recordFromPayload))
+      serverRecords = new Map(records.map(record => [record.id, record]))
+      serverCards = new Map(cardsFromPayload(response.payload.cards).map(card => [card.id, card]))
       observeServerRecords(records)
       handlers.applyRecords(records)
       applyCards(cardsFromPayload(response.payload.cards))
     }
 
     const applySetup = (setup: NonNullable<DraftResponse['inputSetup']>) => {
+      if (!Object.keys(assignmentsFromLineup(setup.formationKey, setup.lineup)).length) return
       const revision = Number(setup.revision || 0)
       const fingerprint = setupFingerprint(setup)
       if (revision < latestSetupRevision) return
@@ -413,23 +467,11 @@ export function useMatchCollaboration() {
       // with the previous lineup while the ACK is still in flight.
       if (pendingSetupFingerprint && fingerprint !== pendingSetupFingerprint && !pendingSubFingerprints.size && !pendingDeletedSubIds.size) return
       latestSetupRevision = Math.max(latestSetupRevision, revision)
+      serverSetup = plain(setup)
       confirmedSetupFingerprint = fingerprint
-      if (pendingSetupFingerprint === fingerprint) pendingSetupFingerprint = ''
       const server = new Map(setup.subs.map(sub => [sub.id, subFingerprint(sub)]))
       for (const [id, fingerprint] of server) {
         if (pendingSubFingerprints.get(id) !== fingerprint) confirmedSubFingerprints.set(id, fingerprint)
-      }
-      for (const [id, fingerprint] of pendingSubFingerprints) {
-        if (server.get(id) === fingerprint) {
-          pendingSubFingerprints.delete(id)
-          confirmedSubFingerprints.set(id, fingerprint)
-        }
-      }
-      for (const id of pendingDeletedSubIds) {
-        if (!server.has(id)) {
-          pendingDeletedSubIds.delete(id)
-          confirmedSubFingerprints.delete(id)
-        }
       }
       const merged = new Map(setup.subs.map(sub => [sub.id, sub]))
       for (const id of pendingDeletedSubIds) merged.delete(id)
@@ -439,15 +481,71 @@ export function useMatchCollaboration() {
       handlers.applySetup?.({ ...setup, subs: sortSubs([...merged.values()]) })
     }
 
+    const applyDelta = (event: any, force = false) => {
+      if (event.gmId !== gmId || event.side !== side || stopped) return
+      if (roomStatus.value && event.roomEpoch != null && event.roomEpoch !== roomStatus.value.roomEpoch) {
+        if (event.roomEpoch > roomStatus.value.roomEpoch) void poll()
+        return
+      }
+      const revision = Number(event.revision || 0)
+      latestRevision = Math.max(latestRevision, revision)
+      void liveRoom.observeDelta(gmId, side, event)
+      let recordsChanged = false
+      for (const raw of event.records || []) {
+        const record = recordFromPayload(raw)
+        if (revision <= Math.max(snapshotRevision, recordVersions.get(record.id) || 0)) continue
+        recordVersions.set(record.id, revision); serverRecords.set(record.id, record); recordsChanged = true
+      }
+      for (const id of event.deletedRecordIds || []) {
+        if (revision <= Math.max(snapshotRevision, recordVersions.get(id) || 0)) continue
+        recordVersions.set(id, revision); serverRecords.delete(id); recordsChanged = true
+      }
+      if (recordsChanged || (force && (event.records || event.deletedRecordIds))) {
+        const records = sortRecords([...serverRecords.values()])
+        observeServerRecords(records)
+        handlers.applyRecords(records)
+      }
+      let cardsChanged = false
+      for (const card of cardsFromPayload(event.cards || [])) {
+        if (revision <= Math.max(snapshotRevision, cardVersions.get(card.id) || 0)) continue
+        cardVersions.set(card.id, revision); serverCards.set(card.id, card); cardsChanged = true
+      }
+      for (const id of event.deletedCardIds || []) {
+        if (revision <= Math.max(snapshotRevision, cardVersions.get(id) || 0)) continue
+        cardVersions.set(id, revision); serverCards.delete(id); cardsChanged = true
+      }
+      if (cardsChanged || (force && (event.cards || event.deletedCardIds))) applyCards([...serverCards.values()])
+      if (event.sharedState && revision >= stateRevision) {
+        stateRevision = revision
+        handlers.applyState(liveState(event.sharedState))
+      }
+      const header = event.setup && (!serverSetup || event.setup.revision >= serverSetup.revision) ? event.setup : serverSetup
+      if (header && (event.setup || event.subs || event.deletedSubIds)) {
+        const subs = new Map((serverSetup?.subs || []).map(sub => [sub.id, sub]))
+        for (const sub of event.subs || []) {
+          if (revision <= Math.max(snapshotRevision, subVersions.get(sub.id) || 0)) continue
+          subVersions.set(sub.id, revision); subs.set(sub.id, sub)
+        }
+        for (const id of event.deletedSubIds || []) {
+          if (revision <= Math.max(snapshotRevision, subVersions.get(id) || 0)) continue
+          subVersions.set(id, revision); subs.delete(id)
+        }
+        applySetup({ ...header, subs: sortSubs([...subs.values()]), forceApply: true })
+      }
+    }
+
+    let recoveryAttempts = 0, nextRecoveryAt = 0
     const poll = async () => {
-      if (stopped || polling || current !== session) return
+      if (stopped || polling || current !== session || Date.now() < nextRecoveryAt) return
       polling = true
       try {
-        const response = await request<DraftResponse>(
-          `/api/v1/match-input/drafts/${encodeURIComponent(gmId)}/${side}`,
-        )
+        const response = await liveRoom.readSnapshot(gmId, side) as DraftResponse
         if (current !== session) return
+        recoveryAttempts = 0; nextRecoveryAt = 0
+        if (recoveryTimer) clearTimeout(recoveryTimer)
+        recoveryTimer = undefined
         if (response.status === 'missing') {
+          void liveRoom.seed(gmId, side, response)
           // Final promotion deletes the Draft. Check final RAW once so an
           // assistant that polls just after deletion still leaves this screen.
           try {
@@ -461,8 +559,14 @@ export function useMatchCollaboration() {
           return
         }
         applyDraftResponse(response)
-      } catch {
-        // Offline is normal. IndexedDB preserves the next retry checkpoint.
+      } catch (error: any) {
+        if (stopped || current !== session || error?.status === 403) return
+        // Keep the visible state and outbox. Retry gaps even while the socket
+        // remains online, where the ordinary fallback poll is disabled.
+        const delay = Math.min(4_000, 500 * 2 ** recoveryAttempts++)
+        nextRecoveryAt = Date.now() + delay
+        if (recoveryTimer) clearTimeout(recoveryTimer)
+        recoveryTimer = setTimeout(() => { recoveryTimer = undefined; void poll() }, delay)
       } finally {
         polling = false
       }
@@ -471,12 +575,13 @@ export function useMatchCollaboration() {
     const connectSocket = async () => {
       try {
         const socket = await openSocket<{
-        type: 'draft' | 'state' | 'cards' | 'setup' | 'mutation' | 'error' | 'pong'
+        type: 'draft' | 'state' | 'cards' | 'setup' | 'mutation' | 'error' | 'pong' | 'room' | 'closed' | 'resync'
+        room?: { participants: Record<string, { role?: ParticipantRole; name?: string; online?: boolean }>; primaryUid?: string }
         gmId?: string
         side?: 'H' | 'A'
         commandId?: string
         event?: {
-          type: 'draft' | 'state' | 'cards' | 'setup'
+          type: 'draft' | 'state' | 'cards' | 'setup' | 'delta' | 'resync'
           gmId?: string
           side?: 'H' | 'A'
           response?: DraftResponse
@@ -493,17 +598,34 @@ export function useMatchCollaboration() {
         }>(`/api/v1/match-input/drafts/${encodeURIComponent(gmId)}/${side}/live`, (message) => {
         if (stopped || current !== session) return
         lastSocketActivityAt = Date.now()
+        if (socketBridge?.receive(message)) return
         if (message.type === 'pong') return
+        if (message.type === 'resync') { void poll(); return }
+        if (message.type === 'closed' && message.gmId === gmId && message.side === side) {
+          handlers.applyState({ halfStatus: 'final', clockStartedAt: null })
+          return
+        }
+        if (message.type === 'room' && message.room && roomStatus.value) {
+          roomStatus.value.participants = message.room.participants
+          const participant = message.room.participants[$auth.currentUser!.uid]
+          if (participant?.role) {
+            game.participantRole = participant.role
+            game.lifecycleControl = message.room.primaryUid === $auth.currentUser!.uid || (participant.role === 'manager' && !message.room.primaryUid)
+          }
+          return
+        }
         const event = message.type === 'mutation' ? message.event : message
+        if (event?.type === 'batch') { for (const delta of event.events || []) applyDelta(delta); return }
+        if (event?.type === 'delta') { applyDelta(event); return }
+        if (event?.type === 'resync') { void poll(); return }
         if (event?.type === 'draft' && event.response) {
           applyDraftResponse(event.response)
-          acknowledgeServerRecords(sortRecords(event.response.payload.records.map(recordFromPayload)))
         }
         if (event?.type === 'state' && event.gmId === gmId && event.side === side && event.sharedState) {
           const revision = event.revision ?? 0
           if (revision >= latestRevision) {
             latestRevision = revision
-            handlers.applyState(plain(event.sharedState))
+            handlers.applyState(liveState(event.sharedState))
           }
         }
         if (event?.type === 'cards' && event.gmId === gmId && event.side === side && event.cards) {
@@ -517,15 +639,14 @@ export function useMatchCollaboration() {
           }
         }
         if (event?.type === 'setup' && event.gmId === gmId && event.side === side && event.setup) applySetup(event.setup)
-        if (message.commandId) {
-          const resolve = pendingSocketCommands.get(message.commandId)
-          if (resolve) {
-            pendingSocketCommands.delete(message.commandId)
-            resolve(message.type !== 'error')
-          }
-        }
         }, () => {
           if (stopped || current !== session) return
+          socketBridge?.detach(true)
+          socketBridge = undefined
+          if (roomStatus.value) {
+            roomStatus.value.connection = 'offline'
+            for (const participant of Object.values(roomStatus.value.participants)) participant.online = undefined
+          }
           closeSocket = undefined
           sendSocket = undefined
           if (heartbeatTimer) clearInterval(heartbeatTimer)
@@ -535,8 +656,13 @@ export function useMatchCollaboration() {
           reconnectTimer = setTimeout(() => { void connectSocket() }, delay)
         })
         if (current === session && !stopped) {
+          if (roomStatus.value) roomStatus.value.connection = 'online'
           closeSocket = socket.close
           sendSocket = socket.send
+          const bridge = await liveRoom.bindSocket(gmId, side, socket.send)
+          if (current !== session || stopped) { bridge.detach(); socket.close(); return }
+          socketBridge = bridge
+          socket.send({ type: 'subscribe', revision: latestRevision, roomEpoch: roomStatus.value?.roomEpoch || 0 })
           reconnectAttempts = 0
           lastSocketActivityAt = Date.now()
           if (heartbeatTimer) clearInterval(heartbeatTimer)
@@ -553,12 +679,11 @@ export function useMatchCollaboration() {
           }, 5_000)
           if (pollTimer) clearInterval(pollTimer)
           pollTimer = undefined
-          // Events emitted while reconnecting must not wait for the next
-          // operator action. One durable read closes that gap immediately.
-          void poll()
+          // The subscription reports a gap when recovery needs a full read.
         } else socket.close()
       } catch {
         if (stopped || current !== session) return
+        if (roomStatus.value) roomStatus.value.connection = 'offline'
         followParticipants(2)
         const delay = Math.min(4_000, 250 * 2 ** reconnectAttempts++)
         reconnectTimer = setTimeout(() => { void connectSocket() }, delay)
@@ -569,8 +694,95 @@ export function useMatchCollaboration() {
     // legacy callers still establish the boundary through poll().
     const hasInitialDraft = Boolean(initial && initial.status === 'ok')
     if (initial) applyDraftResponse(initial)
-    void connectSocket()
+    const attached = await liveRoom.attach(gmId, side, (response) => {
+      if (stopped || current !== session) return
+      if (response.finalized) {
+        handlers.applyState({ halfStatus: 'final', clockStartedAt: null })
+        return
+      }
+      if (response.pendingCommand) {
+        const command = response.pendingCommand
+        const body = command.request
+        if (command.kind === 'draft') {
+          if (['records', 'state_records', 'checkpoint'].includes(body.syncScope || 'checkpoint')) {
+            for (const record of body.payload.records.map(recordFromPayload)) {
+              const local = game.records.find(item => item.id === record.id)
+              if (local && recordFingerprint(local) === recordFingerprint(record)) {
+                markPendingRecords([local])
+                recordCommands.set(record.id, command.commandId)
+              }
+            }
+            for (const id of body.deletedRecordIds || []) { pendingDeletedRecordIds.add(id); deletedRecordCommands.set(id, command.commandId) }
+          }
+          if (body.syncScope === 'cards') {
+            for (const card of cardsFromPayload(body.payload.cards)) {
+              const local = game.cards.find(item => item.id === card.id)
+              if (local && cardFingerprint(local) === cardFingerprint(card)) {
+                pendingCardFingerprints.set(card.id, cardFingerprint(card))
+                cardCommands.set(card.id, command.commandId)
+              }
+            }
+            for (const id of body.deletedCardIds || []) { pendingDeletedCardIds.add(id); deletedCardCommands.set(id, command.commandId) }
+          }
+        } else if (command.kind === 'setup') {
+          if (body.syncScope === 'setup') {
+            const fingerprint = setupFingerprintFromPayload(body.payload, body.clientState.subs || [])
+            if (fingerprint === pendingSetupFingerprint) setupCommandId = command.commandId
+          }
+          for (const sub of body.clientState.subs || []) {
+            const local = game.subs.find(item => item.id === sub.id)
+            if (local && subFingerprint(local) === subFingerprint(sub)) {
+              pendingSubFingerprints.set(sub.id, subFingerprint(sub))
+              subCommands.set(sub.id, command.commandId)
+            }
+          }
+          for (const id of body.deletedSubIds || []) { pendingDeletedSubIds.add(id); deletedSubCommands.set(id, command.commandId) }
+        }
+        return
+      }
+      if (response.acceptServer) {
+        handlers.resetPending?.()
+        pendingRecordFingerprints.clear()
+        pendingDeletedRecordIds.clear()
+        pendingCardFingerprints.clear()
+        pendingDeletedCardIds.clear()
+        pendingSubFingerprints.clear()
+        pendingDeletedSubIds.clear()
+        pendingSetupFingerprint = ''
+        recordCommands.clear(); deletedRecordCommands.clear()
+        cardCommands.clear(); deletedCardCommands.clear()
+        subCommands.clear(); deletedSubCommands.clear()
+        setupCommandId = ''
+      }
+      const ack = response.ackCommand
+      const settledCommand = ack || response.rejectedCommand
+      if (settledCommand) {
+        for (const [commands, fingerprints] of [[recordCommands, pendingRecordFingerprints], [cardCommands, pendingCardFingerprints], [subCommands, pendingSubFingerprints]]) {
+          for (const [id, commandId] of commands!) {
+            if (commandId === settledCommand.commandId) { commands!.delete(id); fingerprints!.delete(id) }
+          }
+        }
+        for (const [commands, deleted] of [[deletedRecordCommands, pendingDeletedRecordIds], [deletedCardCommands, pendingDeletedCardIds], [deletedSubCommands, pendingDeletedSubIds]] as const) {
+          for (const [id, commandId] of commands) {
+            if (commandId === settledCommand.commandId) { commands.delete(id); deleted.delete(id) }
+          }
+        }
+        if (setupCommandId === settledCommand.commandId) { pendingSetupFingerprint = ''; setupCommandId = '' }
+      }
+      if (response.payload) {
+        applyDraftResponse(response.acceptServer && response.inputSetup ? { ...response, inputSetup: { ...response.inputSetup, forceApply: true } } : response)
+      } else if (response.inputSetup) applySetup({ ...response.inputSetup, forceApply: Boolean(ack) })
+      else if (response.event?.type === 'delta') applyDelta(response.event, Boolean(ack))
+      else if (response.event?.type === 'resync') void poll()
+      if (ack && response.payload && response.revision < latestRevision) void poll()
+      if (response.acceptServer && response.replayCommands) restorePendingCommands(response.replayCommands)
+    })
+    if (current !== session || stopped) { attached.detach(); return false }
+    detachRoom = attached.detach
+    roomStatus.value = attached.status
+    roomStatus.value.connection = 'connecting'
     if (!hasInitialDraft) await poll()
+    void connectSocket()
     return current === session
   }
 
@@ -580,31 +792,39 @@ export function useMatchCollaboration() {
     deletedRecordIds: string[] = [],
     clearedRecordPlayerIds: string[] = [],
     changedRecords?: DidRecord[],
-    preferSocket = true,
   ) {
     const { $auth } = useNuxtApp()
     if (!$auth.currentUser || !game.matchId) return false
     // Capture each edit at call time, then send mutations in that exact order.
     // State and records used to race each other and a late whole-Draft write
     // could replace a freshly assigned player after navigation/refresh.
-    const payload = plain(payloadFromState(game))
-    const clientState = cloneState(game)
     const writesRecords = syncScope === 'records' || syncScope === 'state_records'
+    const payload = plain(payloadFromState({ ...game,
+      matchSnapshot: null,
+      records: writesRecords ? (changedRecords || (deletedRecordIds.length ? [] : game.records)) : [],
+      cards: syncScope === 'cards' ? game.cards : [],
+    }))
+    const clientState = plain({ seconds: game.seconds, h1Seconds: game.h1Seconds, h2Seconds: game.h2Seconds,
+      clockStartedAt: game.clockStartedAt ?? null, halfStatus: game.halfStatus, homeScore: game.homeScore, awayScore: game.awayScore,
+      records: [], cards: [], subs: [] })
     const sentRecords = writesRecords
-      ? sortRecords(changedRecords ? plain(changedRecords) : payload.records.map(recordFromPayload))
+      ? sortRecords(changedRecords ? plain(changedRecords) : deletedRecordIds.length ? [] : payload.records.map(recordFromPayload))
       : []
     if (writesRecords) {
       markPendingRecords(sentRecords)
       for (const recordId of deletedRecordIds) {
         pendingRecordFingerprints.delete(recordId)
-        pendingRecordTouchedAt.delete(recordId)
         pendingDeletedRecordIds.add(recordId)
       }
     }
+    else payload.records = []
+    clientState.records = []
+    clientState.cards = []
+    clientState.subs = []
     // A live edit sends only its changed records. The previous implementation
     // resent the complete table for every ACT and made timer/card commands wait
     // behind an ever-growing Firestore batch.
-    if (syncScope === 'state_records') {
+    if (writesRecords) {
       payload.records = recordsToPayload(sentRecords)
       for (const record of payload.records) {
         const recordId = String(record.id)
@@ -625,45 +845,18 @@ export function useMatchCollaboration() {
         pendingDeletedCardIds.add(id)
       }
     }
-    const send = async () => {
-      // ACT, timer, lifecycle and card mutations use the same ordered socket
-      // ACK path. Card scope still broadcasts only the isolated card event, so
-      // it cannot replace records with an incomplete Draft response.
-      if (preferSocket && sendSocket) {
-        const saved = await sendSocketMutation('draft', { payload, clientState, syncScope, deletedRecordIds, deletedCardIds, clearedRecordPlayerIds })
-        if (saved) return true
-      }
-      const response = await request<DraftResponse>(`/api/v1/match-input/drafts/${encodeURIComponent(payload.gmId)}/${payload.side}`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ payload, clientState, syncScope, deletedRecordIds, deletedCardIds, clearedRecordPlayerIds }),
-      })
-      latestRevision = Math.max(latestRevision, response.revision)
-      // A solo primary does not poll; its own saves reveal a newly joined analyst.
-      followParticipants(response.participantCount)
-      if (writesRecords) acknowledgeServerRecords(sortRecords(response.payload.records.map(recordFromPayload)))
-      if (syncScope === 'cards') {
-        const savedCards = cardsFromPayload(response.payload.cards)
-        for (const card of savedCards) {
-          const fingerprint = cardFingerprint(card)
-          if (pendingCardFingerprints.get(card.id) === fingerprint) pendingCardFingerprints.delete(card.id)
-          confirmedCardFingerprints.set(card.id, fingerprint)
-        }
-        for (const id of pendingDeletedCardIds) {
-          if (!savedCards.some(card => card.id === id)) {
-            pendingDeletedCardIds.delete(id)
-            confirmedCardFingerprints.delete(id)
-          }
-        }
-      }
-      return true
-    }
-    // Server-side per-Draft locking establishes revision order. Do not keep a
-    // browser-wide serial queue here: an urgent pause command must never wait
-    // for an older record/card request to finish.
-    return await send()
+    if (syncScope === 'cards') {
+      payload.cards = payload.cards.filter(card => pendingCardFingerprints.has(String(card.id)))
+    } else payload.cards = []
+    return await liveRoom.submit(payload.gmId, payload.side, 'draft', {
+      payload, clientState, syncScope, deletedRecordIds, deletedCardIds, clearedRecordPlayerIds,
+    })
   }
 
   async function syncState(game: MatchState) {
+    // Assistants own event edits, never the shared clock/lifecycle. An empty
+    // debounced event save must not enqueue a forbidden state command.
+    if (!game.lifecycleControl) return true
     return await sync(game, 'state')
   }
 
@@ -672,8 +865,9 @@ export function useMatchCollaboration() {
     return await sync(game, 'records')
   }
 
-  async function syncStateRecords(game: MatchState, records: DidRecord[], clearedRecordPlayerIds: string[] = []) {
-    return await sync(game, 'state_records', [], clearedRecordPlayerIds, records)
+  async function syncStateRecords(game: MatchState, records: DidRecord[], clearedRecordPlayerIds: string[] = [], includeState = true) {
+    if (!records.length && !clearedRecordPlayerIds.length) return includeState ? await syncState(game) : true
+    return await sync(game, includeState && game.lifecycleControl ? 'state_records' : 'records', [], clearedRecordPlayerIds, records)
   }
 
   async function removeRecord(game: MatchState, recordId: string) {
@@ -687,15 +881,23 @@ export function useMatchCollaboration() {
   async function syncSetup(game: MatchState, syncScope: 'setup' | 'substitutions' = 'setup') {
     const { $auth } = useNuxtApp()
     if (!$auth.currentUser || !game.matchId) return false
-    const payload = plain(payloadFromState(game))
-    const clientState = cloneState(game)
+    if (syncScope === 'setup' && !game.lifecycleControl) return false
+    const payload = plain(payloadFromState({ ...game, matchSnapshot: null, records: [], cards: [] }))
+    const clientState = plain({ side: game.side, subs: game.subs, records: [], cards: [] })
+    clientState.records = []
+    clientState.cards = []
+    payload.records = []
+    payload.cards = []
     const setupPendingFingerprint = setupFingerprintFromPayload(payload, game.subs)
     if (syncScope === 'setup' && setupPendingFingerprint !== confirmedSetupFingerprint) pendingSetupFingerprint = setupPendingFingerprint
     const deletedSubIds = [...confirmedSubFingerprints.keys()].filter(id => !game.subs.some(sub => sub.id === id))
     if (syncScope === 'substitutions') {
       for (const sub of game.subs) {
         const fingerprint = subFingerprint(sub)
-        if (confirmedSubFingerprints.get(sub.id) !== fingerprint) pendingSubFingerprints.set(sub.id, fingerprint)
+        if (confirmedSubFingerprints.get(sub.id) !== fingerprint) {
+          if (pendingSubFingerprints.get(sub.id) !== fingerprint) subCommands.delete(sub.id)
+          pendingSubFingerprints.set(sub.id, fingerprint)
+        }
         pendingDeletedSubIds.delete(sub.id)
       }
       for (const id of deletedSubIds) {
@@ -703,44 +905,15 @@ export function useMatchCollaboration() {
         pendingDeletedSubIds.add(id)
       }
     }
-    const send = async () => {
-      if (sendSocket) {
-        const saved = await sendSocketMutation('setup', { payload, clientState, deletedSubIds, syncScope })
-        if (saved) return true
-      }
-      const response = await request<{ inputSetup?: NonNullable<DraftResponse['inputSetup']> }>(`/api/v1/match-input/drafts/${encodeURIComponent(payload.gmId)}/${payload.side}/setup`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ payload, clientState, deletedSubIds, syncScope }),
-      })
-      if (response.inputSetup) {
-        const revision = Number(response.inputSetup.revision || 0)
-        const fingerprint = setupFingerprint(response.inputSetup)
-        latestSetupRevision = Math.max(latestSetupRevision, revision)
-        confirmedSetupFingerprint = fingerprint
-        if (pendingSetupFingerprint === fingerprint) pendingSetupFingerprint = ''
-        for (const sub of response.inputSetup.subs) {
-          const fingerprint = subFingerprint(sub)
-          if (pendingSubFingerprints.get(sub.id) === fingerprint) pendingSubFingerprints.delete(sub.id)
-          confirmedSubFingerprints.set(sub.id, fingerprint)
-        }
-        for (const id of pendingDeletedSubIds) {
-          if (!response.inputSetup.subs.some(sub => sub.id === id)) {
-            pendingDeletedSubIds.delete(id)
-            confirmedSubFingerprints.delete(id)
-          }
-        }
-      }
-      return true
+    if (syncScope === 'substitutions') {
+      clientState.subs = clientState.subs.filter(sub => pendingSubFingerprints.has(sub.id))
     }
-    // Setup is primary-owned and snapshots the whole lineup/substitution
-    // configuration. Keep only setup mutations ordered so an older snapshot
-    // cannot arrive after a newer substitution and erase it.
-    const pending = setupWriteChain.then(send, send)
-    setupWriteChain = pending.catch(() => false)
-    return await pending
+    return await liveRoom.submit(payload.gmId, payload.side, 'setup', {
+      payload, clientState, deletedSubIds, syncScope,
+    })
   }
 
-  // The screen debounces its network write, but polling runs every 400ms.
+  // Protect edits before the debounced network write enters the durable outbox.
   // Protect a local edit from the moment it is made; otherwise a poll inside
   // the debounce window replaces it with the older server list.
   function markLocalRecords(records: DidRecord[]) {
@@ -753,37 +926,17 @@ export function useMatchCollaboration() {
   function markLocalCards(game: MatchState) {
     for (const card of game.cards) {
       const fingerprint = cardFingerprint(card)
-      if (confirmedCardFingerprints.get(card.id) !== fingerprint) pendingCardFingerprints.set(card.id, fingerprint)
+      if (confirmedCardFingerprints.get(card.id) !== fingerprint) {
+        if (pendingCardFingerprints.get(card.id) !== fingerprint) cardCommands.delete(card.id)
+        pendingCardFingerprints.set(card.id, fingerprint)
+      }
       pendingDeletedCardIds.delete(card.id)
     }
   }
 
-  async function sendSocketMutation(kind: 'draft' | 'setup', request: Record<string, unknown>) {
-    const send = sendSocket
-    if (!send) return false
-    const commandId = crypto.randomUUID()
-    return await new Promise<boolean>((resolve) => {
-      const timeout = window.setTimeout(() => {
-        pendingSocketCommands.delete(commandId)
-        // Do not force-close the socket here. A slow Firestore write is not a
-        // dead connection, and closing it used to take down the next ACT.
-        // The caller immediately performs its independent HTTP fallback.
-        resolve(false)
-      }, 2_500)
-      pendingSocketCommands.set(commandId, (saved) => {
-        window.clearTimeout(timeout)
-        pendingSocketCommands.delete(commandId)
-        resolve(saved)
-      })
-      try {
-        send({ type: 'command', commandId, command: 'mutation', mutation: kind, request })
-      } catch {
-        window.clearTimeout(timeout)
-        pendingSocketCommands.delete(commandId)
-        resolve(false)
-      }
-    })
+  async function acceptServer() {
+    if (gameForRoom) await liveRoom.acceptServer(gameForRoom.matchId, sideFor(gameForRoom))
   }
-
-  return { join, enter, start, stop, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards }
+  let gameForRoom: MatchState | undefined
+  return { join, enter, start: async (...args: Parameters<typeof start>) => { gameForRoom = args[0]; return await start(...args) }, stop, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards, roomStatus, acceptServer }
 }

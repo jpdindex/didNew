@@ -188,10 +188,12 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
   // 역할과 계정 등급은 현재 로그인/일정 진입 세션의 값이다. 다른 기기나 이전
   // 입력자가 남긴 Draft clientState를 복원하면서 이 권한 맥락을 덮으면 안 된다.
   const sessionIdentity = {
+    matchId: game.matchId,
     // Team choice belongs to this URL/session. The other analyst's stored
     // clientState must not move an away analyst onto the home-side workspace.
     team: game.team,
     participantRole: game.participantRole,
+    lifecycleControl: game.lifecycleControl,
     participantName: game.participantName,
     recorderLevel: game.recorderLevel,
   }
@@ -293,6 +295,7 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
 
 export function useMatchDraft() {
   const { request } = useBackendApi()
+  const liveRoom = useLiveRoom()
   const keyFor = (game: MatchState) => `${game.matchId}_${inputSide(game)}`
 
   async function saveLocal(game: MatchState, finalized = false): Promise<void> {
@@ -311,11 +314,22 @@ export function useMatchDraft() {
     const draft = toPlain<StoredDraft>({ key: keyFor(game), payload, clientState: cloneState(game), updatedAt: Date.now() })
     await writeLocal(draft)
     try {
-      await request(`/api/v1/match-input/drafts/${encodeURIComponent(payload.gmId)}/${payload.side}`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ payload, clientState: draft.clientState }),
-      })
-      return true
+      const changed = await liveRoom.changedRecords(payload.gmId, payload.side, payload.records)
+      const shell = { ...draft.clientState, records: [], cards: [], subs: [] }
+      const commands: Array<Promise<boolean>> = []
+      // The root checkpoint never resends an acknowledged ACT table. Large
+      // offline restores use bounded, independently acknowledged commands.
+      if (game.lifecycleControl) {
+        commands.push(liveRoom.submit(payload.gmId, payload.side, 'draft', {
+          payload: { ...payload, records: [] }, clientState: shell, syncScope: 'checkpoint',
+        }))
+      }
+      for (let offset = 0; offset < changed.length; offset += 100) {
+        commands.push(liveRoom.submit(payload.gmId, payload.side, 'draft', {
+          payload: { ...payload, records: changed.slice(offset, offset + 100), cards: [] }, clientState: shell, syncScope: 'records',
+        }))
+      }
+      return (await Promise.all(commands)).every(Boolean) && await liveRoom.flush(payload.gmId, payload.side)
     } catch {
       // IndexedDB is the offline retry source. A later explicit lifecycle action retries sync.
       return false
@@ -329,10 +343,7 @@ export function useMatchDraft() {
     const payload = payloadFromState(game)
     const clientState = cloneState(game)
     const send = async () => {
-      await request(`/api/v1/match-input/drafts/${encodeURIComponent(payload.gmId)}/${payload.side}/setup`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ payload, clientState }),
-      })
+      if (!await liveRoom.submit(payload.gmId, payload.side, 'setup', { payload, clientState, syncScope: 'setup' })) throw new Error('세팅 저장을 확인하지 못했습니다.')
     }
     const pending = setupWriteChain.then(send, send)
     setupWriteChain = pending.catch(() => false)
@@ -347,13 +358,16 @@ export function useMatchDraft() {
   async function promoteH1(game: MatchState) {
     if (!await save(game)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 안전하게 저장되었습니다.')
     const payload = payloadFromState(game)
+    if (!await liveRoom.flush(payload.gmId, payload.side)) throw new Error('대기 중인 입력을 저장한 뒤 갱신하세요.')
     return await request(`/api/v1/match-input/drafts/${encodeURIComponent(payload.gmId)}/${payload.side}/promote-h1`, { method: 'POST' })
   }
 
   async function finalizeAdvanced(game: MatchState) {
     if (!await save(game)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 안전하게 저장되었습니다.')
     const payload = payloadFromState(game)
-    const result = await request(`/api/v1/match-input/drafts/${encodeURIComponent(payload.gmId)}/${payload.side}/finalize`, { method: 'POST' })
+    if (!await liveRoom.flush(payload.gmId, payload.side)) throw new Error('대기 중인 입력을 저장한 뒤 갱신하세요.')
+    const result = await liveRoom.submit(payload.gmId, payload.side, 'finalize', {})
+    if (!result) throw new Error('최종 갱신 확인을 기다리고 있습니다. 연결 복구 후 같은 명령으로 재시도합니다.')
     // Final promotion clears its server Draft. A later explicit edit recreates
     // a short-lived Draft from RAW, so final RAW remains the only source.
     await saveLocal(game, true)
@@ -362,8 +376,9 @@ export function useMatchDraft() {
 
   async function restoreFinalRaw(game: MatchState) {
     const side = inputSide(game)
+    if (!await liveRoom.submit(game.matchId, side, 'restore', {})) throw new Error('RAW 복원 확인을 기다리고 있습니다. 연결 복구 후 같은 명령으로 재시도합니다.')
     const response = await request<{ payload: InputPayload; clientState: MatchState }>(
-      `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${side}/restore-raw`, { method: 'POST' },
+      `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${side}`,
     )
     hydrateFromPayload(game, response.payload, response.clientState)
     await writeLocal({ key: keyFor(game), payload: response.payload, clientState: cloneState(game), updatedAt: Date.now() })
@@ -401,10 +416,9 @@ export function useMatchDraft() {
     }
     try {
       const side = inputSide(game)
-      const response = await request<{ status?: string; payload?: InputPayload; clientState?: MatchState; updatedAt?: string }>(
-        `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${side}`,
-      )
+      const response = await liveRoom.readSnapshot(game.matchId, side)
       if (response.status === 'missing' || !response.payload) {
+        if (response.closed) return false
         if (local) {
           hydrateFromPayload(game, local.payload, local.clientState)
           // The page can reload before the debounced shared-Draft write has
@@ -416,19 +430,16 @@ export function useMatchDraft() {
         return false
       }
       if (!payloadMatchesGame(game, response.payload)) return false
-      const serverUpdatedAt = response.updatedAt ? Date.parse(response.updatedAt) : 0
-      // A page reload can happen inside the network debounce window. In that
-      // case this device's immediately-written IndexedDB snapshot is newer than
-      // the server Draft and must be restored + retried, never discarded.
-      if (local && local.updatedAt > serverUpdatedAt) {
-        hydrateFromPayload(game, local.payload, local.clientState)
-        void save(game)
-        return true
-      }
+      // Device wall-clock timestamps cannot establish server write order.
+      // Pending commands, rather than a newer-looking checkpoint, are replayed
+      // by Live Room. Reachable server state is the recovery baseline.
       hydrateFromPayload(game, response.payload, response.clientState)
       await writeLocal({ key: keyFor(game), payload: response.payload, clientState: cloneState(game), updatedAt: Date.now() })
       return true
     } catch {
+      // A temporary snapshot failure must not replace an already-visible
+      // clock/event list with an older device checkpoint.
+      if (game.records.length || game.clockStartedAt != null) return true
       // IndexedDB is an offline fallback only. When the shared Draft is
       // reachable, its state must win over an older device-local snapshot.
       return local ? (hydrateFromPayload(game, local.payload, local.clientState), true) : false

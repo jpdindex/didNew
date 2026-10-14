@@ -42,7 +42,7 @@ const game = useMatchState()
 const { request } = useBackendApi()
 const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
 const { saveLocal, save: saveDraft, finalizeAdvanced, recover: recoverDraft, hydrate: hydrateDraft } = useMatchDraft()
-const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards } = useMatchCollaboration()
+const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards, roomStatus, acceptServer } = useMatchCollaboration()
 const requestedRole = route.query.role === 'assistant' || route.query.role === 'manager' ? route.query.role : 'primary'
 const isPrimary = computed(() => game.value.lifecycleControl || game.value.participantRole === 'primary' || requestedRole === 'primary')
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
@@ -64,20 +64,24 @@ type InputSetup = {
 }
 
 function applyInputSetup(setup: InputSetup | null | undefined) {
-  if (!setup || !FORMATIONS[setup.formationKey]) return
+  if (!setup || !FORMATIONS[setup.formationKey]) return false
+  const assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
+  if (!Object.keys(assigned).length) return false
   game.value.formationKey = setup.formationKey
   if (setup.fieldSide === 'left' || setup.fieldSide === 'right') game.value.side = setup.fieldSide
-  const assigned = assignmentsFromLineup(setup.formationKey, setup.lineup)
   if (setup.lineupIsBaseline) {
     for (const sub of [...setup.subs].sort((a, b) => HALF_ORDER[a.half] * 100000 + a.seconds - (HALF_ORDER[b.half] * 100000 + b.seconds))) {
       const outSlot = Object.entries(assigned).find(([, playerId]) => playerId === sub.outPlayer)?.[0]
       const inSlot = Object.entries(assigned).find(([, playerId]) => playerId === sub.inPlayer)?.[0]
-      if (outSlot && inSlot) [assigned[outSlot], assigned[inSlot]] = [assigned[inSlot], assigned[outSlot]]
+      if (outSlot && inSlot && !outSlot.startsWith('b') && inSlot.startsWith('b')) {
+        [assigned[outSlot], assigned[inSlot]] = [assigned[inSlot], assigned[outSlot]]
+      }
     }
   }
   game.value.assigned = assigned
   game.value.subs = setup.subs.map(sub => ({ ...sub }))
   game.value.inputMode = setup.inputMode
+  return true
 }
 let appliedSetupRevision = -1
 // 수정 화면에서 "대기방으로 나가기"를 누르면 돌아갈 상태. 끝난 half 를 고치러 왔으면
@@ -162,6 +166,7 @@ let timer: ReturnType<typeof setInterval> | undefined
 // state that now belongs to the next screen or another match.
 let disposed = false
 let applyingRemoteDraft = false
+let draftReady = false
 let tickStartedAt = 0
 let tickBaseSeconds = 0
 function startTicking(sharedStartedAt?: number) {
@@ -299,7 +304,6 @@ onMounted(async () => {
     seconds.value = game.value.seconds
   }
   game.value.seconds = seconds.value
-  const restoredRecords = [...records.value]
   // 공유 game 상태는 화면을 나가면 다음 경기가 쓴다. 이 화면의 경기·팀이 아닐 때 도착한
   // 응답은 절대 반영하지 않는다(다른 경기 기록이 새 경기 화면에 덮이던 문제).
   const isCurrentSession = () => !disposed && game.value.matchId === matchId && game.value.team === requestedTeam
@@ -308,6 +312,13 @@ onMounted(async () => {
   // transient recovery failure used to overwrite the active Draft's clock and
   // lifecycle with defaults.
   await startCollaboration(game.value, {
+    resetPending: () => {
+      dirtyRecordIds.clear()
+      clearedRecordPlayerIds.clear()
+      sharedDraftDirty = false
+      recordSavesInFlight.clear()
+      if (draftSaveTimer) clearTimeout(draftSaveTimer)
+    },
     applyState: (state) => {
       if (!isCurrentSession()) return
       // 전/후반 종료 저장 중에 도착한 이전 폴링 응답이 방금 바꾼 H1_done/H2_done 을
@@ -386,10 +397,9 @@ onMounted(async () => {
     },
     applySetup: (setup) => {
       if (!isCurrentSession()) return
-      if (setup.revision <= appliedSetupRevision) return
-      appliedSetupRevision = setup.revision
+      if (setup.revision < appliedSetupRevision || (setup.revision === appliedSetupRevision && !setup.forceApply)) return
       applyingRemoteDraft = true
-      applyInputSetup(setup)
+      if (applyInputSetup(setup)) appliedSetupRevision = setup.revision
       nextTick(() => { applyingRemoteDraft = false })
     },
   }, initialDraft).catch(() => false)
@@ -400,9 +410,7 @@ onMounted(async () => {
     return
   }
 
-  // Put restored RAW records into the same InputDraft subcollection used by
-  // primary/assistant live collaboration. Repeated writes are idempotent.
-  if (restoredRecords.length) void syncRecords(game.value, restoredRecords).catch(() => false)
+  // RAW restoration is server-owned. Re-entry never resends a saved ACT table.
 
   if (!isEditMode && game.value.clockStartedAt) {
     seconds.value = Math.max(seconds.value, Math.floor((Date.now() - game.value.clockStartedAt) / 1000))
@@ -421,6 +429,9 @@ onMounted(async () => {
     else paused.value = true
   }
 
+  await nextTick()
+  draftReady = true
+  if (dirtyRecordIds.size) queueDraftSave()
   nextTick(() => {
     if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
   })
@@ -488,7 +499,14 @@ async function exitToLobby() {
   game.value.halfStatus = editReturnStatus ?? (half.value === '전반' ? 'H1' : 'H2')
 
   // 저장 성공 여부가 화면 이동을 막으면 안 된다. 로컬/서버 Draft 저장은 비동기로 시도한다.
-  void saveDraft(game.value).catch(() => false)
+  if (isEditMode) {
+    if (draftSaveTimer) clearTimeout(draftSaveTimer)
+    const changedRecords = records.value.filter(record => dirtyRecordIds.has(record.id))
+    if (changedRecords.length) {
+      void syncStateRecords(game.value, changedRecords, [...clearedRecordPlayerIds], false).catch(() => false)
+    }
+    void saveLocal(game.value).catch(() => false)
+  } else void saveDraft(game.value).catch(() => false)
   goTeamSelection()
 }
 
@@ -503,6 +521,7 @@ let draftSaveTimer: ReturnType<typeof setTimeout> | undefined
 let sharedDraftDirty = false
 const dirtyRecordIds = new Set<string>()
 const clearedRecordPlayerIds = new Set<string>()
+const recordSavesInFlight = new Map<string, string>()
 // Card mutations are independent events, but they still need one browser-side
 // order. Without this chain a watcher write and a "목록 추가" write can race,
 // making an otherwise saved card appear only after refresh.
@@ -532,7 +551,10 @@ function persistCards() {
 }
 
 function queueDraftSave(shared = true) {
-  if (applyingRemoteDraft) return
+  if (disposed || !draftReady || applyingRemoteDraft) return
+  // Snapshot/ACK application and score recalculation are not local edits.
+  // Cards and substitutions have their own explicit event saves.
+  if (!dirtyRecordIds.size) return
   sharedDraftDirty = sharedDraftDirty || shared
   // Offline/reload protection is immediate. Only the network write is debounced.
   const localDirtyRecords = records.value.filter(record => dirtyRecordIds.has(record.id))
@@ -543,18 +565,29 @@ function queueDraftSave(shared = true) {
   draftSaveTimer = setTimeout(() => {
     const sendShared = sharedDraftDirty
     sharedDraftDirty = false
-    if (!sendShared) return
+    if (!sendShared || disposed) return
     const changedIds = new Set(dirtyRecordIds)
-    const clearedPlayerIds = [...clearedRecordPlayerIds].filter(id => changedIds.has(id))
-    const changedRecords = records.value.filter(record => changedIds.has(record.id))
-    const save = changedRecords.length || clearedPlayerIds.length
-      ? syncStateRecords(game.value, changedRecords, clearedPlayerIds)
-      : syncState(game.value)
+    const changedRecords = records.value.filter(record => changedIds.has(record.id) &&
+      recordSavesInFlight.get(record.id) !== JSON.stringify(record))
+    const clearedPlayerIds = [...clearedRecordPlayerIds].filter(id => changedRecords.some(record => record.id === id))
+    const sentFingerprints = new Map(changedRecords.map(record => [record.id, JSON.stringify(record)]))
+    if (!changedRecords.length && !clearedPlayerIds.length) return
+    for (const [id, fingerprint] of sentFingerprints) recordSavesInFlight.set(id, fingerprint)
+    const save = syncStateRecords(game.value, changedRecords, clearedPlayerIds, !isEditMode)
     void save.then((ok) => {
       if (!ok) return
-      for (const id of changedIds) dirtyRecordIds.delete(id)
-      for (const id of clearedPlayerIds) clearedRecordPlayerIds.delete(id)
-    }).catch(() => false)
+      for (const id of changedIds) {
+        const current = records.value.find(record => record.id === id)
+        if (current && JSON.stringify(current) === sentFingerprints.get(id)) {
+          dirtyRecordIds.delete(id)
+          if (clearedPlayerIds.includes(id)) clearedRecordPlayerIds.delete(id)
+        }
+      }
+    }).catch(() => false).finally(() => {
+      for (const [id, fingerprint] of sentFingerprints) {
+        if (recordSavesInFlight.get(id) === fingerprint) recordSavesInFlight.delete(id)
+      }
+    })
   }, 80)
 }
 
@@ -582,7 +615,7 @@ function exitFinalCorrection() {
   goTeamSelection()
 }
 
-watch([records, homeScore, awayScore, () => game.value.subs], queueDraftSave, { deep: true })
+watch(records, () => queueDraftSave(), { deep: true })
 
 // 입력 중인 팀. TeamSelection 에서 team 쿼리로 넘어온다.
 const team = computed(() => (route.query.team === 'away' ? 'away' : 'home'))
@@ -2292,7 +2325,8 @@ async function finishHalf() {
     // live state channel, so assistants could remain in the input screen even
     // though the primary had already left it.
     await saveLocal(game.value)
-    if (!await syncStateRecords(game.value, records.value)) {
+    const pendingRecords = records.value.filter(record => dirtyRecordIds.has(record.id))
+    if (!await syncStateRecords(game.value, pendingRecords, [...clearedRecordPlayerIds])) {
       throw new Error(`${half.value} Draft를 Firestore에 저장하지 못했습니다. 네트워크 연결을 확인하고 다시 종료해 주세요.`)
     }
     // 종료 전에 대기열에 있던 H1/H2 상태 쓰기가 늦게 도착해도 서버(save_input_draft)가
@@ -2674,6 +2708,10 @@ async function finishHalf() {
                 <button v-for="a in shootActs" :key="a.k" class="actBtn"
                   :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }"
                   @click="clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
+              </div>
+
+              <div class="liveRoomGap">
+                <LiveRoomStatus compact :status="roomStatus" @accept-server="acceptServer" />
               </div>
 
               <div class="goal" :class="{ active: pendingShot !== null || isEditingShoot }">
@@ -4455,13 +4493,23 @@ section.right h1 {
   position: relative;
   flex: 0 0 285px;
   min-height: 0;
-  margin-top: 54px;
+  margin-top: 0;
   opacity: .5;
   pointer-events: none;
   transition: opacity .2s, transform .2s;
   transform: scale(.985);
   cursor: crosshair;
   background: linear-gradient(180deg, rgba(255, 255, 255, .018), transparent 40%)
+}
+
+/* Occupy the original 54px gap without moving the buttons or goal. */
+.liveRoomGap {
+  flex: 0 0 54px;
+  height: 54px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
 }
 
 .goal.active {

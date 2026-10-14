@@ -1,0 +1,531 @@
+from copy import deepcopy
+
+import pytest
+
+from backend.api.api_match_input import DraftWriteRequest, InputSetupWriteRequest, FinalizeCommandRequest
+from backend.system import system_live_room as live
+from backend.system.system_firestore import BackendError, JpdDidData
+
+
+class MemoryDB:
+    def __init__(self, documents):
+        self.documents = deepcopy(documents)
+        self.fail_commit = False
+
+    def collection(self, path):
+        return MemoryCollection(self, path)
+
+    def transaction(self, **kwargs):
+        return MemoryTransaction(self)
+
+
+class MemoryTransaction:
+    def __init__(self, db):
+        self.db, self.writes = db, {}
+
+    def set(self, reference, values, merge=False):
+        self.writes[reference.path] = live._merge(self.db.documents.get(reference.path, {}), values) if merge else deepcopy(values)
+
+    def commit(self):
+        if self.db.fail_commit:
+            raise RuntimeError('commit lost')
+        self.db.documents.update(self.writes)
+
+
+class MemoryReference:
+    def __init__(self, db, path):
+        self.db, self.path, self.id = db, path, path.rsplit('/', 1)[-1]
+
+    def get(self, **kwargs):
+        return live.Snapshot(self, self.db.documents.get(self.path))
+
+    def collection(self, name):
+        return MemoryCollection(self.db, self.path + '/' + name)
+
+    def set(self, values, merge=False, **kwargs):
+        self.db.documents[self.path] = live._merge(self.db.documents.get(self.path, {}), values) if merge else deepcopy(values)
+
+
+class MemoryCollection:
+    def __init__(self, db, path):
+        self.db, self._collection_path = db, path
+        self.id = path.rsplit('/', 1)[-1]
+        self.parent = MemoryReference(db, path.rsplit('/', 1)[0]) if '/' in path else None
+
+    def document(self, key):
+        return MemoryReference(self.db, self._collection_path + '/' + key)
+
+    def stream(self, **kwargs):
+        return iter(live.Snapshot(MemoryReference(self.db, path), values) for path, values in list(self.db.documents.items()) if path.rsplit('/', 1)[0] == self._collection_path)
+
+
+@pytest.fixture
+def data(monkeypatch):
+    def transactional(function):
+        def run(transaction):
+            result = function(transaction)
+            transaction.commit()
+            return result
+        return run
+    monkeypatch.setattr(live.firestore, 'transactional', transactional)
+    result = object.__new__(JpdDidData)
+    result.db = MemoryDB({'inputDrafts/m_H': {'gmId': 'm', 'side': 'H', 'revision': 0, 'primaryUid': 'p',
+        'participants': {'p': {'role': 'primary'}, 'a': {'role': 'assistant'}}, 'payload': payload()}})
+    result.sync_input_summary_from_draft = lambda *args: None
+    return result
+
+
+def payload(records=None, cards=None):
+    return {'gmId': 'm', 'side': 'H', 'inputMode': '분석', 'fieldSide': 'left', 'formationKey': '4-3-3',
+        'homeScore': 0, 'awayScore': 0, 'status': 'H1', 'halves': {'H1': {'seconds': 1}, 'H2': {'seconds': 0}},
+        'lineup': [], 'records': records or [], 'cards': cards or [], 'recorderLevel': 'advanced'}
+
+
+def record(key='r', player='one'):
+    return {'id': key, 'half': 'H1', 'halfSeconds': 1, 'seq': 0, 'act': 'P', 'res': 'O', 'area': 1, 'playerId': player}
+
+
+def command(key='c', records=None, scope='state_records', base=0, cards=None, **fields):
+    return DraftWriteRequest(commandId=key, baseRevision=base, roomEpoch=0, payload=payload(records, cards), clientState={'seconds': 1}, syncScope=scope, **fields)
+
+
+def test_live_ack_does_not_wait_for_derived_summary(data, monkeypatch):
+    scheduled = []
+    monkeypatch.setattr(live, '_queue_summary', lambda *args: scheduled.append(args))
+    data.sync_input_summary_from_draft = lambda *args: pytest.fail('summary must not run before ACK')
+    receipt = live.execute_command(data, 'm', 'H', 'draft', command('start', scope='state'), 'p', defer_summary=True)
+    assert receipt['savedRevision'] == 1
+    assert scheduled == [(data, 'm', 'H')]
+
+
+def test_primary_and_assistant_interleaved_acts_merge_with_stale_independent_bases(data):
+    for index in range(20):
+        uid = 'p' if index % 2 == 0 else 'a'
+        live.execute_command(data, 'm', 'H', 'draft', command(f'c{index}', [record(f'r{index}')], scope='records', base=max(0, index - 1)), uid)
+    draft = data.get_input_draft('m', 'H')
+    assert len(draft['payload']['records']) == 20
+    assert draft['revision'] == 20
+
+
+def test_lost_ack_retry_returns_same_revision_without_reapplying(data):
+    request = command(records=[record()])
+    first = live.execute_command(data, 'm', 'H', 'draft', request, 'p')
+    live.execute_command(data, 'm', 'H', 'draft', command('later', [record(player='two')], base=1), 'p')
+    retried = live.execute_command(data, 'm', 'H', 'draft', request, 'p')
+    assert first == retried
+    assert retried['savedRevision'] == 1
+    assert data.get_input_draft('m', 'H')['revision'] == 2
+    assert data.get_input_draft('m', 'H')['payload']['records'][0]['playerId'] == 'two'
+
+
+def test_atomic_failure_does_not_leave_data_or_command_receipt(data):
+    before = deepcopy(data.db.documents)
+    data.db.fail_commit = True
+    with pytest.raises(RuntimeError):
+        live.execute_command(data, 'm', 'H', 'draft', command(records=[record()]), 'p')
+    assert data.db.documents == before
+
+
+def test_duplicate_id_with_different_content_is_rejected(data):
+    live.execute_command(data, 'm', 'H', 'draft', command(records=[record()]), 'p')
+    with pytest.raises(BackendError) as caught:
+        live.execute_command(data, 'm', 'H', 'draft', command(records=[record(player='other')]), 'p')
+    assert caught.value.code == 'command_id_reused'
+
+
+def test_independent_peer_records_merge_but_same_record_conflicts(data):
+    live.execute_command(data, 'm', 'H', 'draft', command('primary', [record('p')]), 'p')
+    live.execute_command(data, 'm', 'H', 'draft', command('assistant', [record('a')], scope='records'), 'a')
+    assert {item['id'] for item in data.get_input_draft('m', 'H')['payload']['records']} == {'p', 'a'}
+    with pytest.raises(BackendError) as caught:
+        live.execute_command(data, 'm', 'H', 'draft', command('conflict', [record('p', 'other')], scope='records'), 'a')
+    assert caught.value.code == 'draft_conflict'
+    assert data.get_input_draft('m', 'H')['revision'] == 2
+
+
+def test_same_uid_in_another_tab_still_conflicts(data):
+    live.execute_command(data, 'm', 'H', 'draft', command('first', [record()]), 'p')
+    with pytest.raises(BackendError) as caught:
+        live.execute_command(data, 'm', 'H', 'draft', command('second', [record(player='new')]), 'p')
+    assert caught.value.code == 'draft_conflict'
+
+
+def test_cards_do_not_erase_act_and_tombstone_survives_retry(data):
+    live.execute_command(data, 'm', 'H', 'draft', command('act', [record()]), 'p')
+    card = {'id': 'card', 'half': 'H1', 'halfSeconds': 1, 'playerId': 'one', 'card': 'Y'}
+    live.execute_command(data, 'm', 'H', 'draft', command('card', scope='cards', cards=[card], base=1), 'a')
+    assert len(data.get_input_draft('m', 'H')['payload']['records']) == 1
+    deletion = command('delete', scope='cards', base=2, deletedCardIds=['card'])
+    live.execute_command(data, 'm', 'H', 'draft', deletion, 'a')
+    live.execute_command(data, 'm', 'H', 'draft', deletion, 'a')
+    assert data.get_input_draft('m', 'H')['payload']['cards'] == []
+    assert data.get_input_draft('m', 'H')['revision'] == 3
+
+
+def test_substitutions_share_revision_and_do_not_erase_other_events(data):
+    def setup(key, sub):
+        return InputSetupWriteRequest(commandId=key, baseRevision=0, roomEpoch=0, payload=payload(),
+            clientState={'subs': [sub]}, syncScope='substitutions')
+    first = {'id': 's1', 'half': 'H1', 'seconds': 1, 'outPlayer': 'one', 'inPlayer': 'two'}
+    second = {**first, 'id': 's2', 'seconds': 2, 'outPlayer': 'three', 'inPlayer': 'four'}
+    live.execute_command(data, 'm', 'H', 'setup', setup('s1', first), 'p')
+    live.execute_command(data, 'm', 'H', 'setup', setup('s2', second), 'a')
+    reference = data._input_setup_reference('m', 'H')
+    assert len(data._with_input_setup_subs(reference, data._normalise_input_setup(reference.get().to_dict()['setup']))['subs']) == 2
+    assert data.get_input_draft('m', 'H')['revision'] == 2
+
+
+@pytest.mark.parametrize('uid,scope', [('outsider', 'records'), ('a', 'state'), ('a', 'checkpoint')])
+def test_authority_enforced_for_each_command(data, uid, scope):
+    with pytest.raises(BackendError) as caught:
+        live.execute_command(data, 'm', 'H', 'draft', command(scope=scope), uid)
+    assert caught.value.status_code == 403
+
+
+def test_old_session_cannot_reopen_a_restored_draft(data):
+    data.db.documents['inputDrafts/m_H']['roomEpoch'] = 1
+    with pytest.raises(BackendError) as caught:
+        live.execute_command(data, 'm', 'H', 'draft', command(), 'p')
+    assert caught.value.code == 'room_changed'
+
+
+def test_presence_leases_are_per_connection_and_expire(data):
+    live.update_presence(data, 'm', 'H', 'p', 'tab1', True)
+    live.update_presence(data, 'm', 'H', 'p', 'tab2', True)
+    live.update_presence(data, 'm', 'H', 'p', 'tab1', False)
+    assert live.room_state(data, 'm', 'H')['participants']['p']['online']
+    data.db.documents['inputDrafts/m_H/presence/tab2']['expiresAt'] = live.utc_now()
+    assert not live.room_state(data, 'm', 'H')['participants']['p']['online']
+
+
+def test_final_update_freezes_edits_closes_room_and_deduplicates(data):
+    request = FinalizeCommandRequest(commandId='final', baseRevision=0, roomEpoch=0)
+    calls = []
+    def promote(draft):
+        calls.append(draft)
+        with pytest.raises(BackendError) as caught:
+            live.execute_command(data, 'm', 'H', 'draft', command(), 'p')
+        assert caught.value.code == 'room_closing'
+        return {'status': 'ok', 'recordsSaved': 0}
+    first = live.finalize_command(data, 'm', 'H', request, 'p', promote)
+    assert live.finalize_command(data, 'm', 'H', request, 'p', promote) == first
+    assert len(calls) == 1
+    assert data.db.documents['inputDrafts/m_H']['liveClosed']
+    assert data.db.documents['inputDrafts/m_H']['roomEpoch'] == 1
+
+
+def test_interrupted_final_update_resumes_same_command(data):
+    request = FinalizeCommandRequest(commandId='final', baseRevision=0, roomEpoch=0)
+    with pytest.raises(RuntimeError):
+        live.finalize_command(data, 'm', 'H', request, 'p', lambda _: (_ for _ in ()).throw(RuntimeError('RAW failed')))
+    result = live.finalize_command(data, 'm', 'H', request, 'p', lambda _: {'status': 'ok'})
+    assert result['commandId'] == 'final'
+
+
+def test_raw_restore_is_frozen_and_deduplicated(data):
+    root = data.db.documents['inputDrafts/m_H']
+    root.update(liveClosed=True, payload=None)
+    calls = []
+    def restore(*args, **kwargs):
+        calls.append(args)
+        with pytest.raises(BackendError) as caught:
+            live.execute_command(data, 'm', 'H', 'draft', command(), 'p')
+        assert caught.value.code in {'room_closed', 'room_closing'}
+        data.db.documents['inputDrafts/m_H'].update(liveClosed=False, payload=payload(), revision=1)
+    data.restore_input_draft_from_raw = restore
+    request = FinalizeCommandRequest(commandId='restore', baseRevision=0, roomEpoch=0)
+    first = live.restore_command(data, 'm', 'H', request, 'p')
+    assert live.restore_command(data, 'm', 'H', request, 'p') == first
+    assert len(calls) == 1
+    assert first['savedRevision'] == 2
+    assert data.db.documents['inputDrafts/m_H']['liveRestoring'] is None
+
+
+def test_basic_participant_cannot_claim_advanced_final_authority(data):
+    data.db.documents['inputDrafts/m_H']['participants']['p']['level'] = 'basic'
+    with pytest.raises(BackendError) as caught:
+        live.execute_command(data, 'm', 'H', 'draft', command(), 'p')
+    assert caught.value.code == 'recorder_level_mismatch'
+
+
+class SDKTransport:
+    """Only the RPC boundary is replaced; references/queries/transactions are real SDK objects."""
+    def __init__(self, client, documents):
+        self.client = client
+        self.prefix = f'projects/{client.project}/databases/(default)/documents/'
+        self.documents = deepcopy(documents)
+        self.reads = []
+        self.queries = []
+        self.read_calls = 0
+        self.commits = 0
+        self.transaction_modes = []
+
+    def begin_transaction(self, **kwargs):
+        from google.cloud.firestore_v1.types import BeginTransactionResponse
+        options = kwargs['request']['options']
+        self.transaction_modes.append(options._pb.WhichOneof('mode') if options is not None else 'read_write')
+        return BeginTransactionResponse(transaction=b'sdk-test')
+
+    def rollback(self, **kwargs):
+        pass
+
+    def _document(self, path, values):
+        from google.cloud.firestore_v1 import _helpers
+        from google.cloud.firestore_v1.types import Document
+        return Document(name=self.prefix + path, fields=_helpers.encode_dict(values))
+
+    def batch_get_documents(self, request, **kwargs):
+        from google.cloud.firestore_v1.types import BatchGetDocumentsResponse
+        self.read_calls += 1
+        self.reads.extend(request['documents'])
+        for name in request['documents']:
+            path = name.removeprefix(self.prefix)
+            if path in self.documents:
+                yield BatchGetDocumentsResponse(found=self._document(path, self.documents[path]))
+            else:
+                yield BatchGetDocumentsResponse(missing=name)
+
+    def run_query(self, request, **kwargs):
+        from google.cloud.firestore_v1.types import RunQueryResponse
+        parent = request['parent'].removeprefix(self.prefix.rstrip('/')).strip('/')
+        collection_id = request['structured_query'].from_[0].collection_id
+        collection_path = f'{parent}/{collection_id}' if parent else collection_id
+        self.queries.append(collection_path)
+        for path, values in self.documents.items():
+            if path.rsplit('/', 1)[0] == collection_path:
+                yield RunQueryResponse(document=self._document(path, values))
+
+    def commit(self, request, **kwargs):
+        from google.cloud.firestore_v1 import _helpers
+        from google.cloud.firestore_v1.types import CommitResponse
+        self.commits += 1
+        for write in request['writes']:
+            path = write.update.name.removeprefix(self.prefix)
+            self.documents[path] = _helpers.decode_dict(write.update.fields, self.client)
+        return CommitResponse()
+
+
+@pytest.fixture
+def sdk_data():
+    from google.auth.credentials import AnonymousCredentials
+    from google.cloud.firestore_v1 import Client
+    client = Client(project='live-room-sdk-tests', credentials=AnonymousCredentials())
+    transport = SDKTransport(client, {'inputDrafts/m_H': {'gmId': 'm', 'side': 'H', 'revision': 0,
+        'primaryUid': 'p', 'participants': {'p': {'role': 'primary'}}, 'payload': payload()},
+        'inputDrafts/m_H/records/r': record()})
+    client._firestore_api_internal = transport
+    result = object.__new__(JpdDidData)
+    result.db = client
+    result.sync_input_summary_from_draft = lambda *args: None
+    yield result
+    client.close()
+
+
+def test_real_sdk_snapshot_reads_nested_collections_without_collection_path(sdk_data):
+    assert not hasattr(sdk_data.db.collection('inputDrafts'), 'path')
+    assert not hasattr(sdk_data.db.collection('inputDrafts').document('m_H').collection('records'), 'path')
+    draft = sdk_data.get_input_draft('m', 'H')
+    assert draft['payload']['records'][0]['id'] == 'r'
+    assert draft['payload']['cards'] == []
+    assert sdk_data.db._firestore_api_internal.transaction_modes == ['read_only']
+
+
+def test_snapshot_read_abort_restarts_the_entire_read_only_snapshot(sdk_data, monkeypatch):
+    from google.api_core.exceptions import Aborted
+    rpc = sdk_data.db._firestore_api_internal
+    run_query = rpc.run_query
+    aborted = False
+    def contended(request, **kwargs):
+        nonlocal aborted
+        if request['structured_query'].from_[0].collection_id == 'cards' and not aborted:
+            aborted = True
+            rpc.documents['inputDrafts/m_H']['revision'] = 7
+            rpc.documents['inputDrafts/m_H/records/r']['playerId'] = 'new'
+            raise Aborted('contention while streaming cards')
+        return run_query(request, **kwargs)
+    monkeypatch.setattr(rpc, 'run_query', contended)
+    monkeypatch.setattr(live.time, 'sleep', lambda _: None)
+    draft = sdk_data.get_input_draft('m', 'H')
+    assert draft['revision'] == 7
+    assert draft['payload']['records'][0]['playerId'] == 'new'
+    assert rpc.transaction_modes == ['read_only', 'read_only']
+    assert rpc.queries.count('inputDrafts/m_H/records') == 2
+
+
+def test_repeated_read_abort_returns_retryable_503_without_writes(sdk_data, monkeypatch):
+    from google.api_core.exceptions import Aborted
+    rpc = sdk_data.db._firestore_api_internal
+    original = deepcopy(rpc.documents)
+    def contended(*args, **kwargs):
+        raise Aborted('contention')
+    delays = []
+    monkeypatch.setattr(rpc, 'run_query', contended)
+    monkeypatch.setattr(live.time, 'sleep', delays.append)
+    with pytest.raises(BackendError) as error:
+        sdk_data.get_input_draft('m', 'H')
+    assert error.value.code == 'draft_snapshot_busy'
+    assert error.value.status_code == 503
+    assert rpc.transaction_modes == ['read_only'] * 3
+    assert delays == [0.05, 0.1]
+    assert rpc.documents == original
+
+
+def test_snapshot_permission_failure_is_not_retried(sdk_data, monkeypatch):
+    from google.api_core.exceptions import PermissionDenied
+    rpc = sdk_data.db._firestore_api_internal
+    def forbidden(*args, **kwargs):
+        raise PermissionDenied('permission')
+    monkeypatch.setattr(rpc, 'run_query', forbidden)
+    with pytest.raises(PermissionDenied):
+        sdk_data.get_input_draft('m', 'H')
+    assert rpc.transaction_modes == ['read_only']
+
+
+def test_real_sdk_command_transactions_merge_events_and_deduplicate(sdk_data):
+    first = command('sdk-act', [record(player='edited')])
+    receipt = live.execute_command(sdk_data, 'm', 'H', 'draft', first, 'p')
+    assert live.execute_command(sdk_data, 'm', 'H', 'draft', first, 'p') == receipt
+    card = {'id': 'card', 'half': 'H1', 'halfSeconds': 1, 'playerId': 'one', 'card': 'Y'}
+    live.execute_command(sdk_data, 'm', 'H', 'draft', command('sdk-card', scope='cards', cards=[card], base=1), 'p')
+    setup = InputSetupWriteRequest(commandId='sdk-sub', baseRevision=2, roomEpoch=0, payload=payload(),
+        clientState={'subs': [{'id': 's', 'half': 'H1', 'seconds': 2, 'outPlayer': 'one', 'inPlayer': 'two'}]}, syncScope='substitutions')
+    live.execute_command(sdk_data, 'm', 'H', 'setup', setup, 'p')
+    draft = sdk_data.get_input_draft('m', 'H')
+    assert draft['revision'] == 3
+    assert draft['payload']['records'][0]['playerId'] == 'edited'
+    assert draft['payload']['cards'][0]['id'] == 'card'
+    assert draft['_liveSetup']['subs'][0]['id'] == 's'
+
+
+def test_empty_legacy_base_does_not_hide_saved_players():
+    lineup = [{'playerId': 'starter', 'slot': 'gk', 'type': 'START', 'order': 1},
+              {'playerId': 'bench', 'slot': 'b0', 'type': 'BENCH', 'order': 1}]
+    setup = JpdDidData._normalise_input_setup({'formationKey': '4-3-3', 'lineup': lineup, 'baseLineup': []})
+    assert setup['lineup'] == lineup
+    assert setup['lineupIsBaseline'] is False
+
+
+def test_populated_base_remains_authoritative_for_substitution_replay():
+    base = [{'playerId': 'starter', 'type': 'START', 'slot': 'gk'}]
+    setup = JpdDidData._normalise_input_setup({'formationKey': '4-3-3', 'lineup': [], 'baseLineup': base})
+    assert setup['lineup'] == base
+    assert setup['lineupIsBaseline'] is True
+
+
+@pytest.mark.parametrize('history_size', [1, 1000])
+def test_modern_ack_reads_only_changed_event_and_never_scans_history(sdk_data, history_size):
+    from backend.api.api_match_input import _command_ack
+    rpc = sdk_data.db._firestore_api_internal
+    for index in range(history_size):
+        rpc.documents[f'inputDrafts/m_H/records/history-{index}'] = record(f'history-{index}')
+    receipt = live.execute_command(sdk_data, 'm', 'H', 'draft', command('small-ack', [record(player='edited')]), 'p')
+    ack = _command_ack('m', 'H', receipt).model_dump(mode='json')
+    assert rpc.queries == []
+    assert len(rpc.reads) == 3  # receipt, root, affected record; independent of history size
+    assert len(ack['event']['records']) == 1
+    assert 'payload' not in ack and 'clientState' not in ack
+    assert rpc.documents['inputDrafts/m_H']['lastEvent'] == receipt['event']
+    assert live.execute_command(sdk_data, 'm', 'H', 'draft', command('small-ack', [record(player='edited')]), 'p') == receipt
+
+
+def test_card_and_substitution_ack_do_not_query_existing_event_tables(sdk_data):
+    rpc = sdk_data.db._firestore_api_internal
+    card = {'id': 'card', 'half': 'H1', 'halfSeconds': 1, 'playerId': 'one', 'card': 'Y'}
+    ack = live.execute_command(sdk_data, 'm', 'H', 'draft', command('card', scope='cards', cards=[card]), 'p')
+    assert [item['id'] for item in ack['event']['cards']] == ['card']
+    request = InputSetupWriteRequest(commandId='sub', baseRevision=1, roomEpoch=0, payload=payload(),
+        clientState={'subs': [{'id': 's', 'half': 'H1', 'seconds': 2, 'outPlayer': 'one', 'inPlayer': 'two'}]}, syncScope='substitutions')
+    ack = live.execute_command(sdk_data, 'm', 'H', 'setup', request, 'p')
+    assert [item['id'] for item in ack['event']['subs']] == ['s']
+    assert rpc.queries == []
+
+
+def test_entry_draft_skips_setup_already_fetched_by_parallel_entry(sdk_data):
+    rpc = sdk_data.db._firestore_api_internal
+    draft = sdk_data.get_input_draft('m', 'H', include_setup=False)
+    assert '_liveSetup' not in draft
+    assert set(rpc.queries) == {'inputDrafts/m_H/records', 'inputDrafts/m_H/cards'}
+
+
+def test_fifty_acts_use_three_bulk_reads_and_commits_with_original_receipts(sdk_data):
+    rpc = sdk_data.db._firestore_api_internal
+    requests = [('draft', command(f'c{i}', [record(f'r{i}')], scope='records')) for i in range(50)]
+    for start in range(0, 50, 20):
+        response = live.execute_batch(sdk_data, 'm', 'H', requests[start:start + 20], 'p')
+        assert all(item['status'] == 'ack' for item in response['results'])
+    assert rpc.read_calls == 3
+    assert rpc.commits == 3
+    assert rpc.queries == []
+    assert rpc.documents['inputDrafts/m_H']['revision'] == 50
+    assert all(f'inputDrafts/m_H/records/r{i}' in rpc.documents for i in range(50))
+    retry = live.execute_batch(sdk_data, 'm', 'H', requests[:20], 'p')
+    assert [item['savedRevision'] for item in retry['results']] == list(range(1, 21))
+    assert retry['event'] is None
+    assert rpc.documents['inputDrafts/m_H']['revision'] == 50
+
+
+def test_batch_preserves_create_player_edit_delete_order_and_event_revisions(data, monkeypatch):
+    monkeypatch.setattr(live, '_queue_summary', lambda *args: None)
+    requests = [('draft', command('create', [record('same')], scope='records')),
+                ('draft', command('player', [record('same', player='two')], scope='records')),
+                ('draft', command('delete', scope='records', deletedRecordIds=['same']))]
+    response = live.execute_batch(data, 'm', 'H', requests, 'p')
+    assert [item['savedRevision'] for item in response['results']] == [1, 2, 3]
+    assert response['event']['events'][0]['records'][0]['playerId'] == 'one'
+    assert response['event']['events'][1]['records'][0]['playerId'] == 'two'
+    assert response['event']['events'][2]['deletedRecordIds'] == ['same']
+    assert data.get_input_draft('m', 'H')['payload']['records'] == []
+    assert data.db.documents['inputDrafts/m_H/records/same']['commandRevision'] == 3
+
+
+def test_batch_conflict_blocks_dependents_but_saves_unrelated_act_and_card(data, monkeypatch):
+    monkeypatch.setattr(live, '_queue_summary', lambda *args: None)
+    live.execute_command(data, 'm', 'H', 'draft', command('peer', [record('same')], scope='records'), 'a')
+    card = {'id': 'card', 'half': 'H1', 'halfSeconds': 1, 'playerId': 'one', 'card': 'Y'}
+    response = live.execute_batch(data, 'm', 'H', [
+        ('draft', command('conflict', [record('same', player='two')], scope='records')),
+        ('draft', command('dependent', [record('same', player='three')], scope='records')),
+        ('draft', command('independent', [record('new')], scope='records')),
+        ('draft', command('card', scope='cards', cards=[card])),
+    ], 'p')
+    assert [item.get('code', item['status']) for item in response['results']] == ['draft_conflict', 'dependency_blocked', 'ack', 'ack']
+    assert set(item['id'] for item in data.get_input_draft('m', 'H')['payload']['records']) == {'same', 'new'}
+    assert len(response['event']['events']) == 2
+    assert response['event']['events'][0]['records'][0]['id'] == 'new'
+    assert 'records' not in response['event']['events'][1]
+
+
+def test_failed_batch_commit_persists_no_partial_events_or_receipts(data):
+    data.db.fail_commit = True
+    with pytest.raises(RuntimeError):
+        live.execute_batch(data, 'm', 'H', [('draft', command('one', [record('one')], scope='records')),
+                                         ('draft', command('two', [record('two')], scope='records'))], 'p')
+    assert data.db.documents['inputDrafts/m_H']['revision'] == 0
+    assert len(data.db.documents) == 1
+
+
+def test_batch_mixed_card_and_substitution_preserves_each_receipt(sdk_data):
+    card = {'id': 'card', 'half': 'H1', 'halfSeconds': 1, 'playerId': 'one', 'card': 'Y'}
+    sub = InputSetupWriteRequest(commandId='sub', baseRevision=0, roomEpoch=0, payload=payload(),
+        clientState={'subs': [{'id': 's', 'half': 'H1', 'seconds': 2, 'outPlayer': 'one', 'inPlayer': 'two'}]}, syncScope='substitutions')
+    response = live.execute_batch(sdk_data, 'm', 'H', [('draft', command('act', [record('new')], scope='records')),
+        ('draft', command('card', scope='cards', cards=[card])), ('setup', sub)], 'p')
+    assert [item['savedRevision'] for item in response['results']] == [1, 2, 3]
+    assert sdk_data.db._firestore_api_internal.commits == 1
+    draft = sdk_data.get_input_draft('m', 'H')
+    assert len(draft['payload']['cards']) == 1
+    assert len(draft['_liveSetup']['subs']) == 1
+
+
+def test_batch_api_uses_one_match_check_and_returns_individual_durable_acks(sdk_data, monkeypatch):
+    from backend.api import api_match_input as api
+    from backend.system.system_firestore import CurrentUser
+    checked = []
+    sdk_data.get_match = lambda gm_id: checked.append(gm_id) or object()
+    monkeypatch.setattr(api, 'JpdDidData', lambda: sdk_data)
+    request = api.BatchWriteRequest(commands=[{'kind': 'draft', 'request': command(f'c{i}', [record(f'r{i}')], scope='records').model_dump(mode='json')} for i in range(20)])
+    result = api._save_batch_mutation('m', 'H', request, CurrentUser(uid='p', claims={}))
+    assert checked == ['m']
+    assert [item['savedRevision'] for item in result['results']] == list(range(1, 21))
+    assert result['event']['revision'] == 20
+    assert sdk_data.db._firestore_api_internal.commits == 1

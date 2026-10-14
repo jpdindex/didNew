@@ -5,6 +5,97 @@ from pydantic_core import PydanticUndefined
 import pytest
 
 
+def test_draft_snapshot_busy_is_503_and_never_a_missing_draft(monkeypatch):
+    from backend.system.system_firestore import BackendError
+    class Data:
+        def get_input_draft(self, *args):
+            raise BackendError('snapshot busy', status_code=503, code='draft_snapshot_busy')
+    monkeypatch.setattr(api_match_input, 'JpdDidData', Data)
+    with pytest.raises(BackendError) as error:
+        api_match_input.get_draft('m', 'H')
+    assert error.value.status_code == 503
+    assert error.value.code == 'draft_snapshot_busy'
+
+
+def test_live_socket_relays_root_delta_and_requests_resync_for_a_gap(monkeypatch):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from starlette.websockets import WebSocketDisconnect
+
+    class RootWatch:
+        def on_snapshot(self, callback):
+            self.callback = callback
+            self.emit({'revision': 5, 'roomEpoch': 0, 'participants': {}})
+            return self
+
+        def emit(self, document):
+            self.callback([SimpleNamespace(to_dict=lambda: document)])
+
+        def unsubscribe(self):
+            self.unsubscribed = True
+
+    root = RootWatch()
+    class Data:
+        def get_match(self, gm_id):
+            return object()
+
+        def _input_setup_reference(self, gm_id, side):
+            return root
+
+        def get_input_draft(self, *args, **kwargs):
+            raise AssertionError('socket subscriptions must not scan full Drafts')
+
+    async def user(socket):
+        return CurrentUser(uid='p', claims={})
+
+    monkeypatch.setattr(api_match_input, 'JpdDidData', Data)
+    monkeypatch.setattr(api_match_input, '_socket_user', user)
+    monkeypatch.setattr(api_match_input, 'draft_sockets', DraftSocketHub())
+    monkeypatch.setattr(api_match_input, 'update_presence', lambda *args: None)
+    monkeypatch.setattr(api_match_input, 'room_state', lambda *args: {'participants': {}, 'revision': 5})
+
+    async def run():
+        class Socket:
+            def __init__(self):
+                self.incoming = asyncio.Queue()
+                self.outgoing = asyncio.Queue()
+            async def accept(self):
+                pass
+            async def receive_text(self):
+                message = await self.incoming.get()
+                if message is None:
+                    raise WebSocketDisconnect()
+                return json.dumps(message)
+            async def send_json(self, message):
+                await self.outgoing.put(message)
+        socket = Socket()
+        task = asyncio.create_task(api_match_input.live_draft_socket(socket, 'm', 'H'))
+        async def receive(kind):
+            while True:
+                message = await asyncio.wait_for(socket.outgoing.get(), timeout=2)
+                if message['type'] == kind:
+                    return message
+        try:
+            await receive('ready')
+            await socket.incoming.put({'type': 'subscribe', 'revision': 5, 'roomEpoch': 0})
+            await receive('room')
+            event = {'type': 'delta', 'gmId': 'm', 'side': 'H', 'revision': 6, 'roomEpoch': 0, 'records': [{'id': 'one'}]}
+            root.emit({'revision': 6, 'roomEpoch': 0, 'participants': {}, 'lastEvent': event})
+            assert (await receive('mutation'))['event'] == event
+            root.emit({'revision': 8, 'roomEpoch': 0, 'participants': {}, 'lastEvent': {**event, 'revision': 8}})
+            assert (await receive('resync'))['revision'] == 8
+            batch = {'type': 'batch', 'gmId': 'm', 'side': 'H', 'fromRevision': 8, 'revision': 10, 'roomEpoch': 0,
+                     'events': [{**event, 'revision': 9}, {**event, 'revision': 10}]}
+            root.emit({'revision': 10, 'roomEpoch': 0, 'participants': {}, 'lastEvent': batch})
+            assert (await receive('mutation'))['event'] == batch
+        finally:
+            await socket.incoming.put(None)
+            await asyncio.wait_for(task, timeout=2)
+        assert root.unsubscribed
+    asyncio.run(run())
+
+
 def _new_schedule_fixture(serial=1):
     return {
         "gmId": f"20262027epltest{serial:04d}", "date": "2026-10-08", "kickoffTime": "20:00",
@@ -359,7 +450,8 @@ def test_enter_route_returns_join_and_parallel_entry_data(monkeypatch) -> None:
         def get_input_setup(self, gm_id):
             return {"H": None, "A": None}
 
-        def get_input_draft(self, gm_id, side):
+        def get_input_draft(self, gm_id, side, *, include_setup=True):
+            assert include_setup is False
             raise NotFoundError("missing")
 
     monkeypatch.setattr(api_match_input, "JpdDidData", FakeData)

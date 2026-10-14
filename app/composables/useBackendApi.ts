@@ -1,6 +1,7 @@
 import type { Auth } from 'firebase/auth'
 
 type BackendRequestOptions = Omit<RequestInit, 'body' | 'headers'> & {
+  expectedUid?: string
   body?: BodyInit | null
   headers?: HeadersInit
 }
@@ -44,6 +45,10 @@ export function useBackendApi() {
     const { $auth, $authReady } = useNuxtApp()
     await $authReady
     const user = ($auth as Auth).currentUser
+    if (options.expectedUid && user?.uid !== options.expectedUid) {
+      const error = Object.assign(new Error('로그인 계정이 변경되어 대기 명령을 중지했습니다.'), { status: 403, code: 'account_changed' })
+      throw error
+    }
     const token = await user?.getIdToken()
     const response = await fetch(`${await resolveBackendUrl()}${path}`, {
       ...options,
@@ -59,7 +64,9 @@ export function useBackendApi() {
     })
     if (!response.ok) {
       const body = await response.text()
-      throw new Error(body || `백엔드 요청에 실패했습니다. (${response.status})`)
+      let detail: any
+      try { detail = JSON.parse(body)?.error } catch { /* Non-JSON proxy error. */ }
+      throw Object.assign(new Error(detail?.message || body || `백엔드 요청에 실패했습니다. (${response.status})`), { status: response.status, code: detail?.code })
     }
     return await response.json() as T
   }
@@ -105,7 +112,8 @@ export function useBackendApi() {
               // command can close a stale socket and trigger reconnection.
               close: () => socket.close(),
               send: (value) => {
-                if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(value))
+                if (socket.readyState !== WebSocket.OPEN) throw new Error('실시간 연결이 닫혔습니다.')
+                socket.send(JSON.stringify(value))
               },
             })
             return

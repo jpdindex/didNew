@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData, NotFoundError, RequiredUser, ensure_firebase_app, get_settings, utc_now
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
 from backend.system.system_schema import Half, InputMode, Side, MatchDoc
+from backend.system.system_live_room import execute_command, execute_batch, finalize_command, restore_command, room_state, update_presence
 
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,9 @@ MatchInputCommit = MatchInputPayload
 
 class DraftWriteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    commandId: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    baseRevision: int | None = Field(default=None, ge=0)
+    roomEpoch: int | None = Field(default=None, ge=0)
     payload: MatchInputPayload
     clientState: dict[str, Any]
     # One endpoint serves durable checkpoints and the two lightweight live-sync
@@ -173,6 +177,9 @@ class InputSetupWriteRequest(BaseModel):
     """Durable lobby configuration. It deliberately cannot mutate live Draft state."""
 
     model_config = ConfigDict(extra="forbid")
+    commandId: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    baseRevision: int | None = Field(default=None, ge=0)
+    roomEpoch: int | None = Field(default=None, ge=0)
     payload: MatchInputPayload
     clientState: dict[str, Any]
     deletedSubIds: list[str] = Field(default_factory=list)
@@ -187,6 +194,9 @@ class DraftResponse(BaseModel):
     clientState: dict[str, Any]
     sharedState: dict[str, Any] = Field(default_factory=dict)
     revision: int = 0
+    commandId: str | None = None
+    savedRevision: int | None = None
+    roomEpoch: int = 0
     updatedAt: str | None = None
     inputSetup: dict[str, Any] | None = None
     # Browsers poll only while someone else shares this Draft. A solo primary
@@ -198,6 +208,20 @@ class DraftMissingResponse(BaseModel):
     status: Literal["missing"]
     gmId: str
     side: Side
+    revision: int = 0
+    roomEpoch: int = 0
+    closed: bool = False
+
+
+class LiveCommandAck(BaseModel):
+    status: Literal['ack'] = 'ack'
+    gmId: str
+    side: Side
+    commandId: str
+    savedRevision: int
+    revision: int
+    roomEpoch: int
+    event: dict[str, Any]
 
 
 class PromotionResponse(BaseModel):
@@ -207,6 +231,15 @@ class PromotionResponse(BaseModel):
     recordsSaved: int
     cardsSaved: int
     draftDeleted: bool
+    commandId: str | None = None
+    savedRevision: int | None = None
+
+
+class FinalizeCommandRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    commandId: str = Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9_-]+$')
+    baseRevision: int = Field(ge=0)
+    roomEpoch: int = Field(ge=0)
 
 
 class ParticipantJoinRequest(BaseModel):
@@ -241,6 +274,15 @@ class InputPreviewRequest(BaseModel):
 
 
 router = APIRouter(tags=["match-input"])
+
+
+class BatchCommand(BaseModel):
+    kind: Literal['draft', 'setup']
+    request: dict[str, Any]
+
+
+class BatchWriteRequest(BaseModel):
+    commands: list[BatchCommand] = Field(min_length=1, max_length=20)
 
 
 class DraftSocketHub:
@@ -339,27 +381,101 @@ async def _socket_user(socket: WebSocket) -> CurrentUser:
 @router.websocket("/match-input/drafts/{gm_id}/{side}/live")
 async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> None:
     await websocket.accept()
+    session_id = str(uuid4())
+    watcher = None
+    root_watch = None
+    user = None
     try:
         user = await _socket_user(websocket)
         JpdDidData().get_match(gm_id)
         await draft_sockets.connect(gm_id, side, websocket)
+        await asyncio.to_thread(update_presence, JpdDidData(), gm_id, side, user.uid, session_id, True)
         await websocket.send_json({"type": "ready", "gmId": gm_id, "side": side})
+        loop = asyncio.get_running_loop()
+        changes = asyncio.Queue()
+        subscription = {'revision': None, 'roomEpoch': None, 'document': None}
+        def changed(snapshots, *args):
+            document = snapshots[0].to_dict() or {} if snapshots else {}
+            try:
+                loop.call_soon_threadsafe(changes.put_nowait, document)
+            except RuntimeError:
+                pass  # The socket's event loop has already closed.
+        root = JpdDidData()._input_setup_reference(gm_id, side)
+        root_watch = await asyncio.to_thread(root.on_snapshot, changed)
+        async def watch_room():
+            last_room = None
+            last_roster = None
+            while True:
+                try:
+                    try:
+                        document = await asyncio.wait_for(changes.get(), timeout=10)
+                        subscription['document'] = document
+                    except asyncio.TimeoutError:
+                        document = None
+                    if document is not None and subscription['revision'] is not None:
+                        revision = int(document.get('revision') or 0)
+                        epoch = int(document.get('roomEpoch') or 0)
+                        previous = subscription['revision']
+                        if document.get('liveClosed'):
+                            await draft_sockets.send(gm_id, side, websocket, {'type': 'closed', 'gmId': gm_id, 'side': side})
+                        elif revision > previous or epoch != subscription['roomEpoch']:
+                            event = document.get('lastEvent') or {}
+                            consecutive = revision == previous + 1 or (event.get('type') == 'batch' and event.get('fromRevision') <= previous)
+                            if epoch == subscription['roomEpoch'] and consecutive and event.get('revision') == revision:
+                                await draft_sockets.send(gm_id, side, websocket, {'type': 'mutation', 'event': event})
+                            else:
+                                await draft_sockets.send(gm_id, side, websocket, {'type': 'resync', 'gmId': gm_id, 'side': side, 'revision': revision, 'roomEpoch': epoch})
+                        subscription.update(revision=max(previous, revision), roomEpoch=epoch)
+                    # Presence refresh is independent of input storage. Do not
+                    # read every event table for each socket/command anymore.
+                    roster = json.dumps((document or {}).get('participants'), default=str, sort_keys=True)
+                    if document is None or last_room is None or roster != last_roster:
+                        room = await asyncio.to_thread(room_state, JpdDidData(), gm_id, side)
+                        if room != last_room:
+                            await draft_sockets.send(gm_id, side, websocket, {'type': 'room', 'gmId': gm_id, 'side': side, 'room': room})
+                            last_room = room
+                        if document is not None:
+                            last_roster = roster
+                except Exception:
+                    logger.exception('Live Room subscription failed: %s/%s', gm_id, side)
+                    await asyncio.sleep(1)
+        watcher = asyncio.create_task(watch_room())
         while True:
             message = json.loads(await websocket.receive_text())
+            if isinstance(message, dict) and message.get('type') == 'subscribe':
+                subscription['revision'] = max(0, int(message.get('revision') or 0))
+                subscription['roomEpoch'] = max(0, int(message.get('roomEpoch') or 0))
+                if subscription['document'] is not None:
+                    changes.put_nowait(subscription['document'])
+                continue
             if isinstance(message, dict) and message.get("type") == "heartbeat":
+                await asyncio.to_thread(update_presence, JpdDidData(), gm_id, side, user.uid, session_id, True)
                 await draft_sockets.send(gm_id, side, websocket, {"type": "pong"})
                 continue
             if not isinstance(message, dict) or message.get("type") != "command":
                 continue
             command_id = str(message.get("commandId") or "")
             try:
+                if message.get('command') == 'batch':
+                    batch = BatchWriteRequest.model_validate({'commands': message.get('commands')})
+                    response = await asyncio.to_thread(_save_batch_mutation, gm_id, side, batch, user)
+                    if response.get('event'):
+                        draft_sockets.publish(gm_id, side, {'type': 'mutation', 'event': response['event']}, exclude=websocket)
+                    await draft_sockets.send(gm_id, side, websocket, {'type': 'batch_ack', 'commandId': command_id, **response})
+                    continue
                 if message.get("command") != "mutation":
                     await draft_sockets.send(gm_id, side, websocket, {"type": "error", "commandId": command_id, "message": "unknown command"})
                     continue
                 mutation = message.get("mutation")
                 if mutation == "draft":
                     request = DraftWriteRequest.model_validate(message.get("request"))
+                    if request.commandId != command_id:
+                        raise BackendError('Command envelope mismatch', status_code=422, code='command_id_mismatch')
                     response = await asyncio.to_thread(_save_draft_mutation, gm_id, side, request, user)
+                    if isinstance(response, LiveCommandAck):
+                        draft_sockets.publish(gm_id, side, {'type': 'mutation', 'event': response.event}, exclude=websocket)
+                        await draft_sockets.send(gm_id, side, websocket, {'type': 'mutation', **response.model_dump(mode='json')})
+                        continue
                     if request.syncScope == "state":
                         event = {
                             "type": "state", "gmId": gm_id, "side": side,
@@ -376,18 +492,26 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
                     # receive a separate fan-out message. Waiting for a shared
                     # background broadcast made successful card/sub/ACT saves
                     # appear to fail whenever another send was in progress.
-                    await draft_sockets.send(gm_id, side, websocket, {"type": "mutation", "event": event, "commandId": command_id})
+                    await draft_sockets.send(gm_id, side, websocket, {"type": "mutation", "event": event, "commandId": command_id,
+                        'savedRevision': response.savedRevision, 'roomEpoch': response.roomEpoch})
                     draft_sockets.publish(gm_id, side, {"type": "mutation", "event": event}, exclude=websocket)
                 elif mutation == "setup":
                     request = InputSetupWriteRequest.model_validate(message.get("request"))
+                    if request.commandId != command_id:
+                        raise BackendError('Command envelope mismatch', status_code=422, code='command_id_mismatch')
                     setup = await asyncio.to_thread(_save_setup_mutation, gm_id, side, request, user)
+                    if isinstance(setup, LiveCommandAck):
+                        draft_sockets.publish(gm_id, side, {'type': 'mutation', 'event': setup.event}, exclude=websocket)
+                        await draft_sockets.send(gm_id, side, websocket, {'type': 'mutation', **setup.model_dump(mode='json')})
+                        continue
                     event = {"type": "setup", "gmId": gm_id, "side": side, "setup": setup}
-                    await draft_sockets.send(gm_id, side, websocket, {"type": "mutation", "event": event, "commandId": command_id})
+                    await draft_sockets.send(gm_id, side, websocket, {"type": "mutation", "event": event, "commandId": command_id,
+                        'savedRevision': (setup or {}).get('savedRevision'), 'roomEpoch': (setup or {}).get('roomEpoch')})
                     draft_sockets.publish(gm_id, side, {"type": "mutation", "event": event}, exclude=websocket)
                 else:
                     await draft_sockets.send(gm_id, side, websocket, {"type": "error", "commandId": command_id, "message": "unknown mutation"})
             except Exception as exc:
-                await draft_sockets.send(gm_id, side, websocket, {"type": "error", "commandId": command_id, "message": str(exc)})
+                await draft_sockets.send(gm_id, side, websocket, {"type": "error", "commandId": command_id, "message": str(exc), "code": getattr(exc, 'code', 'internal_error'), 'status': getattr(exc, 'status_code', 500)})
     except WebSocketDisconnect as exc:
         logger.info("Draft live socket disconnected: %s/%s code=%s", gm_id, side, exc.code)
     except (asyncio.TimeoutError, ValueError, RuntimeError) as exc:
@@ -400,7 +524,17 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
         # only reliable way to distinguish a client close from a server error.
         logger.exception("Draft live socket crashed: %s/%s", gm_id, side)
     finally:
+        if root_watch:
+            await asyncio.to_thread(root_watch.unsubscribe)
+        if watcher:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
         draft_sockets.disconnect(gm_id, side, websocket)
+        if user:
+            try:
+                await asyncio.to_thread(update_presence, JpdDidData(), gm_id, side, user.uid, session_id, False)
+            except Exception:
+                logger.warning('Presence expires automatically: %s/%s', gm_id, side)
 
 
 def _publish_draft_response(response: DraftResponse, command_id: str | None = None) -> None:
@@ -445,8 +579,9 @@ def _draft_response(document: dict[str, Any], input_setup: dict[str, Any] | None
         clientState=document.get("clientState") or {},
         sharedState=document.get("sharedState") or {},
         revision=int(document.get("revision") or 0),
+        roomEpoch=int(document.get('roomEpoch') or 0),
         updatedAt=updated_at.isoformat() if updated_at else None,
-        inputSetup=input_setup,
+        inputSetup=document.get('_liveSetup', input_setup),
         participantCount=len(participants) if isinstance(participants := document.get("participants"), dict) else 0,
     )
 
@@ -789,14 +924,18 @@ def get_draft(gm_id: str, side: Side, _: RequiredUser = None) -> DraftResponse |
     try:
         data = JpdDidData()
         document = data.get_input_draft(gm_id, side)
+        # read_snapshot maps exhausted transient contention to BackendError
+        # draft_snapshot_busy/503. Let the common error handler return it;
+        # only a genuine NotFound may become a missing Draft below.
         # A primary can be registered before its first lifecycle snapshot. That
         # is a normal empty collaborative Draft, not a malformed API response.
         if not document.get("payload"):
             return DraftMissingResponse(status="missing", gmId=gm_id, side=side)
-        return _draft_response(document, data.get_input_setup(gm_id).get(side))
+        return _draft_response(document)
     except NotFoundError:
         # A side without a draft is the normal first-entry condition.
-        return DraftMissingResponse(status="missing", gmId=gm_id, side=side)
+        room = room_state(data, gm_id, side)
+        return DraftMissingResponse(status="missing", gmId=gm_id, side=side, revision=room['revision'], roomEpoch=room['roomEpoch'], closed=room['closed'])
 
 
 @router.get("/match-input/matches/{gm_id}/recordings/{side}/input-state", response_model=DraftResponse, include_in_schema=False)
@@ -896,6 +1035,7 @@ def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinReque
     return {
         "status": "ok", "gmId": gm_id, "side": side,
         "primaryUid": document.get("primaryUid"), "participants": document.get("participants", {}),
+        'revision': int(document.get('revision') or 0), 'roomEpoch': int(document.get('roomEpoch') or 0),
         "role": (document.get("participants", {}).get(user.uid) or {}).get("role"),
         # Lifecycle (clock, half end, final update) belongs to the primary. A
         # manager in a correction Draft has no primary above it, so it owns it.
@@ -919,7 +1059,7 @@ def enter_draft(gm_id: str, side: Side, request: ParticipantJoinRequest, user: R
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="input-enter") as executor:
         squads_future = executor.submit(data.get_or_create_input_squads, gm_id, match)
         setup_future = executor.submit(data.get_input_setup, gm_id)
-        draft_future = executor.submit(data.get_input_draft, gm_id, side)
+        draft_future = executor.submit(data.get_input_draft, gm_id, side, include_setup=False)
         squads, _ = squads_future.result()
         input_setup = setup_future.result()
         try:
@@ -949,8 +1089,17 @@ def enter_draft(gm_id: str, side: Side, request: ParticipantJoinRequest, user: R
 
 
 @router.post("/match-input/drafts/{gm_id}/{side}/restore-raw", response_model=DraftResponse, include_in_schema=False)
-def restore_raw_to_draft(gm_id: str, side: Side, user: RequiredUser = None) -> DraftResponse:
-    response = _draft_response(JpdDidData().restore_input_draft_from_raw(gm_id, side, user_id=user.uid))
+def restore_raw_to_draft(gm_id: str, side: Side, user: RequiredUser = None, request: FinalizeCommandRequest | None = None) -> DraftResponse:
+    if not request:
+        raise BackendError('RAW restoration requires a command ID and server version', status_code=422, code='command_required')
+    data = JpdDidData()
+    room = room_state(data, gm_id, side)
+    if user.uid not in room['participants']:
+        data.join_input_draft_participant(gm_id, side, user_id=user.uid, role='manager', display_name=user.uid)
+    receipt = restore_command(data, gm_id, side, request, user.uid)
+    response = _draft_response(data.get_input_draft(gm_id, side))
+    response.commandId = receipt['commandId']
+    response.savedRevision = receipt['savedRevision']
     _publish_draft_response(response)
     return response
 
@@ -969,17 +1118,14 @@ def promote_h1(gm_id: str, side: Side, user: RequiredUser = None) -> PromotionRe
 
 
 @router.post("/match-input/drafts/{gm_id}/{side}/finalize", response_model=PromotionResponse, include_in_schema=False)
-def finalize_advanced(gm_id: str, side: Side, user: RequiredUser = None) -> PromotionResponse:
+def finalize_advanced(gm_id: str, side: Side, user: RequiredUser = None, request: FinalizeCommandRequest | None = None) -> PromotionResponse:
     data = JpdDidData()
-    draft = data.get_input_draft(gm_id, side)
-    if draft.get("primaryUid") and draft["primaryUid"] != user.uid:
-        raise BackendError("Only the primary analyst can finalize RAW", status_code=403, code="primary_required")
-    payload = MatchInputPayload.model_validate(draft["payload"])
-    if payload.recorderLevel != "advanced":
-        raise BackendError("Basic input requires administrator approval", status_code=409, code="basic_approval_required")
-    # RAW is the only durable final source. A later edit explicitly recreates a
-    # short-lived Draft from RAW, so stale collaboration records cannot reopen.
-    return _promote(data, payload, draft, user.uid, status="final", halves={"H1", "H2"}, delete_draft=True)
+    if not request:
+        raise BackendError('Final update requires a command ID and server version', status_code=422, code='command_required')
+    def promote(draft):
+        payload = MatchInputPayload.model_validate(draft['payload'])
+        return _promote(data, payload, draft, user.uid, status='final', halves={'H1', 'H2'}, delete_draft=False).model_dump(mode='json')
+    return PromotionResponse.model_validate(finalize_command(data, gm_id, side, request, user.uid, promote))
 
 
 @router.post("/match-input/approvals/{gm_id}/{side}/promote", response_model=PromotionResponse, include_in_schema=False)
@@ -992,7 +1138,32 @@ def approve_basic(gm_id: str, side: Side, user: RequiredUser = None) -> Promotio
     return _promote(data, payload, draft, user.uid, status="final", halves={"H1", "H2"}, delete_draft=True)
 
 
-def _save_draft_mutation(gm_id: str, side: Side, request: DraftWriteRequest, user: CurrentUser) -> DraftResponse:
+def _save_batch_mutation(gm_id: str, side: Side, request: BatchWriteRequest, user: CurrentUser) -> dict:
+    commands = []
+    for entry in request.commands:
+        parsed = (DraftWriteRequest if entry.kind == 'draft' else InputSetupWriteRequest).model_validate(entry.request)
+        if not parsed.commandId or parsed.payload.gmId != gm_id or parsed.payload.side != side:
+            raise BackendError('Batch command target/ID mismatch', status_code=422, code='draft_target_mismatch')
+        commands.append((entry.kind, parsed))
+    with draft_mutations.hold(gm_id, side):
+        data = JpdDidData()
+        match = data.get_match(gm_id)
+        for _, parsed in commands:
+            snapshot = parsed.payload.matchSnapshot
+            if snapshot and (snapshot.homeTeamId != match.homeTeamId or snapshot.awayTeamId != match.awayTeamId):
+                raise BackendError('Draft match snapshot mismatch', status_code=422, code='draft_match_mismatch')
+        return execute_batch(data, gm_id, side, commands, user.uid)
+
+
+@router.post('/match-input/drafts/{gm_id}/{side}/commands', include_in_schema=False)
+def save_batch(gm_id: str, side: Side, request: BatchWriteRequest, user: RequiredUser = None) -> dict:
+    response = _save_batch_mutation(gm_id, side, request, user)
+    if response.get('event'):
+        draft_sockets.publish(gm_id, side, {'type': 'mutation', 'event': response['event']})
+    return response
+
+
+def _save_draft_mutation(gm_id: str, side: Side, request: DraftWriteRequest, user: CurrentUser) -> DraftResponse | LiveCommandAck:
     if request.payload.gmId != gm_id or request.payload.side != side:
         raise BackendError("Draft path and payload must identify the same match side", status_code=422, code="draft_target_mismatch")
     # Every entry point (REST and socket) takes this same lock.  Firestore
@@ -1004,6 +1175,9 @@ def _save_draft_mutation(gm_id: str, side: Side, request: DraftWriteRequest, use
         snapshot = request.payload.matchSnapshot
         if snapshot and (snapshot.homeTeamId != match.homeTeamId or snapshot.awayTeamId != match.awayTeamId):
             raise BackendError("Draft match snapshot does not match this fixture", status_code=422, code="draft_match_mismatch")
+        if request.commandId:
+            receipt = execute_command(data, gm_id, side, 'draft', request, user.uid, defer_summary=True)
+            return _command_ack(gm_id, side, receipt)
         document = data.save_input_draft(
             gm_id, side, payload=request.payload.model_dump(mode="python"), client_state=request.clientState,
             user_id=user.uid, sync_scope=request.syncScope, deleted_record_ids=request.deletedRecordIds,
@@ -1014,11 +1188,15 @@ def _save_draft_mutation(gm_id: str, side: Side, request: DraftWriteRequest, use
         return _draft_response(document, input_setup)
 
 
-def _save_setup_mutation(gm_id: str, side: Side, request: InputSetupWriteRequest, user: CurrentUser) -> dict[str, Any] | None:
+def _save_setup_mutation(gm_id: str, side: Side, request: InputSetupWriteRequest, user: CurrentUser) -> dict[str, Any] | LiveCommandAck | None:
     if request.payload.gmId != gm_id or request.payload.side != side:
         raise BackendError("Draft path and payload must identify the same match side", status_code=422, code="draft_target_mismatch")
     with draft_mutations.hold(gm_id, side):
         data = JpdDidData()
+        if request.commandId:
+            data.get_match(gm_id)
+            receipt = execute_command(data, gm_id, side, 'setup', request, user.uid)
+            return _command_ack(gm_id, side, receipt)
         draft = data.get_input_draft(gm_id, side)
         return data.save_input_setup(
             gm_id,
@@ -1030,9 +1208,18 @@ def _save_setup_mutation(gm_id: str, side: Side, request: InputSetupWriteRequest
         )
 
 
-@router.put("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse, include_in_schema=False)
-def save_draft(gm_id: str, side: Side, request: DraftWriteRequest, user: RequiredUser = None) -> DraftResponse:
+def _command_ack(gm_id, side, receipt) -> LiveCommandAck:
+    return LiveCommandAck(gmId=gm_id, side=side, commandId=receipt['commandId'], savedRevision=receipt['savedRevision'],
+        revision=receipt['savedRevision'], roomEpoch=receipt.get('roomEpoch', 0), event=receipt.get('event') or {
+            'type': 'resync', 'gmId': gm_id, 'side': side, 'revision': receipt['savedRevision']})
+
+
+@router.put("/match-input/drafts/{gm_id}/{side}", response_model=DraftResponse | LiveCommandAck, include_in_schema=False)
+def save_draft(gm_id: str, side: Side, request: DraftWriteRequest, user: RequiredUser = None) -> DraftResponse | LiveCommandAck:
     response = _save_draft_mutation(gm_id, side, request, user)
+    if isinstance(response, LiveCommandAck):
+        draft_sockets.publish(gm_id, side, {'type': 'mutation', 'event': response.event})
+        return response
     # A card-only mutation response does not include the Draft's record
     # subcollection. Never broadcast it as a complete Draft or connected
     # analysts will replace their ACT list with that intentionally empty list.
@@ -1046,7 +1233,7 @@ def save_draft(gm_id: str, side: Side, request: DraftWriteRequest, user: Require
 
 
 @router.put("/match-input/drafts/{gm_id}/{side}/setup", include_in_schema=False)
-def save_draft_setup(gm_id: str, side: Side, request: InputSetupWriteRequest, user: RequiredUser = None) -> dict:
+def save_draft_setup(gm_id: str, side: Side, request: InputSetupWriteRequest, user: RequiredUser = None) -> dict | LiveCommandAck:
     """Write formation/lineup only after a real configuration action.
 
     This is intentionally hidden from Swagger: it is a browser collaboration
@@ -1054,6 +1241,17 @@ def save_draft_setup(gm_id: str, side: Side, request: InputSetupWriteRequest, us
     touched here.
     """
     setup = _save_setup_mutation(gm_id, side, request, user)
+    if isinstance(setup, LiveCommandAck):
+        draft_sockets.publish(gm_id, side, {'type': 'mutation', 'event': setup.event})
+        return setup
     if setup:
         draft_sockets.publish(gm_id, side, {"type": "setup", "gmId": gm_id, "side": side, "setup": setup})
     return {"status": "ok", "gmId": gm_id, "side": side, "inputSetup": setup}
+
+
+@router.get('/match-input/drafts/{gm_id}/{side}/room', include_in_schema=False)
+def get_live_room(gm_id: str, side: Side, user: RequiredUser = None) -> dict:
+    room = room_state(JpdDidData(), gm_id, side)
+    if user.uid not in room['participants']:
+        raise BackendError('Join the Draft first', status_code=403, code='participant_required')
+    return room

@@ -1004,11 +1004,17 @@ class JpdDidData:
         field_side = values.get("fieldSide")
         if not isinstance(formation_key, str) or not formation_key or not isinstance(lineup, list):
             return None
+        # An empty legacy base must not hide a populated current lineup.
+        has_base = isinstance(base_lineup, list) and any(
+            isinstance(item, dict) and isinstance(item.get('playerId'), str)
+            and item.get('playerId') and item.get('type') in {'START', 'BENCH'}
+            for item in base_lineup
+        )
         return {
             "formationKey": formation_key,
             "fieldSide": field_side if field_side in {"left", "right"} else None,
-            "lineup": [item for item in (base_lineup if isinstance(base_lineup, list) else lineup) if isinstance(item, dict)],
-            "lineupIsBaseline": isinstance(base_lineup, list),
+            "lineup": [item for item in (base_lineup if has_base else lineup) if isinstance(item, dict)],
+            "lineupIsBaseline": has_base,
             "subs": JpdDidData._normalise_input_subs(values.get("subs")),
             "inputMode": values.get("inputMode") if values.get("inputMode") in {"분석", "실시간"} else "분석",
             "revision": int(values.get("revision") or 0),
@@ -1044,14 +1050,14 @@ class JpdDidData:
         client_state: dict[str, Any],
         deleted_sub_ids: list[str] | None = None,
         merge_substitutions: bool = False,
+        delta_only: bool = False,
     ) -> dict[str, Any] | None:
         """Checkpoint Draft setup without allowing blank state writes to erase it."""
         reference = self._input_setup_reference(gm_id, side)
         current = reference.get(retry=None, timeout=10).to_dict() or {}
-        previous = self._with_input_setup_subs(
-            reference,
-            self._normalise_input_setup(current.get("setup")),
-        ) or {}
+        previous = self._normalise_input_setup(current.get('setup')) or {}
+        if not delta_only:
+            previous = self._with_input_setup_subs(reference, previous or None) or {}
         formation_key = payload.get("formationKey")
         lineup = payload.get("lineup")
         selected_field_side = client_state.get("side")
@@ -1100,21 +1106,27 @@ class JpdDidData:
             "updatedAt": utc_now(),
         }
         substitutions = reference.collection("substitutions")
-        existing = list(substitutions.stream(retry=None, timeout=20))
+        existing = list(substitutions.stream(retry=None, timeout=20)) if not delta_only else []
         batch = self.db.batch()
         # Seed a pre-event-array Draft once. Subsequent saves upsert by event
         # ID, so an earlier browser snapshot cannot replace another event.
-        if not existing:
+        if not existing and (not delta_only or not current.get('substitutionsMigrated')):
             for index, legacy in enumerate(previous_subs):
                 sub_id = self._input_sub_id(legacy, index)
-                batch.set(substitutions.document(sub_id), {**legacy, "id": sub_id, "deleted": False}, merge=True)
+                sub_ref = substitutions.document(sub_id)
+                if not delta_only or not sub_ref.get(retry=None, timeout=10).exists:
+                    batch.set(sub_ref, {**legacy, "id": sub_id, "deleted": False}, merge=True)
         for index, sub in enumerate(next_subs):
             sub_id = self._input_sub_id(sub, index)
             batch.set(substitutions.document(sub_id), {**sub, "id": sub_id, "deleted": False}, merge=True)
         for sub_id in deleted_ids:
             batch.set(substitutions.document(sub_id), {"id": sub_id, "deleted": True}, merge=True)
         batch.set(reference, {"setup": next_setup}, merge=True)
+        if delta_only:
+            batch.set(reference, {'substitutionsMigrated': True}, merge=True)
         batch.commit(retry=None, timeout=20)
+        if delta_only:
+            return self._normalise_input_setup(next_setup)
         return self._with_input_setup_subs(reference, self._normalise_input_setup(next_setup))
 
     @staticmethod
@@ -1735,7 +1747,10 @@ class JpdDidData:
     def _lifecycle_rank(cls, status: Any) -> int:
         return cls._LIFECYCLE_ORDER.index(status) if status in cls._LIFECYCLE_ORDER else -1
 
-    def get_input_draft(self, gm_id: str, side: Side) -> dict[str, Any]:
+    def get_input_draft(self, gm_id: str, side: Side, *, include_setup: bool = True) -> dict[str, Any]:
+        if not getattr(self.db, 'live_transaction', False):
+            from backend.system.system_live_room import read_snapshot
+            return read_snapshot(self, gm_id, side, include_setup=include_setup)
         reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
         snapshot = reference.get(retry=None, timeout=10)
         if not snapshot.exists:
@@ -1745,6 +1760,8 @@ class JpdDidData:
         # A document path is not sufficient identity proof: old browser bugs
         # could leave a payload from another session under a reused Draft key.
         # Never let that data enter bootstrap, polling, or the live socket.
+        if document.get('liveClosed') or document.get('liveRestoring') or not isinstance(payload, dict):
+            raise NotFoundError(f"Input draft not found: {gm_id}/{side}")
         if document.get("gmId") not in {None, gm_id} or document.get("side") not in {None, side}:
             raise BackendError("Input draft root identity does not match its path", status_code=409, code="draft_identity_mismatch")
         if isinstance(payload, dict) and (payload.get("gmId") != gm_id or payload.get("side") != side):
@@ -1756,7 +1773,7 @@ class JpdDidData:
         """Accept both the old browser record shape and the API payload shape."""
         if values.get("deleted"):
             return None
-        record = {key: value for key, value in values.items() if key not in {"deleted", "updatedAt", "updatedBy", "edited"}}
+        record = {key: value for key, value in values.items() if key not in {"deleted", "updatedAt", "updatedBy", "edited", "commandRevision"}}
         record["id"] = str(record.get("id") or record_id)
         if "halfSeconds" not in record and "seconds" in record:
             record["halfSeconds"] = record.pop("seconds")
@@ -1828,12 +1845,17 @@ class JpdDidData:
         deleted_card_ids: list[str] | None = None,
         cleared_record_player_ids: list[str] | None = None,
         include_events: bool = True,
+        allow_closed: bool = False,
+        delta_only: bool = False,
     ) -> dict[str, Any]:
         reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
         now = utc_now()
         current = reference.get(retry=None, timeout=10)
         previous = current.to_dict() or {}
-        previous_shared = previous.get("sharedState") if isinstance(previous.get("sharedState"), dict) else {}
+        if not allow_closed and (previous.get('liveClosed') or previous.get('liveClosing') or previous.get('liveRestoring')):
+            raise BackendError('The input session is closed or finalizing', status_code=409, code='room_closed')
+        live_state_keys = {'halfStatus', 'seconds', 'h1Seconds', 'h2Seconds', 'clockStartedAt', 'homeScore', 'awayScore'}
+        previous_shared = {key: value for key, value in (previous.get('sharedState') or {}).items() if key in live_state_keys}
         previous_client = previous.get("clientState") if isinstance(previous.get("clientState"), dict) else {}
         previous_payload = previous.get("payload") if isinstance(previous.get("payload"), dict) else {}
         # Only the primary analyst can advance shared match lifecycle/clock.
@@ -1845,7 +1867,7 @@ class JpdDidData:
         can_write_live_state = not primary_uid or primary_uid == user_id or is_participant_primary
         if is_participant_primary and primary_uid != user_id:
             primary_uid = user_id
-        if sync_scope in {"state", "state_records"} and can_write_live_state:
+        if sync_scope in {"state", "state_records", "checkpoint"} and can_write_live_state and not allow_closed:
             # A live state write queued before "half end" can reach the server after
             # the H1_done/H2_done checkpoint. It must never reopen a finished half.
             previous_status = previous_shared.get("halfStatus") or previous_payload.get("status")
@@ -1913,29 +1935,37 @@ class JpdDidData:
                     "deleted": False, "updatedAt": now, "updatedBy": user_id,
                 }, merge=True)
                 record_mutation_count += 1
+                if sync_scope == 'checkpoint' and record_mutation_count % 400 == 0:
+                    records_batch.commit(retry=None, timeout=20)
+                    records_batch = self.db.batch()
             for record_id in deleted_record_ids or []:
                 if record_id:
                     records_batch.set(records_reference.document(str(record_id)), {
                         "id": str(record_id), "deleted": True, "updatedAt": now, "updatedBy": user_id,
                     }, merge=True)
                     record_mutation_count += 1
+                    if sync_scope == 'checkpoint' and record_mutation_count % 400 == 0:
+                        records_batch.commit(retry=None, timeout=20)
+                        records_batch = self.db.batch()
 
         cards_batch = None
         if sync_scope == "cards":
             cards_reference = reference.collection("cards")
             cards_batch = self.db.batch()
-            existing_cards = list(cards_reference.stream(retry=None, timeout=20))
+            existing_cards = list(cards_reference.stream(retry=None, timeout=20)) if not delta_only else []
             # Migrate legacy root-array cards once before accepting per-event
             # writes. Tombstones are documents too, so an all-card deletion is
             # preserved rather than falling back to the old root array.
-            if not existing_cards:
+            if not existing_cards and (not delta_only or not previous.get('cardsMigrated')):
                 for index, legacy in enumerate(previous_payload.get("cards", [])):
                     if not isinstance(legacy, dict):
                         continue
                     legacy_id = str(legacy.get("id") or f"legacy-card:{legacy.get('playerId')}:{legacy.get('half')}:{legacy.get('halfSeconds')}:{legacy.get('card')}:{index}")
-                    cards_batch.set(cards_reference.document(legacy_id), {
-                        **legacy, "id": legacy_id, "deleted": False, "updatedAt": now, "updatedBy": user_id,
-                    }, merge=True)
+                    legacy_ref = cards_reference.document(legacy_id)
+                    if not delta_only or not legacy_ref.get(retry=None, timeout=10).exists:
+                        cards_batch.set(legacy_ref, {
+                            **legacy, "id": legacy_id, "deleted": False, "updatedAt": now, "updatedBy": user_id,
+                        }, merge=True)
             for index, card in enumerate(payload.get("cards", [])):
                 if not isinstance(card, dict):
                     continue
@@ -1970,6 +2000,8 @@ class JpdDidData:
             next_client_state = previous_client
         else:
             next_client_state = client_state
+        # Recovery UI shell is never another copy of the shared event tables.
+        next_client_state = {key: value for key, value in next_client_state.items() if key not in {'records', 'cards', 'subs'}}
         document: dict[str, Any] = {
             "gmId": gm_id,
             "side": side,
@@ -1987,6 +2019,10 @@ class JpdDidData:
             "collaboration": previous.get("collaboration", {}),
             "sharedState": shared_state,
         }
+        if allow_closed:
+            document.update(liveClosed=False, liveClosing=None, setup=None)
+        if delta_only and sync_scope == 'cards':
+            document['cardsMigrated'] = True
         if payload_update is not None:
             document["payload"] = payload_update
         # A normal live command touches one or a handful of record documents.
@@ -2026,7 +2062,7 @@ class JpdDidData:
             self.sync_input_summary_from_draft(gm_id, side, saved)
         if include_events:
             return self._with_draft_records(reference, saved)
-        if sync_scope == "cards" and isinstance(saved.get("payload"), dict):
+        if sync_scope == "cards" and not delta_only and isinstance(saved.get("payload"), dict):
             saved = {**saved, "payload": {**saved["payload"], "cards": self._draft_cards(reference)}}
         return saved
 
@@ -2254,13 +2290,20 @@ class JpdDidData:
             for snapshot in records[start:start + 400]:
                 batch.delete(snapshot.reference)
             batch.commit(retry=None, timeout=20)
-        reference.delete(retry=None, timeout=20)
+        previous = reference.get(retry=None, timeout=10).to_dict() or {}
+        # Keep a closed aggregate head: stale offline commands must not create
+        # another active Draft after final RAW promotion.
+        reference.set({'liveClosed': True, 'liveClosing': None, 'payload': None, 'clientState': {},
+            'status': 'final', 'sharedState': {'halfStatus': 'final', 'clockStartedAt': None},
+            'revision': int(previous.get('revision') or 0) + 1,
+            'roomEpoch': int(previous.get('roomEpoch') or 0) + 1}, merge=True, retry=None, timeout=20)
 
     def list_input_drafts(self, *, recorder_level: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
         # Drafts are operationally small. Filtering locally avoids requiring a composite index.
         documents = [snapshot.to_dict() or {} for snapshot in self.db.collection("inputDrafts").stream(retry=None, timeout=30)]
         return [
             document for document in documents
+            if not document.get('liveClosed')
             if (recorder_level is None or document.get("recorderLevel") == recorder_level)
             and (status is None or document.get("status") == status)
         ]
@@ -2697,7 +2740,7 @@ class JpdDidData:
             with ThreadPoolExecutor(max_workers=3, thread_name_prefix="input-bootstrap-live") as executor:
                 setup_future = executor.submit(self.get_input_setup, gm_id)
                 kpi_future = executor.submit(self.read_match_dashboard_kpis_bootstrap, gm_id, bootstrap_kpi_halves)
-                draft_future = executor.submit(self.get_input_draft, gm_id, side)
+                draft_future = executor.submit(self.get_input_draft, gm_id, side, include_setup=False)
                 input_setup = setup_future.result()
                 dashboard_kpis = kpi_future.result()
                 try:
@@ -2752,12 +2795,26 @@ class JpdDidData:
         except NotFoundError:
             pass
         raw_state = self.read_input_state_from_raw(gm_id, side)
+        reference = self._input_setup_reference(gm_id, side)
+        previous = reference.get(retry=None, timeout=10).to_dict() or {}
+        if previous.get('liveClosing'):
+            raise BackendError('Final update is still running', status_code=409, code='room_closing')
+        # Finalized Drafts retain only a closed root and command receipts. Clear
+        # prior event authorities before the explicit RAW correction session.
+        for name in ('records', 'cards', 'substitutions'):
+            snapshots = list(reference.collection(name).stream(retry=None, timeout=20))
+            for start in range(0, len(snapshots), 400):
+                batch = self.db.batch()
+                for snapshot in snapshots[start:start + 400]:
+                    batch.delete(snapshot.reference)
+                batch.commit(retry=None, timeout=20)
         draft = self.save_input_draft(
             gm_id,
             side,
             payload=raw_state["payload"],
             client_state=raw_state["clientState"],
             user_id=user_id,
+            allow_closed=True,
         )
         # Final RAW already owns formation, field side and lineup. Seed the
         # temporary setup when the explicit edit action recreates its Draft.
