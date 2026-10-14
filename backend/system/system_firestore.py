@@ -2686,10 +2686,11 @@ class JpdDidData:
                     ),
                 }
         elif selected_status.get("lifecycleStatus") == "ready":
-            # Fresh scheduled fixtures have no Draft, setup, or KPI data. The
-            # prebuilt summary + roster snapshot are enough for the waiting
-            # room, so do not spend reads proving that those documents miss.
-            input_setup = {"H": None, "A": None}
+            # Fresh scheduled fixtures have no Draft or KPI data, so do not
+            # spend reads proving that those documents miss. Setup is still
+            # read: "세팅 저장" keeps the fixture ready, and leaving the lobby
+            # must not hide the saved formation/lineup on the next visit.
+            input_setup = self.get_input_setup(gm_id)
             dashboard_kpis = self._empty_input_dashboard_kpis()
             session = {"status": "missing", "gmId": gm_id, "side": side}
         else:

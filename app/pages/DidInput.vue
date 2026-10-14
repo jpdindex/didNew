@@ -613,9 +613,8 @@ watch([visibleRecords, halfCode, previewScope], () => {
   scheduleInputPreview(visibleRecords.value, halfCode.value, previewScope.value)
 }, { deep: true, immediate: true })
 
-// 가안 행 시간: 기본은 위치를 찍은 순간에 멈춘다. '흐르는 초' 버튼을 켜면 경기 시계를 그대로 따라간다.
+// 가안 행 시간: 위치를 찍은 순간에 멈춘다.
 // 확정되는 레코드의 시간도 가안 행에 보이던 값과 같게 draftSeconds 를 쓴다.
-const liveDraftTime = ref(false)
 const pendingSeconds = ref<number | null>(null)
 // 수정 화면 전용: 기록표에서 누른 기록의 시각. 시계에 이 시각을 보여주고, 새로 입력하는
 // 기록도 이 시각으로 만들어 그 행 바로 뒤에 끼워 넣는다(예: 00:01 기록은 가장 가까운 00:09
@@ -623,7 +622,7 @@ const pendingSeconds = ref<number | null>(null)
 const anchorSeconds = ref<number | null>(null)
 const clockSeconds = computed(() => (isEditMode && anchorSeconds.value !== null ? anchorSeconds.value : seconds.value))
 const draftSeconds = computed(() =>
-  liveDraftTime.value || pendingSeconds.value === null ? clockSeconds.value : pendingSeconds.value
+  pendingSeconds.value === null ? clockSeconds.value : pendingSeconds.value
 )
 // 수정 화면에서 기존 기록 사이에 끼워 넣은 레코드를 시간 자리로 정렬한다. 같은 초의 기존 기록
 // 뒤에 오도록 seq 를 지금까지 가장 큰 값 다음으로 준다 — didLogic 의 seq 카운터는 화면을 새로
@@ -2219,8 +2218,25 @@ function saveToStore() {
   else game.value.h2Seconds = seconds.value
 }
 
+const returnTo = useReturnNavigation()
+// 앱 안의 버튼/종료 흐름으로 나가는 중인지. 아니면(태블릿 뒤로가기) 아래 가드가 이동을 막고
+// "대기방으로 나가기"와 같은 확인 절차를 거치게 한다.
+let leavingToLobby = false
+onBeforeRouteLeave(() => {
+  if (leavingToLobby) return true
+  if (confirmDialog.value) {
+    closeConfirm(false)
+    return false
+  }
+  if (isFinalCorrection) exitFinalCorrection()
+  else void exitToLobby()
+  return false
+})
+
 function goTeamSelection() {
-  navigateTo({
+  if (leavingToLobby) return
+  leavingToLobby = true
+  return returnTo({
     path: '/TeamSelection',
     query: {
       matchId: route.query.matchId,
@@ -2331,10 +2347,7 @@ async function finishHalf() {
             <button class="swapIcon" :class="{ on: subOpen }" title="선수 교체" @click="openSubPanel">🔄</button>
             <div class="clockCtrl">
               <button v-if="inputMode === '분석'" class="pauseBtn" :disabled="!isPrimary || isEditMode" :class="{ paused }"
-                @click="togglePause">{{ paused ? '▶' : '❚❚' }}</button>
-              <button class="liveTimeBtn" :class="{ on: liveDraftTime }" title="가안 행 시간을 경기 시계에 맞춰 흐르게 한다"
-                @click="liveDraftTime = !liveDraftTime">흐르는 초</button>
-            </div>
+                @click="togglePause">{{ paused ? '▶' : '❚❚' }}</button>            </div>
             <div v-if="inputMode !== '분석'" class="modeTag">실시간</div>
           </div>
 
@@ -3392,25 +3405,6 @@ button {
 .pauseBtn.paused {
   background: rgba(240, 180, 41, .2);
   border-color: #f0b429
-}
-
-.liveTimeBtn {
-  height: 34px;
-  padding: 0 10px;
-  border-radius: 4px;
-  border: 1px solid rgba(255, 255, 255, .15);
-  background: rgba(255, 255, 255, .06);
-  color: rgba(255, 255, 255, .5);
-  font-size: 12px;
-  font-weight: 700;
-  white-space: nowrap;
-  cursor: pointer
-}
-
-.liveTimeBtn.on {
-  background: rgba(240, 180, 41, .2);
-  border-color: #f0b429;
-  color: #f0b429
 }
 
 .modeTag {

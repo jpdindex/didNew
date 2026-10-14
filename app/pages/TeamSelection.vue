@@ -21,6 +21,8 @@ import {
 } from '~/utils/grass'
 
 const route = useRoute()
+// 경기 스케줄은 이 화면의 이전 기록이다. 버튼과 태블릿 뒤로가기가 같은 기록으로 돌아가게 한다.
+const returnTo = useReturnNavigation()
 const matchId = computed(() => String(route.query.matchId ?? ''))
 const match = computed(() => ({
   date: String(route.query.date ?? '') || '2024-12-15', time: String(route.query.time ?? '12:00'),
@@ -47,6 +49,9 @@ let appliedSetupFingerprint = ''
 let appliedSetupRevision = -1
 let pendingSetupFingerprint = ''
 let applyingRemoteSetup = false
+// 로컬 편집/저장마다 올린다. KPI 폴링 응답은 요청 시점의 값과 다르면 세팅을 적용하지 않는다
+// — 저장 전에 출발한 응답이 방금 저장한 라인업을 옛 세팅으로 덮지 못하게 한다.
+let setupEpoch = 0
 
 // ---- 공유 상태 ----
 // TeamSelection ↔ DidInput 이 함께 쓰는 임시 스토어(useState). 전반/후반 종료 후
@@ -307,6 +312,7 @@ async function loadSquads() {
 async function loadDashboardKpis(half: 'all' | 'H1' | 'H2' = kpiHalf.value) {
   if (!matchId.value || dashboardKpiLoading.has(half)) return
   dashboardKpiLoading.add(half)
+  const requestedEpoch = setupEpoch
   try {
   const payload = await request<{ kpis: { H: DashboardKpi; A: DashboardKpi }; inputSetup?: { H: InputSetup | null; A: InputSetup | null } }>(
     `/api/v1/match-input/matches/${encodeURIComponent(matchId.value)}/dashboard-kpis?half=${half}`,
@@ -317,7 +323,8 @@ async function loadDashboardKpis(half: 'all' | 'H1' | 'H2' = kpiHalf.value) {
   const setups = payload.inputSetup ?? { H: null, A: null }
   applySetupFieldSides(setups)
   const setup = game.value.team === 'away' ? setups.A : setups.H
-  if (setup) applyInputSetup(setup)
+  // 세팅 저장 중이거나 요청 이후 로컬 편집/저장이 있었다면 이 응답의 세팅은 이미 낡았다.
+  if (setup && !lifecycleBusy.value && requestedEpoch === setupEpoch) applyInputSetup(setup)
   if (game.value.halfStatus === 'ready') applyOpponentFieldSideDefault(game.value.team)
   } finally {
     dashboardKpiLoading.delete(half)
@@ -535,6 +542,10 @@ function resetForInputTeam(team: 'home' | 'away') {
     h1Locked: false,
     h2Locked: false,
   })
+  // 화면을 비우는 초기화는 사용자의 라인업 편집이 아니다. 편집으로 잡히면 빈 라인업이
+  // "저장 대기"로 고정돼, 뒤이어 받은 서버 세팅(저장된 라인업)을 applyInputSetup 이 거절한다.
+  applyingRemoteSetup = true
+  nextTick(() => { applyingRemoteSetup = false })
 }
 
 async function pickTeam(team: 'home' | 'away') {
@@ -673,6 +684,7 @@ function onDragStart(playerId: string) {
 function recordFormationChange() {
   if (applyingRemoteSetup) return
   if (!game.value.matchId) return
+  setupEpoch++
   // Lock the local lineup immediately, before the debounce starts. A late
   // response from the old server snapshot must not erase a just-picked player.
   pendingSetupFingerprint = currentSetupFingerprint()
@@ -705,8 +717,10 @@ function persistCurrentSetup(fingerprint = currentSetupFingerprint()): Promise<b
   if (!game.value.formationKey) return Promise.resolve(false)
   if (pendingSetupFingerprint === fingerprint && pendingSetupSave) return pendingSetupSave
   pendingSetupFingerprint = fingerprint
+  setupEpoch++
   const save = syncSetup(game.value)
     .then(saved => {
+      setupEpoch++
       if (saved && pendingSetupFingerprint === fingerprint) {
         appliedSetupFingerprint = fingerprint
         pendingSetupFingerprint = ''
@@ -929,8 +943,11 @@ async function enterPreparedHalf(target: 'H1' | 'H2') {
   }
 }
 
-function startFirstHalf() {
-  return setupSaved.value ? enterPreparedHalf('H1') : saveEntrySetup()
+async function startFirstHalf() {
+  if (!setupSaved.value) return saveEntrySetup()
+  if (lifecycleBusy.value || !canStart.value || matchInfoEditMode.value) return
+  if (!await askConfirm('전반전을 시작하시겠습니까?', '시작하면 경기 시간이 흐르기 시작합니다.', '전반전 시작')) return
+  return enterPreparedHalf('H1')
 }
 function roleLabel(role: 'primary' | 'assistant' | 'manager') {
   return role === 'primary' ? '주 분석관' : role === 'manager' ? '매니저' : '부 분석관'
@@ -1002,8 +1019,11 @@ function editHalf() {
   game.value.halfStatus = prevStatus === 'H2_done' ? 'H2' : 'H1'
   navigateTo({ path: '/DidInput', query: didInputQuery(game.value.halfStatus === 'H2' ? '후반' : '전반', true, prevStatus) })
 }
-function startSecondHalf() {
-  return setupSaved.value ? enterPreparedHalf('H2') : saveEntrySetup()
+async function startSecondHalf() {
+  if (!setupSaved.value) return saveEntrySetup()
+  if (lifecycleBusy.value || !canStart.value || matchInfoEditMode.value) return
+  if (!await askConfirm('후반전을 시작하시겠습니까?', '시작하면 경기 시간이 흐르기 시작합니다.', '후반전 시작')) return
+  return enterPreparedHalf('H2')
 }
 
 onMounted(async () => {
@@ -1507,7 +1527,7 @@ function undoSub(index: number) {
 <template>
   <div class="page">
     <div class="bg" />
-    <button type="button" class="topBack" @click="navigateTo('/schedule')">← 경기 선택</button>
+    <button type="button" class="topBack" @click="returnTo('/schedule')">← 경기 선택</button>
     <div class="frame">
       <aside class="sidebar">
         <div class="sidebarFixed">
@@ -1827,7 +1847,7 @@ function undoSub(index: number) {
                 </div>
               </template>
               <p v-if="lifecycleError" class="lifecycleError">{{ lifecycleError }}</p>
-              <small v-if="matchId">matchId: {{ matchId }}</small>
+              <small v-if="matchId" class="matchIdTag">matchId: {{ matchId }}</small>
             </section>
           </div>
         </div>
@@ -3497,6 +3517,9 @@ button {
 }
 
 .modeBtn small {
+  position: absolute;
+  right: 8px;
+  bottom: 3px;
   font-size: 8px;
   font-weight: 600;
   color: rgba(255, 255, 255, .3)
@@ -3541,9 +3564,9 @@ button {
   cursor: pointer
 }
 
-.startPanel small {
+.startPanel .matchIdTag {
   position: absolute;
-  right: 8px;
+  left: 8px;
   bottom: 3px;
   color: rgba(255, 255, 255, .25);
   font-size: 8px

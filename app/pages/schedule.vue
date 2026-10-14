@@ -34,7 +34,15 @@ const viewMonth = ref(today.getMonth()) // 0-11
 const yearOptions = computed(() => Array.from({ length: 101 }, (_, index) => 2000 + index))
 const monthOptions = Array.from({ length: 12 }, (_, index) => index)
 
-const selectedDate = ref<string>('') // YYYY-MM-DD
+function toYMD(y: number, m0: number, d: number) {
+  const mm = String(m0 + 1).padStart(2, '0')
+  const dd = String(d).padStart(2, '0')
+  return `${y}-${mm}-${dd}`
+}
+
+const todayYMD = toYMD(today.getFullYear(), today.getMonth(), today.getDate())
+
+const selectedDate = ref<string>(todayYMD) // YYYY-MM-DD, 진입 시 오늘 날짜 자동 선택
 const selectedMatchId = ref<string>('')
 const selectedTeam = ref<'home' | 'away' | null>(null)
 const roleDialogOpen = ref(false)
@@ -42,12 +50,6 @@ const matches = ref<MatchItem[]>([])
 const loadingMatches = ref(false)
 const loadError = ref('')
 const { request } = useBackendApi()
-
-function toYMD(y: number, m0: number, d: number) {
-  const mm = String(m0 + 1).padStart(2, '0')
-  const dd = String(d).padStart(2, '0')
-  return `${y}-${mm}-${dd}`
-}
 
 const calendarDays = computed(() => {
   const y = viewYear.value
@@ -86,8 +88,121 @@ function nextMonth() {
   applyCalendarView()
 }
 
+// 달력 좌우 스와이프로 월 이동 (왼쪽 → 다음 달, 오른쪽 → 이전 달)
+const SWIPE_THRESHOLD = 50
+const SLIDE_DISTANCE = 140
+const SLIDE_MS = 180
+let swipeStart: { x: number; y: number; id: number; dragging: boolean } | null = null
+let suppressNextClick = false
+let sliding = false
+
+// 손가락을 따라 달력이 움직이고, 월이 바뀔 때 밀려나갔다 들어오는 효과
+const calOffset = ref(0)
+const calOpacity = ref(1)
+const calTransition = ref(false)
+const calStyle = computed(() => ({
+  transform: `translateX(${calOffset.value}px)`,
+  opacity: calOpacity.value,
+  transition: calTransition.value ? `transform ${SLIDE_MS}ms ease-out, opacity ${SLIDE_MS}ms ease-out` : 'none',
+}))
+
+function prefersReducedMotion() {
+  return typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+}
+
+function nextFrame() {
+  return new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+}
+
+function wait(ms: number) {
+  return new Promise<void>(resolve => setTimeout(resolve, ms))
+}
+
+// dir: 1 → 다음 달(왼쪽으로 밀려남), -1 → 이전 달
+async function slideMonth(dir: 1 | -1) {
+  if (sliding) return
+  if (prefersReducedMotion()) {
+    calOffset.value = 0
+    dir === 1 ? nextMonth() : prevMonth()
+    return
+  }
+  sliding = true
+  calTransition.value = true
+  calOffset.value = -dir * SLIDE_DISTANCE
+  calOpacity.value = 0
+  await wait(SLIDE_MS)
+  dir === 1 ? nextMonth() : prevMonth()
+  calTransition.value = false
+  calOffset.value = dir * SLIDE_DISTANCE
+  await nextFrame()
+  calTransition.value = true
+  calOffset.value = 0
+  calOpacity.value = 1
+  await wait(SLIDE_MS)
+  calTransition.value = false
+  sliding = false
+}
+
+function onCalendarPointerDown(event: PointerEvent) {
+  if (event.pointerType === 'mouse' || sliding) return
+  swipeStart = { x: event.clientX, y: event.clientY, id: event.pointerId, dragging: false }
+}
+
+function onCalendarPointerMove(event: PointerEvent) {
+  if (!swipeStart || swipeStart.id !== event.pointerId) return
+  const dx = event.clientX - swipeStart.x
+  const dy = event.clientY - swipeStart.y
+  if (!swipeStart.dragging) {
+    if (Math.abs(dx) < 10 || Math.abs(dx) < Math.abs(dy)) return
+    swipeStart.dragging = true
+    // 가로 드래그가 확정된 뒤에만 캡처 (탭 클릭 대상은 그대로 유지)
+    ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+  }
+  calTransition.value = false
+  calOffset.value = dx * 0.6
+  calOpacity.value = 1 - Math.min(Math.abs(dx) / 600, 0.35)
+}
+
+function onCalendarPointerUp(event: PointerEvent) {
+  if (!swipeStart || swipeStart.id !== event.pointerId) return
+  const dx = event.clientX - swipeStart.x
+  const dy = event.clientY - swipeStart.y
+  const dragging = swipeStart.dragging
+  swipeStart = null
+  if (dragging) {
+    // 스와이프 끝에 손가락 아래 셀이 클릭되는 것 방지
+    suppressNextClick = true
+    setTimeout(() => { suppressNextClick = false }, 300)
+  }
+  if (Math.abs(dx) < SWIPE_THRESHOLD || Math.abs(dx) < Math.abs(dy) * 1.5) {
+    snapBack()
+    return
+  }
+  slideMonth(dx < 0 ? 1 : -1)
+}
+
+function snapBack() {
+  calTransition.value = true
+  calOffset.value = 0
+  calOpacity.value = 1
+}
+
+function onCalendarPointerCancel() {
+  swipeStart = null
+  snapBack()
+}
+
+function onCalendarClickCapture(event: MouseEvent) {
+  if (!suppressNextClick) return
+  suppressNextClick = false
+  event.stopPropagation()
+  event.preventDefault()
+}
+
 function applyCalendarView() {
-  selectedDate.value = ''
+  // 이번 달로 돌아오면 오늘 날짜를 다시 선택
+  const isCurrentMonth = viewYear.value === today.getFullYear() && viewMonth.value === today.getMonth()
+  selectedDate.value = isCurrentMonth ? todayYMD : ''
   selectedMatchId.value = ''
   selectedTeam.value = null
   loadMatches()
@@ -341,7 +456,6 @@ function onCancel() {
       <div class="topBar">
         <div class="title">경기일자와 경기를 선택해주세요</div>
         <div class="topRight">
-          <div class="meta">did.matchison.com · v0.8.17</div>
           <NuxtLink class="manageBtn" to="/manage">데이터 관리</NuxtLink>
           <button class="logoutBtn" @click="logout">로그아웃</button>
         </div>
@@ -364,8 +478,8 @@ function onCancel() {
               </select>
             </div>
             <div class="monthNav" aria-label="월 이동">
-              <button class="iconBtn" @click="prevMonth" aria-label="Prev month">‹</button>
-              <button class="iconBtn" @click="nextMonth" aria-label="Next month">›</button>
+              <button class="iconBtn" @click="slideMonth(-1)" aria-label="Prev month">‹</button>
+              <button class="iconBtn" @click="slideMonth(1)" aria-label="Next month">›</button>
             </div>
           </div>
 
@@ -373,7 +487,16 @@ function onCancel() {
             <span>일</span><span>월</span><span>화</span><span>수</span><span>목</span><span>금</span><span>토</span>
           </div>
 
-          <div class="cal">
+          <div class="calViewport">
+          <div
+            class="cal"
+            :style="calStyle"
+            @pointerdown="onCalendarPointerDown"
+            @pointermove="onCalendarPointerMove"
+            @pointerup="onCalendarPointerUp"
+            @pointercancel="onCalendarPointerCancel"
+            @click.capture="onCalendarClickCapture"
+          >
             <button
               v-for="(c, idx) in calendarDays"
               :key="idx"
@@ -388,6 +511,7 @@ function onCancel() {
             >
               <span v-if="c.day">{{ c.day }}</span>
             </button>
+          </div>
           </div>
         </section>
 
@@ -537,7 +661,6 @@ function onCancel() {
 }
 .title { color: rgba(255,255,255,0.85); font-weight: 700; letter-spacing: 0.02em; }
 .topRight { position: absolute; right: 16px; display: flex; align-items: center; gap: 12px; }
-.meta { color: rgba(255,255,255,0.35); font-size: 12px; }
 .logoutBtn {
   height: 26px;
   padding: 0 10px;
@@ -624,11 +747,16 @@ function onCancel() {
   text-align: center;
 }
 
+.calViewport { min-height: 0; overflow: hidden; }
 .cal {
+  height: 100%;
+  will-change: transform;
   display: grid;
   grid-template-columns: repeat(7, 1fr);
   gap: 12px 6px;
   align-content: start;
+  touch-action: pan-y; /* 가로 스와이프는 월 이동으로 처리 */
+  user-select: none;
 }
 .cell {
   height: 56px;
