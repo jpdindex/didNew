@@ -1106,6 +1106,7 @@ function halfEntryEnvironment({ baseline = false, delayed = false, differentPeer
     lifecycleBusy: vue.ref(false), lifecycleError: vue.ref(''), bootstrapApplied: vue.ref(true), canStart: vue.ref(true), matchInfoEditMode: vue.ref(false),
     preparedInput: vue.ref(null), savedEntryFingerprint: vue.ref(''), requestedRole: 'primary', formationSaveTimer: undefined,
     preloadRouteComponents: async () => {}, clearTimeout() {},
+    ensureLobbyHistory: async () => {},
     ensureLobbyParticipant: async () => { game.value.participantRole = 'primary'; game.value.lifecycleControl = true },
     persistCurrentSetup: async () => {
       if (delayed) await gate.promise

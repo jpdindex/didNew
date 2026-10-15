@@ -11,10 +11,12 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response
 
 from backend.api.api_health import router as health_router
+from backend.api.api_aifootballx import router as aifootballx_router
 from backend.api.api_legacy_import import router as legacy_import_router
 from backend.api.api_match_kpis import router as match_kpis_router
 from backend.api.api_match_input import router as match_input_router
 from backend.api.api_match_ratings import router as match_ratings_router
+from backend.system.system_aifootballx import close_delivery_service
 from backend.system.system_firestore import (
     BackendError,
     PROJECT_ROOT,
@@ -39,6 +41,7 @@ async def lifespan(_: FastAPI):
         except FirebaseUnavailableError:
             logger.warning("Firebase Admin initialization failed; health will report firebaseInitialized=false")
     yield
+    close_delivery_service()
     logger.info("Stopping %s", settings.app_name)
 
 
@@ -89,6 +92,7 @@ async def unhandled_error_handler(_: Request, exc: Exception) -> JSONResponse:
 
 
 app.include_router(health_router)
+app.include_router(aifootballx_router, prefix=settings.api_prefix)
 app.include_router(legacy_import_router, prefix=settings.api_prefix)
 app.include_router(match_kpis_router, prefix=settings.api_prefix)
 app.include_router(match_input_router, prefix=settings.api_prefix)

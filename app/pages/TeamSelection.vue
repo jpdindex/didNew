@@ -49,9 +49,13 @@ let appliedSetupFingerprint = ''
 let appliedSetupRevision = -1
 let pendingSetupFingerprint = ''
 let applyingRemoteSetup = false
-// 로컬 편집/저장마다 올린다. KPI 폴링 응답은 요청 시점의 값과 다르면 세팅을 적용하지 않는다
-// — 저장 전에 출발한 응답이 방금 저장한 라인업을 옛 세팅으로 덮지 못하게 한다.
-let setupEpoch = 0
+let lobbyActive = true
+let initialKpisLoading = true
+let lobbyHistoryPromise: Promise<unknown> | undefined
+let lobbyHistoryLoaded = false
+const lobbyTeam = route.query.team === 'away' ? 'away' : 'home'
+const lobbyMatchId = matchId.value
+const isCurrentLobby = () => lobbyActive && game.value.matchId === lobbyMatchId && game.value.team === lobbyTeam
 
 // ---- 공유 상태 ----
 // TeamSelection ↔ DidInput 이 함께 쓰는 임시 스토어(useState). 전반/후반 종료 후
@@ -72,10 +76,10 @@ const bootstrapApplied = ref(false)
 watch(() => game.value.halfStatus, (st) => {
   if (st === 'H1' || st === 'H1_done') kpiHalf.value = 'H1'
   else if (st === 'H2' || st === 'H2_done') kpiHalf.value = 'H2'
-  else if (st === 'final') kpiHalf.value = 'all'
+  else if (st === 'final' || st === 'ready') kpiHalf.value = 'all'
 }, { immediate: true })
 watch(kpiHalf, half => {
-  if (!bootstrapApplied.value) return
+  if (!bootstrapApplied.value || initialKpisLoading) return
   void loadDashboardKpis(half).catch(() => false)
 })
 
@@ -112,6 +116,8 @@ type InputBootstrapSession = {
   side: 'H' | 'A'
   payload?: InputPayload
   clientState?: MatchState
+  summaryOnly?: boolean
+  sharedState?: Partial<MatchState>
 }
 
 type InputSetup = {
@@ -142,7 +148,7 @@ function applyInputSetup(setup: InputSetup | null | undefined) {
   if (!Object.keys(assigned).length) return
   const revision = Number(setup.revision || 0)
   const fingerprint = setupFingerprint(setup)
-  // A delayed bootstrap/KPI/socket response is allowed to fill an empty
+  // A delayed bootstrap/socket response is allowed to fill an empty
   // lobby, but it must never replace a lineup the analyst has just placed and
   // not yet received an acknowledgement for.
   if (revision < appliedSetupRevision) return
@@ -197,11 +203,14 @@ function startLobbyCollaboration() {
       game.value.records = records
       // The lobby has a server KPI view. Refresh it after a peer event instead
       // of waiting for its recovery timer.
-      void loadDashboardKpis(kpiHalf.value).catch(() => false)
+      if (!initialKpisLoading) void loadDashboardKpis(kpiHalf.value).catch(() => false)
     },
     applyCards: (cards) => {
       if (!isCurrentLobbySession()) return
       game.value.cards = cards
+    },
+    snapshotReady: () => {
+      if (isCurrentLobbySession()) lobbyHistoryLoaded = true
     },
     applySetup: (setup) => {
       if (!isCurrentLobbySession()) return
@@ -265,7 +274,7 @@ async function loadBootstrap() {
   if (!matchId.value) return
   const side = game.value.team === 'away' ? 'A' : 'H'
   return await request<InputBootstrap>(
-    `/api/v1/match-input/matches/${encodeURIComponent(matchId.value)}/bootstrap?side=${side}`,
+    `/api/v1/match-input/matches/${encodeURIComponent(matchId.value)}/bootstrap?side=${side}&phase=setup`,
   )
 }
 
@@ -286,7 +295,11 @@ function applyBootstrap(payload: InputBootstrap) {
   const setups = payload.inputSetup ?? { H: null, A: null }
   applySetupFieldSides(setups)
   const selectedSetup = selectedTeam === 'home' ? setups.H : setups.A
-  if (payload.session.status === 'ok' && payload.session.payload) {
+  if (payload.session.summaryOnly) {
+    // The compact setup phase never hydrates transient UI/clientState fields.
+    if (selectedStatus.lifecycleStatus === 'ready') resetForInputTeam(selectedTeam)
+    Object.assign(game.value, payload.session.sharedState || {})
+  } else if (payload.session.status === 'ok' && payload.session.payload) {
     hydrate(game.value, payload.session.payload, payload.session.clientState)
   } else if (selectedStatus.lifecycleStatus === 'ready') {
     resetForInputTeam(selectedTeam)
@@ -302,7 +315,7 @@ function applyBootstrap(payload: InputBootstrap) {
   // Drafts are transient collaboration state. The snapshot is the lobby
   // authority for formation, field side and player placement.
   applyInputSetup(selectedSetup)
-  return payload.session.status === 'ok' && Boolean(payload.session.payload)
+  return Boolean(selectedSetup) || (payload.session.status === 'ok' && Boolean(payload.session.payload))
 }
 
 async function loadSquads() {
@@ -314,6 +327,7 @@ async function loadSquads() {
     inputStatus: { H: InputSideStatus; A: InputSideStatus }
     inputSetup: { H: InputSetup | null; A: InputSetup | null }
   }>(`/api/v1/match-input/matches/${encodeURIComponent(matchId.value)}/squads`)
+  if (!isCurrentLobby()) return
   const squads = { home: payload.H, away: payload.A }
   game.value.squads = squads
   game.value.matchSnapshot = payload.matchSnapshot
@@ -322,24 +336,60 @@ async function loadSquads() {
 }
 
 async function loadDashboardKpis(half: 'all' | 'H1' | 'H2' = kpiHalf.value) {
-  if (!matchId.value || dashboardKpiLoading.has(half)) return
+  if (!isCurrentLobby() || !matchId.value || dashboardKpiLoading.has(half)) return
   dashboardKpiLoading.add(half)
-  const requestedEpoch = setupEpoch
   try {
-  const payload = await request<{ kpis: { H: DashboardKpi; A: DashboardKpi }; inputSetup?: { H: InputSetup | null; A: InputSetup | null } }>(
-    `/api/v1/match-input/matches/${encodeURIComponent(matchId.value)}/dashboard-kpis?half=${half}`,
-  )
-  dashboardKpis.value.H[half] = payload.kpis.H
-  dashboardKpis.value.A[half] = payload.kpis.A
-  dashboardKpiLoaded[half] = true
-  const setups = payload.inputSetup ?? { H: null, A: null }
-  applySetupFieldSides(setups)
-  const setup = game.value.team === 'away' ? setups.A : setups.H
-  // 세팅 저장 중이거나 요청 이후 로컬 편집/저장이 있었다면 이 응답의 세팅은 이미 낡았다.
-  if (setup && !lifecycleBusy.value && requestedEpoch === setupEpoch) applyInputSetup(setup)
-  if (game.value.halfStatus === 'ready') applyOpponentFieldSideDefault(game.value.team)
+    const payload = await request<{ kpis: { H: DashboardKpi; A: DashboardKpi } }>(
+      `/api/v1/match-input/matches/${encodeURIComponent(lobbyMatchId)}/dashboard-kpis?half=${half}`,
+    )
+    if (!isCurrentLobby()) return
+    dashboardKpis.value.H[half] = payload.kpis.H
+    dashboardKpis.value.A[half] = payload.kpis.A
+    dashboardKpiLoaded[half] = true
+    // KPI responses never mutate the already displayed formation or lineup.
   } finally {
     dashboardKpiLoading.delete(half)
+  }
+}
+
+async function loadInitialKpis() {
+  const half = game.value.halfStatus.startsWith('H1') ? 'H1'
+    : game.value.halfStatus.startsWith('H2') ? 'H2' : null
+  try {
+    if (half) {
+      const side = lobbyTeam === 'away' ? 'A' : 'H'
+      const payload = await request<Pick<InputBootstrap, 'dashboardKpis'>>(
+        `/api/v1/match-input/matches/${encodeURIComponent(lobbyMatchId)}/bootstrap?side=${side}&phase=preview&half=${half}`,
+      )
+      if (!isCurrentLobby()) return
+      dashboardKpis.value.H[half] = payload.dashboardKpis.H[half]
+      dashboardKpis.value.A[half] = payload.dashboardKpis.A[half]
+      dashboardKpiLoaded[half] = true
+    }
+  } catch {
+    // Recovery polling retries the visible preview without delaying setup.
+  } finally {
+    if (isCurrentLobby()) {
+      initialKpisLoading = false
+      // Full-match KPI and collaboration history are the third stage.
+      void loadDashboardKpis('all').catch(() => false)
+      if (kpiHalf.value !== 'all' && kpiHalf.value !== half) void loadDashboardKpis(kpiHalf.value).catch(() => false)
+      void ensureLobbyHistory().catch(() => false)
+    }
+  }
+}
+
+async function ensureLobbyHistory() {
+  if (!isCurrentLobby() || inputStatus.value[lobbyTeam === 'away' ? 'A' : 'H'].rawStatus === 'final') return Promise.resolve()
+  if (!lobbyHistoryPromise) {
+    lobbyHistoryPromise = startLobbyCollaboration().catch(error => {
+      lobbyHistoryPromise = undefined
+      throw error
+    })
+  }
+  await lobbyHistoryPromise
+  if (!lobbyHistoryLoaded && game.value.halfStatus !== 'ready') {
+    throw new Error('기록을 불러오는 중입니다. 잠시 후 다시 시도하세요.')
   }
 }
 
@@ -475,6 +525,7 @@ async function loadRecorderProfile() {
   const user = $auth.currentUser
   if (!user) return
   const profile = await request<{ name?: string; level?: 'basic' | 'advanced' }>('/api/v1/match-input/recorder-profile')
+  if (!isCurrentLobby()) return
   if (profile.level === 'basic' || profile.level === 'advanced') game.value.recorderLevel = profile.level
   game.value.participantName = String(profile.name || user.displayName || user.email || '')
 }
@@ -697,7 +748,6 @@ function recordFormationChange() {
   if (applyingRemoteSetup) return
   if (!bootstrapApplied.value || !matchInfoEditable.value) return
   if (!game.value.matchId) return
-  setupEpoch++
   // Lock the local lineup immediately, before the debounce starts. A late
   // response from the old server snapshot must not erase a just-picked player.
   pendingSetupFingerprint = currentSetupFingerprint()
@@ -732,10 +782,8 @@ function persistCurrentSetup(fingerprint = currentSetupFingerprint()): Promise<b
   if (!game.value.formationKey) return Promise.resolve(false)
   if (pendingSetupFingerprint === fingerprint && pendingSetupSave) return pendingSetupSave
   pendingSetupFingerprint = fingerprint
-  setupEpoch++
   const save = syncSetup(game.value)
     .then(saved => {
-      setupEpoch++
       if (saved && pendingSetupFingerprint === fingerprint) {
         appliedSetupFingerprint = fingerprint
         pendingSetupFingerprint = ''
@@ -864,6 +912,7 @@ async function saveEntrySetup() {
     // Viewing the lobby never claims a seat. This explicit save confirms it.
     const inputChunk = preloadRouteComponents('/DidInput').catch(() => undefined)
     await ensureLobbyParticipant(requestedRole)
+    await ensureLobbyHistory()
     if (!game.value.lifecycleControl) throw new Error('주 분석관만 세팅을 저장할 수 있습니다.')
     if (formationSaveTimer) {
       clearTimeout(formationSaveTimer)
@@ -1066,33 +1115,35 @@ async function startSecondHalf() {
 }
 
 onMounted(async () => {
-  const [bootstrapResult] = await Promise.allSettled([loadBootstrap(), loadRecorderProfile()])
+  // Profile and KPI latency must not hold the saved setup behind a barrier.
+  void loadRecorderProfile().catch(() => false)
   let recovered = false
-  if (bootstrapResult.status === 'fulfilled' && bootstrapResult.value) {
-    // Squads, selected RAW/Draft and every initially visible KPI state land in
-    // one reactive update. Nothing waits for a follow-up read before rendering.
-    recovered = applyBootstrap(bootstrapResult.value)
-  } else {
-    lifecycleError.value = bootstrapResult.status === 'rejected' && bootstrapResult.reason instanceof Error
-      ? bootstrapResult.reason.message
-      : '입력 대기 데이터를 불러오지 못했습니다.'
-    // Keep the former independent flow only as a resilience fallback.
-    const [squadResult] = await Promise.allSettled([loadSquads(), loadDashboardKpis('all')])
-    if (squadResult.status === 'fulfilled' && squadResult.value) {
-      const selectedState = game.value.team === 'home' ? inputStatus.value.H : inputStatus.value.A
-      if (selectedState.lifecycleStatus === 'ready' && game.value.halfStatus !== 'ready') resetForInputTeam(game.value.team)
-      recovered = await recoverSelectedTeamState()
-      applyCurrentMatchSquads(squadResult.value.squads, squadResult.value.snapshot)
-      const setups = squadResult.value.inputSetup ?? { H: null, A: null }
+  try {
+    const payload = await loadBootstrap()
+    if (!isCurrentLobby()) return
+    if (!payload) throw new Error('입력 대기 데이터를 불러오지 못했습니다.')
+    recovered = applyBootstrap(payload)
+  } catch (error) {
+    if (!isCurrentLobby()) return
+    try {
+      const result = await loadSquads()
+      if (!isCurrentLobby()) return
+      if (!result) throw error
+      applyCurrentMatchSquads(result.squads, result.snapshot)
+      const setups = result.inputSetup ?? { H: null, A: null }
+      applySetupFieldSides(setups)
       applyInputSetup(game.value.team === 'home' ? setups.H : setups.A)
-    } else {
-      lifecycleError.value = squadResult.status === 'rejected' && squadResult.reason instanceof Error
-        ? squadResult.reason.message
-        : '선수 명단을 불러오지 못했습니다.'
+      const state = inputStatus.value[game.value.team === 'home' ? 'H' : 'A']
+      if (state.lifecycleStatus) game.value.halfStatus = state.lifecycleStatus
+    } catch (fallbackError) {
+      if (isCurrentLobby()) lifecycleError.value = fallbackError instanceof Error ? fallbackError.message : '선수 명단을 불러오지 못했습니다.'
+      return
     }
   }
   bootstrapApplied.value = true
-  if (!dashboardKpiLoaded[kpiHalf.value]) void loadDashboardKpis(kpiHalf.value).catch(() => false)
+  await nextTick()
+  if (!isCurrentLobby()) return
+  void loadInitialKpis()
 
   const selectedState = game.value.team === 'home' ? inputStatus.value.H : inputStatus.value.A
   // 끝난 팀 입력에는 매니저만 들어온다. 수정 Draft의 제어 권한을 받으려면 여기서도 join한다.
@@ -1109,7 +1160,7 @@ onMounted(async () => {
   // Lobby and input screen subscribe to the same per-team Draft channel.
   // Formation, field side and substitutions therefore do not wait for the
   // dashboard polling interval to appear after the other analyst changes them.
-  if (selectedState.rawStatus !== 'final') void startLobbyCollaboration().catch(() => false)
+  // Collaboration history starts after the visible half preview.
   // 현재 팀에 저장된 세션이 없는 신규 입력이라면, 이미 RAW가 있는 상대 팀의
   // 진영을 기준으로 자동 반대 진영을 지정한다. 저장된 세션의 값은 절대 덮지 않는다.
   if (!recovered && game.value.halfStatus === 'ready') applyOpponentFieldSideDefault(game.value.team)
@@ -1126,12 +1177,13 @@ onMounted(async () => {
   // KPI does not remain at the value from lobby entry.
   if (selectedState.rawStatus !== 'final') {
     dashboardKpiTimer = setInterval(() => {
-      void loadDashboardKpis(kpiHalf.value).catch(() => false)
+      if (!initialKpisLoading) void loadDashboardKpis(kpiHalf.value).catch(() => false)
     }, 1200)
   }
 })
 
 onUnmounted(() => {
+  lobbyActive = false
   if (formationSaveTimer) clearTimeout(formationSaveTimer)
   if (lobbyClockTimer) clearInterval(lobbyClockTimer)
   if (dashboardKpiTimer) clearInterval(dashboardKpiTimer)
@@ -1143,9 +1195,10 @@ async function finishMatch() {
   if (!confirm(isBasicPrimary ? '기록을 제출하시겠습니까? 관리자 승인 전까지 RAW로 반영되지 않습니다.' : '최종 갱신하시겠습니까?')) return
   lifecycleBusy.value = true
   lifecycleError.value = ''
-  game.value.halfStatus = 'final'
-  game.value.clockStartedAt = null
   try {
+    await ensureLobbyHistory()
+    game.value.halfStatus = 'final'
+    game.value.clockStartedAt = null
     if (!game.value.lifecycleControl) throw new Error('주 분석관만 제출 또는 최종 갱신을 할 수 있습니다.')
     if (!await saveDraft(game.value)) throw new Error('최종 Draft를 검증 API에 전달하지 못했습니다.')
     // BASIC 주 분석관은 최종 Draft를 제출만 한다. RAW 승격은 관리자 승인 화면에서만 가능하다.
@@ -1236,32 +1289,16 @@ watch([kpiRecords, kpiHalf, () => game.value.team, matchId], () => {
     `${matchId.value}:${game.value.team === 'home' ? 'H' : 'A'}`,
   )
 }, { deep: true, immediate: true })
-const kpiValues = computed(() => {
-  const values = currentPreview.value.kpis
-  return {
-    TAP: values.TAP ?? 0,
-    DAP: values.DAP ?? 0,
-    DTP: values.DTP ?? 0,
-    Shoot: values.SHOT ?? 0,
-    Goal: values.GOAL ?? 0,
-    ASR: Math.round((values.ASR ?? 0) * 100),
-    SSR: Math.round((values.SSR ?? 0) * 100),
-    BAP: values.BAP ?? 0,
-  }
-})
 const displayedKpis = computed(() => {
-  const selectedSide = game.value.team === 'home' ? 'H' : 'A'
   if (kpiHalf.value !== 'all') {
     return {
       H: dashboardKpiLoaded[kpiHalf.value] ? dashboardKpis.value.H[kpiHalf.value] : emptyDashboardKpi(),
       A: dashboardKpiLoaded[kpiHalf.value] ? dashboardKpis.value.A[kpiHalf.value] : emptyDashboardKpi(),
     }
   }
-  const selectedIsFinal = inputStatus.value[selectedSide].completed
-  const selectedValues = selectedIsFinal ? dashboardKpis.value[selectedSide][kpiHalf.value] : kpiValues.value
   return {
-    H: selectedSide === 'H' ? selectedValues : dashboardKpis.value.H[kpiHalf.value],
-    A: selectedSide === 'A' ? selectedValues : dashboardKpis.value.A[kpiHalf.value],
+    H: dashboardKpiLoaded.all ? dashboardKpis.value.H.all : emptyDashboardKpi(),
+    A: dashboardKpiLoaded.all ? dashboardKpis.value.A.all : emptyDashboardKpi(),
   }
 })
 
@@ -1565,7 +1602,6 @@ function undoSub(index: number) {
 
 <template>
   <div class="page">
-    <LiveRoomStatus :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
     <div class="bg" />
     <button type="button" class="topBack" @click="returnTo('/schedule')">← 경기 선택</button>
     <div class="frame">
@@ -1595,7 +1631,7 @@ function undoSub(index: number) {
           </div>
           <div class="kpis">
             <div v-for="key in kpis" :key="key" class="kpiRow">
-              <span>{{ displayedKpis.H[key] }}</span><b>{{ key }}</b><span>{{ displayedKpis.A[key] }}</span>
+              <span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.H[key] : 0 }}</span><b>{{ key }}</b><span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.A[key] : 0 }}</span>
             </div>
           </div>
         </div>
@@ -1625,6 +1661,9 @@ function undoSub(index: number) {
           </div>
           <div class="analystInfo analystRole" :class="{ assistant: game.participantRole !== 'primary' }">
             분석 역할: {{ roleLabel(game.participantRole) }}
+          </div>
+          <div v-if="roomStatus" class="sidebarRoomStatus">
+            <LiveRoomStatus compact :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
           </div>
         </div>
       </aside>
@@ -2054,6 +2093,21 @@ button {
 .sidebarFooter {
   flex: 0 0 auto;
   min-height: 0
+}
+
+.sidebarRoomStatus {
+  margin-top: 6px;
+  max-height: 96px;
+  overflow-y: auto;
+  border: 1px solid rgba(255, 255, 255, .07);
+  border-radius: 4px;
+  color: rgba(255, 255, 255, .65);
+}
+
+.sidebarRoomStatus :deep(.liveRoomStatus.compact) {
+  grid-template-columns: minmax(0, 1fr);
+  max-height: none;
+  color: inherit;
 }
 
 .matchDate {

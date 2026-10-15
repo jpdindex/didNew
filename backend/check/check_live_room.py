@@ -692,3 +692,126 @@ def test_batch_api_uses_one_match_check_and_returns_individual_durable_acks(sdk_
     assert [item['savedRevision'] for item in result['results']] == list(range(1, 21))
     assert result['event']['revision'] == 20
     assert sdk_data.db._firestore_api_internal.commits == 1
+
+
+
+def test_kpi_halves_share_one_records_only_snapshot_per_team(sdk_data):
+    from backend.system.system_firestore import NotFoundError
+    rpc = sdk_data.db._firestore_api_internal
+    rpc.documents['inputDrafts/m_A'] = {'gmId': 'm', 'side': 'A', 'payload': {**payload(), 'side': 'A'}}
+    rpc.documents['inputDrafts/m_H/records/h2'] = {**record('h2'), 'half': 'H2', 'act': 'SH', 'res': 'GOAL', 'isShot': True}
+    def no_raw(*args):
+        raise NotFoundError('no RAW')
+    sdk_data.get_recording = no_raw
+    views = sdk_data.read_match_dashboard_kpis_bootstrap('m', ['H1', 'H2'])
+    assert views['H']['H1']['Goal'] == 0
+    assert views['H']['H2']['Goal'] == 1
+    assert rpc.queries.count('inputDrafts/m_H/records') == 1
+    assert rpc.queries.count('inputDrafts/m_A/records') == 1
+    assert all(not path.endswith(('/cards', '/substitutions')) for path in rpc.queries)
+    assert rpc.transaction_modes == ['read_only', 'read_only']
+
+
+def test_setup_bootstrap_returns_saved_setup_without_reading_records_or_kpis(sdk_data):
+    from types import SimpleNamespace
+    from backend.system.system_firestore import NotFoundError
+    rpc = sdk_data.db._firestore_api_internal
+    root = rpc.documents['inputDrafts/m_H']
+    root['setup'] = {'formationKey': '4-3-3', 'fieldSide': 'left', 'lineup': []}
+    root['payload']['status'] = 'H2_done'
+    rpc.documents['inputDrafts/m_A'] = {'gmId': 'm', 'side': 'A', 'payload': {**payload(), 'side': 'A'}}
+    status = {'rawStatus': None, 'lifecycleStatus': 'H2_done', 'completed': False}
+    rpc.documents['matches/m/inputSummaries/current'] = {'inputStatus': {'H': status, 'A': status}}
+    sdk_data.get_match = lambda gm_id: SimpleNamespace(homeTeamId='h', awayTeamId='a', leagueId='l', seasonId='s',
+        round=1, date='2026.10.15', kickoffTime=None, stadiumId='stadium', matchType='league', score=SimpleNamespace(home=0, away=0))
+    sdk_data._get_or_create_input_squads_snapshot = lambda *args: ({'H': [], 'A': []}, True, {})
+    def no_raw(*args):
+        raise NotFoundError('no RAW')
+    sdk_data.get_recording = no_raw
+    before = deepcopy(rpc.documents)
+    result = sdk_data.build_input_bootstrap('m', 'H')
+    assert result['session']['summaryOnly'] is True
+    assert result['session']['sharedState']['halfStatus'] == 'H2_done'
+    assert result['inputSetup']['H']['formationKey'] == '4-3-3'
+    assert result['dashboardKpiHalves'] == []
+    assert not any(path.endswith(('/records', '/cards')) for path in rpc.queries)
+    assert rpc.queries.count('inputDrafts/m_H/substitutions') == 1
+    assert rpc.transaction_modes == ['read_only']
+    assert rpc.documents == before
+
+
+def test_kpi_raw_halves_share_one_read_and_final_total_stays_cached(sdk_data):
+    from types import SimpleNamespace
+    calls = []
+    sdk_data.get_recording = lambda gm_id, side: SimpleNamespace(kpi=SimpleNamespace(model_dump=lambda **kwargs: {'GOAL': 5}))
+    def records(gm_id, side):
+        calls.append(side)
+        return [('one', SimpleNamespace(half='H1', halfSeconds=1, seq=1, act='SH', res='GOAL', area=1,
+            playerId=None, shootPosX=None, shootPosY=None, shootDspRange=None, isShot=True))]
+    sdk_data.list_records = records
+    views = sdk_data.read_match_dashboard_kpis_bootstrap('m', ['H1', 'H2'])
+    assert sorted(calls) == ['A', 'H']
+    assert views['H']['H1']['Goal'] == 1
+    assert views['H']['H2']['Goal'] == 0
+    calls.clear()
+    assert sdk_data.read_match_dashboard_kpis('m')['H']['Goal'] == 5
+    assert calls == []
+
+
+
+def test_missing_selected_snapshot_is_not_read_again_for_kpis(sdk_data):
+    from backend.system.system_firestore import NotFoundError
+    rpc = sdk_data.db._firestore_api_internal
+    del rpc.documents['inputDrafts/m_H']
+    def no_raw(*args):
+        raise NotFoundError('no RAW')
+    sdk_data.get_recording = no_raw
+    views = sdk_data.read_match_dashboard_kpis_bootstrap('m', ['H1', 'H2'], drafts={'H': None})
+    assert views['H']['H1']['Goal'] == views['H']['H2']['Goal'] == 0
+    assert all(not name.endswith('inputDrafts/m_H') for name in rpc.reads)
+    assert rpc.transaction_modes == ['read_only']
+
+
+@pytest.mark.parametrize('lifecycle', ['ready', 'final'])
+def test_ready_and_final_bootstrap_still_skip_event_reads(sdk_data, lifecycle):
+    from types import SimpleNamespace
+    rpc = sdk_data.db._firestore_api_internal
+    status = {'rawStatus': 'final' if lifecycle == 'final' else None, 'lifecycleStatus': lifecycle, 'completed': lifecycle == 'final'}
+    rpc.documents['matches/m/inputSummaries/current'] = {'inputStatus': {'H': status, 'A': status}}
+    rpc.documents['inputDrafts/m_H']['setup'] = {'formationKey': '4-3-3', 'fieldSide': 'left', 'lineup': []}
+    rpc.documents['inputDrafts/m_H']['payload']['status'] = lifecycle
+    sdk_data.get_match = lambda gm_id: SimpleNamespace(homeTeamId='h', awayTeamId='a', leagueId='l', seasonId='s',
+        round=1, date='2026.10.15', kickoffTime=None, stadiumId='stadium', matchType='league', score=SimpleNamespace(home=0, away=0))
+    sdk_data._get_or_create_input_squads_snapshot = lambda *args: ({'H': [], 'A': []}, True, {})
+    sdk_data._final_lobby_session_from_snapshot = lambda *args: {'status': 'ok', 'gmId': 'm', 'side': 'H'}
+    result = sdk_data.build_input_bootstrap('m', 'H')
+    assert result['dashboardKpiHalves'] == []
+    assert not any(path.endswith(('/records', '/cards')) for path in rpc.queries)
+    assert rpc.transaction_modes == (['read_only'] if lifecycle == 'ready' else [])
+    if lifecycle == 'ready':
+        assert result['inputSetup']['H']['formationKey'] == '4-3-3'
+        assert result['session']['status'] == 'missing'
+    else:
+        assert result['inputSetup'] == {'H': None, 'A': None}
+        assert rpc.queries == []
+
+
+
+def test_lobby_setup_snapshot_retries_with_a_fresh_consistent_revision(sdk_data, monkeypatch):
+    from google.api_core.exceptions import Aborted
+    rpc = sdk_data.db._firestore_api_internal
+    rpc.documents['inputDrafts/m_H']['setup'] = {'formationKey': '4-3-3', 'fieldSide': 'left', 'lineup': []}
+    original = rpc.run_query
+    def once(request, **kwargs):
+        if rpc.documents['inputDrafts/m_H']['revision'] == 0:
+            rpc.documents['inputDrafts/m_H'].update(revision=3, setup={'formationKey': '4-4-2', 'fieldSide': 'right', 'lineup': []})
+            raise Aborted('setup changed')
+        return original(request, **kwargs)
+    monkeypatch.setattr(rpc, 'run_query', once)
+    monkeypatch.setattr(live.time, 'sleep', lambda _: None)
+    heads, setups = live.read_lobby_snapshot(sdk_data, 'm')
+    assert heads['H']['revision'] == 3
+    assert setups['H']['formationKey'] == '4-4-2'
+    assert setups['H']['fieldSide'] == 'right'
+    assert rpc.transaction_modes == ['read_only', 'read_only']
+    assert not any(path.endswith(('/records', '/cards')) for path in rpc.queries)

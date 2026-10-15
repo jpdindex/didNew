@@ -767,17 +767,33 @@ def create_schedule_matches(request: ScheduleMatchesCreateRequest, _: RequiredUs
     return {"status": "ok", "gmIds": list(matches)}
 
 
+@router.get("/match-input/calendar", include_in_schema=False)
+def list_input_calendar(year: int = Query(..., ge=2000, le=2100), month: int = Query(..., ge=1, le=12), _: RequiredUser = None) -> dict:
+    return {"status": "ok", "fixtures": JpdDidData().list_calendar_fixtures(year, month)}
+
+
 @router.get("/match-input/matches", include_in_schema=False)
-def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Query(..., ge=1, le=12), _: RequiredUser = None) -> dict:
+def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Query(..., ge=1, le=12), _: RequiredUser = None,
+                       day: str | None = Query(default=None, alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict:
     data = JpdDidData()
+    day = day if isinstance(day, str) else None
+    if day:
+        try:
+            selected = date.fromisoformat(day)
+        except ValueError as exc:
+            raise BackendError("Invalid calendar date", status_code=422, code="match_date_invalid") from exc
+        if selected.year != year or selected.month != month:
+            raise BackendError("Selected date is outside the requested month", status_code=422, code="match_date_invalid")
+    summary_query_available = True
     try:
-        summaries = data.list_input_summaries_for_month(year, month)
+        summaries = data.list_input_summaries_for_day(day) if day else data.list_input_summaries_for_month(year, month)
     except FailedPrecondition:
         # A newly deployed collection-group index can take a short time to
         # become queryable. Keep the schedule available during that window.
         logger.info("Schedule summary index is still building; using legacy monthly query")
         summaries = []
-    if data.input_summary_backfill_complete_for_month(year, month):
+        summary_query_available = False
+    if not day and summary_query_available and data.input_summary_backfill_complete_for_month(year, month):
         # The schedule read model carries every card's participant roster and
         # state. Once a season migration is complete this is the normal path:
         # one collection-group range query, not a per-match source walk.
@@ -791,9 +807,18 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
         for item in summaries
         if isinstance(item.get("gmId"), str) and item.get("gmId")
     }
-    month_matches = data.list_matches_for_month(year, month)
+    month_matches = data.list_matches_for_day(day) if day else data.list_matches_for_month(year, month)
     if not month_matches:
         return {"status": "ok", "matches": []}
+
+    # New fixtures publish their summary atomically, even in a month without
+    # a migration marker. Only fixtures still missing a summary need RAW/Draft
+    # and presentation reads. Keep matches as the authority for membership so
+    # orphaned summaries cannot reintroduce deleted fixtures.
+    covered_matches = [summaries_by_gm[gm_id] for gm_id, _ in month_matches if gm_id in summaries_by_gm]
+    month_matches = [(gm_id, match) for gm_id, match in month_matches if gm_id not in summaries_by_gm]
+    if not month_matches:
+        return {"status": "ok", "matches": sorted(covered_matches, key=lambda item: (item["date"], item.get("kickoffTime") or "", item["gmId"]))}
 
     team_ids = {
         team_id
@@ -861,7 +886,7 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
             },
             "collaboration": collaboration,
         })
-    merged = [summaries_by_gm.get(item["gmId"], item) for item in matches]
+    merged = covered_matches + matches
     return {"status": "ok", "matches": sorted(merged, key=lambda item: (item["date"], item["kickoffTime"] or "", item["gmId"]))}
 
 
@@ -882,10 +907,19 @@ def read_analyst_dashboard(
 def read_match_input_bootstrap(
     gm_id: str,
     side: Side = Query(...),
+    phase: Literal["setup", "preview"] = Query(default="setup"),
+    half: Literal["H1", "H2"] | None = Query(default=None),
     _: RequiredUser = None,
 ) -> dict:
-    """Load squads, selected session and all dashboard KPI views atomically for the lobby."""
-    return {"status": "ok", **JpdDidData().build_input_bootstrap(gm_id, side)}
+    """Paint setup first; the half preview is a separate bootstrap request."""
+    data = JpdDidData()
+    if phase == "preview":
+        if half not in {"H1", "H2"}:
+            raise BackendError("Preview requires H1 or H2", status_code=422, code="preview_half_required")
+        data.get_match(gm_id)
+        return {"status": "ok", "gmId": gm_id, "side": side, "dashboardKpiHalves": [half],
+                "dashboardKpis": data.read_match_dashboard_kpis_bootstrap(gm_id, [half])}
+    return {"status": "ok", **data.build_input_bootstrap(gm_id, side)}
 
 
 @router.get("/match-input/matches/{gm_id}/dashboard-kpis", include_in_schema=False)
@@ -896,21 +930,9 @@ def read_match_dashboard_kpis(
 ) -> dict:
     data = JpdDidData()
     data.get_match(gm_id)
-    input_status = data.get_recording_input_states(gm_id)
-    # Final-match dashboards do not edit formation or substitutions. Avoid two
-    # guaranteed-missing inputDraft reads when their deferred KPI request runs.
-    input_setup = (
-        {"H": None, "A": None}
-        if all(input_status[item]["rawStatus"] == "final" for item in ("H", "A"))
-        else data.get_input_setup(gm_id)
-    )
     return {
         "status": "ok", "gmId": gm_id, "half": half,
         "kpis": data.read_match_dashboard_kpis(gm_id, half=half),
-        # The lobby already polls this lightweight response for live KPI. Keep
-        # the durable setup in the same response so it never falls back to a
-        # transient Draft just to paint formation or player placement.
-        "inputSetup": input_setup,
     }
 
 

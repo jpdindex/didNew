@@ -40,13 +40,18 @@ function toYMD(y: number, m0: number, d: number) {
   return `${y}-${mm}-${dd}`
 }
 
-const todayYMD = toYMD(today.getFullYear(), today.getMonth(), today.getDate())
-
-const selectedDate = ref<string>(todayYMD) // YYYY-MM-DD, 진입 시 오늘 날짜 자동 선택
+const selectedDate = ref<string>('')
 const selectedMatchId = ref<string>('')
 const selectedTeam = ref<'home' | 'away' | null>(null)
 const roleDialogOpen = ref(false)
 const matches = ref<MatchItem[]>([])
+type CalendarFixture = { date: string; leagueId: string }
+const calendarFixtures = ref<CalendarFixture[]>([])
+const calendarCache = useState<Record<string, CalendarFixture[]>>('schedule-calendar-dates', () => ({}))
+let calendarGeneration = 0
+let detailGeneration = 0
+let scheduleActive = true
+onUnmounted(() => { scheduleActive = false; calendarGeneration++; detailGeneration++ })
 const loadingMatches = ref(false)
 const loadError = ref('')
 const { request } = useBackendApi()
@@ -200,19 +205,47 @@ function onCalendarClickCapture(event: MouseEvent) {
 }
 
 function applyCalendarView() {
-  // 이번 달로 돌아오면 오늘 날짜를 다시 선택
-  const isCurrentMonth = viewYear.value === today.getFullYear() && viewMonth.value === today.getMonth()
-  selectedDate.value = isCurrentMonth ? todayYMD : ''
+  selectedDate.value = ''
+  matches.value = []
   selectedMatchId.value = ''
   selectedTeam.value = null
-  loadMatches()
+  void loadCalendar()
 }
 
 function pickDate(ymd?: string) {
-  if (!ymd) return
-  selectedDate.value = ymd
-  selectedMatchId.value = '' // 날짜 바꾸면 경기 선택 초기화
+  selectedDate.value = ymd || ''
+  selectedMatchId.value = ''
   selectedTeam.value = null
+  void loadMatches()
+}
+
+async function loadCalendar() {
+  const generation = ++calendarGeneration
+  ++detailGeneration
+  const key = `${viewYear.value}-${viewMonth.value + 1}`
+  const current = () => scheduleActive && generation === calendarGeneration
+  const apply = (fixtures: CalendarFixture[]) => {
+    calendarFixtures.value = fixtures
+    const dates = fixtures.filter(item => selectedLeague.value === 'all' || item.leagueId === selectedLeague.value)
+      .map(item => normalizeDate(item.date)).sort()
+    // Start with the latest fixture day, then preserve a user's chosen day.
+    const selected = selectedDate.value || dates[dates.length - 1] || ''
+    if (selected !== selectedDate.value) pickDate(selected)
+  }
+  calendarFixtures.value = []
+  loadError.value = ''
+  loadingMatches.value = false
+  const cached = calendarCache.value[key]
+  if (cached) apply(cached)
+  try {
+    const payload = await request<{ fixtures: CalendarFixture[] }>(`/api/v1/match-input/calendar?year=${viewYear.value}&month=${viewMonth.value + 1}`)
+    if (!current()) return
+    calendarCache.value[key] = payload.fixtures
+    apply(payload.fixtures)
+  } catch (error) {
+    if (!current()) return
+    loadError.value = error instanceof Error ? error.message : '경기 날짜를 불러오지 못했습니다.'
+  }
 }
 
 function normalizeDate(value: string) {
@@ -221,6 +254,11 @@ function normalizeDate(value: string) {
 }
 
 async function loadMatches() {
+  const generation = ++detailGeneration
+  const day = selectedDate.value
+  const current = () => scheduleActive && generation === detailGeneration && day === selectedDate.value
+  matches.value = []
+  if (!day) { loadingMatches.value = false; return }
   loadingMatches.value = true
   loadError.value = ''
   try {
@@ -230,7 +268,8 @@ async function loadMatches() {
       score: { home: number; away: number }
       inputStatus: { H: TeamInputStatus; A: TeamInputStatus }
       collaboration?: MatchItem['collaboration']
-    }> }>(`/api/v1/match-input/matches?year=${viewYear.value}&month=${viewMonth.value + 1}`)
+    }> }>(`/api/v1/match-input/matches?year=${viewYear.value}&month=${viewMonth.value + 1}&date=${day}`)
+    if (!current()) return
     matches.value = payload.matches.map((item) => ({
       id: item.gmId,
       date: normalizeDate(item.date),
@@ -245,19 +284,20 @@ async function loadMatches() {
       collaboration: item.collaboration ?? { H: {}, A: {} },
     }))
   } catch (error) {
+    if (!current()) return
     matches.value = []
     loadError.value = error instanceof Error ? error.message : '경기 목록을 불러오지 못했습니다.'
   } finally {
-    loadingMatches.value = false
+    if (current()) loadingMatches.value = false
   }
 }
 
-onMounted(loadMatches)
+onMounted(loadCalendar)
 
 // 리그 필터: 월이 바뀌어도 선택은 유지하고, 그 달에 경기가 없어도 옵션은 남긴다.
 const selectedLeague = ref<string>('all')
 const leagueOptions = computed(() => {
-  const leagues = new Set(matches.value.map(match => match.league).filter(Boolean))
+  const leagues = new Set(calendarFixtures.value.map(match => match.leagueId).filter(Boolean))
   if (selectedLeague.value !== 'all') leagues.add(selectedLeague.value)
   return [...leagues].sort((a, b) => a.localeCompare(b))
 })
@@ -269,6 +309,9 @@ const visibleMatches = computed(() => (
 function applyLeagueFilter() {
   selectedMatchId.value = ''
   selectedTeam.value = null
+  const dates = calendarFixtures.value.filter(item => selectedLeague.value === 'all' || item.leagueId === selectedLeague.value)
+    .map(item => normalizeDate(item.date)).sort()
+  pickDate(dates.includes(selectedDate.value) ? selectedDate.value : dates[dates.length - 1] || '')
 }
 
 const matchList = computed(() => {
@@ -504,7 +547,7 @@ function onCancel() {
               :class="{
                 empty: !c.day,
                 active: c.ymd && c.ymd === selectedDate,
-                hasMatch: c.ymd && visibleMatches.some(match => match.date === c.ymd),
+                hasMatch: c.ymd && calendarFixtures.some(match => match.date === c.ymd && (selectedLeague === 'all' || match.leagueId === selectedLeague)),
               }"
               :disabled="!c.day"
               @click="pickDate(c.ymd)"
@@ -520,7 +563,7 @@ function onCancel() {
           <div class="rightTitle">경기선택</div>
 
           <div v-if="!selectedDate" class="hint">
-            왼쪽에서 날짜를 선택해줘.
+            {{ loadError || '왼쪽에서 날짜를 선택해줘.' }}
           </div>
 
           <div v-else class="list">

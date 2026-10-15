@@ -94,6 +94,9 @@ class Settings(BaseSettings):
     firebase_credentials_json: str | None = None
     firebase_emulator_host: str | None = None
     swagger_api_key: str | None = None
+    aifootballx_credentials_path: str | None = None
+    aifootballx_write_enabled: bool = False
+    aifootballx_slot_mapping_path: str | None = None
     jpd_rating_base_url: str = "https://jpd-rating-296087686925.asia-northeast3.run.app"
     jpd_rating_token: str | None = None
 
@@ -389,6 +392,36 @@ class JpdDidData:
                     MatchDoc, snapshot.to_dict() or {}, path=snapshot.reference.path
                 )
         return list(found.items())
+
+    def list_calendar_fixtures(self, year: int, month: int) -> list[dict[str, str]]:
+        """Only dates/leagues for calendar dots; never open RAW or Drafts."""
+        next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
+        def read_format(separator: str) -> list[dict[str, str]]:
+            start = f"{year}{separator}{month:02d}{separator}01"
+            end = f"{next_year}{separator}{next_month:02d}{separator}01"
+            query = self.db.collection("matches").select(["date", "leagueId"]).where(
+                filter=FieldFilter("date", ">=", start)
+            ).where(filter=FieldFilter("date", "<", end))
+            return [{"date": self._normalise_match_date(values["date"]).replace(".", "-"),
+                     "leagueId": str(values.get("leagueId") or "")}
+                    for snapshot in query.stream(retry=None, timeout=20)
+                    if (values := snapshot.to_dict())]
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="calendar-dates") as executor:
+            return [item for rows in executor.map(read_format, ("", "-", ".")) for item in rows]
+
+    def list_matches_for_day(self, day: str) -> list[tuple[str, MatchDoc]]:
+        canonical = self._normalise_match_date(day)
+        query = self.db.collection("matches").where(filter=FieldFilter(
+            "date", "in", [canonical, canonical.replace(".", "-"), canonical.replace(".", "")],
+        ))
+        return [(snapshot.id, _validate_document(MatchDoc, snapshot.to_dict() or {}, path=snapshot.reference.path))
+                for snapshot in query.stream(retry=None, timeout=20)]
+
+    def list_input_summaries_for_day(self, day: str) -> list[dict[str, Any]]:
+        query = self.db.collection_group("inputSummaries").where(
+            filter=FieldFilter("date", "==", self._normalise_match_date(day)),
+        )
+        return [snapshot.to_dict() or {} for snapshot in query.stream(retry=None, timeout=20)]
 
     def get_documents_by_ids(self, collection_name: str, document_ids: set[str]) -> dict[str, dict[str, Any]]:
         """Batch-read a small set of referenced documents in a few RPCs."""
@@ -1020,9 +1053,15 @@ class JpdDidData:
             "revision": int(values.get("revision") or 0),
         }
 
-    def get_input_setup(self, gm_id: str) -> dict[Side, dict[str, Any] | None]:
-        references = {side: self._input_setup_reference(gm_id, side) for side in ("H", "A")}
-        snapshots = {snapshot.reference.path: snapshot for snapshot in self.db.get_all(list(references.values()), retry=None, timeout=20)}
+    def get_input_setup(
+        self, gm_id: str, *, drafts: dict[Side, dict[str, Any] | None] | None = None,
+    ) -> dict[Side, dict[str, Any] | None]:
+        # Reuse only setup explicitly read in the Draft's consistent snapshot.
+        # A missing Draft can still own a ready lobby's durable setup.
+        reused = {side: draft["_liveSetup"] for side, draft in (drafts or {}).items()
+                  if isinstance(draft, dict) and "_liveSetup" in draft}
+        references = {side: self._input_setup_reference(gm_id, side) for side in ("H", "A") if side not in reused}
+        snapshots = {snapshot.reference.path: snapshot for snapshot in self.db.get_all(list(references.values()), retry=None, timeout=20)} if references else {}
         base: dict[Side, tuple[Any, dict[str, Any]] | None] = {"H": None, "A": None}
         for side, reference in references.items():
             snapshot = snapshots.get(reference.path)
@@ -1031,7 +1070,7 @@ class JpdDidData:
                 if setup is not None:
                     base[side] = (reference, setup)
 
-        result: dict[Side, dict[str, Any] | None] = {"H": None, "A": None}
+        result: dict[Side, dict[str, Any] | None] = {"H": None, "A": None, **reused}
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="input-setup") as executor:
             futures = {
                 side: executor.submit(self._with_input_setup_subs, value[0], value[1])
@@ -1747,10 +1786,10 @@ class JpdDidData:
     def _lifecycle_rank(cls, status: Any) -> int:
         return cls._LIFECYCLE_ORDER.index(status) if status in cls._LIFECYCLE_ORDER else -1
 
-    def get_input_draft(self, gm_id: str, side: Side, *, include_setup: bool = True) -> dict[str, Any]:
+    def get_input_draft(self, gm_id: str, side: Side, *, include_setup: bool = True, include_cards: bool = True) -> dict[str, Any]:
         if not getattr(self.db, 'live_transaction', False):
             from backend.system.system_live_room import read_snapshot
-            return read_snapshot(self, gm_id, side, include_setup=include_setup)
+            return read_snapshot(self, gm_id, side, include_setup=include_setup, include_cards=include_cards)
         reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
         snapshot = reference.get(retry=None, timeout=10)
         if not snapshot.exists:
@@ -1766,7 +1805,7 @@ class JpdDidData:
             raise BackendError("Input draft root identity does not match its path", status_code=409, code="draft_identity_mismatch")
         if isinstance(payload, dict) and (payload.get("gmId") != gm_id or payload.get("side") != side):
             raise BackendError("Input draft payload identity does not match its path", status_code=409, code="draft_identity_mismatch")
-        return self._with_draft_records(reference, document)
+        return self._with_draft_records(reference, document, include_cards=include_cards)
 
     @staticmethod
     def _normalise_draft_record(record_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
@@ -1780,7 +1819,7 @@ class JpdDidData:
         record.setdefault("half", "H1")
         return record
 
-    def _with_draft_records(self, reference: Any, document: dict[str, Any]) -> dict[str, Any]:
+    def _with_draft_records(self, reference: Any, document: dict[str, Any], *, include_cards: bool = True) -> dict[str, Any]:
         """Hydrate a Draft payload from server-owned per-record documents.
 
         Root payloads remain useful for first open/offline recovery.  Once a
@@ -1800,7 +1839,7 @@ class JpdDidData:
             ]
             records.sort(key=lambda item: (str(item.get("half", "H1")), int(item.get("halfSeconds", 0)), int(item.get("seq", 0))))
             next_payload["records"] = records
-        card_documents = list(reference.collection("cards").stream(retry=None, timeout=20))
+        card_documents = list(reference.collection("cards").stream(retry=None, timeout=20)) if include_cards else []
         if card_documents:
             cards = [
                 normalised for item in card_documents
@@ -2579,94 +2618,99 @@ class JpdDidData:
         *,
         half: Literal["all", "H1", "H2"] = "all",
     ) -> dict[Side, dict[str, int | float]]:
-        """Return both teams' display KPI without reading unused historic records."""
+        views = self._read_match_dashboard_kpi_views(gm_id, [half])
+        return {side: views[side][half] for side in ("H", "A")}
+
+    def _read_match_dashboard_kpi_views(
+        self,
+        gm_id: str,
+        halves: list[Literal["all", "H1", "H2"]],
+        *,
+        drafts: dict[Side, dict[str, Any] | None] | None = None,
+    ) -> dict[Side, dict[str, dict[str, int | float]]]:
+        """Read each side once and calculate every requested view in memory.
+
+        Supplied Drafts belong to this request only. In bootstrap the selected
+        snapshot also supplies session recovery and its transaction-consistent
+        setup; no process cache can hide a newer collaboration revision.
+        """
         fields = ("TAP", "DAP", "DTP", "Shoot", "Goal", "SSR", "BAP", "ASR")
+        drafts = drafts or {}
 
         def display(values: dict[str, Any]) -> dict[str, int | float]:
             result: dict[str, int | float] = {}
             for field in fields:
                 source_field = {"Shoot": "SHOT", "Goal": "GOAL"}.get(field, field)
                 value = values.get(source_field, 0)
-                # KPI engine ratios are 0..1; legacy final RAW stores 0..100.
                 if field in {"ASR", "SSR"} and isinstance(value, (int, float)) and 0 <= value <= 1:
                     value = round(value * 100)
                 result[field] = value if isinstance(value, (int, float)) else 0
             return result
 
-        def calculated(records: list[tuple[str, RecordDoc]]) -> dict[str, int | float]:
-            source = [
-                KpiRecord(
+        def read_side(side: Side) -> dict[str, dict[str, int | float]]:
+            try:
+                recording = self.get_recording(gm_id, side)
+            except NotFoundError:
+                recording = None
+                if side in drafts:
+                    draft = drafts[side]
+                else:
+                    try:
+                        draft = self.get_input_draft(gm_id, side, include_setup=False, include_cards=False)
+                    except NotFoundError:
+                        draft = None
+                payload = (draft or {}).get("payload")
+                payload = payload if isinstance(payload, dict) else {}
+                source = []
+                for index, item in enumerate(payload.get("records") or []):
+                    if not isinstance(item, dict):
+                        continue
+                    source.append(KpiRecord(
+                        id=str(item.get("id") or f"draft-{index}"), half=str(item.get("half") or "H1"),
+                        seconds=int(item.get("halfSeconds") or 0), seq=int(item.get("seq") or index),
+                        act=str(item.get("act") or ""), res=str(item.get("res") or ""), area=int(item.get("area") or 1),
+                        player_id=str(item["playerId"]) if item.get("playerId") else None,
+                        shoot_pos_x=item.get("shootPosX"), shoot_pos_y=item.get("shootPosY"),
+                        shoot_dsp_range=item.get("shootDspRange"), is_shot=item.get("isShot"),
+                    ))
+            else:
+                # Keep the final all-match KPI fast path. Individual halves
+                # share one RAW read rather than streaming it once per half.
+                records = self.list_records(gm_id, side) if any(
+                    half != "all" or recording.kpi is None for half in halves
+                ) else []
+                source = [KpiRecord(
                     id=record_id, half=record.half, seconds=record.halfSeconds, seq=record.seq,
                     act=record.act, res=record.res, area=record.area, player_id=record.playerId,
                     shoot_pos_x=record.shootPosX, shoot_pos_y=record.shootPosY,
                     shoot_dsp_range=record.shootDspRange, is_shot=record.isShot,
-                )
-                for record_id, record in records
-            ]
-            return display(calculate_kpis(source).team_kpi)
+                ) for record_id, record in records]
+            result = {}
+            for half in halves:
+                if half == "all" and recording is not None and recording.kpi is not None:
+                    result[half] = display(recording.kpi.model_dump(mode="python"))
+                else:
+                    scoped = source if half == "all" else [item for item in source if item.half == half]
+                    result[half] = display(calculate_kpis(scoped).team_kpi)
+            return result
 
-        def calculated_draft(side: Side) -> dict[str, int | float] | None:
-            """Use the shared Draft for an in-progress side with no final RAW."""
-            try:
-                payload = self.get_input_draft(gm_id, side).get("payload")
-            except NotFoundError:
-                return None
-            if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
-                return None
-            source = []
-            for index, item in enumerate(payload["records"]):
-                if not isinstance(item, dict):
-                    continue
-                record_half = str(item.get("half") or "H1")
-                if half != "all" and record_half != half:
-                    continue
-                source.append(KpiRecord(
-                    id=str(item.get("id") or f"draft-{index}"), half=record_half,
-                    seconds=int(item.get("halfSeconds") or 0), seq=int(item.get("seq") or index),
-                    act=str(item.get("act") or ""), res=str(item.get("res") or ""), area=int(item.get("area") or 1),
-                    player_id=str(item["playerId"]) if item.get("playerId") else None,
-                    shoot_pos_x=item.get("shootPosX"), shoot_pos_y=item.get("shootPosY"),
-                    shoot_dsp_range=item.get("shootDspRange"), is_shot=item.get("isShot"),
-                ))
-            return display(calculate_kpis(source).team_kpi)
-
-        result: dict[Side, dict[str, int | float]] = {"H": display({}), "A": display({})}
-        for side in ("H", "A"):
-            try:
-                recording = self.get_recording(gm_id, side)
-            except NotFoundError:
-                draft_kpis = calculated_draft(side)
-                if draft_kpis is not None:
-                    result[side] = draft_kpis
-                continue
-            # Imported/finalized all-match KPI is already stored on the small
-            # recording document. Avoid streaming thousands of raw rows until a
-            # user explicitly opens an individual half.
-            if half == "all" and recording.kpi is not None:
-                result[side] = display(recording.kpi.model_dump(mode="python"))
-                continue
-            records = self.list_records(gm_id, side)
-            scoped = records if half == "all" else [item for item in records if item[1].half == half]
-            result[side] = calculated(scoped)
+        result = self._empty_input_dashboard_kpis()
+        if halves:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="input-kpi") as executor:
+                futures = {side: executor.submit(read_side, side) for side in ("H", "A")}
+                for side, future in futures.items():
+                    result[side].update(future.result())
         return result
 
     def read_match_dashboard_kpis_bootstrap(
         self,
         gm_id: str,
         halves: list[Literal["H1", "H2"]],
+        *,
+        drafts: dict[Side, dict[str, Any] | None] | None = None,
     ) -> dict[Side, dict[str, dict[str, int | float]]]:
-        """Return only the half KPI views that are immediately useful in lobby.
-
-        All-match KPI remains lazy-loaded. During H1/H1_done the lobby needs H1;
-        during H2/H2_done it needs H1 and H2. Ready/final states do not preload
-        KPI here, keeping the initial lobby payload light.
-        """
-        result = self._empty_input_dashboard_kpis()
-        for half in halves:
-            half_kpis = self.read_match_dashboard_kpis(gm_id, half=half)
-            for side in ("H", "A"):
-                result[side][half] = half_kpis[side]
-        return result
+        """Preload only visible halves, sharing their RAW/Draft reads."""
+        return self._read_match_dashboard_kpi_views(gm_id, halves, drafts=drafts)
 
     @staticmethod
     def _empty_input_dashboard_kpis() -> dict[Side, dict[str, dict[str, int | float]]]:
@@ -2681,7 +2725,7 @@ class JpdDidData:
         if lifecycle in {"H1", "H1_done"}:
             return ["H1"]
         if lifecycle in {"H2", "H2_done"}:
-            return ["H1", "H2"]
+            return ["H2"]
         return []
 
     def build_input_bootstrap(self, gm_id: str, side: Side) -> dict[str, Any]:
@@ -2702,7 +2746,7 @@ class JpdDidData:
         # render; Draft, setup, KPI, and RAW event rows are deferred until the
         # user asks for an action that needs them.
         is_final_lobby = selected_status["rawStatus"] == "final"
-        bootstrap_kpi_halves = [] if is_final_lobby else self.input_bootstrap_kpi_halves(selected_status.get("lifecycleStatus"))
+        bootstrap_kpi_halves = []
         if is_final_lobby:
             input_setup: dict[Side, dict[str, Any] | None] = {"H": None, "A": None}
             dashboard_kpis = self._empty_input_dashboard_kpis()
@@ -2728,45 +2772,30 @@ class JpdDidData:
                         recording=recording,
                     ),
                 }
-        elif selected_status.get("lifecycleStatus") == "ready":
-            # Fresh scheduled fixtures have no Draft or KPI data, so do not
-            # spend reads proving that those documents miss. Setup is still
-            # read: "세팅 저장" keeps the fixture ready, and leaving the lobby
-            # must not hide the saved formation/lineup on the next visit.
-            input_setup = self.get_input_setup(gm_id)
-            dashboard_kpis = self._empty_input_dashboard_kpis()
-            session = {"status": "missing", "gmId": gm_id, "side": side}
         else:
-            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="input-bootstrap-live") as executor:
-                setup_future = executor.submit(self.get_input_setup, gm_id)
-                kpi_future = executor.submit(self.read_match_dashboard_kpis_bootstrap, gm_id, bootstrap_kpi_halves)
-                draft_future = executor.submit(self.get_input_draft, gm_id, side, include_setup=False)
-                input_setup = setup_future.result()
-                dashboard_kpis = kpi_future.result()
-                try:
-                    draft = draft_future.result()
-                except NotFoundError:
-                    session = {"status": "missing", "gmId": gm_id, "side": side}
-                else:
-                    session = {
-                        "status": "ok",
-                        "gmId": gm_id,
-                        "side": side,
-                        "payload": draft.get("payload"),
-                        "clientState": draft.get("clientState") or {},
-                        "updatedAt": draft.get("updatedAt"),
-                    } if draft.get("payload") else {"status": "missing", "gmId": gm_id, "side": side}
+            # Setup/clock is enough to paint the lobby. Do not hydrate records,
+            # cards or calculate KPI before returning the initial response.
+            from backend.system.system_live_room import read_lobby_snapshot
+            heads, input_setup = read_lobby_snapshot(self, gm_id)
+            head = heads[side]
+            payload = head.get("payload") if isinstance(head.get("payload"), dict) else {}
+            shared = head.get("sharedState") if isinstance(head.get("sharedState"), dict) else {}
+            lifecycle = shared.get("halfStatus") or payload.get("status") or selected_status.get("lifecycleStatus") or "ready"
+            input_status[side] = {**selected_status, "lifecycleStatus": lifecycle}
+            session = {"status": "missing", "gmId": gm_id, "side": side, "summaryOnly": True,
+                       "sharedState": {"homeScore": (summary.get("score") or {}).get("home", match.score.home),
+                                       "awayScore": (summary.get("score") or {}).get("away", match.score.away),
+                                       "h1Seconds": (payload.get("halves", {}).get("H1") or {}).get("seconds", 0),
+                                       "h2Seconds": (payload.get("halves", {}).get("H2") or {}).get("seconds", 0),
+                                       **{key: payload[key] for key in ("homeScore", "awayScore") if key in payload},
+                                       **{key: shared[key] for key in ("seconds", "h1Seconds", "h2Seconds", "clockStartedAt", "homeScore", "awayScore") if key in shared},
+                                       "halfStatus": lifecycle}}
+            # A pre-setup-field legacy Draft can still supply its formation
+            # shell without reading event tables or writing during a GET.
+            if input_setup[side] is None:
+                input_setup[side] = self._normalise_input_setup({**payload, "subs": (head.get("clientState") or {}).get("subs", [])})
+            dashboard_kpis = self._empty_input_dashboard_kpis()
 
-        # Existing active Drafts predate the dedicated setup field. Copy their
-        # completed configuration once; later record/timer writes never touch it.
-        if input_setup[side] is None and isinstance(session.get("payload"), dict):
-            self.save_input_setup(
-                gm_id,
-                side,
-                payload=session["payload"],
-                client_state=session.get("clientState") if isinstance(session.get("clientState"), dict) else {},
-            )
-            input_setup = self.get_input_setup(gm_id)
         return {
             "gmId": gm_id,
             "homeTeamId": match.homeTeamId,

@@ -24,6 +24,7 @@ backend/data/
 
 # Local Firestore mapping audit outputs (shared notes live in one Markdown file)
 docs/aifootballx/*.json
+*.xlsx
 
 # Misc
 .DS_Store

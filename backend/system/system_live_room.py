@@ -144,12 +144,12 @@ class TransactionStore:
             self.transaction.set(reference, values)
 
 
-def read_snapshot(data, gm_id, side, *, include_setup=True):
+def read_snapshot(data, gm_id, side, *, include_setup=True, include_cards=True):
     @firestore.transactional
     def read(transaction):
         working = copy(data)
         working.db = TransactionStore(data.db, transaction)
-        document = working.get_input_draft(gm_id, side)
+        document = working.get_input_draft(gm_id, side, include_cards=include_cards)
         if not include_setup:
             return document
         reference = working._input_setup_reference(gm_id, side)
@@ -165,6 +165,33 @@ def read_snapshot(data, gm_id, side, *, include_setup=True):
             if attempt == 2:
                 raise BackendError('Draft 조회가 일시적으로 지연되었습니다. 잠시 후 다시 시도하세요.',
                                    status_code=503, code='draft_snapshot_busy') from error
+            time.sleep(0.05 * (attempt + 1))
+
+
+def read_lobby_snapshot(data, gm_id):
+    """Read saved setup and clock consistently, excluding ACT/card history."""
+    @firestore.transactional
+    def read(transaction):
+        working = copy(data)
+        working.db = TransactionStore(data.db, transaction)
+        references = {side: working._input_setup_reference(gm_id, side) for side in ('H', 'A')}
+        # Both roots belong to the same read-only transaction and share one
+        # RPC. Seed its cache before resolving setup/substitution documents.
+        for snapshot in data.db.get_all([reference.raw for reference in references.values()], transaction=transaction, retry=None, timeout=10):
+            working.db.cache[snapshot.reference.path] = snapshot.to_dict()
+        heads, setups = {}, {}
+        for side in ('H', 'A'):
+            reference = references[side]
+            head = reference.get().to_dict() or {}
+            heads[side] = head
+            setups[side] = working._with_input_setup_subs(reference, working._normalise_input_setup(head.get('setup')))
+        return heads, setups
+    for attempt in range(3):
+        try:
+            return read(data.db.transaction(read_only=True, max_attempts=1))
+        except (Aborted, DeadlineExceeded, ServiceUnavailable) as error:
+            if attempt == 2:
+                raise BackendError('세팅 조회가 일시적으로 지연되었습니다.', status_code=503, code='draft_snapshot_busy') from error
             time.sleep(0.05 * (attempt + 1))
 
 

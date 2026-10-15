@@ -515,3 +515,109 @@ def test_legacy_lineup_snapshot_separates_gk_from_start_order_one() -> None:
     assert [row["order"] for row in normalized if row["type"] == "START" and row["slot"] == "start"] == list(range(1, 11))
     assert [row["order"] for row in normalized if row["type"] == "BENCH"] == [1]
     assert issues == []
+
+
+@pytest.mark.parametrize("missing_summary", [False, True])
+def test_unmarked_month_reads_details_only_for_missing_summaries(monkeypatch, missing_summary):
+    from backend.system.system_schema import MatchDoc
+    store = _ScheduleStore()
+    data = _schedule_data(monkeypatch, store)
+    request = api_match_input.ScheduleMatchesCreateRequest(matches=[_new_schedule_fixture(1), _new_schedule_fixture(2)])
+    ids = api_match_input.create_schedule_matches(request)["gmIds"]
+    summaries = [store.documents[f"matches/{gm_id}/inputSummaries/current"] for gm_id in ids]
+    data.input_summary_backfill_complete_for_month = lambda *args: False
+    data.list_input_summaries_for_month = lambda *args: summaries[:1] if missing_summary else summaries
+    data.list_matches_for_month = lambda *args: [(gm_id, MatchDoc.model_validate(store.documents[f"matches/{gm_id}"])) for gm_id in ids]
+    heads, drafts, metadata = [], [], []
+    data.get_recording_heads_many = lambda keys: heads.append(keys) or {}
+    data.get_input_draft_participants_many = lambda keys: drafts.append(keys) or {}
+    data.get_documents_by_ids = lambda collection, keys: metadata.append((collection, keys)) or {}
+    result = api_match_input.list_input_matches(2026, 10)["matches"]
+    assert {row["gmId"] for row in result} == set(ids)
+    assert next(row for row in result if row["gmId"] == ids[0]) == summaries[0]
+    assert heads == ([[ids[1]]] if missing_summary else [])
+    assert drafts == heads
+    assert len(metadata) == (2 if missing_summary else 0)
+
+
+def test_summary_index_unavailable_uses_legacy_even_for_completed_month(monkeypatch):
+    from google.api_core.exceptions import FailedPrecondition
+    from backend.system.system_schema import MatchDoc
+    store = _ScheduleStore()
+    data = _schedule_data(monkeypatch, store)
+    gm_id = api_match_input.create_schedule_matches(api_match_input.ScheduleMatchesCreateRequest(matches=[_new_schedule_fixture()]))["gmIds"][0]
+    def unavailable(*args):
+        raise FailedPrecondition("index building")
+    data.list_input_summaries_for_month = unavailable
+    data.input_summary_backfill_complete_for_month = lambda *args: True
+    data.list_matches_for_month = lambda *args: [(gm_id, MatchDoc.model_validate(store.documents[f"matches/{gm_id}"]))]
+    assert [row["gmId"] for row in api_match_input.list_input_matches(2026, 10)["matches"]] == [gm_id]
+
+
+def test_unmarked_month_ignores_orphaned_summaries(monkeypatch):
+    store = _ScheduleStore()
+    data = _schedule_data(monkeypatch, store)
+    data.input_summary_backfill_complete_for_month = lambda *args: False
+    data.list_input_summaries_for_month = lambda *args: [{"gmId": "deleted"}]
+    data.list_matches_for_month = lambda *args: []
+    assert api_match_input.list_input_matches(2026, 10)["matches"] == []
+
+
+
+def test_daily_match_list_never_reads_the_whole_month(monkeypatch):
+    from backend.system.system_schema import MatchDoc
+    store = _ScheduleStore()
+    data = _schedule_data(monkeypatch, store)
+    gm_id = api_match_input.create_schedule_matches(api_match_input.ScheduleMatchesCreateRequest(matches=[_new_schedule_fixture()]))['gmIds'][0]
+    summary = store.documents[f'matches/{gm_id}/inputSummaries/current']
+    data.list_input_summaries_for_day = lambda day: [summary]
+    data.list_matches_for_day = lambda day: [(gm_id, MatchDoc.model_validate(store.documents[f'matches/{gm_id}']))]
+    data.list_matches_for_month = lambda *args: pytest.fail('day request must not scan the month')
+    data.list_input_summaries_for_month = lambda *args: pytest.fail('day request must not scan monthly summaries')
+    data.input_summary_backfill_complete_for_month = lambda *args: pytest.fail('day request does not need migration markers')
+    data.get_recording_heads_many = lambda *args: pytest.fail('covered fixture must not open RAW')
+    assert api_match_input.list_input_matches(2026, 10, day='2026-10-08')['matches'] == [summary]
+
+
+@pytest.mark.parametrize('day', ['2026-11-01', '2026-10-99'])
+def test_daily_match_list_rejects_invalid_or_out_of_month_dates(monkeypatch, day):
+    from backend.system.system_firestore import BackendError
+    monkeypatch.setattr(api_match_input, 'JpdDidData', lambda: object())
+    with pytest.raises(BackendError) as error:
+        api_match_input.list_input_matches(2026, 10, day=day)
+    assert error.value.status_code == 422
+
+
+def test_calendar_endpoint_returns_dates_without_any_match_details(monkeypatch):
+    class Data:
+        def list_calendar_fixtures(self, year, month):
+            assert (year, month) == (2026, 10)
+            return [{'date': '2026-10-08', 'leagueId': 'EPL'}]
+    monkeypatch.setattr(api_match_input, 'JpdDidData', Data)
+    assert api_match_input.list_input_calendar(2026, 10)['fixtures'] == [{'date': '2026-10-08', 'leagueId': 'EPL'}]
+
+
+@pytest.mark.parametrize('half', ['H1', 'H2'])
+def test_preview_bootstrap_reads_only_the_requested_half_without_setup(monkeypatch, half):
+    class Data:
+        def get_match(self, gm_id):
+            assert gm_id == 'm'
+        def read_match_dashboard_kpis_bootstrap(self, gm_id, halves):
+            assert halves == [half]
+            return {'H': {half: {'Goal': 1}}, 'A': {half: {'Goal': 0}}}
+    monkeypatch.setattr(api_match_input, 'JpdDidData', Data)
+    result = api_match_input.read_match_input_bootstrap('m', side='H', phase='preview', half=half)
+    assert result['dashboardKpiHalves'] == [half]
+    assert 'inputSetup' not in result and 'session' not in result
+
+
+def test_dashboard_kpi_refresh_never_reads_or_returns_setup(monkeypatch):
+    class Data:
+        def get_match(self, gm_id):
+            pass
+        def read_match_dashboard_kpis(self, gm_id, half):
+            return {'H': {'Goal': 1}, 'A': {'Goal': 0}}
+    monkeypatch.setattr(api_match_input, 'JpdDidData', Data)
+    result = api_match_input.read_match_dashboard_kpis('m', half='all')
+    assert result['kpis']['H']['Goal'] == 1
+    assert 'inputSetup' not in result

@@ -342,6 +342,7 @@ export function useMatchCollaboration() {
     applyRecords: (records: DidRecord[]) => void
     applyCards?: (cards: CardRecord[]) => void
     applySetup?: (setup: NonNullable<DraftResponse['inputSetup']>) => void
+    snapshotReady?: () => void
     resetPending?: () => void
   }, initial?: DraftResponse | null) {
     stop()
@@ -456,6 +457,7 @@ export function useMatchCollaboration() {
       observeServerRecords(records)
       handlers.applyRecords(records)
       applyCards(cardsFromPayload(response.payload.cards))
+      handlers.snapshotReady?.()
     }
 
     const applySetup = (setup: NonNullable<DraftResponse['inputSetup']>) => {
