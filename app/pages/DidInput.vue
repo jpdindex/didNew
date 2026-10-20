@@ -1230,13 +1230,31 @@ function pickTop(y: number) {
   return `calc(${PICK_EDGE_PX}px + (100% - ${PICK_EDGE_PX * 2}px) * ${ratio.toFixed(4)})`
 }
 
-// 선수 선택: 경기장 위 11명 외에 교체 기록에 나오는 선수(들어온/나간)도 고를 수 있어야 한다.
-// 교체 전 시점의 기록엔 나간 선수를, 배치에 아직 반영 안 된 교체면 들어온 선수를 골라야 하기 때문.
+const subKey = (s: SubRecord) => (HALF_ORDER[s.half] ?? 0) * 100000 + s.seconds
+// 선수선택 창의 경기장 배치는 "그 기록 시각" 기준이다. 수정 화면에서 02:37 기록을 고르는데
+// 02:58 에 나간 선수가 교체 OUT 줄로 밀려나 있으면 안 되므로, 기록 시각 이후(같은 시각 포함)의
+// 교체는 뒤에서부터 되돌려 나간 선수를 원래 자리에 둔다.
+const pickLineup = computed(() => {
+  const recordKey = pickRecordKey.value
+  if (recordKey === null) return lineup.value
+  const field = lineup.value.map(p => ({ ...p }))
+  for (const s of [...game.value.subs].reverse()) {
+    if (subKey(s) < recordKey) continue
+    const idx = field.findIndex(p => p.playerId === s.inPlayer)
+    const outPlayer = squad.value.find(p => p.playerId === s.outPlayer)
+    if (idx >= 0 && outPlayer) field[idx] = { ...outPlayer, slot: field[idx]!.slot }
+  }
+  return field
+})
+// 선수 선택: 경기장 위 11명 외에 교체 기록에 나오는 선수도 고를 수 있어야 한다.
+// 배치가 기록 시각 기준이라, 아직 안 들어온(뒤 시각 교체의 IN) 선수는 보이지 않는다.
+// 교체와 같은 시각의 기록은 어느 쪽인지 알 수 없으므로 IN 선수도 함께 띄운다.
 const subPickPlayers = computed(() => {
-  const onField = new Set(lineup.value.map(p => p.playerId))
+  const onField = new Set(pickLineup.value.map(p => p.playerId))
+  const recordKey = pickRecordKey.value
   const tags = new Map<string, 'IN' | 'OUT'>()
   for (const s of game.value.subs) {
-    if (!onField.has(s.inPlayer)) tags.set(s.inPlayer, 'IN')
+    if (!onField.has(s.inPlayer) && (recordKey === null || subKey(s) <= recordKey)) tags.set(s.inPlayer, 'IN')
     if (!onField.has(s.outPlayer)) tags.set(s.outPlayer, 'OUT')
   }
   return [...tags]
@@ -2814,7 +2832,7 @@ async function finishHalf() {
                 :style="{ top: pickTop(GK_LINEUP_SLOT.y) }" @click="togglePickSubmit">
                 Submit<br>{{ pickSubmitOn ? 'ON' : 'OFF' }}
               </button>
-              <button v-for="p in lineup" :key="p.playerId" class="jersey"
+              <button v-for="p in pickLineup" :key="p.playerId" class="jersey"
                 :class="{ on: pickedPlayerId === p.playerId }" :style="{ left: p.slot.x + '%', top: pickTop(p.slot.y) }"
                 :disabled="isPickGone(p.playerId)" @click="pickPlayer(p.playerId)">
                 <span class="shirtWrap"><span class="shirt">{{ p.no }}</span><span v-if="pickSubbedIn.has(p.playerId)"
