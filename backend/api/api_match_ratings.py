@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from backend.build.build_match_rating import BuildMatchRating
 from backend.system.system_schema import Side
+from backend.system.system_aifootballx import rating_display
 from backend.system.system_firestore import BackendError, JpdDidData, RequiredUser
 from backend.system.system_pipeline_jobs import PipelineJob, pipeline_jobs
 
@@ -46,6 +47,8 @@ class MatchRatingReadResponse(BaseModel):
     kpi: dict[str, int | float] | None
     teamRating: dict[str, Any] | None
     playerRatings: list[dict[str, Any]]
+    teamRatingDisplay: dict[str, Any] | None
+    playerRatingsDisplay: list[dict[str, Any]]
 
 
 router = APIRouter(tags=["match-ratings"])
@@ -167,4 +170,6 @@ def read_match_rating(
         kpi=recording.kpi.model_dump(mode="json") if recording.kpi else None,
         teamRating=recording.teamRating.model_dump(mode="json") if recording.teamRating else None,
         playerRatings=player_ratings,
+        teamRatingDisplay=rating_display(recording.teamRating.model_dump(mode="json") if recording.teamRating else None),
+        playerRatingsDisplay=[rating_display(row) for row in player_ratings],
     )

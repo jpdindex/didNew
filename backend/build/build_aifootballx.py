@@ -972,7 +972,7 @@ def validate_rating(body, response):
     check('team-JMX-finite',math.isfinite(team.jmx) and 0<=team.jmx<=99.9)
     kpi=body['teamKpi']
     expected={'apx':min(kpi['DAP']/400*100,99.9),'tpx':min(kpi['DTP']/12*100,99.9),
-              'fpx':(min(kpi['SHOT']/15*100,99.9)+min((kpi['GOAL']-kpi['OG'])/3*100,99.9))/2}
+              'fpx':(min(kpi['SHOT']/15*100,99.9)+min(kpi['GOAL']/3*100,99.9))/2}
     for metric,value in expected.items():
         actual=getattr(team,metric)
         check('team-'+metric+'-NEW-baseline',abs(actual-value)<0.00011,expected=value,actual=actual)

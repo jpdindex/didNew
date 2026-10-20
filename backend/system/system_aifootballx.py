@@ -14,7 +14,7 @@ from collections import Counter, defaultdict
 from hashlib import sha256
 from typing import Any
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 from statistics import mean
 from copy import deepcopy
 from pathlib import Path
@@ -108,6 +108,27 @@ def grade(value: float) -> str:
         raise ValueError('Grade requires a finite nonnegative score')
     return next(label for minimum, label in ((90, 'A+'), (80, 'A'), (70, 'B'),
                                             (60, 'C'), (50, 'D'), (0, 'F')) if value >= minimum)
+
+
+def truncate_rating(value, digits=1):
+    """Trim presentation precision without promoting a score across a grade boundary."""
+    number=Decimal(str(value))
+    if not number.is_finite():
+        raise ValueError('Rating must be finite')
+    return float(number.quantize(Decimal(10) ** -digits,rounding=ROUND_DOWN))
+
+
+def rating_display(values):
+    """Separate display strings from the original numeric calculation/storage payload."""
+    if values is None:
+        return None
+    result=dict(values)
+    for field in ('apx','tpx','fpx','jmx','score','scoreRel','scoreAbs'):
+        if result.get(field) is not None:
+            result[field]=format(truncate_rating(result[field]),'.1f')
+    if isinstance(result.get('jmxSeries'),list):
+        result['jmxSeries']=[format(truncate_rating(value),'.1f') for value in result['jmxSeries']]
+    return result
 
 
 def bucket(half: str, seconds: int) -> int:
@@ -383,7 +404,7 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any) -> di
                     emit('multiSheet_' + metric, {**{k: v for k, v in wide.items() if '-H' not in k}, **fields})
             emit('multiSheet_ALL', wide)
             shotscore = min(kpi['SHOT'] / SCORE_BASELINES['SHOT'] * 100, 99.9)
-            goalscore = min((kpi['GOAL'] - kpi.get('OG', 0)) / SCORE_BASELINES['GOAL'] * 100, 99.9)
+            goalscore = min(kpi['GOAL'] / SCORE_BASELINES['GOAL'] * 100, 99.9)
             ssrscore = min(kpi['SSR'] / SCORE_BASELINES['SSR'] * 100, 99.9)
             dmst = {**common, 'gm_date': dotted_date(match['date']), 't_code': team_id, 'IDX_CODE': idx,
                     'H-A': side, 'Season': short_season, 'Match': position,
@@ -708,6 +729,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
     if calculation_mode not in ('current', 'legacy-audit'):
         raise ValueError('Unknown calculation mode')
     legacy = calculation_mode == 'legacy-audit'
+    rating_precision = rounded if legacy else truncate_rating
     if prediction_index_baselines is not None and not legacy:
         raise ValueError('Historical I-* recipes require calculation_mode=legacy-audit')
     if prediction_inputs is not None and not legacy:
@@ -846,7 +868,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
             mmst.update({f'{side}-Code': row['team'], f'{side}-IDX': row['idx'],
                          f'{side}-Name': row['name'], f'{side}-DWL': row['wdl']})
             if row['jmx'] is not None:
-                mmst[f'{side}-FX'] = rounded(row['jmx'], 2)
+                mmst[f'{side}-FX'] = rating_precision(row['jmx'], 2)
             else:
                 blocked['mMST'].add(f'{side}-FX: missing stored JMX')
             mmst.update({f'6{side}-{m}': rounded(row['kpi'][m], 3 if m == 'SSR' else 1) for m in METRICS})
@@ -894,7 +916,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
             emit('pMST', pmst)
         avg = avg_known([h['jmx'], a['jmx']], 'mMST', 'HA-avg', mid)
         if avg is not None:
-            mmst['HA-avg'] = rounded(avg, 2)
+            mmst['HA-avg'] = rating_precision(avg, 2)
         emit('mMST', mmst)
 
     block = slot_definitions.get('seasonSlotMappings', {}).get(season, {})
@@ -929,7 +951,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                 continue
             cavg.update({f'C{slot}-WDL': row['point'], f'C{slot}-S': row['goals'], f'C{slot}-C': row['against']})
             if row['jmx'] is not None:
-                cavg[f'C{slot}-AVG'] = rounded(row['jmx'])
+                cavg[f'C{slot}-AVG'] = rating_precision(row['jmx'])
             else:
                 blocked['cAVG'].add(f'C{slot}-AVG: missing stored JMX')
         cavg.update({'C-W': sum(r['point'] == 3 for r in round_rows),
@@ -939,7 +961,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
             cavg['RC-AVG'] = rounded(mean(r['against'] for r in round_rows))
         round_avg = avg_known([r['jmx'] for r in round_rows] if complete else [], 'cAVG', 'R-AVG', scope)
         if round_avg is not None:
-            cavg['R-AVG'] = rounded(round_avg)
+            cavg['R-AVG'] = rating_precision(round_avg)
         emit('cAVG', cavg)
         ravg = {'PlSeason': season, 'Round': round_no}
         fixture_means = []
@@ -951,18 +973,18 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                 ravg[f'M{side}{n}_NM'] = row['idx']
                 ravg[f'M{side}{n}-WDL'] = row['wdl']
                 if row['jmx'] is not None:
-                    ravg[f'M{side}{n}-IDX'] = rounded(row['jmx'])
+                    ravg[f'M{side}{n}-IDX'] = rating_precision(row['jmx'])
                 else:
                     blocked['rAVG'].add(f'M{side}{n}-IDX: missing stored JMX')
             avg = avg_known([pair['H']['jmx'], pair['A']['jmx']], 'rAVG', f'M{n}-AVG', scope)
             if avg is not None:
-                ravg[f'M{n}-AVG'] = rounded(avg)
+                ravg[f'M{n}-AVG'] = rating_precision(avg)
                 fixture_means.append(avg)
         if round_avg is not None:
-            ravg['M-AVG'] = rounded(round_avg)
+            ravg['M-AVG'] = rating_precision(round_avg)
         round_means.append(round_avg)
         if history_available and all(v is not None for v in round_means):
-            ravg['S_AVG'] = rounded(mean(round_means))
+            ravg['S_AVG'] = rating_precision(mean(round_means))
         else:
             blocked['rAVG'].add('S_AVG: missing prior round ratings')
         emit('rAVG', ravg)
@@ -973,13 +995,13 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
             cumulative_against[row['team']] += row['against']
         points = [cumulative_points[r['team']] for r in round_rows]
         ratings = [r['jmx'] for r in round_rows]
-        # Current chart policy reads the rounded rAVG rating, caps it at 99.9,
+        # Current chart policy reads the truncated rAVG rating, caps it at 99.9,
         # and breaks ties using rounded growth over the previous played round.
         wrk_map = {r['team']: n for n, r in enumerate(sorted(round_rows, key=lambda r: (
             -cumulative_points[r['team']],
             -(cumulative_goals[r['team']] - cumulative_against[r['team']]),
             -cumulative_goals[r['team']], r['idx'])), 1)}
-        current_ratings = {r['team']: min(rounded(r['jmx']), 99.9)
+        current_ratings = {r['team']: min(rating_precision(r['jmx']), 99.9)
                            for r in round_rows if r['jmx'] is not None}
         rating_history_complete = all(r['team'] not in previous_ratings or
                                       previous_ratings[r['team']] is not None for r in round_rows)
@@ -1005,7 +1027,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                 if legacy:
                     ranks[f'WGR{number}'] = wrk // 4 + 1
             if row['jmx'] is not None:
-                ranks[f'RAV{number}'] = rounded(row['jmx'])
+                ranks[f'RAV{number}'] = rating_precision(row['jmx'])
                 if complete and all(v is not None for v in ratings) and (legacy or (history_available and rating_history_complete)):
                     ranks[f'RRK{number}'] = rank_competition(row['jmx'], ratings) if legacy else rrk_map[row['team']]
                 elif not legacy:
@@ -1013,11 +1035,11 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
             else:
                 blocked['rank'].add(f'RAV{number}/RRK{number}: missing stored JMX')
         if round_avg is not None:
-            ranks.update({'R_Avg': rounded(round_avg), 'Max': rounded(max(ratings)), 'Min': rounded(min(ratings))})
+            ranks.update({'R_Avg': rating_precision(round_avg), 'Max': rating_precision(max(ratings)), 'Min': rating_precision(min(ratings))})
             if legacy:
-                ranks.update(Season=rounded(round_avg / round_no), S_Avg=rounded(round_avg / round_no ** 2))
+                ranks.update(Season=rating_precision(round_avg / round_no), S_Avg=rating_precision(round_avg / round_no ** 2))
             if previous_mean is not None and (legacy or previous_round_no == round_no - 1):
-                ranks['R_Gap'] = rounded(round_avg - previous_mean, 2)
+                ranks['R_Gap'] = rating_precision(round_avg - previous_mean, 2)
                 if legacy:
                     ranks['R_Rate'] = rounded((round_avg - previous_mean) / round_avg, 3) if round_avg else 0
             elif round_no == 1:
@@ -1039,7 +1061,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
         savg[dest] = rounded(mean(r['kpi'][source] for r in all_rows), digits)
     rating_avg = avg_known([r['jmx'] for r in all_rows], 'sAVG', 'AI Rating', season)
     if rating_avg is not None:
-        savg['AI Rating'] = rounded(rating_avg)
+        savg['AI Rating'] = rating_precision(rating_avg)
         if not legacy:
             savg['AVG'] = savg['AI Rating']
     if legacy:
@@ -1309,9 +1331,9 @@ def validate_aggregate_links(generated, items, codes, slots):
             n = mids.index(item['match_id']) + 1
             team = item['recording']['teamId']
             match = item['match']
-            check('mMST', (season, number, match['homeTeamId'], match['awayTeamId']), item['side'] + '-FX', rounded(jmx, 2))
+            check('mMST', (season, number, match['homeTeamId'], match['awayTeamId']), item['side'] + '-FX', truncate_rating(jmx, 2))
             check('pMST', (season, number, team), 'gi_score', jmx)
-            check('rAVG', (season, number), f'M{item["side"]}{n}-IDX', rounded(jmx))
+            check('rAVG', (season, number), f'M{item["side"]}{n}-IDX', truncate_rating(jmx))
             try:
                 code = resolve_team_code(codes, season, team)
             except ValueError as exc:
@@ -1319,7 +1341,7 @@ def validate_aggregate_links(generated, items, codes, slots):
                 continue
             for slot, info in slots.get('seasonSlotMappings', {}).get(season, {}).get('cavgSlotToCodeTeamCodeMapping', {}).items():
                 if info['codeTeamCode'] == code['team_code_number']:
-                    check('cAVG', (season, number), f'C{slot}-AVG', rounded(jmx))
+                    check('cAVG', (season, number), f'C{slot}-AVG', truncate_rating(jmx))
         rank_values = []
         for item in values:
             team = item['recording']['teamId']
@@ -1333,8 +1355,8 @@ def validate_aggregate_links(generated, items, codes, slots):
                                'field': 'season-POSITION'})
                 continue
             position = LEGACY_RANK_SLOT_OVERRIDES.get(season, {}).get(team, int(next(iter(positions))))
-            check('rank', (season, number), f'RAV{position}', rounded(jmx))
-            current_rating = min(rounded(jmx), 99.9)
+            check('rank', (season, number), f'RAV{position}', truncate_rating(jmx))
+            current_rating = min(truncate_rating(jmx), 99.9)
             growth = round((current_rating - previous[team]) / previous[team] * 100, 1) if previous.get(team) else 0.0
             idx = resolve_team_code(codes, season, team)['IDX_CODE']
             rank_values.append((team, position, current_rating, growth, idx))
@@ -1350,15 +1372,15 @@ def validate_aggregate_links(generated, items, codes, slots):
         for mid, pair in pairs.items():
             if len(pair) == 2:
                 match = next(i['match'] for i in values if i['match_id'] == mid)
-                check('mMST', (season, number, match['homeTeamId'], match['awayTeamId']), 'HA-avg', rounded(mean(pair), 2))
+                check('mMST', (season, number, match['homeTeamId'], match['awayTeamId']), 'HA-avg', truncate_rating(mean(pair), 2))
         if len(current) == len(values):
             cumulative.append(mean(current))
-            check('cAVG', (season, number), 'R-AVG', rounded(mean(current)))
-            check('rAVG', (season, number), 'M-AVG', rounded(mean(current)))
-            check('rAVG', (season, number), 'S_AVG', rounded(mean(cumulative)))
+            check('cAVG', (season, number), 'R-AVG', truncate_rating(mean(current)))
+            check('rAVG', (season, number), 'M-AVG', truncate_rating(mean(current)))
+            check('rAVG', (season, number), 'S_AVG', truncate_rating(mean(cumulative)))
     if len(ratings) == len(final):
         for field in ('AI Rating', 'AVG'):
-            check('sAVG', (season[2:4] + '/' + season[7:9],), field, rounded(mean(ratings)))
+            check('sAVG', (season[2:4] + '/' + season[7:9],), field, truncate_rating(mean(ratings)))
     return {'passed': facts['passed'] and all(c['passed'] for c in checks), 'source_facts': facts,
             'rating_checks': checks, 'rating_checks_count': len(checks),
             'rating_checks_failed': sum(not c['passed'] for c in checks)}
@@ -1685,7 +1707,7 @@ def generate_delivery(evidence, selected, aggregate_items, slots, setup):
 # ==========================================================================
 
 
-VALIDATION_POLICY = 'registered-players-independent-of-appearance-v4'
+VALIDATION_POLICY = 'goal-inclusive-fpx-truncated-rating-display-v5'
 
 
 def dump(value):

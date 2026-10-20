@@ -35,6 +35,8 @@ from backend.system.system_aifootballx import (
     player_game_type,
     select_contract,
     source_records,
+    rating_display,
+    truncate_rating,
     PLAYER_MST_KPI,
     LEGACY_PREDICTION_BASELINES,
     build_aggregates,
@@ -650,11 +652,13 @@ def test_current_rating_rejects_visible_50_point_f_grade():
     assert failed==['team-fpx-grade']
 
 
-def test_current_rating_fpx_must_exclude_own_goals():
+def test_current_rating_fpx_includes_own_goals_without_changing_shots():
     body,response=rating_fixture()
     body['teamKpi']['OG']=1
     failed=[c for c in validate_rating(body,response) if not c['passed']]
-    assert any(c['name']=='team-fpx-NEW-baseline' and abs(c['expected']-33.3333333333333)<1e-6 for c in failed)
+    assert not failed
+    response['teamRating']['fpx']=33.3333
+    assert any(c['name']=='team-fpx-NEW-baseline' for c in validate_rating(body,response) if not c['passed'])
 
 
 def test_current_rating_cannot_omit_player_identities():
@@ -1109,6 +1113,66 @@ def test_new_did_player_links_master_tactic_and_appearance_to_same_identity():
     for doc in result['documents']:
         if doc['collection']=='TACTIC' and doc['data']['p_id']!='\\N':
             assert doc['data']['p_id']==str(identity)
+
+
+
+@pytest.mark.parametrize('value,display,expected_grade',[
+    (59.76,'59.7','D'),(49.99,'49.9','F'),(49.9999,'49.9','F'),
+    (50.0,'50.0','D'),(59.9999,'59.9','D'),(60.0,'60.0','C')])
+def test_rating_presentation_truncates_without_regrading_or_changing_raw(value,display,expected_grade):
+    raw={'fpx':value,'fpxGrade':expected_grade,'jmxSeries':[value]*20}
+    original=deepcopy(raw)
+    result=rating_display(raw)
+    assert result['fpx']==display and result['fpxGrade']==expected_grade
+    assert result['jmxSeries']==[display]*20 and raw==original
+    assert grade(value)==expected_grade
+
+
+def test_aggregate_rating_precision_preserves_source_and_averages_before_truncation():
+    items,codes,slots=aggregate_fixture()
+    for index,item in enumerate(items):
+        item['recording']['teamRating']['jmx']=59.79 if index<10 else 59.89
+    original=deepcopy(items)
+    result=build_aggregates(items,codes,slots)
+    assert result['complete'],result
+    assert validate_aggregate_links(result,items,codes,slots)['passed']
+    assert docs(result,'sAVG')[0]['AI Rating']==59.8
+    assert {d['gi_score'] for d in docs(result,'pMST')}=={59.79,59.89}
+    assert docs(result,'rAVG')[0]['MH1-IDX']==59.7
+    assert items==original
+
+
+def test_rating_read_exposes_truncated_strings_beside_original_numbers(monkeypatch):
+    from backend.api import api_match_ratings
+    raw={'apx':49.9999,'apxGrade':'F','tpx':59.76,'tpxGrade':'D',
+         'fpx':50.0,'fpxGrade':'D','jmx':59.76,'jmxSeries':[59.76]*20}
+    recording=SimpleNamespace(teamId='H',opponentTeamId='A',kpiVersion=1,ratingBasedOn=1,kpi=None,
+                              teamRating=SimpleNamespace(model_dump=lambda **kw:deepcopy(raw)))
+    data=SimpleNamespace(get_recording=lambda *a:recording,
+                         list_player_stats=lambda *a:{'p':{'playerId':'p',**deepcopy(raw)}})
+    monkeypatch.setattr(api_match_ratings,'JpdDidData',lambda:data)
+    response=api_match_ratings.read_match_rating('match','H')
+    assert response.teamRating['tpx']==59.76
+    assert response.teamRatingDisplay['tpx']=='59.7'
+    assert response.teamRatingDisplay['apx']=='49.9'
+    assert response.playerRatings[0]['jmx']==59.76
+    assert response.playerRatingsDisplay[0]['jmx']=='59.7'
+
+
+def test_preview_fpx_includes_own_goal_but_analysis_goal_intervals_do_not():
+    evidence,mid=preview_fixture();item=evidence['source_recordings'][0]
+    item['children']['records'][-1]['data']['playerId']='OWN'
+    computed=calculate_kpis(source_records(item));kpi=computed.team_kpi
+    item['recording']['kpi']=kpi
+    item['recording']['teamRating'].update(apx=kpi['DAP']/4,tpx=kpi['DTP']/12*100,
+        fpx=(min(kpi['SHOT']/15*100,99.9)+min(kpi['GOAL']/3*100,99.9))/2)
+    result=build(evidence,mid)
+    assert result['validation_passed'],result['errors']
+    dmst=next(d['data'] for d in result['documents'] if d['collection']=='dMST' and d['data']['H-A']=='H')
+    assert dmst['GOAL']==1 and dmst['OG']==1
+    assert dmst['GOALScore']==pytest.approx(100/3)
+    wide=next(d['data'] for d in result['documents'] if d['collection']=='multiSheet_ALL' and d['data']['team_type']=='HOME')
+    assert sum(v for k,v in wide.items() if k.startswith('GOAL-H'))==0
 
 
 def run_self_tests() -> int:
