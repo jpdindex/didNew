@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   applyResult,
+  canBeOwnGoal,
   closePrecedingOpenAct,
   computeAttackPaths,
   createActRecord,
@@ -483,10 +484,16 @@ function closeConfirm(ok: boolean) {
 // 돌아갈 상태는 editReturnStatus 가 있으면 그걸 그대로 쓰고(수정 화면 — 원래 있던
 // 화면으로 정확히 복귀), 없으면 진행중인 half 를 정지시키는 것뿐이므로 'H1'/'H2'.
 async function exitToLobby() {
-  const clockMessage = isEditMode || paused.value
-    ? `${clock.value}에 일시정지된 상태로 대기방으로 나갑니다.`
-    : '대기방으로 나가도 경기 시간은 계속 흐릅니다.'
-  if (!await askConfirm('대기방으로 나가시겠습니까?', clockMessage, '나가기')) return
+  const confirmed = isEditMode
+    ? await askConfirm('수정 모드를 끝낼까요?', '수정한 내용을 저장하고 대기방으로 나갑니다.', '수정 끝내기')
+    : await askConfirm(
+        '대기방으로 나가시겠습니까?',
+        paused.value
+          ? `${clock.value}에 일시정지된 상태로 대기방으로 나갑니다.`
+          : '대기방으로 나가도 경기 시간은 계속 흐릅니다.',
+        '나가기',
+      )
+  if (!confirmed) return
 
   if (timer) clearInterval(timer)
   timer = undefined
@@ -708,8 +715,9 @@ const rows = computed(() => {
       // X/B 로 끝난 액트 레코드(P|B, P|X)도 액트는 성립하므로 대상이 된다. 단독인
       // 경우는 레거시 규칙(UTP 는 포인트 2개 이상)에 의해 UPP 로 강등되어 자동 제외되고,
       // 뒤따라 생기는 act 없는 결과 레코드도 isDap = !!act 규칙으로 자동 제외된다.
-      isDap: flags.get(r.id)?.isDap ?? false,
-      playerName: squad.value.find(p => p.playerId === r.playerId)?.name ?? '',
+      // 자책골(OWN)은 TAP·DAP 집계에서 빠지지만, 지정을 고치거나 지울 수 있게 선수 버튼은 남긴다.
+      isDap: (flags.get(r.id)?.isDap ?? false) || r.playerId === 'OWN',
+      playerName: r.playerId === 'OWN' ? 'OWN' : squad.value.find(p => p.playerId === r.playerId)?.name ?? '',
       draft: false,
     }))
   // 위치만 찍고 아직 액트를 안 고른 상태 — 확정 레코드가 아니라 표시 전용 "가안" 행이다.
@@ -864,7 +872,8 @@ const editPlayerEligible = computed(() => {
   const result = computeAttackPaths(preview.filter(r => (r.half ?? 'H1') === halfCode.value), { closeTrailing: true })
   const flags = result.flags.get(editingId.value)
   const path = result.paths.find(p => p.recordIds.includes(editingId.value!))
-  return !!flags?.isDap || path?.ptype === 'DTP' || path?.ptype === 'STP'
+  const rec = records.value.find(r => r.id === editingId.value)
+  return !!flags?.isDap || path?.ptype === 'DTP' || path?.ptype === 'STP' || (!!rec && canBeOwnGoal(rec))
 })
 watch(editPlayerEligible, eligible => {
   if (eligible || !editingId.value) return
@@ -1023,7 +1032,8 @@ function applyEdit() {
       rec.shootDspRange = undefined
       if (pendingShot.value?.id === rec.id) pendingShot.value = null
     }
-    if (!editPlayerEligible.value) {
+    // 자책골(OWN)은 슛 득점에만 붙는다 — 결과·액트를 바꿔 득점 슛이 아니게 되면 같이 지운다.
+    if (!editPlayerEligible.value || (rec.playerId === 'OWN' && !canBeOwnGoal(rec))) {
       rec.playerId = undefined
       markRecordPlayerClear(rec.id)
       if (playerPickFor.value === rec.id) playerPickFor.value = null
@@ -1206,6 +1216,20 @@ const lineup = computed(() => {
   return gk ? [...fallback, { ...gk, slot: GK_LINEUP_SLOT }] : fallback
 })
 
+// 선수선택 창은 포메이션 좌표(맨 앞 줄 ~ 골키퍼)를 창 위아래 끝까지 펼쳐 빈 여백을 없앤다.
+// 유니폼 카드 절반 높이만큼 안쪽으로 들여 위·아래 줄이 잘리지 않게 한다.
+const PICK_EDGE_PX = 50
+const pickYRange = computed(() => {
+  const ys = lineup.value.map(p => p.slot.y)
+  const min = Math.min(...ys, GK_LINEUP_SLOT.y)
+  const max = Math.max(...ys, GK_LINEUP_SLOT.y)
+  return { min, span: Math.max(max - min, 1) }
+})
+function pickTop(y: number) {
+  const ratio = (y - pickYRange.value.min) / pickYRange.value.span
+  return `calc(${PICK_EDGE_PX}px + (100% - ${PICK_EDGE_PX * 2}px) * ${ratio.toFixed(4)})`
+}
+
 // 선수 선택: 경기장 위 11명 외에 교체 기록에 나오는 선수(들어온/나간)도 고를 수 있어야 한다.
 // 교체 전 시점의 기록엔 나간 선수를, 배치에 아직 반영 안 된 교체면 들어온 선수를 골라야 하기 때문.
 const subPickPlayers = computed(() => {
@@ -1240,6 +1264,12 @@ const pickRecordKey = computed(() => {
 const pickOutKeyByPlayer = computed(() =>
   new Map(game.value.subs.map(s => [s.outPlayer, (HALF_ORDER[s.half] ?? 0) * 100000 + s.seconds]))
 )
+// 슛으로 찍은 득점이면 교체 OUT 줄에 OWN(자책골) 버튼을 띄운다.
+// OWN 득점은 스코어엔 들어가지만 SHOT·SSR 에는 세지 않는다(didLogic isOwnGoalRecord).
+const pickOwnGoalAllowed = computed(() => {
+  const rec = records.value.find(r => r.id === playerPickFor.value)
+  return !!rec && canBeOwnGoal(rec)
+})
 function isPickGone(playerId: string) {
   const recordKey = pickRecordKey.value
   const outKey = pickOutKeyByPlayer.value.get(playerId)
@@ -1817,6 +1847,16 @@ const activeAct = computed(() => (
         : null
 ) || null)
 
+// 터치펜으로 방금 입력한 액트/결과 버튼을 hover 처럼 계속 표시해, 무엇을 눌렀는지 다음
+// 입력 전까지 확인할 수 있게 한다. 그 기록이 삭제되면 표시도 사라지고, 수정/peek 중에는
+// on 표시와 헷갈리지 않게 숨긴다. 다음 입력을 위해 위치를 새로 찍으면 바로 지운다.
+const lastTap = ref<{ id: string; key: string } | null>(null)
+const recentTapKey = computed(() => {
+  const tap = lastTap.value
+  if (!tap || pendingPos.value || editingId.value || peekRecord.value) return null
+  return records.value.some(r => r.id === tap.id) ? tap.key : null
+})
+
 // 위 레코드의 결과가 X/B 면 그 결과 버튼도 "선택됨"으로 보여준다.
 // 하나의 레코드에 act 와 res(X/B) 가 함께 있는 경우(예: 표에서 "P|B" 한 줄로 보이는
 // 레코드를 직접 클릭해서 보는 중) 는 activeAct 와 동시에 채워진다 — 의도된 동작이다.
@@ -1987,6 +2027,7 @@ function clickAct(actKey: string, isShot: boolean) {
   )
   records.value.push(rec)
   markRecordDirty(rec.id)
+  lastTap.value = { id: rec.id, key: actKey }
   if (isEditMode) placeInsertedRecords([rec.id])
   if (isShot) {
     pendingShot.value = {
@@ -2042,6 +2083,7 @@ function clickResult(res: 'X' | 'B') {
       pos: { x: pendingPos.value.x, y: pendingPos.value.y },
     })
     markRecordDirty(last.id)
+    lastTap.value = { id: last.id, key: res }
     for (const record of records.value) if (!beforeIds.has(record.id)) markRecordDirty(record.id)
     if (isEditMode) {
       const resultRec = records.value[records.value.findIndex(r => r.id === last.id) + 1]
@@ -2059,6 +2101,7 @@ function clickResult(res: 'X' | 'B') {
     })
     records.value.push(rec)
     markRecordDirty(rec.id)
+    lastTap.value = { id: rec.id, key: res }
     if (isEditMode) placeInsertedRecords([rec.id])
     closePrecedingOpenAct(records.value, rec.id)
     const recIndex = records.value.findIndex(record => record.id === rec.id)
@@ -2409,7 +2452,7 @@ async function finishHalf() {
           </div>
 
           <div class="scoreBar">
-            <div class="team">{{ home }}</div>
+            <div class="team" :class="{ mine: team === 'home' }">{{ home }}</div>
             <div class="score">{{ homeScore }}</div>
             <div class="halfBox">
               <div class="clockRow">
@@ -2423,7 +2466,7 @@ async function finishHalf() {
               </div>
             </div>
             <div class="score">{{ awayScore }}</div>
-            <div class="team right">{{ away }}</div>
+            <div class="team right" :class="{ mine: team === 'away' }">{{ away }}</div>
           </div>
 
           <div class="pitch" :style="pitchStyle" @pointerdown="clickPitch">
@@ -2448,10 +2491,6 @@ async function finishHalf() {
               :style="{ left: pendingPos.x + '%', top: pendingPos.y + '%' }" />
           </div>
 
-          <div v-if="isEditMode" class="tableBar">
-            <button class="tableToggle" @click="tableExpanded = !tableExpanded">{{ tableToggleLabel }}</button>
-            <button class="rangeToggle" :class="{ on: rangeMode }" @click="toggleRangeMode">구간 수정</button>
-          </div>
           <div v-if="rangeMode" class="rangeHint">{{ rangeEditingOpen ? '델타를 조절하거나 선택 구간을 삭제하세요' : (!rangeStartId ? '구간 시작 레코드를 탭하세요' : (!rangeEndId ? '구간 끝 레코드를 탭하세요' : '길게 눌러 이 구간을 수정하세요')) }}</div>
           <div v-if="rangeEditingOpen" class="rangeEditBar" @mousedown.stop @touchstart.stop>
             <span class="rangeEditLabel">{{ rangeDelta > 0 ? '+' : '' }}{{ rangeDelta }}초</span>
@@ -2473,8 +2512,9 @@ async function finishHalf() {
                 @mouseleave="cancelPress" @touchstart="!r.draft && startPress(r.id, true)" @touchmove="handleTouchMove"
                 @touchend="!r.draft && endPress(r.id, true)" @contextmenu.prevent>
                 <template v-if="editingId === r.id">
-                  <div class="editTimeRow" @mousedown.stop @touchstart.stop>
-                    <div class="editClock">
+                  <!-- 수정 중인 행의 빈 곳을 한 번 더 누르면 취소와 같이 수정모드를 닫는다 (버튼·숫자 위는 제외) -->
+                  <div class="editTimeRow" @mousedown.stop @touchstart.stop @click.self="cancelEdit">
+                    <div class="editClock" @click.self="cancelEdit">
                       <span class="editUnit"><button class="editStep" @click.stop="stepEditMinute(-1)">−</button><b>{{
                         String(editMinute).padStart(2, '0') }}</b><button class="editStep"
                           @click.stop="stepEditMinute(1)">+</button></span>
@@ -2707,16 +2747,16 @@ async function finishHalf() {
               <div class="groupTitle">Kick</div>
               <div class="kickGrid">
                 <button v-for="a in kickActs" :key="a.k" class="actBtn kickPrimary"
-                  :class="[`kick-${a.k.toLowerCase()}`, { on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }]"
-                  @click="clickAct(a.k, false)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
+                  :class="[`kick-${a.k.toLowerCase()}`, { on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k }]"
+                  @pointerdown="clickAct(a.k, false)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
                 <div class="stacked">
                   <button v-for="a in kickActs2" :key="a.k" class="actBtn small"
-                    :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }"
-                    @click="clickAct(a.k, false)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
+                    :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k }"
+                    @pointerdown="clickAct(a.k, false)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
                 </div>
                 <button v-for="a in kickResultActs" :key="a.k" class="actBtn kickResult"
-                  :class="[`kick-${a.k.toLowerCase()}`, { on: activeResult === a.k }]"
-                  @click="clickResult(a.k as 'X' | 'B')"><b>{{ a.k }}</b><span class="divider">|</span><span>{{ a.label
+                  :class="[`kick-${a.k.toLowerCase()}`, { on: activeResult === a.k, recent: recentTapKey === a.k }]"
+                  @pointerdown="clickResult(a.k as 'X' | 'B')"><b>{{ a.k }}</b><span class="divider">|</span><span>{{ a.label
                   }}</span></button>
               </div>
             </div>
@@ -2725,24 +2765,30 @@ async function finishHalf() {
               <div class="groupTitle">Shooting</div>
               <div class="shootGrid">
                 <button v-for="a in shootActs" :key="a.k" class="actBtn"
-                  :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k }"
-                  @click="clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
+                  :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k }"
+                  @pointerdown="clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
               </div>
 
               <div class="liveRoomGap">
                 <LiveRoomStatus compact :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
+                <!-- 수정 화면의 기록 더보기·구간 수정은 골대 위에 둔다 (스코어바에 두면 팀 이름이 밀려나고, 경기장 아래에 두면 코너 위치 입력과 겹친다) -->
+                <div v-if="isEditMode" class="editTools">
+                  <button class="scoreTool" :class="{ on: tableExpanded }"
+                    @click="tableExpanded = !tableExpanded">{{ tableToggleLabel }}</button>
+                  <button class="scoreTool" :class="{ on: rangeMode }" @click="toggleRangeMode">구간 수정</button>
+                </div>
               </div>
 
               <div class="goal" :class="{ active: pendingShot !== null || isEditingShoot }">
-                <button type="button" class="goalZone goalMissButton hx" @click="selectOuterMiss('HX')">HX</button>
-                <div class="goalZone goalAimZone h" @click="clickOuterZone($event, 'H')">H</div>
-                <button type="button" class="goalZone goalMissButton lx" @click="selectOuterMiss('LX')">LX</button>
-                <div class="goalZone goalAimZone l" @click="clickOuterZone($event, 'L')">L</div>
-                <button type="button" class="goalZone goalMissButton rx" @click="selectOuterMiss('RX')">RX</button>
-                <div class="goalZone goalAimZone r" @click="clickOuterZone($event, 'R')">R</div>
+                <button type="button" class="goalZone goalMissButton hx" @pointerdown="selectOuterMiss('HX')">HX</button>
+                <div class="goalZone goalAimZone h" @pointerdown="clickOuterZone($event, 'H')">H</div>
+                <button type="button" class="goalZone goalMissButton lx" @pointerdown="selectOuterMiss('LX')">LX</button>
+                <div class="goalZone goalAimZone l" @pointerdown="clickOuterZone($event, 'L')">L</div>
+                <button type="button" class="goalZone goalMissButton rx" @pointerdown="selectOuterMiss('RX')">RX</button>
+                <div class="goalZone goalAimZone r" @pointerdown="clickOuterZone($event, 'R')">R</div>
                 <div class="hxDivider" aria-hidden="true" />
                 <div class="meterGuide" aria-hidden="true" />
-                <div class="goalFrame" @click="clickGoalFrame">
+                <div class="goalFrame" @pointerdown="clickGoalFrame">
                   <div class="goalZone goalCenter" aria-hidden="true" />
                 </div>
                 <div v-if="infoGoalPos && !pendingFramePos && !pendingOuterScreenPos" class="marker editMarker"
@@ -2751,9 +2797,9 @@ async function finishHalf() {
                 <div v-if="pendingFrameScreenPos" class="marker editMarker" :style="pendingFrameScreenPos" />
               </div>
               <div class="goalResultButtons" :class="{ active: pendingShot !== null || isEditingShoot }">
-                <button class="goalResultBtn resB" @click="confirmGoalFrame('B')">B</button>
-                <button class="goalResultBtn resGoal" @click="confirmGoalFrame('GOAL')">GOAL</button>
-                <button class="goalResultBtn resX" @click="confirmGoalFrame('X')">X</button>
+                <button class="goalResultBtn resB" @pointerdown="confirmGoalFrame('B')">B</button>
+                <button class="goalResultBtn resGoal" @pointerdown="confirmGoalFrame('GOAL')">GOAL</button>
+                <button class="goalResultBtn resX" @pointerdown="confirmGoalFrame('X')">X</button>
               </div>
             </div>
 
@@ -2762,14 +2808,14 @@ async function finishHalf() {
           <!-- 선수선택: PPT 대로 액트 입력창 자리에서 UI 를 전환한다 -->
           <div v-if="!cardOpen && !subOpen && playerPickFor" class="group pickGroup">
             <div class="pickField">
-              <button class="pickLineBtn pickReset" :style="{ top: GK_LINEUP_SLOT.y + '%' }"
+              <button class="pickLineBtn pickReset" :style="{ top: pickTop(GK_LINEUP_SLOT.y) }"
                 @click="resetPlayerPick">Reset</button>
               <button class="pickLineBtn pickSubmitToggle" :class="{ on: pickSubmitOn }"
-                :style="{ top: GK_LINEUP_SLOT.y + '%' }" @click="togglePickSubmit">
+                :style="{ top: pickTop(GK_LINEUP_SLOT.y) }" @click="togglePickSubmit">
                 Submit<br>{{ pickSubmitOn ? 'ON' : 'OFF' }}
               </button>
               <button v-for="p in lineup" :key="p.playerId" class="jersey"
-                :class="{ on: pickedPlayerId === p.playerId }" :style="{ left: p.slot.x + '%', top: p.slot.y + '%' }"
+                :class="{ on: pickedPlayerId === p.playerId }" :style="{ left: p.slot.x + '%', top: pickTop(p.slot.y) }"
                 :disabled="isPickGone(p.playerId)" @click="pickPlayer(p.playerId)">
                 <span class="shirtWrap"><span class="shirt">{{ p.no }}</span><span v-if="pickSubbedIn.has(p.playerId)"
                     class="shirtTag">In</span><i v-if="pickCardMark(p.playerId)" class="cardMark"
@@ -2777,7 +2823,7 @@ async function finishHalf() {
                 <span class="jname">{{ p.name }}</span>
               </button>
             </div>
-            <div v-if="subPickPlayers.length" class="pickSubs">
+            <div v-if="subPickPlayers.length || pickOwnGoalAllowed" class="pickSubs">
               <span class="pickSubsLabel">교체<br>OUT</span>
               <button v-for="p in subPickPlayers" :key="p.playerId" class="jersey subJersey"
                 :class="{ on: pickedPlayerId === p.playerId }" :disabled="isPickGone(p.playerId)"
@@ -2787,6 +2833,8 @@ async function finishHalf() {
                     :class="pickCardMark(p.playerId)!" /></span>
                 <span class="jname">{{ p.name }}</span>
               </button>
+              <button v-if="pickOwnGoalAllowed" class="pickOwnBtn" :class="{ on: pickedPlayerId === 'OWN' }"
+                @click="pickPlayer('OWN')">OWN<span>자책골</span></button>
             </div>
             <div class="pickActions">
               <button class="pickCancel" @click="cancelPlayerPick">Cancel</button>
@@ -3094,7 +3142,8 @@ button {
   gap: 10px;
   border: 1px solid rgba(255, 255, 255, .12);
   background: rgba(0, 0, 0, .18);
-  border-radius: 6px
+  border-radius: 6px;
+  animation: pickGroupSlideIn .28s cubic-bezier(.22, .8, .3, 1) both
 }
 
 .cardPanelTitle {
@@ -3342,11 +3391,29 @@ button {
   flex: 0 0 auto;
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) 24px auto 24px minmax(150px, 1fr);
+  grid-template-columns: minmax(120px, 1fr) 27px auto 27px minmax(150px, 1fr);
   align-items: center;
   gap: 10px;
   padding: 8px 14px;
   border-bottom: 1px solid rgba(255, 255, 255, .08)
+}
+
+.scoreTool {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid rgba(240, 180, 41, .45);
+  border-radius: 4px;
+  background: #20242b;
+  color: #f0b429;
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+  cursor: pointer
+}
+
+.scoreTool:active,
+.scoreTool.on {
+  background: rgba(240, 180, 41, .2)
 }
 
 .team {
@@ -3356,18 +3423,22 @@ button {
   white-space: nowrap;
   color: #eee;
   font-weight: 800;
-  font-size: 13px
+  font-size: 15px
 }
 
 .team.right {
   text-align: right
 }
 
+.team.mine {
+  color: #f0b429
+}
+
 .score {
   color: #fff;
   font-weight: 900;
-  font-size: 20px;
-  min-width: 20px;
+  font-size: 22px;
+  min-width: 22px;
   text-align: center
 }
 
@@ -3379,7 +3450,7 @@ button {
   background: #111417;
   border: 1px solid rgba(255, 255, 255, .1);
   border-radius: 6px;
-  padding: 6px 20px
+  padding: 7px 21px
 }
 
 .clockRow {
@@ -3389,13 +3460,13 @@ button {
 }
 
 .timeStep {
-  width: 24px;
-  height: 20px;
+  width: 27px;
+  height: 23px;
   border-radius: 3px;
   border: 1px solid rgba(255, 255, 255, .3);
   background: rgba(255, 255, 255, .1);
   color: rgba(255, 255, 255, .6);
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 900;
   line-height: 1;
   cursor: pointer;
@@ -3411,7 +3482,7 @@ button {
 }
 
 .halfLabel {
-  font-size: 10px;
+  font-size: 11px;
   color: rgba(255, 255, 255, .35);
   font-weight: 800
 }
@@ -3432,7 +3503,7 @@ button {
 
 .clock {
   font-family: monospace;
-  font-size: 18px;
+  font-size: 20px;
   color: #f0b429;
   font-weight: 800
 }
@@ -3451,13 +3522,13 @@ button {
 }
 
 .pauseBtn {
-  width: 110px;
-  height: 34px;
+  width: 112px;
+  height: 35px;
   border-radius: 4px;
   border: 1px solid rgba(255, 255, 255, .15);
   background: rgba(255, 255, 255, .06);
   color: #f0b429;
-  font-size: 16px;
+  font-size: 17px;
   cursor: pointer;
   display: grid;
   place-items: center;
@@ -3594,30 +3665,30 @@ button {
 
 .corner {
   position: absolute;
-  width: 22px;
-  height: 22px;
+  width: 32px;
+  height: 32px;
   border: 2px solid rgba(255, 255, 255, .35);
   border-radius: 50%
 }
 
 .cornerTL {
-  left: -12px;
-  top: -12px
+  left: -17px;
+  top: -17px
 }
 
 .cornerBL {
-  left: -12px;
-  bottom: -12px
+  left: -17px;
+  bottom: -17px
 }
 
 .cornerTR {
-  right: -12px;
-  top: -12px
+  right: -17px;
+  top: -17px
 }
 
 .cornerBR {
-  right: -12px;
-  bottom: -12px
+  right: -17px;
+  bottom: -17px
 }
 
 .marker {
@@ -3686,21 +3757,7 @@ button {
   }
 }
 
-.tableToggle {
-  flex: 0 0 auto;
-  height: 20px;
-  border: none;
-  border-top: 1px solid rgba(255, 255, 255, .08);
-  background: #20242b;
-  color: #f0b429;
-  font-size: 10px;
-  font-weight: 800;
-  cursor: pointer
-}
 
-.tableToggle:hover {
-  background: #262b33
-}
 
 .table {
   position: absolute;
@@ -3740,6 +3797,11 @@ button {
 .trow span:last-child {
   text-align: left;
   padding-left: 18px
+}
+
+/* 선수 버튼 칸은 왼쪽 여백을 줄여, 긴 이름의 버튼이 오른쪽에서 잘리지 않게 한다. */
+.trow span:last-child {
+  padding-left: 4px
 }
 
 .thead {
@@ -3789,6 +3851,7 @@ button {
   height: 32px;
   min-width: 88px;
   padding: 0 14px;
+  white-space: nowrap;
   border-radius: 8px;
   border: 1.5px dashed rgba(240, 180, 41, .65);
   background: rgba(240, 180, 41, .08);
@@ -3946,6 +4009,8 @@ button {
   position: relative;
   flex: 1;
   min-height: 0;
+  /* 줄 간격이 유니폼 카드보다 넓게 남는 높이까지만 — 남는 공간은 버튼 아래로 보내 버튼을 위로 올린다 */
+  max-height: 560px;
   border: 1px solid rgba(255, 255, 255, .1);
   background: rgba(255, 255, 255, .02)
 }
@@ -4062,6 +4127,40 @@ button {
   margin-right: 6px
 }
 
+/* 자책골(OWN) — 교체 OUT 줄 오른쪽 끝. 태블릿 터치 기준: hover 없이 :active 로 눌림 표시 */
+.pickOwnBtn {
+  margin-left: auto;
+  min-width: 64px;
+  min-height: 48px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 1px;
+  padding: 4px 10px;
+  border: 1px solid #e5484d;
+  border-radius: 4px;
+  background: transparent;
+  color: #e5484d;
+  font-size: 15px;
+  font-weight: 900;
+  cursor: pointer
+}
+
+.pickOwnBtn span {
+  font-size: 10px;
+  font-weight: 700
+}
+
+.pickOwnBtn:active {
+  background: rgba(229, 72, 77, .2)
+}
+
+.pickOwnBtn.on {
+  border-color: #f0b429;
+  background: #f0b429;
+  color: #191919
+}
+
 /* 선수 선택창 표시 — 유니폼(.shirt) 바로 옆에 붙인다: In 은 왼쪽 위, 카드(경고/퇴장)는 오른쪽 위.
    .shirt 는 clip-path 로 잘리므로 감싸는 .shirtWrap 을 기준으로 배치한다. */
 .shirtWrap {
@@ -4129,7 +4228,7 @@ button {
 
 .pickCancel,
 .pickSubmit {
-  height: 34px;
+  height: 48px;
   border-radius: 4px;
   font-weight: 800;
   font-size: 13px;
@@ -4377,7 +4476,10 @@ section.right h1 {
   color: rgba(255, 255, 255, .45);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06), inset 0 -2px 0 rgba(0, 0, 0, .18);
   cursor: pointer;
-  transition: opacity .15s, background .15s, transform .1s, box-shadow .1s
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none
 }
 
 .actBtn.small {
@@ -4456,14 +4558,36 @@ section.right h1 {
   cursor: not-allowed
 }
 
-.actBtn:not(:disabled):hover {
-  background: rgba(255, 255, 255, .1);
-  border-color: rgba(255, 255, 255, .32)
+@media (hover: hover) {
+  .actBtn:not(:disabled):hover {
+    background: rgba(255, 255, 255, .1);
+    border-color: rgba(255, 255, 255, .32)
+  }
 }
 
 .actBtn:not(:disabled):active {
-  transform: scale(.98);
   box-shadow: inset 0 2px 4px rgba(0, 0, 0, .3)
+}
+
+/* 방금 터치로 입력한 버튼 — 다음 입력 전까지 hover 처럼 표시해 둔다.
+   available/on 규칙보다 앞에 둬서, 다음 위치를 찍으면 그 상태가 우선 보이게 한다. */
+.actBtn.recent:not(:disabled) {
+  background: linear-gradient(135deg, #f0b429, #d79e20);
+  border-color: #f0b429;
+  color: #191919;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .25), inset 0 -2px 0 rgba(120, 75, 0, .28), 0 2px 5px rgba(0, 0, 0, .2)
+}
+
+/* X/B 는 노란색이 아닌 흰색으로 표시한다. */
+.actBtn.kickResult.recent:not(:disabled) {
+  background: linear-gradient(135deg, #f4f4f4, #d9d9d9);
+  border-color: #ffffff;
+  color: #161616;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .5), inset 0 -2px 0 rgba(0, 0, 0, .18), 0 2px 5px rgba(0, 0, 0, .2)
+}
+
+.actBtn.kickResult.recent .divider {
+  color: rgba(0, 0, 0, .25)
 }
 
 /* 3단계: 기본(회색) → 위치를 찍으면 available(테두리+텍스트만 노란색) → 실제 사용한 것만 on(안까지 채움).
@@ -4475,8 +4599,10 @@ section.right h1 {
   box-shadow: inset 0 1px 0 rgba(240, 180, 41, .18), inset 0 -2px 0 rgba(0, 0, 0, .16)
 }
 
-.actBtn.available:not(:disabled):hover {
-  background: rgba(240, 180, 41, .2)
+@media (hover: hover) {
+  .actBtn.available:not(:disabled):hover {
+    background: rgba(240, 180, 41, .2)
+  }
 }
 
 .actBtn.on:not(:disabled) {
@@ -4486,19 +4612,28 @@ section.right h1 {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .25), inset 0 -2px 0 rgba(120, 75, 0, .28), 0 2px 5px rgba(0, 0, 0, .2)
 }
 
-.actBtn.on:not(:disabled):hover {
-  background: #ffc84a
+@media (hover: hover) {
+  .actBtn.on:not(:disabled):hover {
+    background: #ffc84a
+  }
 }
 
 /* X/B 는 절대 노란색이 되지 않는다 — 결과로 선택된 상태는 회색 계열로 채운다 (specificity 로 위 규칙을 덮는다) */
 .actBtn.kickResult.on:not(:disabled) {
-  background: rgba(255, 255, 255, .35);
-  border-color: rgba(255, 255, 255, .55);
-  color: #161616
+  background: linear-gradient(135deg, #f4f4f4, #d9d9d9);
+  border-color: #ffffff;
+  color: #161616;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .5), inset 0 -2px 0 rgba(0, 0, 0, .18), 0 2px 5px rgba(0, 0, 0, .2)
 }
 
-.actBtn.kickResult.on:not(:disabled):hover {
-  background: rgba(255, 255, 255, .45)
+.actBtn.kickResult.on .divider {
+  color: rgba(0, 0, 0, .25)
+}
+
+@media (hover: hover) {
+  .actBtn.kickResult.on:not(:disabled):hover {
+    background: #ffffff
+  }
 }
 
 .shootGrid {
@@ -4515,7 +4650,7 @@ section.right h1 {
   margin-top: 0;
   opacity: .5;
   pointer-events: none;
-  transition: opacity .2s, transform .2s;
+  transition: opacity .08s, transform .08s;
   transform: scale(.985);
   cursor: crosshair;
   background: linear-gradient(180deg, rgba(255, 255, 255, .018), transparent 40%)
@@ -4529,6 +4664,13 @@ section.right h1 {
   display: flex;
   align-items: center;
   overflow: hidden;
+}
+
+.editTools {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+  flex: 0 0 auto
 }
 
 .goal.active {
@@ -4550,6 +4692,8 @@ section.right h1 {
   border-bottom: none;
   border-radius: 2px 2px 0 0;
   cursor: crosshair;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
   background:
     linear-gradient(180deg, rgba(86, 110, 105, .16), transparent 16%),
     repeating-linear-gradient(0deg, rgba(122, 160, 151, .10) 0 1px, transparent 1px 18px),
@@ -4587,6 +4731,10 @@ section.right h1 {
 
 .goalZone {
   cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
   color: #f0b429;
   font-weight: 800;
   font-size: 11px;
@@ -4601,10 +4749,12 @@ section.right h1 {
   color: rgba(255, 255, 255, .72)
 }
 
-.goalMissButton:hover {
-  border-color: #f0b429;
-  background: rgba(240, 180, 41, .2);
-  color: #f0b429
+@media (hover: hover) {
+  .goalMissButton:hover {
+    border-color: #f0b429;
+    background: rgba(240, 180, 41, .2);
+    color: #f0b429
+  }
 }
 
 /* 좌표 없는 바깥 결과 버튼은 각 실측 가이드라인 바깥 영역을 정확히 채운다. */
@@ -4673,8 +4823,10 @@ section.right h1 {
   pointer-events: none
 }
 
-.goalAimZone:hover {
-  background: rgba(240, 180, 41, .08)
+@media (hover: hover) {
+  .goalAimZone:hover {
+    background: rgba(240, 180, 41, .08)
+  }
 }
 
 .goalResultButtons {
@@ -4685,7 +4837,7 @@ section.right h1 {
   /* 골대(.goal)와 같이, 슛 액트를 눌러 결과를 기다릴 때만 활성화한다. */
   opacity: .5;
   pointer-events: none;
-  transition: opacity .2s
+  transition: opacity .08s
 }
 
 .goalResultButtons.active {
@@ -4700,11 +4852,23 @@ section.right h1 {
   color: #f1f1f1;
   font-weight: 900;
   font-size: 15px;
-  cursor: pointer
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none
 }
 
-.goalResultBtn:hover {
-  background: #353a3f
+/* 터치에선 hover 가 없으니 누르는 순간의 피드백을 확실히 준다. */
+.goalResultBtn:active,
+.goalMissButton:active {
+  background: rgba(240, 180, 41, .3)
+}
+
+@media (hover: hover) {
+  .goalResultBtn:hover {
+    background: #353a3f
+  }
 }
 
 .goalResultBtn.resGoal {
@@ -4713,8 +4877,10 @@ section.right h1 {
   color: #f0b429
 }
 
-.goalResultBtn.resGoal:hover {
-  background: rgba(240, 180, 41, .3)
+@media (hover: hover) {
+  .goalResultBtn.resGoal:hover {
+    background: rgba(240, 180, 41, .3)
+  }
 }
 
 /* ---- 선수 교체 --------------------------------------------------------------
@@ -4730,7 +4896,8 @@ section.right h1 {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-height: 0
+  min-height: 0;
+  animation: pickGroupSlideIn .28s cubic-bezier(.22, .8, .3, 1) both
 }
 
 .subCols {
@@ -5053,30 +5220,7 @@ section.right h1 {
 </style>
 
 <style scoped>
-.tableBar {
-  display: flex;
-  gap: 4px;
-  flex: 0 0 auto;
-}
 
-.tableBar .tableToggle {
-  flex: 1;
-}
-
-.rangeToggle {
-  height: 20px;
-  padding: 0 10px;
-  border: 1px solid rgba(240, 180, 41, .45);
-  background: #20242b;
-  color: #f0b429;
-  font-size: 10px;
-  font-weight: 800;
-  cursor: pointer;
-}
-
-.rangeToggle.on {
-  background: rgba(240, 180, 41, .2);
-}
 
 .rangeHint {
   flex: 0 0 auto;

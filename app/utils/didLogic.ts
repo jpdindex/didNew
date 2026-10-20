@@ -108,6 +108,16 @@ function isGoal(res: ResCode) {
   return res === 'GOAL'
 }
 
+/** 자책골 = 슛 액트로 찍은 GOAL 레코드의 선수를 'OWN' 으로 지정한 것. SHOT·SSR·TAP 집계에서 빠진다. */
+export function isOwnGoalRecord(r: Pick<DidRecord, 'res' | 'playerId'>) {
+  return isGoal(r.res) && r.playerId === 'OWN'
+}
+
+/** 선수선택에서 OWN(자책골)을 고를 수 있는 레코드 — 슛으로 찍은 득점 */
+export function canBeOwnGoal(r: Pick<DidRecord, 'act' | 'res' | 'isShot'>) {
+  return isGoal(r.res) && (!!r.isShot || isShotAct(r.act))
+}
+
 /**
  * 판정 대상 레코드만 시간순으로 추린다.
  * 레거시 정렬 기준: gr_seconds asc, gr_regdt asc → seconds, seq 순.
@@ -251,6 +261,8 @@ export function closePrecedingOpenAct(records: DidRecord[], resultRecordId: stri
   // 골대 좌표·DSP 범위도 지워 유효슈팅으로 잡히지 않게 한다.
   if (prev && (prev.isShot || isShotAct(prev.act)) && SHOT_ZONE_RESULTS.has(prev.res)) {
     prev.res = resultRec.res
+    // 득점이 아니게 됐으면 자책골(OWN) 지정도 의미가 없다.
+    if (prev.playerId === 'OWN') prev.playerId = undefined
     prev.shootPosX = undefined
     prev.shootPosY = undefined
     prev.shootDspRange = undefined
@@ -395,11 +407,11 @@ function classifyChain(chain: DidRecord[]): { path: AttackPath; flags: Map<strin
 
     if (act) count++
 
-    if (r.isShot || (act && isShotAct(act))) {
+    if (!isOwnGoal && (r.isShot || (act && isShotAct(act)))) {
       // 슛이 있으면 전/후방 무관하게 슛 루트. 같은 루트 안(4초 이하로 연결)에서
       // C/P/K/F 뒤에 나온 슛만 DTP 이고, 앞선 연결 액트가 없으면 단독슛(STP)이다.
       ptype = 'DTP'
-      if (seenConnect && !isOwnGoal) linkedShot = true
+      if (seenConnect) linkedShot = true
       if (isGoal(r.res)) isGoalChain = true
 
       // DSP: 유효슈팅(득점 / 유효방향 L·H·R / 좌표가 찍힌 블락 / 골키퍼 선방)을 포함하는지.
@@ -413,7 +425,7 @@ function classifyChain(chain: DidRecord[]): { path: AttackPath; flags: Map<strin
     } else if (act) {
       seenConnect = true
     }
-    if (!(r.isShot || (act && isShotAct(act))) && r.area < 7 && ptype === 'UPP') {
+    if (!(!isOwnGoal && (r.isShot || (act && isShotAct(act)))) && r.area < 7 && ptype === 'UPP') {
       // 공격영역(구역 1~6) 진입 → UTP 로 승격하고 진입지점을 기록
       ptype = 'UTP'
       utpBeginId = r.id
@@ -478,13 +490,17 @@ function classifyChain(chain: DidRecord[]): { path: AttackPath; flags: Map<strin
   // ---- 공통 플래그 (TAP / SHT / GOL) ----
   for (const r of chain) {
     const f = flags.get(r.id)!
-    const { act, res } = r
+    const { res } = r
+    // 자책골은 레거시 PHP 처럼 액트를 비운 것으로 보고 TAP·SHOT 을 세지 않는다(GOAL 만 남는다).
+    const ownGoal = isOwnGoalRecord(r)
+    const act = ownGoal ? '' : r.act
+    const shot = !ownGoal && (isShotAct(act) || !!r.isShot)
     const hasShootPos = (r.shootPosX ?? 0) > 0 || (r.shootPosY ?? 0) > 0
 
     f.isTap = !!act
     f.isTapS = !!act && (res === 'O' || isGoal(res))
-    f.isSht = isShotAct(act) || !!r.isShot
-    f.isShtS = (isShotAct(act) || !!r.isShot) &&
+    f.isSht = shot
+    f.isShtS = shot &&
       (isGoal(res) || res === 'R' || res === 'L' || res === 'H' || res === 'GB' ||
         (res === 'B' && hasShootPos) || !!r.shootDspRange)
     f.isGol = isGoal(res)
