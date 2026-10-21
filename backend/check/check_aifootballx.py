@@ -734,7 +734,15 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(sum(values['DTP']), 1)
         self.assertEqual(values['DTP'][0:2], [0, 1])
         self.assertEqual(values['SSR'][0:3], [0, 1, 1])
-        self.assertEqual(values['SSR'][10], 0)
+        self.assertEqual(values['SSR'][10], 1)
+
+        item = evidence['source_recordings'][0]
+        item['children']['records'].append({'id': 'second-half-shot', 'data': {
+            'half': 'H2', 'halfSeconds': 300, 'seq': 3, 'act': 'S', 'res': 'O', 'area': 2}})
+        records = source_records(item)
+        values = intervals(records, calculate_kpis(records))
+        self.assertEqual(values['SSR'][10], 1)
+        self.assertEqual(values['SSR'][11:], [.5] * 9)
 
     def test_own_goals_excluded(self):
         evidence, _ = preview_fixture()
@@ -968,6 +976,28 @@ def test_sql_own_goal_does_not_create_player_goal_or_analysis_goal():
     assert report['available_source_validation_passed']
     assert not any(d['collection']=='playerGoal' for d in report['documents'])
     assert next(d['data'] for d in report['documents'] if d['collection']=='dMST' and d['data']['H-A']=='H')['OG']==1
+    timeline=next(d['data'] for d in report['documents'] if d['collection']=='multiSheet_GOAL-시간' and d['data']['team_type']=='HOME')
+    assert timeline['GOAL1']=='H1_OG_300'
+    assert all(timeline[f'GOAL{n}']=='\\N' for n in range(2,11))
+
+
+def test_sql_ssr_carries_first_half_and_timeline_orders_own_goals_with_normal_goals():
+    game,infos,children,codes=sql_fixture()
+    goal=children['H']['ff_game_record'][0]
+    children['H']['ff_game_record'].extend([
+        {**goal,'gr_id':'late-goal','gr_half':'H2','gr_half_seconds':600,'gr_is_sht':1},
+        {**goal,'gr_id':'own-goal','gr_half':'H2','gr_half_seconds':300,'p_id':'OWN','gr_is_sht':0},
+    ])
+    report=build_details(game,infos,children,codes)
+    assert report['available_source_validation_passed'],report['errors']
+    wide=next(d['data'] for d in report['documents'] if d['collection']=='multiSheet_ALL' and d['data']['team_type']=='HOME')
+    assert wide['SSR-H2-0-5']==1
+    assert wide['SSR-H2-5-10']==1
+    assert wide['SSR-H2-10-15']==1
+    assert sum(v for k,v in wide.items() if k.startswith('GOAL-H'))==2
+    timeline=next(d['data'] for d in report['documents'] if d['collection']=='multiSheet_GOAL-시간' and d['data']['team_type']=='HOME')
+    assert [timeline[f'GOAL{n}'] for n in range(1,5)]==['H1_300','H2_OG_300','H2_600','\\N']
+    assert len([d for d in report['documents'] if d['collection']=='playerGoal'])==2
 
 
 @pytest.mark.parametrize('seconds,total_seconds', [(0,0),(1,1),(4,3064),(1,2755)])
@@ -1173,6 +1203,10 @@ def test_preview_fpx_includes_own_goal_but_analysis_goal_intervals_do_not():
     assert dmst['GOALScore']==pytest.approx(100/3)
     wide=next(d['data'] for d in result['documents'] if d['collection']=='multiSheet_ALL' and d['data']['team_type']=='HOME')
     assert sum(v for k,v in wide.items() if k.startswith('GOAL-H'))==0
+    timeline=next(d['data'] for d in result['documents'] if d['collection']=='multiSheet_GOAL-시간' and d['data']['team_type']=='HOME')
+    assert timeline['GOAL1']=='H1_OG_300'
+    assert all(timeline[f'GOAL{n}']=='\\N' for n in range(2,11))
+    assert not any(d['collection']=='playerGoal' and d['data']['team_type']=='HOME' for d in result['documents'])
 
 
 def run_self_tests() -> int:

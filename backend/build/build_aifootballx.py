@@ -277,10 +277,10 @@ def field_rule(collection: str, field: str, label: str = '') -> tuple[str, str, 
             if field.startswith('JMX-'):
                 return 'candidate', 'recordings.teamRating.jmxSeries[0..19]', 'H1 10개→H2 10개; 누적 평점 직접 사용, 재계산 금지'
             if field.startswith('SSR-'):
-                return 'derived', '자책골 제외 누적 GOAL / 누적 SHOT', 'NEW 엑셀 SSR-5 기준: 각 반 시작부터 해당 구간까지 누적, 분모 0은 0'
+                return 'derived', '자책골 제외 누적 GOAL / 누적 SHOT', 'NEW 엑셀 SSR-5 기준: 경기 시작부터 해당 구간까지 누적, 후반에도 전반 누적 유지; 분모 0은 0'
             return 'derived', 'records → KPI flags/구간 집계', '5:00은 5–10 구간; 분석 골은 자책골 제외. DTP 경기 총계는 구간 합과 일치'
         if re.fullmatch(r'GOAL\d+', field):
-            return 'derived', '골 records.half/halfSeconds/seq → H1_초 또는 H2_초', '미지정은 문자열 \\N; 자책골 제외, 10골 초과 목적지 처리 확인 필요'
+            return 'derived', '골 records.half/halfSeconds/seq → H1_초 또는 H2_초; 자책골은 H1_OG_초 또는 H2_OG_초', '시간순으로 자책골도 보존; 미지정은 문자열 \\N; 10골 초과 목적지 처리 확인 필요'
     if collection.startswith('bmas_') and field in {'gr_area_code', 'gr_half', 'gr_pos_x', 'gr_pos_y', 'gr_seconds', 'Type'}:
         return 'derived', 'records + flags.is_dt*', '역할 판정 이벤트만 추출; Type·시간 오프셋 대조 필요'
     if collection == 'Player':
@@ -1718,8 +1718,9 @@ def build_details(game, infos, children, codes):
                 if row.get(field):
                     emit('bmas_' + role, {**common,'team_type':wide['team_type'],'t_code':idx,'Type':role,
                         **{k:projected[k] for k in ('gr_half','gr_seconds','gr_area_code','gr_pos_x','gr_pos_y')}}, (mid,side,row['gr_id'],role))
+            if row.get('gr_is_gol'):
+                goal_times.append((half or str(row['gr_half']), seconds, seq, row.get('p_id') == 'OWN'))
             if row.get('gr_is_gol') and row.get('p_id') != 'OWN':
-                goal_times.append((half or str(row['gr_half']), seconds))
                 emit('playerGoal',{**common,'gm_date':wide['gm_date'],'IDX_CODE':idx,'t_code':team,'team_type':wide['team_type'],
                     'HA':side,'gr_res_code':'G','gr_half':projected['gr_half'],'gr_half_seconds':seconds,'p_id':row.get('p_id') or '\\N'},(mid,side,row['gr_id']))
         for path in paths:
@@ -1735,11 +1736,10 @@ def build_details(game, infos, children, codes):
             if half and type(row['gr_half_seconds']) is int and row['gr_half_seconds'] >= 0:
                 bins['BAP'][bucket(half,row['gr_half_seconds'])] += 1
             else: errors.append(f'{side}: BAP outside supported clock')
-        for offset in (0,10):
-            goals = shots = 0
-            for n in range(offset,offset+10):
-                goals += bins['GOAL'][n]; shots += bins['SHOT'][n]
-                bins['SSR'][n] = goals/shots if shots else 0
+        goals = shots = 0
+        for n in range(20):
+            goals += bins['GOAL'][n]; shots += bins['SHOT'][n]
+            bins['SSR'][n] = goals/shots if shots else 0
         for metric in ('DAP','DTP','BAP','SHOT','GOAL'):
             expected = info[TEAM_COLUMNS[metric]] - (own_goals if metric == 'GOAL' else 0)
             check(side + ':interval-total-' + metric, sum(bins[metric]), expected)
@@ -1749,8 +1749,10 @@ def build_details(game, infos, children, codes):
             wide.update(fields)
         emit('multiSheet_ALL',wide)
         if len(goal_times)>10: errors.append(f'{side}: More than ten goals')
+        ordered_goals = [f"{half}_{'OG_' if own else ''}{seconds}"
+                         for half, seconds, _, own in sorted(goal_times)]
         emit('multiSheet_GOAL-시간', {**common,'gm_date':wide['gm_date'],'t_code':idx,'team_type':wide['team_type'],
-             **{f'GOAL{n+1}':f'{sorted(goal_times)[n][0]}_{sorted(goal_times)[n][1]}' if n<len(goal_times) else '\\N' for n in range(10)}})
+             **{f'GOAL{n+1}':ordered_goals[n] if n<len(ordered_goals) else '\\N' for n in range(10)}})
         for row in source.get('ff_game_player', []):
             if not str(row.get('p_id') or '').isdigit():
                 errors.append(f'{side}: Non-numeric SQL player ID')

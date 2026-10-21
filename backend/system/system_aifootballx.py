@@ -180,12 +180,11 @@ def intervals(records: list[KpiRecord], computed: Any) -> dict[str, list[float]]
         # Count a path once at its terminal record, never once per member or by prefix recalculation.
         terminal = members[-1]
         values['DTP'][bucket(terminal.half, terminal.seconds)] += 1
-    for offset in (0, 10):
-        goals = shots = 0
-        for index in range(offset, offset + 10):
-            goals += values['GOAL'][index]
-            shots += values['SHOT'][index]
-            values['SSR'][index] = goals / shots if shots else 0
+    goals = shots = 0
+    for index in range(20):
+        goals += values['GOAL'][index]
+        shots += values['SHOT'][index]
+        values['SSR'][index] = goals / shots if shots else 0
     return values
 
 
@@ -458,9 +457,12 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any) -> di
                         emit('bmas_' + role, {**common, 'team_type': wide['team_type'], 't_code': idx, 'Type': role,
                              **{k: projection[k] for k in ('gr_half', 'gr_seconds', 'gr_area_code', 'gr_pos_x', 'gr_pos_y')}},
                              (match_id, side, row['id'], role))
-                if not flag.is_goal or value.get('playerId') == 'OWN':
+                if not flag.is_goal:
                     continue
-                goals.append(f"{value['half']}_{value['halfSeconds']}")
+                own_goal = value.get('playerId') == 'OWN'
+                goals.append(f"{value['half']}_{'OG_' if own_goal else ''}{value['halfSeconds']}")
+                if own_goal:
+                    continue
                 player = evidence.get('player_profiles', {}).get(value.get('playerId'), {})
                 goal = {**common, 'gm_date': dotted_date(match['date']), 'IDX_CODE': idx, 't_code': team_id,
                         'team_type': wide['team_type'], 'HA': side, 'gr_res_code': 'G',
@@ -1707,7 +1709,7 @@ def generate_delivery(evidence, selected, aggregate_items, slots, setup):
 # ==========================================================================
 
 
-VALIDATION_POLICY = 'goal-inclusive-fpx-truncated-rating-display-v5'
+VALIDATION_POLICY = 'goal-inclusive-fpx-whole-match-ssr-og-timeline-v6'
 
 
 def dump(value):
