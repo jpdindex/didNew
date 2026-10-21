@@ -1174,9 +1174,17 @@ function reenterHalf() {
 }
 // 진행 중 대기방에서는 경기 정보가 기본 잠금 상태다.
 // 이 버튼을 눌렀을 때만 라인업/포메이션/진영을 바꿀 수 있고, 변경 완료 시 Draft를 다시 저장한다.
+// 변경 취소 시 되돌릴 진입 시점의 라인업/포메이션/진영.
+let matchInfoEditBackup: { formationKey: MatchState['formationKey'], assigned: MatchState['assigned'], side: MatchState['side'], formationChangeCount: number } | null = null
 async function toggleMatchInfoEdit() {
   lifecycleError.value = ''
   if (!matchInfoEditMode.value) {
+    matchInfoEditBackup = {
+      formationKey: game.value.formationKey,
+      assigned: { ...game.value.assigned },
+      side: game.value.side,
+      formationChangeCount: game.value.formationChanges.length,
+    }
     matchInfoEditMode.value = true
     subOpen.value = false
     menuOpen.value = false
@@ -1204,6 +1212,39 @@ async function toggleMatchInfoEdit() {
   } finally {
     lifecycleBusy.value = false
   }
+}
+
+// 변경 취소: 진입 시점 값으로 되돌린다. 진행 중에는 변경이 자동 저장됐을 수 있으므로
+// 되돌린 값이 달라졌으면 같은 경로(변경 완료)로 다시 저장한다.
+async function cancelMatchInfoEdit() {
+  if (!matchInfoEditMode.value || lifecycleBusy.value) return
+  const backup = matchInfoEditBackup
+  matchInfoEditBackup = null
+  if (formationSaveTimer) clearTimeout(formationSaveTimer)
+  formationSaveTimer = undefined
+  if (!backup) {
+    lifecycleError.value = ''
+    matchInfoEditMode.value = false
+    activeSlot.value = null
+    menuOpen.value = false
+    return
+  }
+  const changed = backup.formationKey !== game.value.formationKey || backup.side !== game.value.side ||
+    backup.formationChangeCount !== game.value.formationChanges.length ||
+    JSON.stringify(Object.entries(backup.assigned).sort(([a], [b]) => a.localeCompare(b))) !==
+    JSON.stringify(Object.entries(game.value.assigned).sort(([a], [b]) => a.localeCompare(b)))
+  game.value.formationKey = backup.formationKey
+  game.value.assigned = backup.assigned
+  game.value.side = backup.side
+  game.value.formationChanges.splice(backup.formationChangeCount)
+  if (!changed) {
+    lifecycleError.value = ''
+    matchInfoEditMode.value = false
+    activeSlot.value = null
+    menuOpen.value = false
+    return
+  }
+  await toggleMatchInfoEdit()
 }
 
 // 전반 종료 후 대기 화면(이 화면)에서 고르는 두 가지 선택.
@@ -2008,8 +2049,9 @@ function undoSub(index: number) {
                 <p>세팅 저장 시 주 분석관으로 확정됩니다.<br><b>입장하면 경기 시간이 흐르기 시작합니다.</b></p>
                 <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
                 <div v-if="game.lifecycleControl" class="halfActions">
-                  <button v-if="canToggleMatchInfoEdit" class="editBtn" :disabled="lifecycleBusy"
-                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? '변경 완료' : '경기 정보 변경' }}</button>
+                  <button v-if="canToggleMatchInfoEdit" :class="matchInfoEditMode ? 'startBtn' : 'editBtn'" :disabled="lifecycleBusy"
+                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? (lifecycleBusy ? '저장 중…' : '변경 완료') : '경기 정보 변경' }}</button>
+                  <button v-if="matchInfoEditMode" class="editBtn cancelEditBtn" :disabled="lifecycleBusy" @click="cancelMatchInfoEdit">변경 취소</button>
                   <button v-if="!matchInfoEditMode" class="startBtn" :disabled="!bootstrapApplied || !canStart || lifecycleBusy" @click="startFirstHalf">{{ lifecycleBusy ? '처리 중…' : setupSaved ? '전반전 입장' : '세팅 저장' }}</button>
                 </div>
                 <button v-else class="startBtn" :disabled="lifecycleBusy" @click="enterAsAssistant">{{ roleLabel(game.participantRole) }} 참여</button>
@@ -2019,10 +2061,11 @@ function undoSub(index: number) {
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">BASIC 주 분석관 기록은 제출 후 관리자 승인 전까지 Draft에만 저장됩니다.</p>
                 <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
                 <div class="halfActions">
-                  <button v-if="canToggleMatchInfoEdit" class="editBtn" :disabled="lifecycleBusy"
-                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? '변경 완료' : '경기 정보 변경' }}</button>
-                  <button class="editBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="editHalf">수정</button>
-                  <button v-if="game.lifecycleControl" class="startBtn" :disabled="!bootstrapApplied || !canStart || matchInfoEditMode || lifecycleBusy" @click="startSecondHalf">{{ lifecycleBusy ? '처리 중…' : setupSaved ? '후반전 입장' : '세팅 저장' }}</button>
+                  <button v-if="canToggleMatchInfoEdit" :class="matchInfoEditMode ? 'startBtn' : 'editBtn'" :disabled="lifecycleBusy"
+                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? (lifecycleBusy ? '저장 중…' : '변경 완료') : '경기 정보 변경' }}</button>
+                  <button v-if="matchInfoEditMode" class="editBtn cancelEditBtn" :disabled="lifecycleBusy" @click="cancelMatchInfoEdit">변경 취소</button>
+                  <button v-if="!matchInfoEditMode" class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
+                  <button v-if="game.lifecycleControl && !matchInfoEditMode" class="startBtn" :disabled="!bootstrapApplied || !canStart || lifecycleBusy" @click="startSecondHalf">{{ lifecycleBusy ? '처리 중…' : setupSaved ? '후반전 입장' : '세팅 저장' }}</button>
                 </div>
               </template>
               <template v-else-if="game.halfStatus === 'H2_done'">
@@ -2030,10 +2073,11 @@ function undoSub(index: number) {
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">제출하면 관리자 승인 대기 Draft로 유지됩니다.</p>
                 <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
                 <div class="halfActions">
-                  <button v-if="canToggleMatchInfoEdit" class="editBtn" :disabled="lifecycleBusy"
-                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? '변경 완료' : '경기 정보 변경' }}</button>
-                  <button class="editBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="editHalf">수정</button>
-                  <button v-if="game.lifecycleControl" class="startBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="finishMatch">{{ game.recorderLevel ===
+                  <button v-if="canToggleMatchInfoEdit" :class="matchInfoEditMode ? 'startBtn' : 'editBtn'" :disabled="lifecycleBusy"
+                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? (lifecycleBusy ? '저장 중…' : '변경 완료') : '경기 정보 변경' }}</button>
+                  <button v-if="matchInfoEditMode" class="editBtn cancelEditBtn" :disabled="lifecycleBusy" @click="cancelMatchInfoEdit">변경 취소</button>
+                  <button v-if="!matchInfoEditMode" class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
+                  <button v-if="game.lifecycleControl && !matchInfoEditMode" class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">{{ game.recorderLevel ===
                     'basic' ? '제출' : '최종 갱신' }}</button>
                 </div>
               </template>
@@ -2041,9 +2085,9 @@ function undoSub(index: number) {
                 <p>{{ pausedHalf }} 기록이 대기 중입니다<br><b>{{ pausedClock }} 시점부터 이어서 입력합니다.</b></p>
                 <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
                 <div class="halfActions">
-                  <button class="editBtn" :disabled="lifecycleBusy" @click="toggleMatchInfoEdit">{{ matchInfoEditMode ?
-                    '변경 완료' : '경기 정보 변경' }}</button>
-                  <button class="startBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="reenterHalf">{{
+                  <button :class="matchInfoEditMode ? 'startBtn' : 'editBtn'" :disabled="lifecycleBusy" @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? (lifecycleBusy ? '저장 중…' : '변경 완료') : '경기 정보 변경' }}</button>
+                  <button v-if="matchInfoEditMode" class="editBtn cancelEditBtn" :disabled="lifecycleBusy" @click="cancelMatchInfoEdit">변경 취소</button>
+                  <button v-if="!matchInfoEditMode" class="startBtn" :disabled="lifecycleBusy" @click="reenterHalf">{{
                     pausedHalf }}전 입장</button>
                 </div>
               </template>
@@ -2052,9 +2096,10 @@ function undoSub(index: number) {
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">관리자 페이지에서 RAW 승격 전까지 Draft만 유지됩니다.</p>
                 <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
                 <div class="halfActions">
-                  <button v-if="canToggleMatchInfoEdit" class="editBtn" :disabled="lifecycleBusy"
-                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? '변경 완료' : '경기 정보 변경' }}</button>
-                  <button class="editBtn" :disabled="matchInfoEditMode || lifecycleBusy" @click="editFinal">{{ !game.lifecycleControl ? '전반/후반 수정' : '수정' }}</button>
+                  <button v-if="canToggleMatchInfoEdit" :class="matchInfoEditMode ? 'startBtn' : 'editBtn'" :disabled="lifecycleBusy"
+                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? (lifecycleBusy ? '저장 중…' : '변경 완료') : '경기 정보 변경' }}</button>
+                  <button v-if="matchInfoEditMode" class="editBtn cancelEditBtn" :disabled="lifecycleBusy" @click="cancelMatchInfoEdit">변경 취소</button>
+                  <button v-if="!matchInfoEditMode" class="editBtn" :disabled="lifecycleBusy" @click="editFinal">{{ !game.lifecycleControl ? '전반/후반 수정' : '수정' }}</button>
                 </div>
               </template>
               <p v-if="lifecycleError" class="lifecycleError">{{ lifecycleError }}</p>
@@ -3878,6 +3923,11 @@ button {
 /* 버튼이 3개라 아랫줄로 내려간 시작 버튼은 윗줄 두 버튼 폭에 맞춰 가로로 꽉 채운다. */
 .halfActions > .startBtn:nth-child(3) {
   grid-column: 1 / -1
+}
+
+/* 경기 정보 변경 중에는 취소를 왼쪽, 변경 완료를 오른쪽(넓은 칸)에 둔다. */
+.halfActions > .cancelEditBtn {
+  order: -1
 }
 
 /* 세팅 저장 전·경기 정보 변경 중에는 버튼이 하나뿐이라 한 줄을 꽉 채운다. */
