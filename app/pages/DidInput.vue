@@ -213,6 +213,14 @@ onMounted(async () => {
   // The URL identity must win over useState's initial defaults on every
   // entry. In particular, an assistant refresh must never become primary
   // before the server confirms its existing participant role.
+  // 기록표는 서버 응답을 받아 맨 아래로 내린 뒤에 한 번에 보여준다. 응답이 늦어도
+  // 계속 비어 있지 않도록 3초 뒤에는 그때까지의 기록으로 보여준다.
+  tableShowTimer = setTimeout(() => {
+    if (tableShown.value) return
+    if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
+    tableShown.value = true
+  }, 3000)
+
   game.value.team = requestedTeam
   if (matchId) game.value.matchId = matchId
   game.value.participantRole = requestedRole
@@ -438,12 +446,17 @@ onMounted(async () => {
   draftReady = true
   if (dirtyRecordIds.size) queueDraftSave()
   nextTick(() => {
-    if (tableEl.value && !historyPinned.value && !editingId.value && !playerPickFor.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
+    if (tableShown.value) {
+      if (tableEl.value && !historyPinned.value && !editingId.value && !playerPickFor.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
+    } else if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
+    tableShown.value = true
+    if (tableShowTimer) clearTimeout(tableShowTimer)
   })
 })
 
 onUnmounted(() => {
   disposed = true
+  if (tableShowTimer) clearTimeout(tableShowTimer)
   cancelPress()
   if (timer) clearInterval(timer)
   if (flashTimer) clearTimeout(flashTimer)
@@ -747,6 +760,9 @@ const rows = computed(() => {
 
 // 최신 기록이 맨 아래에 쌓이므로, 기록이 늘면 표를 아래로 붙여준다.
 const tableEl = ref<HTMLElement | null>(null)
+// 진입 직후 맨 아래로 내리기 전에는 기록표를 숨겨, 맨 위가 잠깐 보였다가 내려가지 않게 한다.
+const tableShown = ref(false)
+let tableShowTimer: ReturnType<typeof setTimeout> | undefined
 // 수정 화면 전용: 기록표를 눌러서 넓히면(경기장이 위로 줄어들며) 더 많은 액트를 한 번에 본다.
 const tableExpanded = ref(false)
 // 템플릿에 긴 문자열 리터럴을 직접 두면 에디터 자동 포맷터가 줄바꿈을 문자열 안에 넣어
@@ -1155,6 +1171,8 @@ onMounted(() => document.addEventListener('pointerdown', closeMirrorOnOutside))
 onUnmounted(() => document.removeEventListener('pointerdown', closeMirrorOnOutside))
 
 const pendingPos = ref<{ x: number; y: number } | null>(null)
+// 액트/결과로 확정된 직전 위치. 다음 위치를 찍기 전까지 경기장에 점을 남겨 둔다.
+const lastInputPos = ref<{ id: string; x: number; y: number } | null>(null)
 // 슛(S/H/R)도 C/P/K/F 와 동일하게 버튼을 누르는 즉시 실제 레코드를 만든다(res:'O').
 // 골 존 결과가 나오기 전까지는 그 레코드의 id 만 여기 들고 있다가, 결과가 정해지면
 // applyResult() 로 같은 레코드의 res 를 덮어쓴다 — 새 레코드를 만들지 않는다.
@@ -1319,7 +1337,6 @@ const cardType = ref<'Y' | 'R'>('Y')
 // 카드가 cardByPlayer(→ isSentOff → onFieldSlots)에 계속 반영되어, 확정되지 않은
 // 퇴장 처리 때문에 선수가 그라운드/벤치 목록에서 사라진 채로 남는다.
 const cardQueue = ref<CardRecord[]>([])
-const cardAddedInPanel = ref(false)
 const cardByPlayer = computed(() => groupCardsByPlayer(game.value.cards, cardQueue.value))
 // 히스토리에서 "경고 · 퇴장"으로 같이 보여줄 두 번째 경고 카드들
 const secondYellows = computed(() => secondYellowCards([...game.value.cards, ...cardQueue.value]))
@@ -1338,7 +1355,6 @@ const cardHistory = computed(() => {
 function resetCardDraft() {
   cardPlayer.value = null
   cardQueue.value = []
-  cardAddedInPanel.value = false
   cardPlayerEditTarget.value = null
   cardEditSnapshot.value = null
 }
@@ -1356,7 +1372,7 @@ function openCardPanel() {
 }
 // 카드 시각은 스테퍼로 미리 정해두는 게 아니라, 실제로 목록에 넣는 이 순간의
 // 흘러가는 시계(seconds)값을 그대로 쓴다. 목록 추가는 임시 큐가 아니라 즉시
-// 공유 Draft 이벤트를 만든다. Submit은 패널을 닫는 명령일 뿐이다.
+// 공유 Draft 이벤트를 만든다.
 function queueCard() {
   if (cardPlayer.value === null) return false
   const card: CardRecord = {
@@ -1364,17 +1380,11 @@ function queueCard() {
     player: cardPlayer.value, card: cardType.value,
   }
   cardPlayer.value = null
-  cardAddedInPanel.value = true
   game.value.cards.push(card)
   // "목록 추가" is the card commit action. It uses the same ordered event
-  // path as substitutions and never waits for Submit or a reactive watcher.
+  // path as substitutions and never waits for a reactive watcher.
   void persistCards()
   return true
-}
-function submitCards() {
-  queueCard()
-  cardOpen.value = false
-  resetCardDraft()
 }
 function cancelCards() { cardOpen.value = false; resetCardDraft() }
 function removeQueuedCard(index: number) { cardQueue.value.splice(index, 1) }
@@ -1603,7 +1613,6 @@ function openSubPanel() {
   subInSlot.value = null
   syncSubTimeToClock()
   editingSubIndex.value = null
-  subAddedInPanel.value = false
   subOpen.value = true
 }
 /** 수정 중이던 교체를 Submit 없이 그냥 닫으면, editSub 에서 되돌려 둔 배치를 원래대로 되돌린다. */
@@ -1717,23 +1726,10 @@ function submitSub() {
   }
   subOutSlot.value = null
   subInSlot.value = null
-  subAddedInPanel.value = true
   syncSubTimeToClock() // 다음 교체는 다시 현재 시계부터
   // 교체만 durable lineup snapshot을 바꾼다. 기록/시계 자동 저장은
   // 이 경로를 타지 않으므로 대기방 구성이 흔들리지 않는다.
   persistSubstitutionSetup()
-}
-
-// 카드 입력창과 같은 흐름: "목록추가"(submitSub)는 교체를 넣고 패널을 열어 둔 채 다음 교체를 받고,
-// "Submit"은 지금 고른 교체가 있으면 넣은 뒤 패널을 닫는다.
-// 목록추가로 이미 넣은 교체가 있으면 선수를 안 골라도 Submit 으로 닫을 수 있다.
-const subAddedInPanel = ref(false)
-function submitSubAndClose() {
-  if (canSubmitSub.value) {
-    submitSub()
-    if (editingSubIndex.value !== null) return // 수정이 겹침 경고로 막혔으면 패널을 닫지 않는다
-  }
-  subOpen.value = false
 }
 
 /** 잘못 넣은 교체 되돌리기 — 자리도 원래대로 돌려놓는다 */
@@ -1903,6 +1899,11 @@ const displayPos = computed(() => {
 const infoMarkerPos = computed(() => (
   displayPos.value ? { left: displayPos.value.x + '%', top: displayPos.value.y + '%' } : null
 ))
+const lastInputMarkerPos = computed(() => {
+  const last = lastInputPos.value
+  if (!last || pendingPos.value || infoMarkerPos.value || !records.value.some(r => r.id === last.id)) return null
+  return { left: last.x + '%', top: last.y + '%' }
+})
 const infoCellRect = computed(() => {
   if (displayPos.value) return null // 정확한 좌표가 있으면 사각형 대신 점으로 보여준다
   const r = editingId.value ? editingRecord.value : infoRecord.value
@@ -2066,6 +2067,7 @@ function clickAct(actKey: string, isShot: boolean) {
       posY: rec.posY,
     }
   }
+  lastInputPos.value = { id: rec.id, ...pendingPos.value }
   pendingPos.value = null
   pendingCell.value = null
   flashCell.value = null
@@ -2135,6 +2137,7 @@ function clickResult(res: 'X' | 'B') {
     const previous = recIndex > 0 ? records.value[recIndex - 1] : null
     if (previous) markRecordDirty(previous.id)
   }
+  lastInputPos.value = { id: lastTap.value!.id, ...pendingPos.value }
   pendingPos.value = null
   pendingCell.value = null
   flashCell.value = null
@@ -2540,6 +2543,7 @@ async function finishHalf() {
             <div v-if="cellRect" :key="flashKey" class="zoneHighlight" :style="cellRect" />
             <div v-if="infoCellRect" class="zoneHighlight editZoneHighlight" :style="infoCellRect" />
             <div v-if="infoMarkerPos" class="marker editMarker" :style="infoMarkerPos" />
+            <div v-if="lastInputMarkerPos" class="marker" :style="lastInputMarkerPos" />
             <div v-if="pendingPos" :key="flashKey" class="marker pendingMarker"
               :style="{ left: pendingPos.x + '%', top: pendingPos.y + '%' }" />
           </div>
@@ -2552,7 +2556,8 @@ async function finishHalf() {
             <button class="rangeApply" @click="applyRangeEdit">적용</button><button class="rangeDelete"
               @click="deleteRangeRecords">삭제</button><button class="rangeCancel" @click="cancelRangeEdit">취소</button>
           </div>
-          <div ref="tableEl" class="table" :class="{ expanded: tableExpanded }"
+          <div v-if="!tableShown" class="tableLoading" :class="{ expanded: tableExpanded }">서버 응답 중…</div>
+          <div ref="tableEl" class="table" :class="{ expanded: tableExpanded, notShown: !tableShown }"
             @pointerdown.capture="closeOverlayPanelsOnOutsideTouch">
             <div class="thead">
               <span>No.</span><span>Time</span><span>Act</span><span>Result</span><span>Area</span><span>Player</span>
@@ -2633,25 +2638,27 @@ async function finishHalf() {
             </template>
           </div>
 
-          <div v-if="!editingId && !cardPlayerEditTarget && editingSubIndex === null" ref="mirrorWrapRef"
-            class="mirrorWrap">
-            <button class="mirrorIcon" :class="{ on: mirrorOpen }" @click="openMirrorPopup">⇄</button>
-            <div v-if="mirrorOpen" class="mirrorPop">
-              <div class="popRow">
-                <span class="popLabel">좌우 반전</span>
-                <div class="popOpts">
-                  <button class="popBtn" :class="{ on: !pendingMirrored }" @click="pendingMirrored = false">기본</button>
-                  <button class="popBtn" :class="{ on: pendingMirrored }" @click="pendingMirrored = true">반전</button>
-                </div>
-              </div>
-              <button class="popOk" @click="confirmMirror">확인</button>
-            </div>
-          </div>
-
           <!-- 카드 입력·선수교체 제목은 각 입력창 안(.cardPanelTitle)에 둔다. 상단 버튼 줄과 겹치지 않도록
                h1 은 보이지 않게(editTitle) 자리만 잡아, 수정 전/후 입력창 크기가 같게 한다. -->
-          <h1 :class="{ editTitle: !!editingId || cardOpen || subOpen }">{{
-            subOpen ? '선수교체' : playerPickFor ? '선수선택' : 'DID-INPUT' }}</h1>
+          <!-- 제목을 왼쪽에 두고 좌우 반전(⇄) 버튼은 제목 바로 오른쪽에 붙인다. -->
+          <div class="titleRow">
+            <h1 :class="{ editTitle: !!editingId || cardOpen || subOpen }">{{
+              subOpen ? '선수교체' : playerPickFor ? '선수선택' : 'DID-INPUT' }}</h1>
+            <div v-if="!editingId && !cardPlayerEditTarget && editingSubIndex === null" ref="mirrorWrapRef"
+              class="mirrorWrap">
+              <button class="mirrorIcon" :class="{ on: mirrorOpen }" @click="openMirrorPopup">⇄</button>
+              <div v-if="mirrorOpen" class="mirrorPop">
+                <div class="popRow">
+                  <span class="popLabel">좌우 반전</span>
+                  <div class="popOpts">
+                    <button class="popBtn" :class="{ on: !pendingMirrored }" @click="pendingMirrored = false">기본</button>
+                    <button class="popBtn" :class="{ on: pendingMirrored }" @click="pendingMirrored = true">반전</button>
+                  </div>
+                </div>
+                <button class="popOk" @click="confirmMirror">확인</button>
+              </div>
+            </div>
+          </div>
 
           <div v-if="cardOpen" class="cardPanel">
             <div class="cardPanelTitle">카드 입력</div>
@@ -2702,13 +2709,11 @@ async function finishHalf() {
                 </span>
               </div>
             </div>
-            <!-- 선수교체 패널과 같은 하단 버튼(Close · 목록추가 · Submit) — 패널 맨 아래에 붙는다 -->
+            <!-- 선수교체 패널과 같은 하단 버튼(Close · 목록추가) — 패널 맨 아래에 붙는다 -->
             <div class="subActions">
               <button class="subCancel" @click="cancelCards">Close</button>
               <button v-if="!cardPlayerEditTarget" class="subQueue" :disabled="cardPlayer === null"
                 @click="queueCard">목록추가</button>
-              <button class="subSubmit" :disabled="cardPlayer === null && !cardAddedInPanel"
-                @click="submitCards">Submit</button>
             </div>
           </div>
 
@@ -2788,8 +2793,6 @@ async function finishHalf() {
               <button class="subCancel" @click="closeSubPanel">Close</button>
               <button v-if="editingSubIndex === null" class="subQueue" :disabled="!canSubmitSub"
                 @click="submitSub">목록추가</button>
-              <button class="subSubmit" :disabled="!canSubmitSub && !subAddedInPanel"
-                @click="submitSubAndClose">Submit</button>
             </div>
           </div>
 
@@ -3142,7 +3145,7 @@ button {
   border-radius: 4px;
   cursor: pointer;
   width: 48px;
-  height: 44px;
+  height: 40px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3336,7 +3339,7 @@ button {
 }
 
 .stat {
-  height: 44px;
+  height: 40px;
   min-width: 48px;
   padding: 0 12px;
   font-size: 17px;
@@ -3355,7 +3358,7 @@ button {
 .grassIcon,
 .swapIcon {
   width: 48px;
-  height: 44px;
+  height: 40px;
   display: grid;
   place-items: center;
   border-radius: 4px;
@@ -3662,8 +3665,8 @@ button {
 }
 
 .pauseBtn {
-  width: 104px;
-  height: 44px;
+  width: 136px;
+  height: 40px;
   border-radius: 4px;
   border: 1px solid rgba(255, 255, 255, .15);
   background: rgba(255, 255, 255, .06);
@@ -3810,60 +3813,42 @@ button {
 
 .corner {
   position: absolute;
-  width: 32px;
-  height: 32px;
+  width: 40px;
+  height: 40px;
   border: 2px solid rgba(255, 255, 255, .35);
   border-radius: 50%
 }
 
 .cornerTL {
-  left: -17px;
-  top: -17px
+  left: -21px;
+  top: -21px
 }
 
 .cornerBL {
-  left: -17px;
-  bottom: -17px
+  left: -21px;
+  bottom: -21px
 }
 
 .cornerTR {
-  right: -17px;
-  top: -17px
+  right: -21px;
+  top: -21px
 }
 
 .cornerBR {
-  right: -17px;
-  bottom: -17px
+  right: -21px;
+  bottom: -21px
 }
 
 .marker {
   position: absolute;
-  width: 9px;
-  height: 9px;
-  margin: -4.5px;
+  width: 14px;
+  height: 14px;
+  margin: -7px;
   border-radius: 50%;
   background: rgba(235, 235, 235, .72);
-  border: 2px solid rgba(255, 255, 255, .9);
-  box-shadow: 0 0 0 5px rgba(210, 210, 210, .4);
+  border: 2.5px solid rgba(255, 255, 255, .9);
+  box-shadow: 0 0 0 8px rgba(210, 210, 210, .4);
   pointer-events: none
-}
-
-.pendingMarker {
-  animation: markerPulse .34s ease-out both
-}
-
-@keyframes markerPulse {
-  0% {
-    box-shadow: 0 0 0 0 rgba(210, 210, 210, .55)
-  }
-
-  55% {
-    box-shadow: 0 0 0 8px rgba(210, 210, 210, .28)
-  }
-
-  100% {
-    box-shadow: 0 0 0 5px rgba(210, 210, 210, .4)
-  }
 }
 
 .zoneHighlight {
@@ -3884,7 +3869,7 @@ button {
 .editMarker {
   background: rgba(240, 180, 41, .85);
   border-color: #fff;
-  box-shadow: 0 0 0 5px rgba(240, 180, 41, .3);
+  box-shadow: 0 0 0 8px rgba(240, 180, 41, .3);
   z-index: 2
 }
 
@@ -3903,6 +3888,29 @@ button {
 }
 
 
+
+.table.notShown {
+  visibility: hidden
+}
+
+.tableLoading {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 210px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-top: 1px solid rgba(255, 255, 255, .08);
+  color: rgba(255, 255, 255, .55);
+  font-size: 14px;
+  font-weight: 600
+}
+
+.tableLoading.expanded {
+  height: 380px
+}
 
 .table {
   position: absolute;
@@ -3999,11 +4007,11 @@ button {
   padding: 0 14px;
   white-space: nowrap;
   border-radius: 8px;
-  border: 1.5px dashed rgba(240, 180, 41, .65);
-  background: rgba(240, 180, 41, .08);
-  color: #f0b429;
-  font-size: 12px;
-  font-weight: 600;
+  border: 1.5px solid #f0b429;
+  background: #f0b429;
+  color: #1a1a1a;
+  font-size: 13px;
+  font-weight: 800;
   letter-spacing: .02em;
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
@@ -4013,8 +4021,8 @@ button {
 /* 누르는 순간의 피드백 — 터치에선 이게 유일한 반응이라 확실하게 준다. */
 .playerBtn:active {
   transform: scale(.95);
-  border-style: solid;
-  background: rgba(240, 180, 41, .28)
+  border-color: #c99212;
+  background: #c99212
 }
 
 /* 배정된 선수는 "해야 할 일"(점선 노랑)이 아니라 이미 채워진 값이므로,
@@ -4252,7 +4260,7 @@ button {
 
 .jname {
   color: #ddd;
-  font-size: 10px;
+  font-size: 12px;
   white-space: nowrap
 }
 
@@ -4463,15 +4471,20 @@ button {
   background: rgba(255, 255, 255, .035)
 }
 
+.titleRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px
+}
+
 .mirrorWrap {
-  position: absolute;
-  top: 8px;
-  left: 8px
+  position: relative
 }
 
 .mirrorIcon {
-  width: 40px;
-  height: 40px;
+  width: 34px;
+  height: 34px;
   display: grid;
   place-items: center;
   border-radius: 4px;
@@ -4492,7 +4505,7 @@ button {
 .mirrorPop {
   position: absolute;
   z-index: 30;
-  top: 32px;
+  top: 38px;
   left: 0;
   width: 200px;
   padding: 10px;
@@ -4536,12 +4549,12 @@ button {
 }
 
 .editActions button {
-  height: 28px;
+  height: 40px;
   width: 100%;
   padding: 0 10px;
   border-radius: 5px;
   font-weight: 800;
-  font-size: 12.5px;
+  font-size: 14.5px;
   letter-spacing: .02em;
   cursor: pointer;
   border: 1px solid transparent
@@ -4602,7 +4615,6 @@ section.right h1 {
   display: flex;
   align-items: center;
   min-height: 40px;
-  padding-left: 46px;
   color: #fff;
   font-size: 18px
 }
@@ -4629,13 +4641,13 @@ section.right h1 {
 
 .kickGrid {
   display: grid;
-  grid-template-columns: repeat(8, minmax(0, 1fr));
-  grid-template-rows: 110px 72px;
+  grid-template-columns: repeat(80, minmax(0, 1fr));
+  grid-template-rows: 120px 72px;
   gap: 5px
 }
 
 .stacked {
-  grid-column: 7/9;
+  grid-column: 59/81;
   grid-row: 1;
   min-width: 0;
   display: grid;
@@ -4674,16 +4686,16 @@ section.right h1 {
 }
 
 .kickPrimary {
-  height: 110px
+  height: 120px
 }
 
 .kick-c {
-  grid-column: 1/4;
+  grid-column: 1/30;
   grid-row: 1
 }
 
 .kick-p {
-  grid-column: 4/7;
+  grid-column: 30/59;
   grid-row: 1
 }
 
@@ -4694,12 +4706,12 @@ section.right h1 {
 }
 
 .kick-x {
-  grid-column: 1/5;
+  grid-column: 1/41;
   grid-row: 2
 }
 
 .kick-b {
-  grid-column: 5/9;
+  grid-column: 41/81;
   grid-row: 2
 }
 
@@ -4840,8 +4852,8 @@ section.right h1 {
 
 /* Occupy the original 54px gap without moving the buttons or goal. */
 .liveRoomGap {
-  flex: 0 0 54px;
-  height: 54px;
+  flex: 0 0 38px;
+  height: 38px;
   min-width: 0;
   display: flex;
   align-items: center;
@@ -5351,8 +5363,7 @@ section.right h1 {
 }
 
 .subCancel,
-.subQueue,
-.subSubmit {
+.subQueue {
   flex: 1;
   min-width: 0;
   padding: 14px 20px;
@@ -5384,22 +5395,6 @@ section.right h1 {
 }
 
 .subQueue:disabled {
-  opacity: .35;
-  cursor: not-allowed
-}
-
-.subSubmit {
-  border: 1px solid rgba(240, 180, 41, .6);
-  background: rgba(240, 180, 41, .2);
-  color: #f0b429;
-  font-weight: 700
-}
-
-.subSubmit:hover:not(:disabled) {
-  background: rgba(240, 180, 41, .32)
-}
-
-.subSubmit:disabled {
   opacity: .35;
   cursor: not-allowed
 }

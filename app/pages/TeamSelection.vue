@@ -534,9 +534,10 @@ const benchIds = BENCH_IDS
 const menuOpen = ref(false)
 const activeSlot = ref<string | null>(null)
 const matchInfoEditMode = ref(false)
-const matchInfoLockedByStatus = computed(() => game.value.halfStatus !== 'ready')
+// 시작 전에도 세팅을 저장하고 나면 잠그고, "경기 정보 변경"을 눌러야 다시 바꿀 수 있다.
+const matchInfoLockedByStatus = computed(() => game.value.halfStatus !== 'ready' || setupSaved.value)
 const canToggleMatchInfoEdit = computed(() =>
-  game.value.lifecycleControl && game.value.halfStatus !== 'ready'
+  game.value.lifecycleControl && (game.value.halfStatus !== 'ready' || setupSaved.value || matchInfoEditMode.value)
 )
 const matchInfoEditable = computed(() =>
   !lifecycleBusy.value && game.value.lifecycleControl && (!matchInfoLockedByStatus.value || matchInfoEditMode.value)
@@ -1162,6 +1163,15 @@ async function toggleMatchInfoEdit() {
     subOpen.value = false
     menuOpen.value = false
     activeSlot.value = firstEmptyLineupSlot()
+    return
+  }
+
+  // 시작 전 변경은 세팅 저장을 다시 거쳐야 전반전에 입장할 수 있다.
+  if (game.value.halfStatus === 'ready') {
+    matchInfoEditMode.value = false
+    activeSlot.value = null
+    menuOpen.value = false
+    if (!setupSaved.value) await saveEntrySetup()
     return
   }
 
@@ -1964,7 +1974,12 @@ function undoSub(index: number) {
                     @click="game.inputMode = '실시간'">실시간<small>정지 불가</small></button>
                 </div>
                 <p>세팅 저장 시 주 분석관으로 확정됩니다.<br><b>입장하면 경기 시간이 흐르기 시작합니다.</b></p>
-                <button v-if="game.lifecycleControl" class="startBtn" :disabled="!bootstrapApplied || !canStart || lifecycleBusy" @click="startFirstHalf">{{ lifecycleBusy ? '처리 중…' : setupSaved ? '전반전 입장' : '세팅 저장' }}</button>
+                <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
+                <div v-if="game.lifecycleControl" class="halfActions">
+                  <button v-if="canToggleMatchInfoEdit" class="editBtn" :disabled="lifecycleBusy"
+                    @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? '변경 완료' : '경기 정보 변경' }}</button>
+                  <button v-if="!matchInfoEditMode" class="startBtn" :disabled="!bootstrapApplied || !canStart || lifecycleBusy" @click="startFirstHalf">{{ lifecycleBusy ? '처리 중…' : setupSaved ? '전반전 입장' : '세팅 저장' }}</button>
+                </div>
                 <button v-else class="startBtn" :disabled="lifecycleBusy" @click="enterAsAssistant">{{ roleLabel(game.participantRole) }} 참여</button>
               </template>
               <template v-else-if="game.halfStatus === 'H1_done'">
@@ -2052,7 +2067,7 @@ function undoSub(index: number) {
   padding: 32px 30px 24px;
   border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 10px;
-  background: #1b1f24;
+  background: #25282d;
   box-shadow: 0 16px 40px rgba(0, 0, 0, .5)
 }
 
@@ -2089,7 +2104,7 @@ function undoSub(index: number) {
 
 .confirmCancel {
   border: 1px solid rgba(255, 255, 255, .15);
-  background: #23262b;
+  background: #2a2e33;
   color: #ddd
 }
 
@@ -2100,7 +2115,7 @@ function undoSub(index: number) {
 }
 
 .confirmCancel:active {
-  background: #2e3238
+  background: #3d4249
 }
 
 .confirmOk:active {
@@ -2119,7 +2134,7 @@ button {
   place-items: center;
   overflow: hidden;
   position: relative;
-  background: #0b0f17;
+  background: #1c1f23;
   color: #fff;
   font-family: Arial, "Noto Sans KR", sans-serif
 }
@@ -2127,7 +2142,7 @@ button {
 .bg {
   position: absolute;
   inset: 0;
-  background: radial-gradient(1200px 500px at 50% 25%, rgba(255, 255, 255, .08), transparent 60%), radial-gradient(900px 400px at 20% 70%, rgba(111, 159, 186, .09), transparent 55%), radial-gradient(900px 400px at 80% 70%, rgba(241, 180, 0, .08), transparent 55%), linear-gradient(180deg, rgba(0, 0, 0, .55), rgba(0, 0, 0, .78))
+  background: radial-gradient(1200px 500px at 50% 25%, rgba(255, 255, 255, .08), transparent 60%), radial-gradient(900px 400px at 20% 70%, rgba(111, 159, 186, .09), transparent 55%), radial-gradient(900px 400px at 80% 70%, rgba(241, 180, 0, .08), transparent 55%), linear-gradient(180deg, rgba(0, 0, 0, .04), rgba(0, 0, 0, .12))
 }
 
 .topBack {
@@ -2139,7 +2154,7 @@ button {
   padding: 0 10px;
   border: 1px solid rgba(255, 255, 255, .22);
   border-radius: 4px;
-  background: rgba(10, 14, 22, .88);
+  background: #2a2e33;
   color: rgba(255, 255, 255, .86);
   font-size: 12px;
   font-weight: 800;
@@ -2160,9 +2175,9 @@ button {
   grid-template-columns: 266px 1014px;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, .08);
-  background: rgba(10, 14, 22, .78);
+  background: #1c1f23;
   backdrop-filter: blur(8px);
-  box-shadow: 0 18px 60px rgba(0, 0, 0, .55)
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .3)
 }
 
 .sidebar {
@@ -2821,8 +2836,7 @@ button {
 }
 
 .miniBox.locked {
-  cursor: not-allowed;
-  opacity: .45
+  cursor: not-allowed
 }
 
 .slot:hover {
@@ -2898,7 +2912,7 @@ button {
   padding: 10px;
   border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, .16);
-  background: #1b1e22;
+  background: #25282d;
   box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
   display: flex;
   flex-direction: column;
@@ -3103,12 +3117,12 @@ button {
   cursor: pointer
 }
 
-.miniBox:hover {
-  background: rgba(255, 255, 255, .08)
+.miniBox:not(.locked):active {
+  background: rgba(255, 255, 255, .1)
 }
 
 .miniBox.active {
-  background: rgba(111, 159, 186, .22)
+  background: rgba(111, 159, 186, .45)
 }
 
 .leftBox {
@@ -3197,8 +3211,8 @@ button {
 }
 
 .player strong {
-  font-size: 19px;
-  line-height: 20px;
+  font-size: 22px;
+  line-height: 24px;
   color: rgba(255, 255, 255, .85)
 }
 
@@ -3209,7 +3223,7 @@ button {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: rgba(255, 255, 255, .45);
-  font-size: 8px
+  font-size: 10px
 }
 
 .player.gk strong {
@@ -3791,6 +3805,11 @@ button {
 
 /* 버튼이 3개라 아랫줄로 내려간 시작 버튼은 윗줄 두 버튼 폭에 맞춰 가로로 꽉 채운다. */
 .halfActions > .startBtn:nth-child(3) {
+  grid-column: 1 / -1
+}
+
+/* 세팅 저장 전·경기 정보 변경 중에는 버튼이 하나뿐이라 한 줄을 꽉 채운다. */
+.halfActions > :only-child {
   grid-column: 1 / -1
 }
 

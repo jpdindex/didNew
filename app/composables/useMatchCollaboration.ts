@@ -849,8 +849,11 @@ export function useMatchCollaboration() {
         if (record.playerId === null && !clearedRecordPlayerIds.includes(recordId)) delete record.playerId
       }
     }
+    // A card added a moment ago is not confirmed yet, but deleting it must still
+    // reach the server, or the queued add brings it back.
     const deletedCardIds = syncScope === 'cards'
-      ? [...confirmedCardFingerprints.keys()].filter(id => !game.cards.some(card => card.id === id))
+      ? [...new Set([...confirmedCardFingerprints.keys(), ...pendingCardFingerprints.keys(), ...pendingDeletedCardIds])]
+        .filter(id => !game.cards.some(card => card.id === id))
       : []
     if (syncScope === 'cards') {
       for (const card of game.cards) {
@@ -949,6 +952,15 @@ export function useMatchCollaboration() {
         pendingCardFingerprints.set(card.id, fingerprint)
       }
       pendingDeletedCardIds.delete(card.id)
+    }
+    // Mark deletions now too. The network save waits behind earlier card saves,
+    // and a server echo arriving meanwhile would otherwise restore the card.
+    const localIds = new Set(game.cards.map(card => card.id))
+    for (const id of new Set([...confirmedCardFingerprints.keys(), ...pendingCardFingerprints.keys()])) {
+      if (localIds.has(id)) continue
+      pendingCardFingerprints.delete(id)
+      cardCommands.delete(id)
+      pendingDeletedCardIds.add(id)
     }
   }
 

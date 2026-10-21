@@ -757,14 +757,14 @@ function onCancel() {
 </template>
 
 <style scoped>
-.page { box-sizing: border-box; width: 1280px; height: 800px; margin: 0 auto; display: grid; place-items: center; position: relative; overflow: hidden; background: #0b0f17; }
+.page { box-sizing: border-box; width: 1280px; height: 800px; margin: 0 auto; display: grid; place-items: center; position: relative; overflow: hidden; background: #1c1f23; }
 .bg {
   position: absolute; inset: 0;
   background:
     radial-gradient(1200px 500px at 50% 25%, rgba(255,255,255,0.08), transparent 60%),
     radial-gradient(900px 400px at 20% 70%, rgba(0,217,255,0.10), transparent 55%),
     radial-gradient(900px 400px at 80% 70%, rgba(241,180,0,0.08), transparent 55%),
-    linear-gradient(180deg, rgba(0,0,0,0.55), rgba(0,0,0,0.78));
+    linear-gradient(180deg, rgba(0,0,0,0.04), rgba(0,0,0,0.12));
 }
 
 .frame {
@@ -773,9 +773,9 @@ function onCancel() {
   width: 1280px;
   height: 800px;
   border-radius: 0;
-  background: rgba(10, 14, 22, 0.78);
+  background: #1c1f23;
   border: 1px solid rgba(255,255,255,0.08);
-  box-shadow: 0 18px 60px rgba(0,0,0,0.55);
+  box-shadow: 0 18px 60px rgba(0,0,0,0.3);
   backdrop-filter: blur(8px);
   display: grid;
   grid-template-columns: 1280px;
@@ -836,12 +836,12 @@ function onCancel() {
   appearance: none; -webkit-appearance: none;
   height: 40px; padding: 0 32px 0 12px;
   border: 1px solid rgba(255,255,255,.14); border-radius: 4px;
-  background: #171b22 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%2376d7e8' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 11px center;
+  background: #2a2e33 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%2376d7e8' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 11px center;
   color: rgba(255,255,255,.9);
   font: inherit; font-size: 15px; font-weight: 750; color-scheme: dark; cursor: pointer;
 }
 .calendarFilter select:focus { outline: none; border-color: rgba(93,204,229,.72); box-shadow: 0 0 0 2px rgba(93,204,229,.18); }
-.calendarFilter select option { background: #171b22; color: rgba(255,255,255,.9); font-weight: 700; }
+.calendarFilter select option { background: #2a2e33; color: rgba(255,255,255,.9); font-weight: 700; }
 .calendarFilter select.monthSelect {
   flex: 0 0 84px; box-sizing: border-box;
   width: 84px; min-width: 84px; max-width: 84px;
@@ -854,7 +854,7 @@ function onCancel() {
   .calendarFilter select::picker-icon { display: none; }
   .calendarFilter select::picker(select) {
     max-height: 280px; margin-top: 4px; padding: 4px; overflow-y: auto;
-    background: #171b22; border: 1px solid rgba(255,255,255,.14); border-radius: 6px;
+    background: #2a2e33; border: 1px solid rgba(255,255,255,.14); border-radius: 6px;
     box-shadow: 0 12px 28px rgba(0,0,0,.5); scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.2) transparent;
   }
   .calendarFilter select option { min-height: 40px; padding: 0 12px; border-radius: 4px; font-size: 15px; }
@@ -939,7 +939,7 @@ function onCancel() {
 
 .hint { color: rgba(255,255,255,0.45); display: grid; place-items: center; font-size: 14px; }
 .roleOverlay { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; background: rgba(0,0,0,.58); }
-.roleDialog { width: min(520px, calc(100% - 40px)); padding: 24px; border: 1px solid rgba(255,255,255,.16); border-radius: 6px; background: #151a22; box-shadow: 0 20px 60px rgba(0,0,0,.55); }
+.roleDialog { width: min(520px, calc(100% - 40px)); padding: 24px; border: 1px solid rgba(255,255,255,.16); border-radius: 6px; background: #25282d; box-shadow: 0 20px 60px rgba(0,0,0,.55); }
 .roleHeader { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .roleDialog h2 { margin: 0; color: #fff; font-size: 20px; }
 .roleClose { flex: none; display: grid; place-items: center; width: 40px; height: 40px; align-self: flex-start; margin: -14px -12px -8px 0; border: 0; border-radius: 4px; background: transparent; color: rgba(255,255,255,.6); cursor: pointer; }
