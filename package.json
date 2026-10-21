@@ -4,8 +4,10 @@
   "private": true,
   "scripts": {
     "build": "nuxt build",
-    "dev": "nuxt dev --port 3000",
+    "dev": "nuxt dev --no-fork --port 3000",
     "dev:backend": ".\\.venv\\Scripts\\python.exe -m backend.app",
+    "dev:mac": "nuxt dev --no-fork --port 3000",
+    "dev:backend:mac": "./.venv/bin/python -m backend.app",
     "generate": "nuxt generate",
     "preview": "nuxt preview",
     "postinstall": "nuxt prepare"
