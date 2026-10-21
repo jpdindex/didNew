@@ -77,6 +77,39 @@ const calendarDays = computed(() => {
   return cells
 })
 
+const todayYmd = toYMD(today.getFullYear(), today.getMonth(), today.getDate())
+
+// 날짜별 경기 수(선택한 리그 기준). 달력 칸에 "N경기"로 표시한다.
+const matchCountByDate = computed(() => {
+  const counts: Record<string, number> = {}
+  for (const fixture of calendarFixtures.value) {
+    if (selectedLeague.value !== 'all' && fixture.leagueId !== selectedLeague.value) continue
+    counts[fixture.date] = (counts[fixture.date] ?? 0) + 1
+  }
+  return counts
+})
+
+const DOW_NAMES = ['일', '월', '화', '수', '목', '금', '토']
+
+// 달력 아래 요약: 선택한 날짜와 그날의 경기 수.
+const selectedDateLabel = computed(() => {
+  const ymd = selectedDate.value
+  if (!ymd) return '날짜를 선택하세요'
+  const [y, m, d] = ymd.split('-').map(Number)
+  const dow = DOW_NAMES[new Date(y!, m! - 1, d!).getDay()]
+  const count = matchCountByDate.value[ymd] ?? 0
+  return `${y}.${String(m).padStart(2, '0')}.${String(d).padStart(2, '0')} (${dow}) · ${count ? `${count}경기` : '경기 없음'}`
+})
+
+// 오늘이 속한 달로 이동하고 오늘 날짜를 바로 선택한다.
+function goToday() {
+  const monthChanged = viewYear.value !== today.getFullYear() || viewMonth.value !== today.getMonth()
+  viewYear.value = today.getFullYear()
+  viewMonth.value = today.getMonth()
+  if (monthChanged) applyCalendarView()
+  pickDate(todayYmd)
+}
+
 function prevMonth() {
   if (viewMonth.value === 0) {
     viewMonth.value = 11
@@ -325,6 +358,12 @@ function selectMatch(id: string) {
 }
 
 function selectTeam(matchId: string, team: 'home' | 'away') {
+  // 이미 선택한 팀을 다시 누르면 선택을 해제한다(경기 선택도 함께 풀어 다른 카드의 흐림도 사라진다).
+  if (selectedMatchId.value === matchId && selectedTeam.value === team) {
+    selectedMatchId.value = ''
+    selectedTeam.value = null
+    return
+  }
   selectedMatchId.value = matchId
   selectedTeam.value = team
 }
@@ -351,13 +390,48 @@ function isMatchComplete(match: MatchItem) {
   return match.inputStatus.H.completed && match.inputStatus.A.completed
 }
 
+// 경기장 이름 끝의 '스타디움'은 항상 둘째 줄로 내린다. 이름 길이와 상관없이 같은 모양으로 보이게 한다.
+function stadiumLines(name: string) {
+  const match = name.trim().match(/^(.+?)\s*(스타디움|Stadium)$/i)
+  return match ? [match[1]!, match[2]!] : [name]
+}
+
 function teamCollaboration(match: MatchItem, team: 'home' | 'away') {
   return team === 'home' ? match.collaboration.H : match.collaboration.A
 }
 
-function orderedParticipants(summary: CollaborationSummary) {
-  const order: Record<string, number> = { primary: 0, assistant: 1, manager: 2 }
-  return [...(summary.participants || [])].sort((a, b) => (order[a.role || ''] ?? 1) - (order[b.role || ''] ?? 1))
+// 내 계정이 참여한 팀인지. 입장 로직(selectedParticipantRole)과 같은 기준으로 판별한다.
+function isMe(participant: { uid: string; name?: string }) {
+  const user = $auth.currentUser
+  if (!user) return false
+  if (participant.uid === user.uid) return true
+  // 예전 로컬 Draft는 공용 UID를 썼다. 저장된 이름이 내 계정과 같으면 내 참여로 본다.
+  const names = [user.displayName, user.email].filter(Boolean)
+  return participant.uid === 'local-did-input' && names.includes(participant.name || '')
+}
+
+function teamIsMine(match: MatchItem, team: 'home' | 'away') {
+  return Boolean(teamCollaboration(match, team).participants?.some(isMe))
+}
+
+function matchHasMine(match: MatchItem) {
+  return teamIsMine(match, 'home') || teamIsMine(match, 'away')
+}
+
+// 분석관은 실제로 있는 사람만 Main → Sub → Manager 순서로 위에서부터 쌓는다. 자리를 미리 잡아 두지 않는다.
+// 한 카드의 두 팀 상자는 사람이 더 많은 쪽 높이에 맞춰지고, 적은 쪽은 아래가 비어 보인다.
+type AnalystRow = { key: string; label: 'Main' | 'Sub' | 'Manager'; participant: { uid: string; role?: string; name?: string } }
+function analystRows(summary: CollaborationSummary): AnalystRow[] {
+  const participants = summary.participants || []
+  const rows: AnalystRow[] = []
+  const main = participants.find(item => item.role === 'primary')
+  const sub = participants.find(item => item.role === 'assistant')
+  if (main) rows.push({ key: 'main', label: 'Main', participant: main })
+  if (sub) rows.push({ key: 'sub', label: 'Sub', participant: sub })
+  for (const manager of participants.filter(item => item.role === 'manager')) {
+    rows.push({ key: `manager-${manager.uid}`, label: 'Manager', participant: manager })
+  }
+  return rows
 }
 
 type ParticipantRole = 'primary' | 'assistant' | 'manager'
@@ -547,13 +621,22 @@ function onCancel() {
               :class="{
                 empty: !c.day,
                 active: c.ymd && c.ymd === selectedDate,
-                hasMatch: c.ymd && calendarFixtures.some(match => match.date === c.ymd && (selectedLeague === 'all' || match.leagueId === selectedLeague)),
+                today: c.ymd === todayYmd,
+                hasMatch: c.ymd && (matchCountByDate[c.ymd] ?? 0) > 0,
               }"
               :disabled="!c.day"
               @click="pickDate(c.ymd)"
             >
-              <span v-if="c.day">{{ c.day }}</span>
+              <template v-if="c.day">
+                <span class="num">{{ c.day }}</span>
+                <span v-if="c.ymd && matchCountByDate[c.ymd]" class="cnt">{{ matchCountByDate[c.ymd] }}경기</span>
+              </template>
             </button>
+          </div>
+
+          <div class="calFoot">
+            <div class="selectedInfo">{{ selectedDateLabel }}</div>
+            <button class="todayBtn" type="button" @click="goToday">오늘</button>
           </div>
           </div>
         </section>
@@ -566,7 +649,7 @@ function onCancel() {
             {{ loadError || '왼쪽에서 날짜를 선택해줘.' }}
           </div>
 
-          <div v-else class="list">
+          <div v-else class="list" :class="{ hasSelection: Boolean(selectedMatchId) }">
             <div v-if="loadingMatches" class="hint">경기 목록을 불러오는 중입니다.</div>
             <div v-else-if="loadError" class="hint">{{ loadError }}</div>
             <template v-else>
@@ -578,6 +661,7 @@ function onCancel() {
                   selected: m.id === selectedMatchId,
                   'match-complete': isMatchComplete(m),
                   'match-pending': !isMatchComplete(m),
+                  'has-mine': matchHasMine(m),
                 }"
                 @click="selectMatch(m.id)"
                 role="button"
@@ -590,7 +674,8 @@ function onCancel() {
                   <div class="competition">{{ m.league }}</div>
                   <div class="roundBadge">{{ m.round }}</div>
                 </div>
-                <div class="stadium">{{ m.stadium }}</div>
+                <div class="stadium"><span v-for="(line, lineIndex) in stadiumLines(m.stadium)" :key="lineIndex">{{ line }}</span></div>
+                <div v-if="matchHasMine(m)" class="mineTag">내 경기</div>
               </div>
 
               <div class="vs">
@@ -598,7 +683,7 @@ function onCancel() {
                   v-for="side in (['home', 'away'] as const)"
                   :key="side"
                   class="teamChoice"
-                  :class="[side === 'home' ? 'teamHome' : 'teamAway', { chosen: m.id === selectedMatchId && selectedTeam === side }]"
+                  :class="[side === 'home' ? 'teamHome' : 'teamAway', { chosen: m.id === selectedMatchId && selectedTeam === side, mine: teamIsMine(m, side) }]"
                   :style="{ order: side === 'home' ? 0 : 2 }"
                   type="button"
                   @click.stop="selectTeam(m.id, side)"
@@ -610,11 +695,15 @@ function onCancel() {
                     </div>
                   </div>
                   <div class="analystLine" :aria-label="side === 'home' ? '홈팀 분석관' : '원정팀 분석관'">
-                    <span v-for="participant in orderedParticipants(teamCollaboration(m, side))" :key="participant.uid" class="analyst">
-                      <span class="analystRole" :class="{ main: participant.role === 'primary' }">{{ participant.role === 'primary' ? 'Main' : participant.role === 'manager' ? 'Manager' : 'Sub' }}</span>
-                      <span class="analystName">{{ (participant.name || participant.uid).split('@')[0] }}</span>
+                    <span
+                      v-for="row in analystRows(teamCollaboration(m, side))"
+                      :key="row.key"
+                      class="analyst"
+                      :class="{ me: isMe(row.participant), isMain: row.label === 'Main' }"
+                    >
+                      <span class="analystRole" :class="`role-${row.label.toLowerCase()}`"><span class="roleBadge">{{ row.label }}</span></span>
+                      <span class="analystName">{{ (row.participant.name || row.participant.uid).split('@')[0] }}</span>
                     </span>
-                    <span v-if="!teamCollaboration(m, side).participants?.length" class="analystEmpty">배정된 분석관 없음</span>
                   </div>
                 </button>
                 <div class="mid">
@@ -745,17 +834,17 @@ function onCancel() {
 .calendarFilter { display: flex; align-items: center; gap: 8px; }
 .calendarFilter select {
   appearance: none; -webkit-appearance: none;
-  height: 32px; padding: 0 28px 0 10px;
+  height: 40px; padding: 0 32px 0 12px;
   border: 1px solid rgba(255,255,255,.14); border-radius: 4px;
-  background: #171b22 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%2376d7e8' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 9px center;
+  background: #171b22 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%2376d7e8' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 11px center;
   color: rgba(255,255,255,.9);
-  font: inherit; font-size: 13px; font-weight: 750; color-scheme: dark; cursor: pointer;
+  font: inherit; font-size: 15px; font-weight: 750; color-scheme: dark; cursor: pointer;
 }
 .calendarFilter select:focus { outline: none; border-color: rgba(93,204,229,.72); box-shadow: 0 0 0 2px rgba(93,204,229,.18); }
 .calendarFilter select option { background: #171b22; color: rgba(255,255,255,.9); font-weight: 700; }
 .calendarFilter select.monthSelect {
-  flex: 0 0 76px; box-sizing: border-box;
-  width: 76px; min-width: 76px; max-width: 76px;
+  flex: 0 0 84px; box-sizing: border-box;
+  width: 84px; min-width: 84px; max-width: 84px;
   field-sizing: fixed; font-variant-numeric: tabular-nums;
 }
 /* 지원 브라우저(Chromium 135+)에서는 펼침 목록까지 다크 테마로 */
@@ -768,15 +857,15 @@ function onCancel() {
     background: #171b22; border: 1px solid rgba(255,255,255,.14); border-radius: 6px;
     box-shadow: 0 12px 28px rgba(0,0,0,.5); scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.2) transparent;
   }
-  .calendarFilter select option { min-height: 36px; padding: 0 10px; border-radius: 4px; font-size: 13px; }
+  .calendarFilter select option { min-height: 40px; padding: 0 12px; border-radius: 4px; font-size: 15px; }
   .calendarFilter select option::checkmark { display: none; }
   .calendarFilter select option:checked { background: rgba(241,180,0,.14); color: #f1b400; }
   .calendarFilter select option:focus-visible { outline: none; background: rgba(255,255,255,.08); }
   .calendarFilter select option:active { background: rgba(255,255,255,.12); }
 }
-.monthNav { display: flex; align-items: center; gap: 10px; }
+.monthNav { display: flex; align-items: center; gap: 8px; }
 .iconBtn {
-  width: 28px; height: 28px; border-radius: 4px;
+  width: 40px; height: 40px; border-radius: 4px; font-size: 18px;
   border: 1px solid rgba(255,255,255,0.10);
   background: rgba(255,255,255,0.04);
   color: rgba(255,255,255,0.8);
@@ -785,33 +874,65 @@ function onCancel() {
 .dow {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  color: rgba(255,255,255,0.5);
-  font-size: 12px;
+  column-gap: 6px;
+  color: rgba(255,255,255,0.75);
+  font-size: 14px;
+  font-weight: 700;
   text-align: center;
+  align-items: center;
 }
 
 .calViewport { min-height: 0; overflow: hidden; }
 .cal {
-  height: 100%;
   will-change: transform;
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  gap: 12px 6px;
+  gap: 8px 6px;
+  grid-auto-rows: 76px;
   align-content: start;
   touch-action: pan-y; /* 가로 스와이프는 월 이동으로 처리 */
   user-select: none;
 }
 .cell {
-  height: 56px;
+  position: relative;
+  box-sizing: border-box;
+  height: 76px;
+  padding: 10px 4px 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
   border-radius: 4px;
-  border: 1px solid rgba(255,255,255,0.10);
-  background: rgba(255,255,255,0.03);
-  color: rgba(255,255,255,0.75);
+  border: 1px solid rgba(255,255,255,0.06);
+  background: rgba(255,255,255,0.02);
+  color: rgba(255,255,255,0.28);
+  text-align: center;
   cursor: pointer;
+  transition: background .12s, border-color .12s;
 }
+.cell .num { font-size: 19px; font-weight: 500; line-height: 1; font-variant-numeric: tabular-nums; }
+.cell .cnt { font-size: 13px; font-weight: 700; line-height: 1; color: #7fdcf0; white-space: nowrap; }
+.cell:not(.empty):hover { background: rgba(255,255,255,0.05); }
 .cell.empty { border-color: transparent; background: transparent; cursor: default; }
-.cell.active { border-color: rgba(241,180,0,0.7); box-shadow: 0 0 0 3px rgba(241,180,0,0.12); }
-.cell.hasMatch:not(.active) { border-color: rgba(0,217,255,0.35); }
+/* 경기가 있는 날: 숫자를 밝게 하고 왼쪽에 가는 선만 둔다 */
+.cell.hasMatch { color: #fff; background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.14); }
+.cell.hasMatch .num { font-weight: 700; }
+.cell.hasMatch::before { content: ''; position: absolute; left: 10px; right: 10px; top: -1px; height: 2px; border-radius: 0 0 2px 2px; background: #3fb3cc; }
+/* 오늘: 숫자에만 얇은 고리 */
+.cell.today .num { color: rgba(255,255,255,0.85); display: inline-grid; place-items: center; min-width: 28px; height: 28px; margin: -5px 0 0; padding: 0 6px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.6); box-sizing: border-box; }
+.cell.active { border-color: rgba(241,180,0,0.85); background: rgba(241,180,0,0.09); color: #fff; }
+.cell.active .num { color: #ffc61a; }
+.cell.active.hasMatch::before { background: #f1b400; }
+
+.calFoot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.06); }
+.selectedInfo { color: rgba(255,255,255,0.92); font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.todayBtn {
+  height: 30px; padding: 0 14px; border-radius: 4px;
+  border: 1px solid rgba(255,255,255,0.18); background: transparent;
+  color: rgba(255,255,255,0.9); font-size: 14px; font-weight: 600; cursor: pointer;
+}
+.todayBtn:hover { background: rgba(255,255,255,0.06); }
+.todayBtn:active { background: rgba(255,255,255,0.12); }
 
 .right { padding: 16px; display: grid; grid-template-rows: 36px 1fr; gap: 10px; }
 .rightTitle { color: rgba(255,255,255,0.85); font-weight: 800; font-size: 18px; text-align: center; }
@@ -831,21 +952,21 @@ function onCancel() {
 .roleChoice:disabled { border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.08); color: rgba(255,255,255,.4); cursor: not-allowed; }
 .roleCancel { border: 1px solid rgba(255,255,255,.15); background: transparent; color: rgba(255,255,255,.7); }
 
-.list { display: grid; gap: 10px; align-content: start; overflow: auto; padding: 2px 6px 12px 2px; }
+.list { display: grid; gap: 12px; align-content: start; overflow: auto; padding: 2px 6px 12px 2px; }
 
 .matchRow {
   display: grid;
   grid-template-columns: 116px minmax(0, 1fr);
   gap: 14px;
   align-items: center;
-  min-height: 98px;
-  padding: 12px 14px;
-  border-radius: 6px;
+  min-height: 120px;
+  padding: 14px 18px;
+  border-radius: 8px;
   border: 1px solid rgba(255,255,255,.10);
   background: rgba(255,255,255,0.025);
   cursor: pointer;
   text-align: left;
-  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease, transform 140ms ease;
+  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease, transform 140ms ease, filter 160ms ease, opacity 160ms ease;
 }
 /* 한 팀이라도 입력 대기면 경기 카드 자체를 살아있는 작업 대상으로 표시한다. */
 .matchRow.match-pending {
@@ -858,36 +979,40 @@ function onCancel() {
   box-shadow: none;
 }
 .matchRow:active { background: rgba(255,255,255,.055); }
+/* 경기를 하나 선택하면 나머지 카드는 채도·밝기를 낮춰 선택한 카드가 돋보이게 한다. 눌러서 다시 고를 수는 있다. */
+.list.hasSelection .matchRow:not(.selected) { filter: saturate(.25) brightness(.88); opacity: .62; }
 .matchRow.selected {
   background: rgba(241,180,0,0.055);
   box-shadow: 0 0 0 2px rgba(241,180,0,0.46);
 }
-.time { display: grid; gap: 5px; align-content: center; min-width: 0; }
+.time { display: grid; gap: 7px; align-content: center; min-width: 0; }
 .timeRow { display: flex; align-items: center; gap: 8px; }
-.time .t { color: rgba(255,255,255,.94); font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; }
-.roundBadge { color: rgba(255,255,255,.58); font-size: 12px; font-weight: 750; }
-.competition { color: #76d7e8; font-size: 12px; font-weight: 750; }
-.stadium { color: rgba(255,255,255,.43); font-size: 12px; line-height: 1.35; word-break: keep-all; }
+.time .t { color: rgba(255,255,255,.94); font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.roundBadge { color: rgba(255,255,255,.62); font-size: 13px; font-weight: 750; }
+.competition { color: #76d7e8; font-size: 13px; font-weight: 750; }
+.stadium { color: rgba(255,255,255,.5); font-size: 11.5px; line-height: 1.35; word-break: keep-all; }
+.stadium span { display: block; }
 .vs {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 68px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 84px minmax(0, 1fr);
   align-items: stretch;
-  gap: 8px;
+  gap: 10px;
   min-width: 0;
 }
 .mid { order: 1; display: grid; place-items: center; }
-.score { display: flex; align-items: center; justify-content: center; gap: 7px; min-width: 64px; padding: 10px 4px; border-radius: 4px; background: rgba(255,255,255,.05); color: rgba(255,255,255,.92); font-size: 24px; font-weight: 850; line-height: 1; font-variant-numeric: tabular-nums; }
-.scoreDivider { color: rgba(255,255,255,.35); font-size: 16px; }
+.score { display: flex; align-items: center; justify-content: center; gap: 7px; min-width: 76px; padding: 14px 4px; border-radius: 6px; background: rgba(255,255,255,.06); color: rgba(255,255,255,.95); font-size: 30px; font-weight: 850; line-height: 1; font-variant-numeric: tabular-nums; }
+.scoreDivider { color: rgba(255,255,255,.35); font-size: 20px; }
 
 /* 팀 카드 = 선택 버튼. 팀명·진행 상태·분석관을 한 덩어리로 묶는다. */
 .teamChoice {
   min-width: 0;
   display: grid;
-  align-content: center;
-  gap: 8px;
-  padding: 10px 12px;
+  align-content: start;
+  gap: 10px;
+  min-height: 96px;
+  padding: 14px 16px;
   border: 1px solid rgba(255,255,255,.10);
-  border-radius: 6px;
+  border-radius: 8px;
   background: rgba(255,255,255,.03);
   cursor: pointer;
   font: inherit;
@@ -895,35 +1020,52 @@ function onCancel() {
 }
 .teamChoice:active { background: rgba(255,255,255,.09); }
 /* 노란색은 '내가 고른 팀' 표시에만 쓴다. */
-.teamChoice.chosen { border-color: rgba(241,180,0,.85); background: rgba(241,180,0,.10); box-shadow: inset 0 0 0 1px rgba(241,180,0,.35); }
+.teamChoice.chosen, .teamChoice.teamHome.chosen, .teamChoice.teamAway.chosen { border-color: rgba(241,180,0,.85); background: rgba(241,180,0,.12); box-shadow: inset 0 0 0 1px rgba(241,180,0,.35); }
 .teamChoice:focus-visible { outline: 2px solid #5dcce5; outline-offset: 2px; }
-.teamHome { text-align: right; justify-items: end; }
-.teamAway { text-align: left; justify-items: start; }
+/* 내가 참여 중인 팀: 보라색 계열. 노란색(선택)·청록(진행)·초록(종료)과 겹치지 않게 한다. */
+.teamChoice.mine:not(.chosen) { border-color: rgba(150,130,255,.42); background: linear-gradient(90deg, rgba(150,130,255,.04), rgba(150,130,255,.11)); }
+.teamChoice.teamAway.mine:not(.chosen) { background: linear-gradient(270deg, rgba(150,130,255,.04), rgba(150,130,255,.11)); }
+.matchRow.has-mine { border-left: 3px solid #9682ff; }
+.mineTag { justify-self: start; margin-top: 2px; padding: 3px 8px; border-radius: 4px; background: rgba(150,130,255,.13); color: #bdb2fb; font-size: 12px; font-weight: 700; }
+.analyst.me { background: rgba(150,130,255,.08); }
+.analyst.me .analystName { color: #9e97c4; font-weight: 600; }
+.analyst.me .role-main .roleBadge { background: rgba(150,130,255,.14); color: #a49dcf; }
+.analyst.me .role-sub .roleBadge { color: #9890c4; box-shadow: inset 0 0 0 1px rgba(150,130,255,.26); }
+.teamHome { text-align: right; justify-items: end; background: linear-gradient(90deg, rgba(255,255,255,.02), rgba(96,150,200,.12)); }
+.teamAway { text-align: left; justify-items: start; background: linear-gradient(270deg, rgba(255,255,255,.02), rgba(96,150,200,.12)); }
 
-.teamHead { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; }
+.teamHead { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; max-width: 100%; }
 .teamHome .teamHead { flex-direction: row-reverse; }
 .team {
   min-width: 0;
-  color: rgba(255,255,255,0.92);
-  font-size: 17px;
+  color: #fff;
+  font-size: 21px;
   font-weight: 800;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .teamChoice.chosen .team { color: #fff; }
-.teamStatus { flex: none; padding: 3px 6px; border-radius: 3px; font-size: 11px; line-height: 1.1; white-space: nowrap; font-weight: 800; }
-.teamStatus-waiting { background: rgba(255,255,255,.07); color: rgba(255,255,255,.55); }
-.teamStatus-live { background: rgba(0,217,255,.12); color: #76d7e8; }
-.teamStatus-done { background: rgba(80,200,120,.13); color: #7fd99a; }
+.teamStatus { flex: none; padding: 5px 9px; border-radius: 4px; font-size: 13px; line-height: 1.1; white-space: nowrap; font-weight: 800; }
+.teamStatus-waiting { background: rgba(255,255,255,.06); color: rgba(255,255,255,.5); }
+.teamStatus-live { background: rgba(110,170,185,.12); color: #7eadb8; }
+.teamStatus-done { background: rgba(120,175,140,.12); color: #84ab92; }
 
-.analystLine { display: flex; flex-wrap: wrap; gap: 4px 10px; min-width: 0; max-width: 100%; min-height: 18px; align-items: center; }
-.teamHome .analystLine { justify-content: flex-end; }
-.analyst { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; font-size: 12px; line-height: 18px; }
-.analystRole { flex: none; padding: 0 4px; border: 1px solid rgba(255,255,255,.16); border-radius: 3px; color: rgba(255,255,255,.5); font-size: 10px; font-weight: 800; line-height: 14px; }
-.analystRole.main { border-color: rgba(255,255,255,.3); color: rgba(255,255,255,.8); }
-.analystName { overflow: hidden; color: rgba(255,255,255,.62); text-overflow: ellipsis; white-space: nowrap; }
-.analystEmpty { color: rgba(255,255,255,.28); font-size: 12px; line-height: 18px; }
+.analystLine { display: flex; flex-direction: column; flex-wrap: nowrap; gap: 3px; width: 100%; min-width: 0; align-items: stretch; }
+.analyst { box-sizing: border-box; display: flex; align-items: center; gap: 12px; min-width: 0; padding: 7px 12px; border-radius: 4px; background: rgba(255,255,255,.03); font-size: 14px; line-height: 20px; }
+.teamHome .analyst { flex-direction: row-reverse; }
+.teamHome .analystName { text-align: right; }
+.teamHome .analystRole { justify-content: flex-end; }
+.analystRole { flex: none; width: 84px; display: flex; align-items: center; }
+/* 역할 뱃지: 모양으로 구분한다 — Main은 채움, Sub는 테두리, Manager는 회청색 채움. 색은 늘리지 않는다. */
+.roleBadge { padding: 2px 9px; border-radius: 3px; font-size: 11px; font-weight: 800; letter-spacing: .06em; line-height: 16px; text-transform: uppercase; }
+.role-main .roleBadge { background: rgba(255,255,255,.07); color: rgba(255,255,255,.52); }
+.role-sub .roleBadge { background: transparent; color: rgba(255,255,255,.36); box-shadow: inset 0 0 0 1px rgba(255,255,255,.12); }
+.role-manager .roleBadge { background: rgba(255,255,255,.06); color: #8b95a1; }
+.analyst.isMain { background: rgba(255,255,255,.055); }
+.analyst.isMain .analystName { color: rgba(255,255,255,.6); font-weight: 600; }
+.analystName { flex: 1 1 auto; min-width: 0; overflow: hidden; color: rgba(255,255,255,.46); text-overflow: ellipsis; white-space: nowrap; }
+.analystEmpty { color: rgba(255,255,255,.35); font-size: 14px; line-height: 22px; }
 
 .bottomBar {
   grid-area: schedule-bottom;
