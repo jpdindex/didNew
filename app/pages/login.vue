@@ -15,6 +15,7 @@ const saveId = ref(true)
 const autoLogin = ref(false)
 const message = ref('')
 const loading = ref(false)
+const showPw = ref(false)
 
 const { $auth } = useNuxtApp()
 const { request } = useBackendApi()
@@ -31,7 +32,36 @@ onMounted(() => {
 // 짧은 ID만 입력한 경우엔 내부용 가짜 이메일로 변환한다.
 const toInternalEmail = (id: string) => (id.includes('@') ? id : `${id}@jpd-did.internal`)
 
+// 로그인 실패 원인에 맞는 안내 문구. 아이디/비밀번호 문제가 아닌데도 "일치하지 않습니다"라고
+// 보여주면 서버·네트워크 장애를 계정 문제로 오해하게 된다.
+function loginErrorMessage(error: unknown) {
+  const { code, status } = (error ?? {}) as { code?: string; status?: number }
+
+  if (typeof code === 'string' && code.startsWith('auth/')) {
+    switch (code) {
+      case 'auth/invalid-credential':
+      case 'auth/wrong-password':
+      case 'auth/user-not-found':
+      case 'auth/invalid-email':
+        return '아이디 또는 비밀번호가 일치하지 않습니다.'
+      case 'auth/network-request-failed':
+        return '인터넷 연결을 확인한 뒤 다시 시도해 주세요.'
+      case 'auth/too-many-requests':
+        return '로그인 시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.'
+      case 'auth/user-disabled':
+        return '사용이 중지된 계정입니다. 관리자에게 문의해 주세요.'
+      default:
+        return '로그인에 실패했습니다. 잠시 후 다시 시도해 주세요.'
+    }
+  }
+
+  // 인증은 통과했지만 이후 서버 단계에서 실패한 경우.
+  if (status === 401 || status === 403) return '로그인 권한을 확인하지 못했습니다. 관리자에게 문의해 주세요.'
+  return '서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.'
+}
+
 async function login() {
+  if (loading.value) return
   if (!uId.value || !uPw.value) {
     message.value = 'ID / PASSWORD 를 입력해줘.'
     return
@@ -57,8 +87,8 @@ async function login() {
     }
 
     await navigateTo('/schedule')
-  } catch {
-    message.value = '아이디 또는 비밀번호가 일치하지 않습니다.'
+  } catch (error) {
+    message.value = loginErrorMessage(error)
   } finally {
     loading.value = false
   }
@@ -72,7 +102,7 @@ async function login() {
     <div class="card">
       <div class="brand">
         <div class="brandTop">AIMBROAD</div>
-        <div class="brandSub">DIGITAL BROADCAST</div>
+        <div class="brandSub">CODE INPUT DEVICE</div>
       </div>
 
       <div class="form">
@@ -85,17 +115,30 @@ async function login() {
         />
 
         <div class="row">
-          <input
-            v-model="uPw"
-            class="input"
-            type="password"
-            placeholder="PASSWORD"
-            autocomplete="current-password"
-            @keyup.enter="login"
-          />
+          <div class="pwWrap">
+            <input
+              v-model="uPw"
+              class="input pwInput"
+              :type="showPw ? 'text' : 'password'"
+              placeholder="PASSWORD"
+              autocomplete="current-password"
+              @keyup.enter="login"
+            />
+            <!-- mousedown.prevent: 버튼을 눌러도 입력칸 포커스가 빠지지 않아 태블릿 키보드가 닫히지 않는다. -->
+            <button
+              type="button"
+              class="pwToggle"
+              :aria-pressed="showPw"
+              :aria-label="showPw ? '비밀번호 숨기기' : '비밀번호 보기'"
+              @mousedown.prevent
+              @click="showPw = !showPw"
+            >
+              {{ showPw ? '숨김' : '보기' }}
+            </button>
+          </div>
 
-          <button class="lockBtn" :disabled="loading" @click="login" aria-label="Login">
-            🔒
+          <button class="lockBtn" type="button" :disabled="loading" @click="login">
+            {{ loading ? '로그인 중…' : '로그인' }}
           </button>
         </div>
 
@@ -111,7 +154,7 @@ async function login() {
           </label>
         </div>
 
-        <p v-if="message" class="message">{{ message }}</p>
+        <p v-if="message" class="message" role="alert">{{ message }}</p>
       </div>
     </div>
   </div>
@@ -146,7 +189,7 @@ async function login() {
   width: 673.3281px;
   height: 393.3281px;
   display: grid;
-  grid-template-columns: 1fr 1.2fr;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.3fr);
   gap: 24px;
   padding: 28px;
   border-radius: 10px;
@@ -178,13 +221,17 @@ async function login() {
 
 .form {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   align-content: center;
   gap: 12px;
+  min-width: 0;
   padding-left: 10px;
 }
 
 .input {
+  box-sizing: border-box;
   width: 100%;
+  min-width: 0;
   height: 46px;
   padding: 0 14px;
   border-radius: 4px;
@@ -201,23 +248,56 @@ async function login() {
 
 .row {
   display: grid;
-  grid-template-columns: 1fr 74px;
-  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) 84px;
+  gap: 8px;
   align-items: center;
 }
 
+.pwWrap {
+  position: relative;
+  min-width: 0;
+}
+.pwInput {
+  padding-right: 62px;
+}
+.pwToggle {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  height: 34px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.10);
+  color: rgba(255,255,255,0.85);
+  font-size: 13px;
+  cursor: pointer;
+}
+.pwToggle:active {
+  background: rgba(255,255,255,0.2);
+}
+
 .lockBtn {
+  box-sizing: border-box;
   height: 46px;
+  padding: 0;
   border-radius: 4px;
   border: none;
   background: #f1b400;
   color: #111;
-  font-size: 18px;
+  font-size: 14px;
+  font-weight: 700;
+  white-space: nowrap;
   cursor: pointer;
   box-shadow: 0 10px 24px rgba(241, 180, 0, 0.25);
 }
 .lockBtn:active {
   transform: translateY(1px);
+}
+.lockBtn:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .options {
@@ -236,8 +316,9 @@ async function login() {
 
 .message {
   margin-top: 10px;
-  color: rgba(255,255,255,0.8);
+  color: #ff9e9e;
   font-size: 14px;
+  line-height: 1.4;
 }
 
 </style>
