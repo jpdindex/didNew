@@ -2056,7 +2056,7 @@ button {
 .topBack {
   position: absolute;
   z-index: 2;
-  top: 14px;
+  top: 6px;
   right: 16px;
   height: 30px;
   padding: 0 10px;
@@ -2399,6 +2399,8 @@ button {
 }
 
 .content h1 {
+  /* 제목 자리는 그대로 두고 눈에 보이는 위치만 위로 올린다(아래 내용은 움직이지 않는다) */
+  transform: translateY(-8px);
   height: 28px;
   margin: 0;
   text-align: center;
