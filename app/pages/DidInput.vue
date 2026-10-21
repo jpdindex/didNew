@@ -2444,15 +2444,31 @@ async function finishHalf() {
       <div class="frame" :class="{ mirrored: game.mirrored }">
         <section class="left" :style="{ paddingBottom: (tableExpanded ? 380 : 210) + 'px' }">
           <div class="statBar">
-            <button class="cardIcon" :class="{ on: cardOpen }" title="카드 입력" @click="openCardPanel">🟨🟥</button>
+            <button class="cardIcon" :class="{ on: cardOpen }" title="카드 입력" aria-label="카드 입력" @click="openCardPanel"><svg
+                class="cardGlyph" viewBox="0 0 26 18" width="36" height="25" aria-hidden="true">
+                <rect x="11" y="1.5" width="10" height="14" rx="2" fill="#e5484d" stroke="rgba(0,0,0,.35)" stroke-width=".8"
+                  transform="rotate(14 16 8.5)" />
+                <rect x="5" y="1.5" width="10" height="14" rx="2" fill="#f5c518" stroke="rgba(0,0,0,.35)" stroke-width=".8"
+                  transform="rotate(-14 10 8.5)" />
+              </svg></button>
             <button class="stat" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(-3)">-3</button>
             <button class="stat" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(-1)">-1</button>
             <div class="spacer" />
             <button class="stat" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(1)">+1</button>
             <button class="stat" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(3)">+3</button>
             <div ref="grassWrapRef" class="grassWrap">
-              <button class="grassIcon" :class="{ on: grassOpen }" title="잔디 패턴" @click="grassOpen = !grassOpen"><span
-                  class="grassSwatch" /></button>
+              <button class="grassIcon" :class="{ on: grassOpen }" title="잔디 패턴" aria-label="잔디 패턴" @click="grassOpen = !grassOpen"><svg
+                  class="grassGlyph" viewBox="0 0 28 20" width="32" height="23" aria-hidden="true">
+                  <defs>
+                    <clipPath id="grassIconClip"><rect x="1" y="1" width="26" height="18" rx="3" /></clipPath>
+                  </defs>
+                  <g clip-path="url(#grassIconClip)">
+                    <rect x="1.00" y="1" width="3.7142857" height="18" fill="#7cb86a" /><rect x="4.71" y="1" width="3.7142857" height="18" fill="#5b9a4d" /><rect x="8.43" y="1" width="3.7142857" height="18" fill="#7cb86a" /><rect x="12.14" y="1" width="3.7142857" height="18" fill="#5b9a4d" /><rect x="15.86" y="1" width="3.7142857" height="18" fill="#7cb86a" /><rect x="19.57" y="1" width="3.7142857" height="18" fill="#5b9a4d" /><rect x="23.29" y="1" width="3.7142857" height="18" fill="#7cb86a" />
+                  </g>
+                  <rect x="1" y="1" width="26" height="18" rx="3" fill="none" stroke="rgba(255,255,255,.6)" stroke-width="1.1" />
+                  <line x1="14" y1="1" x2="14" y2="19" stroke="rgba(255,255,255,.6)" stroke-width="1" />
+                  <circle cx="14" cy="10" r="3.2" fill="none" stroke="rgba(255,255,255,.6)" stroke-width="1" />
+                </svg></button>
               <div v-if="grassOpen" class="grassPop">
                 <div class="popRow">
                   <span class="popLabel">잔디 패턴(중계화면 왼쪽에서부터)</span>
@@ -2472,7 +2488,15 @@ async function finishHalf() {
                 <button class="popOk" @click="grassOpen = false">확인</button>
               </div>
             </div>
-            <button class="swapIcon" :class="{ on: subOpen }" title="선수 교체" @click="openSubPanel">🔄</button>
+            <button class="swapIcon" :class="{ on: subOpen }" title="선수 교체" aria-label="선수 교체" @click="openSubPanel"><svg
+                class="swapGlyph" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke-width="2.2" stroke-linecap="round"
+                stroke-linejoin="round" aria-hidden="true">
+                <!-- 투입(위, 초록) / 퇴장(아래, 빨강) — 축구 교체 표시의 관례 -->
+                <path d="M8 19.5V5" stroke="#5fbf7a" />
+                <path d="M3.8 9.2 8 5l4.2 4.2" stroke="#5fbf7a" />
+                <path d="M16 4.5V19" stroke="#e5484d" />
+                <path d="M11.8 14.8 16 19l4.2-4.2" stroke="#e5484d" />
+              </svg></button>
             <div class="clockCtrl">
               <button v-if="historyPinned" class="pauseBtn followLatestBtn" :disabled="!!editingId || !!playerPickFor" @click="followLatestRecords">최신으로</button>
               <button v-else-if="inputMode === '분석'" class="pauseBtn" :disabled="!isPrimary || isEditMode" :class="{ paused }"
@@ -3117,14 +3141,22 @@ button {
   color: #fff;
   border-radius: 4px;
   cursor: pointer;
-  height: 26px;
+  width: 48px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   line-height: 1;
-  padding: 0 12px
+  padding: 0
 }
 
 .cardIcon.on {
   background: rgba(240, 180, 41, .2);
   border-color: #f0b429
+}
+
+.cardIcon .cardGlyph {
+  display: block
 }
 
 .cardPlayers button {
@@ -3342,6 +3374,10 @@ button {
   background: rgba(240, 180, 41, .18)
 }
 
+.grassIcon .grassGlyph {
+  display: block
+}
+
 .grassSwatch {
   width: 28px;
   height: 18px;
@@ -3358,15 +3394,15 @@ button {
   z-index: 30;
   top: 50px;
   right: 0;
-  width: 250px;
-  padding: 10px;
-  border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, .16);
-  background: #1b1e22;
-  box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
+  width: 268px;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, .10);
+  background: #1a1d22;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, .55);
   display: flex;
   flex-direction: column;
-  gap: 9px
+  gap: 14px
 }
 
 .popRow {
@@ -3424,6 +3460,70 @@ button {
   color: #191919;
   font-weight: 800;
   font-size: 11px;
+  cursor: pointer
+}
+
+.grassPop .popRow {
+  display: flex;
+  flex-direction: column;
+  gap: 8px
+}
+
+.grassPop .popLabel {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  color: rgba(255, 255, 255, .55)
+}
+
+/* 잔디 팝업 전용 — 선택 막대: 하나의 둥근 틀 안에 칸들이 이어져 있고, 선택된 칸만 강조된다 */
+.grassPop .popOpts {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 3px;
+  padding: 3px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .06)
+}
+
+.grassPop .popBtn {
+  height: 32px;
+  border-radius: 7px;
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, .72);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0;
+  transition: background .12s, color .12s
+}
+
+.grassPop .popBtn.on {
+  background: rgba(240, 180, 41, .18);
+  box-shadow: inset 0 0 0 1px rgba(240, 180, 41, .5);
+  color: #f5c24a
+}
+
+.grassPop .popBtn:disabled {
+  opacity: .35;
+  cursor: not-allowed
+}
+
+.grassPop .popPreview {
+  height: 36px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, .12)
+}
+
+.grassPop .popOk {
+  height: 36px;
+  border-radius: 8px;
+  border: none;
+  background: #f0b429;
+  color: #191919;
+  font-weight: 800;
+  font-size: 13px;
   cursor: pointer
 }
 
@@ -4972,6 +5072,10 @@ section.right h1 {
   border-color: rgba(240, 180, 41, .7);
   background: rgba(240, 180, 41, .18);
   color: #f0b429
+}
+
+.swapIcon .swapGlyph {
+  display: block
 }
 
 .subGroup {
