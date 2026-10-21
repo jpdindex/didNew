@@ -1,7 +1,7 @@
 {
   "id": "/",
-  "name": "DID",
-  "short_name": "DID",
+  "name": "CID",
+  "short_name": "CID",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
