@@ -2748,6 +2748,9 @@ class JpdDidData:
         # user asks for an action that needs them.
         is_final_lobby = selected_status["rawStatus"] == "final"
         bootstrap_kpi_halves = []
+        # The lobby joins nobody before "세팅 저장", so a Draft primary means
+        # that analyst already saved this setup and can re-enter without saving.
+        primary_uid = None
         if is_final_lobby:
             input_setup: dict[Side, dict[str, Any] | None] = {"H": None, "A": None}
             dashboard_kpis = self._empty_input_dashboard_kpis()
@@ -2780,6 +2783,7 @@ class JpdDidData:
             heads, input_setup = read_lobby_snapshot(self, gm_id)
             lobby_versions = {item: lobby_head_state(heads[item]) for item in ('H', 'A')}
             head = heads[side]
+            primary_uid = head.get("primaryUid") if isinstance(head.get("primaryUid"), str) else None
             payload = head.get("payload") if isinstance(head.get("payload"), dict) else {}
             shared = head.get("sharedState") if isinstance(head.get("sharedState"), dict) else {}
             lifecycle = shared.get("halfStatus") or payload.get("status") or selected_status.get("lifecycleStatus") or "ready"
@@ -2813,6 +2817,7 @@ class JpdDidData:
             },
             "inputSetup": input_setup,
             "session": session,
+            "primaryUid": primary_uid,
             **({'lobbyState': lobby_versions} if lobby_versions is not None else {}),
             "dashboardKpiHalves": bootstrap_kpi_halves,
             "dashboardKpis": dashboard_kpis,

@@ -1299,14 +1299,16 @@ function halfEntryEnvironment({ baseline = false, delayed = false, differentPeer
     subs: [{ id: 's', half: 'H1', seconds: 42, outPlayer: 'out', inPlayer: 'in' }] }
   const gate = deferred()
   let navigations = 0
+  let persists = 0
   const context = vm.createContext({ ...vue, ...formation, game, HALF_ORDER: { H1: 0, H2: 1 },
     appliedSetupRevision: -1, pendingSetupFingerprint: '', appliedSetupFingerprint: '', applyingRemoteSetup: false,
     lifecycleBusy: vue.ref(false), lifecycleError: vue.ref(''), bootstrapApplied: vue.ref(true), canStart: vue.ref(true), matchInfoEditMode: vue.ref(false),
-    preparedInput: vue.ref(null), savedEntryFingerprint: vue.ref(''), requestedRole: 'primary', formationSaveTimer: undefined,
+    preparedInput: vue.ref(null), savedEntryFingerprint: vue.ref(''), restoredSetupSaved: vue.ref(false), requestedRole: 'primary', formationSaveTimer: undefined,
     preloadRouteComponents: async () => {}, clearTimeout() {},
     ensureLobbyHistory: async () => {},
     ensureLobbyParticipant: async () => { game.value.participantRole = 'primary'; game.value.lifecycleControl = true },
     persistCurrentSetup: async () => {
+      persists++
       if (delayed) await gate.promise
       context.applyInputSetup({ ...setup, forceApply: true })
       return true
@@ -1323,7 +1325,7 @@ function halfEntryEnvironment({ baseline = false, delayed = false, differentPeer
   vm.runInContext(transformSync(functions, { loader: 'ts', format: 'cjs' }).code, context)
   const declarations = source.slice(source.indexOf('const entrySetupFingerprint ='), source.indexOf('function lifecycleErrorMessage'))
   vm.runInContext(transformSync(declarations, { loader: 'ts', format: 'cjs' }).code, context)
-  return { context, game, gate, ready: () => vm.runInContext('setupSaved.value', context), navigations: () => navigations }
+  return { context, game, gate, ready: () => vm.runInContext('setupSaved.value', context), navigations: () => navigations, persists: () => persists }
 }
 
 for (const baseline of [false, true]) test(`second-half preparation saves once and enters after ${baseline ? 'baseline' : 'already-applied'} substitution ACK`, async () => {
@@ -1335,6 +1337,18 @@ for (const baseline of [false, true]) test(`second-half preparation saves once a
   assert.equal(env.game.value.assigned.o7, 'in')
   assert.equal(env.game.value.assigned.b0, 'out')
   await env.context.enterPreparedHalf('H2')
+  assert.equal(env.navigations(), 1)
+  assert.equal(env.game.value.halfStatus, 'H2')
+})
+
+test('a re-entered primary sees the saved setup and enters without saving it again', async () => {
+  const env = halfEntryEnvironment()
+  env.context.savedEntryFingerprint.value = vm.runInContext('entryFingerprint.value', env.context)
+  env.context.restoredSetupSaved.value = true
+  assert.equal(env.ready(), true)
+  await env.context.enterPreparedHalf('H2')
+  assert.equal(env.context.lifecycleError.value, '')
+  assert.equal(env.persists(), 0)
   assert.equal(env.navigations(), 1)
   assert.equal(env.game.value.halfStatus, 'H2')
 })

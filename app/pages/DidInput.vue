@@ -3991,8 +3991,10 @@ button {
   background: rgba(240, 180, 41, .1)
 }
 
+/* 짧게 눌러 선택한 행 — 청록 배경 + 얇은 왼쪽 띠로 은은하게 구분 */
 .trow.peeking {
-  background: rgba(240, 180, 41, .06)
+  background: rgba(45, 212, 191, .14);
+  box-shadow: inset 3px 0 rgba(45, 212, 191, .8)
 }
 
 /* 태블릿(터치) 전용 — hover 가 없으니 가만히 있을 때부터 "누를 수 있는 칸"으로 보여야 하고,

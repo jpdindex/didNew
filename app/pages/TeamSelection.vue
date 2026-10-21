@@ -72,6 +72,9 @@ const { saveLocal, save: saveDraft, finalizeAdvanced, restoreFinalRaw, recoverFi
 const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncSetup, syncState, roomStatus, acceptServer, keepLocal } = useMatchCollaboration()
 const preparedInput = usePreparedInput()
 const savedEntryFingerprint = ref('')
+const restoredSetupSaved = ref(false)
+let bootstrapPrimaryUid: string | null = null
+const lobbyAuth = useNuxtApp().$auth
 const lifecycleBusy = ref(false)
 const lifecycleError = ref('')
 const bootstrapApplied = ref(false)
@@ -145,6 +148,7 @@ type InputBootstrap = {
   dashboardKpiHalves?: Array<'all' | 'H1' | 'H2'>
   dashboardKpis: { H: Record<'all' | 'H1' | 'H2', DashboardKpi>; A: Record<'all' | 'H1' | 'H2', DashboardKpi> }
   lobbyState?: Record<'H' | 'A', LobbySideState>
+  primaryUid?: string | null
 }
 
 type LobbySideState = {
@@ -317,6 +321,7 @@ function applyBootstrap(payload: InputBootstrap) {
   const setups = payload.inputSetup ?? { H: null, A: null }
   applySetupFieldSides(setups)
   const selectedSetup = selectedTeam === 'home' ? setups.H : setups.A
+  bootstrapPrimaryUid = payload.primaryUid ?? null
   if (payload.session.summaryOnly) {
     // The compact setup phase never hydrates transient UI/clientState fields.
     if (selectedStatus.lifecycleStatus === 'ready') resetForInputTeam(selectedTeam)
@@ -512,6 +517,11 @@ function applyCurrentMatchSquads(squads: { home: MatchSquadPlayer[]; away: Match
 type SortKey = 'position' | 'number' | 'name'
 const sortKey = ref<SortKey>('position')
 const POS_ORDER: Record<string, number> = { GK: 0, FW: 1, MF: 2, DF: 3 }
+
+// 선수 그리드: 7열, 행 수는 선수 수에 맞춰(최소 6행) 빈칸 행이 남지 않게 해 카드 세로를 확보한다.
+const PLAYER_GRID_COLS = 7
+const playerGridRows = computed(() => Math.max(6, Math.ceil(players.value.length / PLAYER_GRID_COLS)))
+const playerGridFillers = computed(() => playerGridRows.value * PLAYER_GRID_COLS - players.value.length)
 
 const sortedPlayers = computed(() => {
   const list = players.value.map(p => ({ p, id: p.playerId }))
@@ -971,10 +981,12 @@ const entryFingerprint = computed(() => JSON.stringify({
   matchId: game.value.matchId, team: game.value.team, status: game.value.halfStatus,
   setup: entrySetupFingerprint.value,
 }))
-const setupSaved = computed(() => savedEntryFingerprint.value === entryFingerprint.value && !!preparedInput.value &&
-  game.value.lifecycleControl && preparedInput.value.participant.role === game.value.participantRole)
+// 재입장 복원은 입장 데이터 없이 저장 상태만 되살린다. 입장 데이터는 "입장"을 누를 때 받는다.
+const setupSaved = computed(() => savedEntryFingerprint.value === entryFingerprint.value && game.value.lifecycleControl &&
+  (preparedInput.value ? preparedInput.value.participant.role === game.value.participantRole : restoredSetupSaved.value))
 watch(entryFingerprint, () => {
   savedEntryFingerprint.value = ''
+  restoredSetupSaved.value = false
   preparedInput.value = null
 }, { flush: 'sync' })
 
@@ -985,7 +997,8 @@ function lifecycleErrorMessage(error: unknown, fallback: string) {
     : message || fallback
 }
 
-async function saveEntrySetup() {
+// persist=false: 이미 서버에 저장된 세팅(재입장 복원)이라 다시 쓰지 않고 입장 데이터만 받는다.
+async function saveEntrySetup({ persist = true } = {}) {
   if (lifecycleBusy.value || !bootstrapApplied.value || !canStart.value || matchInfoEditMode.value) return
   if (game.value.halfStatus !== 'ready' && game.value.halfStatus !== 'H1_done') return
   lifecycleBusy.value = true
@@ -1005,10 +1018,12 @@ async function saveEntrySetup() {
       formationSaveTimer = undefined
     }
     if (entryEditRevision !== editRevision || entryFingerprint.value !== fingerprint) throw new Error('세팅이 변경되었습니다. 다시 저장하세요.')
-    if (!await persistCurrentSetup()) throw new Error('포메이션과 명단을 저장하지 못했습니다. 다시 시도하세요.')
-    if (entryEditRevision !== editRevision || entryFingerprint.value !== fingerprint) throw new Error('세팅이 변경되었습니다. 다시 저장하세요.')
-    // Save the waiting status: preparation must not start the match clock.
-    if (!await saveDraft(game.value)) throw new Error('세팅을 서버에 저장하지 못했습니다. 다시 시도하세요.')
+    if (persist) {
+      if (!await persistCurrentSetup()) throw new Error('포메이션과 명단을 저장하지 못했습니다. 다시 시도하세요.')
+      if (entryEditRevision !== editRevision || entryFingerprint.value !== fingerprint) throw new Error('세팅이 변경되었습니다. 다시 저장하세요.')
+      // Save the waiting status: preparation must not start the match clock.
+      if (!await saveDraft(game.value)) throw new Error('세팅을 서버에 저장하지 못했습니다. 다시 시도하세요.')
+    }
     const entry = await enterCollaboration(game.value, requestedRole)
     if (entryEditRevision !== editRevision || entryFingerprint.value !== fingerprint) throw new Error('세팅이 변경되었습니다. 다시 저장하세요.')
     if (!game.value.lifecycleControl) throw new Error('주 분석관의 입장 권한을 확인하지 못했습니다.')
@@ -1077,6 +1092,7 @@ function closeConfirm(ok: boolean) {
 
 async function enterPreparedHalf(target: 'H1' | 'H2') {
   if (lifecycleBusy.value || !setupSaved.value || !canStart.value || matchInfoEditMode.value) return
+  if (!preparedInput.value) await saveEntrySetup({ persist: false })
   const entry = preparedInput.value
   if (!entry || entry.draft.status !== 'ok') return
   const previousStatus = game.value.halfStatus
@@ -1261,6 +1277,13 @@ onMounted(async () => {
   if (!recovered && game.value.halfStatus === 'ready') applyOpponentFieldSideDefault(game.value.team)
   if (game.value.halfStatus === 'ready' && game.value.formationKey && !activeSlot.value) {
     activeSlot.value = firstEmptyLineupSlot()
+  }
+  // 이미 세팅 저장으로 주 분석관이 된 경기라면, 다시 저장하지 않고 저장된 화면으로 연다.
+  if (requestedRole === 'primary' && (game.value.halfStatus === 'ready' || game.value.halfStatus === 'H1_done') &&
+    canStart.value && bootstrapPrimaryUid && bootstrapPrimaryUid === lobbyAuth.currentUser?.uid) {
+    activeSlot.value = null
+    savedEntryFingerprint.value = entryFingerprint.value
+    restoredSetupSaved.value = true
   }
   lobbyClockTimer = setInterval(() => {
     if ((game.value.halfStatus === 'H1' || game.value.halfStatus === 'H2') && game.value.clockStartedAt) {
@@ -1822,13 +1845,13 @@ function undoSub(index: number) {
                   <button :class="{ off: sortKey !== 'number' }" @click="sortKey = 'number'">Number</button>
                   <button :class="{ off: sortKey !== 'name' }" @click="sortKey = 'name'">Name</button>
                 </div>
-                <div class="playerGrid">
+                <div class="playerGrid" :style="{ gridTemplateRows: `repeat(${playerGridRows}, 1fr)` }">
                   <button v-for="{ p, id } in sortedPlayers" :key="id" class="player"
                     :class="[p.pos?.toLowerCase(), { used: usedPlayerIds.has(id), pickable: !usedPlayerIds.has(id) }]"
                     :draggable="matchInfoEditable && !usedPlayerIds.has(id)"
                     :disabled="!matchInfoEditable || usedPlayerIds.has(id)" @click="pickPlayer(id)"
                     @dragstart="onDragStart(id)"><strong>{{ p.no }}</strong><span>{{ p.name }}</span></button>
-                  <div v-for="i in 13" :key="`e${i}`" class="player empty" />
+                  <div v-for="i in playerGridFillers" :key="`e${i}`" class="player empty" />
                 </div>
                 <div class="legend"><span class="gk">GK</span><span class="fw">FW</span><span class="mf">MF</span><span
                     class="df">DF</span></div>
@@ -2067,7 +2090,7 @@ function undoSub(index: number) {
   padding: 32px 30px 24px;
   border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 10px;
-  background: #25282d;
+  background: #2a2b2e;
   box-shadow: 0 16px 40px rgba(0, 0, 0, .5)
 }
 
@@ -2104,7 +2127,7 @@ function undoSub(index: number) {
 
 .confirmCancel {
   border: 1px solid rgba(255, 255, 255, .15);
-  background: #2a2e33;
+  background: #252629;
   color: #ddd
 }
 
@@ -2134,7 +2157,7 @@ button {
   place-items: center;
   overflow: hidden;
   position: relative;
-  background: #1c1f23;
+  background: #303134;
   color: #fff;
   font-family: Arial, "Noto Sans KR", sans-serif
 }
@@ -2154,7 +2177,7 @@ button {
   padding: 0 10px;
   border: 1px solid rgba(255, 255, 255, .22);
   border-radius: 4px;
-  background: #2a2e33;
+  background: #252629;
   color: rgba(255, 255, 255, .86);
   font-size: 12px;
   font-weight: 800;
@@ -2175,7 +2198,7 @@ button {
   grid-template-columns: 266px 1014px;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, .08);
-  background: #1c1f23;
+  background: #303134;
   backdrop-filter: blur(8px);
   box-shadow: 0 18px 60px rgba(0, 0, 0, .3)
 }
@@ -2591,7 +2614,7 @@ button {
   padding: 0 10px;
   background: #f2f2f2;
   color: #252525;
-  font-size: 11px;
+  font-size: 15px;
   border-radius: 4px;
   border: 1px solid rgba(255, 255, 255, .15);
   cursor: pointer;
@@ -2616,9 +2639,9 @@ button {
 }
 
 .menuItem {
-  padding: 8px 10px;
+  padding: 11px 12px;
   color: #252525;
-  font-size: 11px;
+  font-size: 15px;
   cursor: pointer
 }
 
@@ -2912,7 +2935,7 @@ button {
   padding: 10px;
   border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, .16);
-  background: #25282d;
+  background: #2a2b2e;
   box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
   display: flex;
   flex-direction: column;
@@ -3172,7 +3195,6 @@ button {
   margin-top: 8px;
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  grid-template-rows: repeat(6, 1fr);
   gap: 1px;
   background: rgba(255, 255, 255, .06);
   border-radius: 4px;
@@ -3211,8 +3233,8 @@ button {
 }
 
 .player strong {
-  font-size: 22px;
-  line-height: 24px;
+  font-size: 23px;
+  line-height: 25px;
   color: rgba(255, 255, 255, .85)
 }
 
@@ -3220,10 +3242,14 @@ button {
   max-width: 100%;
   padding: 0 2px;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-height: 13px;
+  text-align: center;
+  word-break: break-all;
   color: rgba(255, 255, 255, .45);
-  font-size: 10px
+  font-size: 11px
 }
 
 .player.gk strong {

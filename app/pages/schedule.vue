@@ -757,7 +757,7 @@ function onCancel() {
 </template>
 
 <style scoped>
-.page { box-sizing: border-box; width: 1280px; height: 800px; margin: 0 auto; display: grid; place-items: center; position: relative; overflow: hidden; background: #1c1f23; }
+.page { box-sizing: border-box; width: 1280px; height: 800px; margin: 0 auto; display: grid; place-items: center; position: relative; overflow: hidden; background: #303134; }
 .bg {
   position: absolute; inset: 0;
   background:
@@ -773,7 +773,7 @@ function onCancel() {
   width: 1280px;
   height: 800px;
   border-radius: 0;
-  background: #1c1f23;
+  background: #303134;
   border: 1px solid rgba(255,255,255,0.08);
   box-shadow: 0 18px 60px rgba(0,0,0,0.3);
   backdrop-filter: blur(8px);
@@ -836,12 +836,12 @@ function onCancel() {
   appearance: none; -webkit-appearance: none;
   height: 40px; padding: 0 32px 0 12px;
   border: 1px solid rgba(255,255,255,.14); border-radius: 4px;
-  background: #2a2e33 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%2376d7e8' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 11px center;
+  background: #252629 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%2376d7e8' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 11px center;
   color: rgba(255,255,255,.9);
   font: inherit; font-size: 15px; font-weight: 750; color-scheme: dark; cursor: pointer;
 }
 .calendarFilter select:focus { outline: none; border-color: rgba(93,204,229,.72); box-shadow: 0 0 0 2px rgba(93,204,229,.18); }
-.calendarFilter select option { background: #2a2e33; color: rgba(255,255,255,.9); font-weight: 700; }
+.calendarFilter select option { background: #252629; color: rgba(255,255,255,.9); font-weight: 700; }
 .calendarFilter select.monthSelect {
   flex: 0 0 84px; box-sizing: border-box;
   width: 84px; min-width: 84px; max-width: 84px;
@@ -854,7 +854,7 @@ function onCancel() {
   .calendarFilter select::picker-icon { display: none; }
   .calendarFilter select::picker(select) {
     max-height: 280px; margin-top: 4px; padding: 4px; overflow-y: auto;
-    background: #2a2e33; border: 1px solid rgba(255,255,255,.14); border-radius: 6px;
+    background: #252629; border: 1px solid rgba(255,255,255,.14); border-radius: 6px;
     box-shadow: 0 12px 28px rgba(0,0,0,.5); scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.2) transparent;
   }
   .calendarFilter select option { min-height: 40px; padding: 0 12px; border-radius: 4px; font-size: 15px; }
@@ -903,25 +903,26 @@ function onCancel() {
   align-items: center;
   justify-content: space-between;
   border-radius: 4px;
-  border: 1px solid rgba(255,255,255,0.06);
-  background: rgba(255,255,255,0.02);
-  color: rgba(255,255,255,0.28);
+  border: 1px solid rgba(0,0,0,0.25);
+  background: #404145;
+  color: rgba(255,255,255,0.6);
   text-align: center;
   cursor: pointer;
   transition: background .12s, border-color .12s;
 }
 .cell .num { font-size: 19px; font-weight: 500; line-height: 1; font-variant-numeric: tabular-nums; }
-.cell .cnt { font-size: 13px; font-weight: 700; line-height: 1; color: #7fdcf0; white-space: nowrap; }
-.cell:not(.empty):hover { background: rgba(255,255,255,0.05); }
+.cell .cnt { font-size: 13px; font-weight: 700; line-height: 1; color: #fff; white-space: nowrap; }
+.cell:not(.empty):active { filter: brightness(1.12); }
 .cell.empty { border-color: transparent; background: transparent; cursor: default; }
 /* 경기가 있는 날: 숫자를 밝게 하고 왼쪽에 가는 선만 둔다 */
-.cell.hasMatch { color: #fff; background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.14); }
+.cell.hasMatch { color: #fff; background: #65676c; border-color: rgba(0,0,0,0.25); }
 .cell.hasMatch .num { font-weight: 700; }
 .cell.hasMatch::before { content: ''; position: absolute; left: 10px; right: 10px; top: -1px; height: 2px; border-radius: 0 0 2px 2px; background: #3fb3cc; }
 /* 오늘: 숫자에만 얇은 고리 */
 .cell.today .num { color: rgba(255,255,255,0.85); display: inline-grid; place-items: center; min-width: 28px; height: 28px; margin: -5px 0 0; padding: 0 6px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.6); box-sizing: border-box; }
-.cell.active { border-color: rgba(241,180,0,0.85); background: rgba(241,180,0,0.09); color: #fff; }
-.cell.active .num { color: #ffc61a; }
+.cell.active { border-color: #f1b400; background: #e4e5e7; color: #1c1d20; }
+.cell.active .num, .cell.active.today .num { color: #1c1d20; border-color: rgba(0,0,0,0.5); }
+.cell.active .cnt { color: #9a6c00; }
 .cell.active.hasMatch::before { background: #f1b400; }
 
 .calFoot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.06); }
@@ -934,12 +935,14 @@ function onCancel() {
 .todayBtn:hover { background: rgba(255,255,255,0.06); }
 .todayBtn:active { background: rgba(255,255,255,0.12); }
 
-.right { padding: 16px; display: grid; grid-template-rows: 36px 1fr; gap: 10px; }
+/* 1fr 은 min 이 auto 라 경기가 많으면 목록 높이만큼 늘어나 스크롤이 생기지 않는다 → minmax(0, 1fr) 로 고정.
+   하단 버튼바가 translateY(-22px) 로 본문 위에 22px 겹치므로 그만큼 아래 여백을 더 둔다. */
+.right { min-height: 0; overflow: hidden; padding: 16px 16px 38px; display: grid; grid-template-rows: 36px minmax(0, 1fr); gap: 10px; }
 .rightTitle { color: rgba(255,255,255,0.85); font-weight: 800; font-size: 18px; text-align: center; }
 
 .hint { color: rgba(255,255,255,0.45); display: grid; place-items: center; font-size: 14px; }
 .roleOverlay { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; background: rgba(0,0,0,.58); }
-.roleDialog { width: min(520px, calc(100% - 40px)); padding: 24px; border: 1px solid rgba(255,255,255,.16); border-radius: 6px; background: #25282d; box-shadow: 0 20px 60px rgba(0,0,0,.55); }
+.roleDialog { width: min(520px, calc(100% - 40px)); padding: 24px; border: 1px solid rgba(255,255,255,.16); border-radius: 6px; background: #2a2b2e; box-shadow: 0 20px 60px rgba(0,0,0,.55); }
 .roleHeader { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .roleDialog h2 { margin: 0; color: #fff; font-size: 20px; }
 .roleClose { flex: none; display: grid; place-items: center; width: 40px; height: 40px; align-self: flex-start; margin: -14px -12px -8px 0; border: 0; border-radius: 4px; background: transparent; color: rgba(255,255,255,.6); cursor: pointer; }
@@ -952,7 +955,9 @@ function onCancel() {
 .roleChoice:disabled { border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.08); color: rgba(255,255,255,.4); cursor: not-allowed; }
 .roleCancel { border: 1px solid rgba(255,255,255,.15); background: transparent; color: rgba(255,255,255,.7); }
 
-.list { display: grid; gap: 12px; align-content: start; overflow: auto; padding: 2px 6px 12px 2px; }
+/* 높이가 고정된 스크롤 영역 안에서 카드가 눌려 찌그러지지 않도록 flex 세로 배치 + 카드 flex-shrink: 0. */
+.list { display: flex; flex-direction: column; gap: 12px; overflow-y: auto; padding: 2px 6px 12px 2px; }
+.list > * { flex-shrink: 0; }
 
 .matchRow {
   display: grid;
@@ -963,7 +968,7 @@ function onCancel() {
   padding: 14px 18px;
   border-radius: 8px;
   border: 1px solid rgba(255,255,255,.10);
-  background: rgba(255,255,255,0.025);
+  background: #252629;
   cursor: pointer;
   text-align: left;
   transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease, transform 140ms ease, filter 160ms ease, opacity 160ms ease;
@@ -978,7 +983,7 @@ function onCancel() {
   border-color: rgba(255,255,255,0.10);
   box-shadow: none;
 }
-.matchRow:active { background: rgba(255,255,255,.055); }
+.matchRow:active { background: #2c2d30; }
 /* 경기를 하나 선택하면 나머지 카드는 채도·밝기를 낮춰 선택한 카드가 돋보이게 한다. 눌러서 다시 고를 수는 있다. */
 .list.hasSelection .matchRow:not(.selected) { filter: saturate(.25) brightness(.88); opacity: .62; }
 .matchRow.selected {
