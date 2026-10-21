@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData, NotFoundError, RequiredUser, ensure_firebase_app, get_settings, utc_now
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
 from backend.system.system_schema import Half, InputMode, Side, MatchDoc
-from backend.system.system_live_room import execute_command, execute_batch, finalize_command, restore_command, room_state, update_presence, draft_context, log_draft_event, require_draft_writer
+from backend.system.system_live_room import execute_command, execute_batch, finalize_command, restore_command, room_state, update_presence, draft_context, log_draft_event, require_draft_writer, lobby_state
 
 
 logger = logging.getLogger(__name__)
@@ -968,6 +968,16 @@ def read_match_dashboard_kpis(
         "status": "ok", "gmId": gm_id, "half": half,
         "kpis": data.read_match_dashboard_kpis(gm_id, half=half),
     }
+
+
+@router.get("/match-input/matches/{gm_id}/lobby-state", include_in_schema=False)
+def read_lobby_state(gm_id: str, _: RequiredUser = None) -> dict:
+    return {'status': 'ok', 'gmId': gm_id, 'sides': lobby_state(JpdDidData(), gm_id)}
+
+
+@router.get("/match-input/matches/{gm_id}/input-setup", include_in_schema=False)
+def read_lobby_setup(gm_id: str, _: RequiredUser = None) -> dict:
+    return {'status': 'ok', 'gmId': gm_id, 'inputSetup': JpdDidData().get_input_setup(gm_id)}
 
 
 @router.get("/match-input/matches/{gm_id}/squads", include_in_schema=False)

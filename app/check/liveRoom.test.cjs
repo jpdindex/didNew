@@ -735,18 +735,20 @@ function collaborationEnvironment(queued = [], snapshotReader) {
   return { game, initial, collaboration, handlers, commands, recoveryTimers, intervals, socketState, advance: ms => { now += ms }, receive: event => receive(event), receiveRoom: event => receiveRoom(event) }
 }
 
-test('unjoined lobby reads history without opening a socket and upgrades after joining', async () => {
-  const env = collaborationEnvironment()
+test('unjoined lobby never reads full history or starts polling and upgrades after joining', async () => {
+  const env = collaborationEnvironment([], async () => { throw new Error('view-only lobby must not read a Draft') })
+  env.game.records = [{ id: 'bootstrap' }]
   try {
     await env.collaboration.start(env.game, { ...env.handlers, readOnly: true })
     await settle()
-    assert.equal(env.game.records[0].id, 'r')
+    assert.equal(env.game.records[0].id, 'bootstrap')
     assert.equal(env.socketState.opens, 0)
     assert.equal(env.commands.length, 0)
-    assert.ok(env.intervals.some(timer => timer.delay === 2_000))
+    assert.equal(env.intervals.length, 0)
     await env.collaboration.start(env.game, env.handlers, env.initial)
     await settle()
     assert.equal(env.socketState.opens, 1)
+    assert.equal(env.game.records[0].id, 'r')
     assert.ok(!env.intervals.some(timer => timer.delay === 2_000))
   } finally { env.collaboration.stop() }
 })

@@ -619,6 +619,32 @@ def update_presence(data, gm_id, side, uid, session_id, connected):
         raise
 
 
+def lobby_head_state(document):
+    keys = {'halfStatus', 'seconds', 'h1Seconds', 'h2Seconds', 'clockStartedAt', 'homeScore', 'awayScore'}
+    return {
+        'revision': int(document.get('revision') or 0),
+        'roomEpoch': int(document.get('roomEpoch') or 0),
+        'setupRevision': int((document.get('setup') or {}).get('revision') or 0),
+        'closed': bool(document.get('liveClosed')),
+        'sharedState': {key: value for key, value in (document.get('sharedState') or {}).items() if key in keys},
+    }
+
+
+def lobby_state(data, gm_id):
+    """Two projected head reads, independent of ACT/card/substitution counts."""
+    references = {side: data._input_setup_reference(gm_id, side) for side in ('H', 'A')}
+    fields = ['revision', 'roomEpoch', 'setup.revision', 'liveClosed', 'sharedState']
+    snapshots = {snapshot.reference.path: snapshot for snapshot in data.db.get_all(
+        list(references.values()), field_paths=fields, retry=None, timeout=10,
+    )}
+    result = {}
+    for side, reference in references.items():
+        snapshot = snapshots.get(reference.path)
+        document = snapshot.to_dict() or {} if snapshot else {}
+        result[side] = lobby_head_state(document)
+    return result
+
+
 def room_state(data, gm_id, side):
     root = data.db.collection('inputDrafts').document(data._input_draft_id(gm_id, side))
     draft = root.get().to_dict() or {}

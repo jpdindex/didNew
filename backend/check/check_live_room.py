@@ -255,6 +255,26 @@ def test_presence_leases_are_per_connection_and_expire(data):
     assert not live.room_state(data, 'm', 'H')['participants']['p']['online']
 
 
+@pytest.mark.parametrize('event_count', [0, 1000])
+def test_lobby_state_is_two_projected_heads_without_event_or_presence_scans(data, event_count):
+    calls = []
+    root = data.db.documents['inputDrafts/m_H']
+    root.update(revision=7, roomEpoch=2, setup={'revision': 3}, sharedState={'halfStatus': 'H1', 'seconds': 20, 'participantRole': 'primary'})
+    for index in range(event_count):
+        data.db.documents[f'inputDrafts/m_H/records/r{index}'] = record(f'r{index}')
+    def get_all(references, *, field_paths, **kwargs):
+        calls.append((len(references), field_paths))
+        return [live.Snapshot(reference, data.db.documents.get(reference.path)) for reference in references]
+    data.db.get_all = get_all
+    result = live.lobby_state(data, 'm')
+    assert len(calls) == 1 and calls[0][0] == 2
+    assert set(calls[0][1]) == {'revision', 'roomEpoch', 'setup.revision', 'liveClosed', 'sharedState'}
+    assert result['H'] == {'revision': 7, 'roomEpoch': 2, 'setupRevision': 3, 'closed': False,
+                           'sharedState': {'halfStatus': 'H1', 'seconds': 20}}
+    assert result['A']['revision'] == 0
+    assert all('records' not in state and 'participants' not in state and 'payload' not in state for state in result.values())
+
+
 @pytest.mark.parametrize('missing', [False, True])
 def test_rejected_presence_logs_actual_draft_snapshot_without_writing(data, caplog, missing):
     import json
@@ -784,6 +804,8 @@ def test_setup_bootstrap_returns_saved_setup_without_reading_records_or_kpis(sdk
     before = deepcopy(rpc.documents)
     result = sdk_data.build_input_bootstrap('m', 'H')
     assert result['session']['summaryOnly'] is True
+    assert result['lobbyState']['H']['revision'] == root.get('revision', 0)
+    assert result['lobbyState']['H']['setupRevision'] == root['setup'].get('revision', 0)
     assert result['session']['sharedState']['halfStatus'] == 'H2_done'
     assert result['inputSetup']['H']['formationKey'] == '4-3-3'
     assert result['dashboardKpiHalves'] == []
