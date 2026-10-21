@@ -1,5 +1,18 @@
 export type FormationSlot = { x: number; y: number }
 
+/** Equal-height outfield rows, with equal-width player targets in each row. */
+export function formationPickAreas(slots: FormationSlot[]) {
+  const rows = [...new Set(slots.map(slot => slot.y))].sort((a, b) => a - b)
+  return rows.flatMap((y, row) => {
+    const players = slots.map((slot, index) => ({ slot, index })).filter(item => item.slot.y === y)
+      .sort((a, b) => a.slot.x - b.slot.x)
+    return players.map(({ index }, column) => ({
+      index, left: column * 100 / players.length, top: row * 100 / rows.length,
+      width: 100 / players.length, height: 100 / rows.length,
+    }))
+  })
+}
+
 const line = (count: number, y: number): FormationSlot[] => {
   const xs: Record<number, number[]> = {
     1: [50],

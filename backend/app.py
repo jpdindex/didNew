@@ -61,8 +61,9 @@ app.add_middleware(
 
 
 @app.exception_handler(BackendError)
-async def backend_error_handler(_: Request, exc: BackendError) -> JSONResponse:
-    logger.warning("Backend request rejected: code=%s message=%s", exc.code, exc.message)
+async def backend_error_handler(request: Request, exc: BackendError) -> JSONResponse:
+    logger.warning("Backend request rejected: method=%s path=%s code=%s message=%s",
+                   request.method, request.url.path, exc.code, exc.message)
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": exc.code, "message": exc.message}},

@@ -10,12 +10,52 @@ from threading import Lock
 from datetime import timedelta
 from hashlib import sha256
 import json
+import logging
+import os
 import time
 
 from firebase_admin import firestore
 from google.api_core.exceptions import Aborted, DeadlineExceeded, ServiceUnavailable
 
 from backend.system.system_firestore import BackendError, utc_now
+
+
+logger = logging.getLogger(__name__)
+
+
+def draft_context(document, uid):
+    """Capture admission state without tokens, names or input payloads."""
+    participants = document.get('participants') or {}
+    return {
+        'participantPresent': uid in participants,
+        'participantUids': sorted(participants),
+        'primaryUid': document.get('primaryUid'),
+        'revision': document.get('revision', 0),
+        'roomEpoch': document.get('roomEpoch', 0),
+        'liveClosed': bool(document.get('liveClosed')),
+    }
+
+
+def log_draft_event(event, gm_id, side, *, level=logging.INFO, **fields):
+    logger.log(level, 'Draft admission %s', json.dumps({
+        'event': event, 'gmId': gm_id, 'side': side,
+        'diagnosticsVersion': 1,
+        'draftPath': f'inputDrafts/{gm_id}_{side}',
+        'build': os.environ.get('RENDER_GIT_COMMIT') or os.environ.get('GIT_COMMIT') or 'local',
+        'instance': os.environ.get('RENDER_INSTANCE_ID') or str(os.getpid()),
+        **fields,
+    }, ensure_ascii=False, default=str, sort_keys=True))
+
+
+def require_draft_writer(current, user_id, *, control=False):
+    participant = (current.get('participants') or {}).get(user_id) or {}
+    role = participant.get('role')
+    if role not in {'primary', 'assistant', 'manager'}:
+        raise BackendError('Join the Draft before editing', status_code=403, code='participant_required')
+    owns_lifecycle = current.get('primaryUid') == user_id or (role == 'manager' and not current.get('primaryUid'))
+    if control and not owns_lifecycle:
+        raise BackendError('Only the primary analyst can change setup or lifecycle', status_code=403, code='primary_required')
+    return owns_lifecycle
 
 
 _summary_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='draft-summary')
@@ -348,11 +388,8 @@ def _execute_in_store(data, store, gm_id, side, kind, request, user_id, batch_ve
         if receipt['uid'] != user_id or receipt['digest'] != digest:
             raise BackendError('Command ID was reused with different input', status_code=409, code='command_id_reused')
         return receipt, None
-    participant = (current.get('participants') or {}).get(user_id) or {}
-    role = participant.get('role')
-    if role not in {'primary', 'assistant', 'manager'}:
-        raise BackendError('Join the Draft before editing', status_code=403, code='participant_required')
-    control = current.get('primaryUid') == user_id or (role == 'manager' and not current.get('primaryUid'))
+    control = require_draft_writer(current, user_id)
+    participant = current['participants'][user_id]
     scope = body.get('syncScope', 'checkpoint' if kind == 'draft' else 'setup')
     if kind == 'setup' and scope == 'setup' and not control:
         raise BackendError('Only the primary analyst can change setup', status_code=403, code='primary_required')
@@ -560,18 +597,26 @@ def execute_batch(data, gm_id, side, commands, user_id):
 def update_presence(data, gm_id, side, uid, session_id, connected):
     root = data.db.collection('inputDrafts').document(data._input_draft_id(gm_id, side))
     reference = root.collection('presence').document(session_id)
+    context = {}
 
     @firestore.transactional
     def update(transaction):
-        draft = root.get(transaction=transaction).to_dict() or {}
+        snapshot = root.get(transaction=transaction)
+        draft = snapshot.to_dict() or {}
         if uid not in (draft.get('participants') or {}):
+            context.update(draftExists=snapshot.exists, **draft_context(draft, uid))
             raise BackendError('Join the Draft first', status_code=403, code='participant_required')
         previous = reference.get(transaction=transaction).to_dict() or {}
         if previous and previous.get('uid') != uid:
             raise BackendError('Presence session belongs to another user', status_code=403, code='session_owner_required')
         now = utc_now()
         transaction.set(reference, {'uid': uid, 'connected': connected, 'lastSeenAt': now, 'expiresAt': now + timedelta(seconds=30)})
-    update(data.db.transaction())
+    try:
+        update(data.db.transaction())
+    except BackendError as exc:
+        log_draft_event('presence_rejected', gm_id, side, uid=uid, sessionId=session_id,
+                        connected=connected, code=exc.code, **context)
+        raise
 
 
 def room_state(data, gm_id, side):

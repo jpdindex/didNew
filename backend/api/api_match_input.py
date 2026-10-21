@@ -10,6 +10,7 @@ from datetime import date
 from threading import Lock
 from typing import Any, Literal
 from uuid import uuid4
+from time import monotonic
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from firebase_admin import auth
@@ -19,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData, NotFoundError, RequiredUser, ensure_firebase_app, get_settings, utc_now
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
 from backend.system.system_schema import Half, InputMode, Side, MatchDoc
-from backend.system.system_live_room import execute_command, execute_batch, finalize_command, restore_command, room_state, update_presence
+from backend.system.system_live_room import execute_command, execute_batch, finalize_command, restore_command, room_state, update_presence, draft_context, log_draft_event, require_draft_writer
 
 
 logger = logging.getLogger(__name__)
@@ -389,6 +390,9 @@ async def _socket_user(socket: WebSocket) -> CurrentUser:
     verified_uid = decoded.get("uid")
     if not isinstance(verified_uid, str) or not verified_uid:
         raise ValueError("authentication required")
+    if uid and uid != verified_uid:
+        log_draft_event('socket_identity_mismatch', socket.path_params.get('gm_id'), socket.path_params.get('side'),
+                        uid=verified_uid, clientUid=uid)
     return CurrentUser(uid=verified_uid, claims=dict(decoded))
 
 
@@ -399,11 +403,22 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
     watcher = None
     root_watch = None
     user = None
+    presence_registered = False
+    stage = 'authenticate'
+    started = monotonic()
+    log_draft_event('socket_started', gm_id, side, sessionId=session_id)
     try:
         user = await _socket_user(websocket)
+        stage = 'match_lookup'
+        log_draft_event('socket_authenticated', gm_id, side, uid=user.uid, sessionId=session_id)
         JpdDidData().get_match(gm_id)
         await draft_sockets.connect(gm_id, side, websocket)
+        stage = 'presence_register'
         await asyncio.to_thread(update_presence, JpdDidData(), gm_id, side, user.uid, session_id, True)
+        presence_registered = True
+        log_draft_event('socket_ready', gm_id, side, uid=user.uid, sessionId=session_id,
+                        elapsedMs=round((monotonic() - started) * 1000))
+        stage = 'subscribe'
         await websocket.send_json({"type": "ready", "gmId": gm_id, "side": side})
         loop = asyncio.get_running_loop()
         changes = asyncio.Queue()
@@ -455,6 +470,7 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
                     await asyncio.sleep(1)
         watcher = asyncio.create_task(watch_room())
         while True:
+            stage = 'receive'
             message = json.loads(await websocket.receive_text())
             if isinstance(message, dict) and message.get('type') == 'subscribe':
                 subscription['revision'] = max(0, int(message.get('revision') or 0))
@@ -463,6 +479,7 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
                     changes.put_nowait(subscription['document'])
                 continue
             if isinstance(message, dict) and message.get("type") == "heartbeat":
+                stage = 'heartbeat'
                 await asyncio.to_thread(update_presence, JpdDidData(), gm_id, side, user.uid, session_id, True)
                 await draft_sockets.send(gm_id, side, websocket, {"type": "pong"})
                 continue
@@ -526,14 +543,31 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
                     await draft_sockets.send(gm_id, side, websocket, {"type": "error", "commandId": command_id, "message": "unknown mutation"})
             except Exception as exc:
                 await draft_sockets.send(gm_id, side, websocket, {"type": "error", "commandId": command_id, "message": str(exc), "code": getattr(exc, 'code', 'internal_error'), 'status': getattr(exc, 'status_code', 500)})
+    except BackendError as exc:
+        log_draft_event('socket_rejected', gm_id, side, uid=user.uid if user else None,
+                        sessionId=session_id, stage=stage, code=exc.code, status=exc.status_code)
+        logger.info("Draft live socket rejected: %s/%s code=%s", gm_id, side, exc.code)
+        await draft_sockets.send(gm_id, side, websocket, {
+            'type': 'error', 'code': exc.code, 'status': exc.status_code, 'message': str(exc),
+        })
+        try:
+            await websocket.close(code=1008)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
     except WebSocketDisconnect as exc:
+        log_draft_event('socket_disconnected', gm_id, side, uid=user.uid if user else None,
+                        sessionId=session_id, stage=stage, closeCode=exc.code)
         logger.info("Draft live socket disconnected: %s/%s code=%s", gm_id, side, exc.code)
     except (asyncio.TimeoutError, ValueError, RuntimeError) as exc:
+        log_draft_event('socket_stopped', gm_id, side, uid=user.uid if user else None,
+                        sessionId=session_id, stage=stage, errorType=type(exc).__name__)
         # Refresh, route changes and a browser retry can close the transport
         # between accept/authentication/receive. That is a normal disconnect,
         # not an application error and must never trigger a second close.
         logger.warning("Draft live socket stopped: %s/%s (%s)", gm_id, side, exc)
     except Exception:
+        log_draft_event('socket_failed', gm_id, side, level=logging.ERROR, uid=user.uid if user else None,
+                        sessionId=session_id, stage=stage)
         # Do not swallow an unexpected transport failure. Its traceback is the
         # only reliable way to distinguish a client close from a server error.
         logger.exception("Draft live socket crashed: %s/%s", gm_id, side)
@@ -544,7 +578,7 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
             watcher.cancel()
             await asyncio.gather(watcher, return_exceptions=True)
         draft_sockets.disconnect(gm_id, side, websocket)
-        if user:
+        if user and presence_registered:
             try:
                 await asyncio.to_thread(update_presence, JpdDidData(), gm_id, side, user.uid, session_id, False)
             except Exception:
@@ -1060,14 +1094,31 @@ def ensure_recorder_profile(request: RecorderProfileRequest, user: RequiredUser 
     return {"status": "ok", "name": profile.get("name") or user.uid, "level": profile.get("level", "advanced")}
 
 
+def _join_draft_with_diagnostics(data, gm_id, side, request, user, *, source):
+    attempt_id = str(uuid4())
+    started = monotonic()
+    fields = {'uid': user.uid, 'attemptId': attempt_id, 'source': source, 'requestedRole': request.role}
+    log_draft_event('join_started', gm_id, side, **fields)
+    try:
+        document = data.join_input_draft_participant(
+            gm_id, side, user_id=user.uid, role=request.role, display_name=request.displayName,
+        )
+    except Exception as exc:
+        log_draft_event('join_failed', gm_id, side, level=logging.WARNING, **fields,
+                        code=getattr(exc, 'code', 'internal_error'), errorType=type(exc).__name__,
+                        elapsedMs=round((monotonic() - started) * 1000))
+        raise
+    log_draft_event('join_succeeded', gm_id, side, **fields, **draft_context(document, user.uid),
+                    elapsedMs=round((monotonic() - started) * 1000))
+    return document
+
+
 @router.post("/match-input/drafts/{gm_id}/{side}/participants", include_in_schema=False)
 def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinRequest, user: RequiredUser = None) -> dict:
     data = JpdDidData()
     # The selected fixture must exist even before its first Draft is created.
     data.get_match(gm_id)
-    document = data.join_input_draft_participant(
-        gm_id, side, user_id=user.uid, role=request.role, display_name=request.displayName,
-    )
+    document = _join_draft_with_diagnostics(data, gm_id, side, request, user, source='participants')
     return {
         "status": "ok", "gmId": gm_id, "side": side,
         "primaryUid": document.get("primaryUid"), "participants": document.get("participants", {}),
@@ -1075,7 +1126,8 @@ def join_draft_participant(gm_id: str, side: Side, request: ParticipantJoinReque
         "role": (document.get("participants", {}).get(user.uid) or {}).get("role"),
         # Lifecycle (clock, half end, final update) belongs to the primary. A
         # manager in a correction Draft has no primary above it, so it owns it.
-        "control": not document.get("primaryUid") or document.get("primaryUid") == user.uid,
+        "control": document.get("primaryUid") == user.uid or (
+            not document.get("primaryUid") and (document.get("participants", {}).get(user.uid) or {}).get("role") == 'manager'),
     }
 
 
@@ -1089,9 +1141,7 @@ def enter_draft(gm_id: str, side: Side, request: ParticipantJoinRequest, user: R
     """
     data = JpdDidData()
     match = data.get_match(gm_id)
-    participant_document = data.join_input_draft_participant(
-        gm_id, side, user_id=user.uid, role=request.role, display_name=request.displayName,
-    )
+    participant_document = _join_draft_with_diagnostics(data, gm_id, side, request, user, source='enter')
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="input-enter") as executor:
         squads_future = executor.submit(data.get_or_create_input_squads, gm_id, match)
         setup_future = executor.submit(data.get_input_setup, gm_id)
@@ -1116,7 +1166,8 @@ def enter_draft(gm_id: str, side: Side, request: ParticipantJoinRequest, user: R
             "primaryUid": participant_document.get("primaryUid"),
             "participants": participants,
             "role": (participants.get(user.uid) or {}).get("role"),
-            "control": not participant_document.get("primaryUid") or participant_document.get("primaryUid") == user.uid,
+            "control": participant_document.get("primaryUid") == user.uid or (
+                not participant_document.get("primaryUid") and (participants.get(user.uid) or {}).get("role") == 'manager'),
         },
         draft=draft,
         squads=squads,
@@ -1214,6 +1265,8 @@ def _save_draft_mutation(gm_id: str, side: Side, request: DraftWriteRequest, use
         if request.commandId:
             receipt = execute_command(data, gm_id, side, 'draft', request, user.uid, defer_summary=True)
             return _command_ack(gm_id, side, receipt)
+        current = data._input_setup_reference(gm_id, side).get().to_dict() or {}
+        require_draft_writer(current, user.uid, control=request.syncScope in {'state', 'checkpoint'})
         document = data.save_input_draft(
             gm_id, side, payload=request.payload.model_dump(mode="python"), client_state=request.clientState,
             user_id=user.uid, sync_scope=request.syncScope, deleted_record_ids=request.deletedRecordIds,
@@ -1234,6 +1287,7 @@ def _save_setup_mutation(gm_id: str, side: Side, request: InputSetupWriteRequest
             receipt = execute_command(data, gm_id, side, 'setup', request, user.uid)
             return _command_ack(gm_id, side, receipt)
         draft = data.get_input_draft(gm_id, side)
+        require_draft_writer(draft, user.uid, control=request.syncScope == 'setup')
         return data.save_input_setup(
             gm_id,
             side,

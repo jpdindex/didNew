@@ -29,7 +29,7 @@ import {
 import { canPickForCard, groupCardsByPlayer, isSentOff, secondYellowCards, type CardRecord } from '~/utils/card'
 import type { HalfStatus, MatchSquadPlayer, SubRecord } from '~/composables/useMatchState'
 import type { DraftResponse } from '~/composables/useMatchCollaboration'
-import { FORMATIONS, GK_SLOT, assignmentsFromLineup } from '~/utils/formationLayout'
+import { FORMATIONS, GK_SLOT, assignmentsFromLineup, formationPickAreas } from '~/utils/formationLayout'
 
 const route = useRoute()
 const home = computed(() => String(route.query.home ?? route.query.homeName ?? 'Vallecano').trim() || 'Vallecano')
@@ -45,7 +45,7 @@ const { preview: previewInput, schedule: scheduleInputPreview } = useInputPrevie
 const { saveLocal, save: saveDraft, finalizeAdvanced, recover: recoverDraft, hydrate: hydrateDraft } = useMatchDraft()
 const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncState, syncRecords, syncStateRecords, syncCards, syncSetup, removeRecord, mergeRemoteRecords, markLocalRecords, markLocalCards, roomStatus, acceptServer, keepLocal } = useMatchCollaboration()
 const requestedRole = route.query.role === 'assistant' || route.query.role === 'manager' ? route.query.role : 'primary'
-const isPrimary = computed(() => game.value.lifecycleControl || game.value.participantRole === 'primary' || requestedRole === 'primary')
+const isPrimary = computed(() => game.value.lifecycleControl)
 const resumeHalf = route.query.resumeHalf === '후반' ? '후반' : route.query.resumeHalf === '전반' ? '전반' : null
 // "수정"으로 들어온 경우(이미 끝난 half를 고치러 옴)와 실시간으로 기록 중인 경우를
 // 구분한다. 수정 화면은 시계가 멈춰 있고, 우상단 버튼도 "{half} 종료"가 아니라
@@ -131,7 +131,7 @@ function stepSeconds(delta: number) {
   }
   // 수정 화면에서 기록을 눌러 기준 시각을 잡아둔 상태면, 그 기준 시각(새로 끼워 넣을 기록의
   // 시간)을 움직인다. 확정된 half 종료 시각(seconds)은 건드리지 않는다.
-  if (isEditMode && anchorSeconds.value !== null) {
+  if ((isEditMode || historyPinned.value) && anchorSeconds.value !== null) {
     anchorSeconds.value = Math.max(0, anchorSeconds.value + delta)
     if (pendingSeconds.value !== null) pendingSeconds.value = anchorSeconds.value
     return
@@ -216,7 +216,7 @@ onMounted(async () => {
   game.value.team = requestedTeam
   if (matchId) game.value.matchId = matchId
   game.value.participantRole = requestedRole
-  game.value.lifecycleControl = requestedRole === 'primary'
+  game.value.lifecycleControl = false
 
   let enterSucceeded = false
   let initialDraft: DraftResponse | null = null
@@ -236,6 +236,8 @@ onMounted(async () => {
       const entry = canUsePreparedEntry && preparedEntry
         ? preparedEntry
         : await enterCollaboration(game.value, requestedRole)
+      game.value.participantRole = entry.participant.role ?? requestedRole
+      game.value.lifecycleControl = entry.participant.control === true
       enterSucceeded = true
       if (!game.value.squads.home.length || !game.value.squads.away.length) {
         game.value.squads = { home: entry.squads.H, away: entry.squads.A }
@@ -436,12 +438,13 @@ onMounted(async () => {
   draftReady = true
   if (dirtyRecordIds.size) queueDraftSave()
   nextTick(() => {
-    if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
+    if (tableEl.value && !historyPinned.value && !editingId.value && !playerPickFor.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
   })
 })
 
 onUnmounted(() => {
   disposed = true
+  cancelPress()
   if (timer) clearInterval(timer)
   if (flashTimer) clearTimeout(flashTimer)
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
@@ -675,7 +678,8 @@ const pendingSeconds = ref<number | null>(null)
 // 기록도 이 시각으로 만들어 그 행 바로 뒤에 끼워 넣는다(예: 00:01 기록은 가장 가까운 00:09
 // 행을 눌러 넣은 뒤 시간만 고친다). null 이면 확정된 half 종료 시각(seconds)을 쓴다.
 const anchorSeconds = ref<number | null>(null)
-const clockSeconds = computed(() => (isEditMode && anchorSeconds.value !== null ? anchorSeconds.value : seconds.value))
+const historyPinned = ref(false)
+const clockSeconds = computed(() => ((isEditMode || historyPinned.value) && anchorSeconds.value !== null ? anchorSeconds.value : seconds.value))
 const draftSeconds = computed(() =>
   pendingSeconds.value === null ? clockSeconds.value : pendingSeconds.value
 )
@@ -728,7 +732,7 @@ const rows = computed(() => {
   if (!editingId.value && pendingPos.value) {
     // 수정 화면에서는 새 기록이 그 시각 자리에 끼워지므로, 가안 행도 같은 자리(같은 초의
     // 기존 기록 뒤)에 보여준다. 번호는 그 뒤 행들까지 하나씩 밀어서 다시 매긴다.
-    const at = isEditMode
+    const at = isEditMode || historyPinned.value
       ? visibleRecords.value.filter(r => r.seconds <= draftSeconds.value).length
       : list.length
     list.splice(at, 0, {
@@ -893,36 +897,30 @@ watch(editPlayerEligible, eligible => {
 })
 let pressTimer: ReturnType<typeof setTimeout> | undefined
 let longPressed = false
-let touchMoved = false
-// 터치 이벤트를 처리한 직후엔 브라우저가 호환용으로 만들어내는 가짜 mousedown/mouseup을
-// 무시한다 — touchstart/touchend 에 preventDefault 를 걸면 이 가짜 이벤트는 막히지만
-// 스크롤(펜슬로 표 넘기기)까지 같이 막혀버려서, 대신 이 방식(짧은 시간 동안 무시)을 쓴다.
-let suppressMouseUntil = 0
+let pressedPointer: { id: number; x: number; y: number } | null = null
 
-function startPress(id: string, isTouch = false) {
+function startPress(id: string, event: PointerEvent) {
+  if (!event.isPrimary || event.button !== 0) return
   cancelPress()
   longPressed = false
-  if (isTouch) touchMoved = false
-  else if (Date.now() < suppressMouseUntil) return
+  pressedPointer = { id: event.pointerId, x: event.clientX, y: event.clientY }
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
   if (rangeMode.value) { if (rangeIndices.value) pressTimer = setTimeout(() => { longPressed = true; openRangeEdit() }, 500); return }
   pressTimer = setTimeout(() => { longPressed = true; openEdit(id) }, 500)
 }
 function cancelPress() {
   if (pressTimer) clearTimeout(pressTimer)
   pressTimer = undefined
+  pressedPointer = null
 }
-/** 터치가 스크롤로 이어지면(손가락이 움직이면) 롱프레스/클릭 판정을 취소한다 — 표 스크롤 중 오작동 방지. */
-function handleTouchMove() {
-  touchMoved = true
-  cancelPress()
+/** Small finger/pen jitter is allowed; scrolling cancels the press. */
+function movePress(event: PointerEvent) {
+  if (!pressedPointer || pressedPointer.id !== event.pointerId) return
+  if (Math.hypot(event.clientX - pressedPointer.x, event.clientY - pressedPointer.y) > 10) cancelPress()
 }
-/** mouseup/touchend 에서 호출. 길게 눌러서 이미 수정모드로 들어간 경우가 아니면 "짧은 클릭"으로 본다. */
-function endPress(id: string, isTouch = false) {
+function endPress(id: string, event: PointerEvent) {
+  if (!pressedPointer || pressedPointer.id !== event.pointerId) return
   cancelPress()
-  if (isTouch) {
-    suppressMouseUntil = Date.now() + 500
-    if (touchMoved) return
-  } else if (Date.now() < suppressMouseUntil) return
   if (!longPressed) clickRecord(id)
 }
 // 아직 확정 안 된 새 입력(경기장 클릭 후 액트/결과를 고르는 중인 가안)을 버린다.
@@ -949,9 +947,24 @@ function clickRecord(id: string) {
   clearPendingEntry()
   lastInsertedId.value = null
   peekId.value = peekId.value === id ? null : id
-  if (isEditMode) anchorSeconds.value = peekId.value ? records.value.find(r => r.id === id)?.seconds ?? null : null
+  pinHistory(id)
+  if (isEditMode && !peekId.value) anchorSeconds.value = null
+}
+function pinHistory(id: string) {
+  if (!isPrimary.value && !isEditMode) historyPinned.value = true
+  if (isEditMode || historyPinned.value) anchorSeconds.value = records.value.find(r => r.id === id)?.seconds ?? null
+}
+async function followLatestRecords() {
+  if (editingId.value || playerPickFor.value) return
+  clearPendingEntry()
+  peekId.value = null
+  anchorSeconds.value = null
+  historyPinned.value = false
+  await nextTick()
+  if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
 }
 function openEdit(id: string) {
+  pinHistory(id)
   if (editingId.value && editingId.value !== id) cancelEdit()
   clearPendingEntry()
   lastInsertedId.value = null
@@ -1159,6 +1172,7 @@ const pendingShot = ref<PendingShot | null>(null)
 // visibleRecords.length 만 보면 경기장을 찍은 직후(액트를 고르기 전)엔 스크롤이 안 따라간다.
 // (rows 가 pendingPos/pendingShot 을 참조하므로, 이 둘이 선언된 뒤에 watch 를 걸어야 한다.)
 watch(() => rows.value.length, async (len, prevLen) => {
+  if (historyPinned.value || editingId.value || playerPickFor.value) return
   // 수정 화면에서는 기록을 중간에 끼워 넣으므로 맨 아래로 내리지 않고, 지금 입력 중인
   // 가안 행이나 방금 넣은 기록이 있는 자리를 보여준다. 삭제 등으로 줄어들 때는 그대로 둔다.
   if (isEditMode) {
@@ -1168,6 +1182,7 @@ watch(() => rows.value.length, async (len, prevLen) => {
     return
   }
   await nextTick()
+  if (historyPinned.value || editingId.value || playerPickFor.value) return
   if (tableEl.value) tableEl.value.scrollTop = tableEl.value.scrollHeight
 })
 
@@ -1216,19 +1231,13 @@ const lineup = computed(() => {
   return gk ? [...fallback, { ...gk, slot: GK_LINEUP_SLOT }] : fallback
 })
 
-// 선수선택 창은 포메이션 좌표(맨 앞 줄 ~ 골키퍼)를 창 위아래 끝까지 펼쳐 빈 여백을 없앤다.
-// 유니폼 카드 절반 높이만큼 안쪽으로 들여 위·아래 줄이 잘리지 않게 한다.
-const PICK_EDGE_PX = 50
-const pickYRange = computed(() => {
-  const ys = lineup.value.map(p => p.slot.y)
-  const min = Math.min(...ys, GK_LINEUP_SLOT.y)
-  const max = Math.max(...ys, GK_LINEUP_SLOT.y)
-  return { min, span: Math.max(max - min, 1) }
+// 필드 선수 영역은 줄 수로 높이를, 각 줄의 인원수로 폭을 균등 분할한다.
+// 골키퍼와 Reset·Submit 토글은 별도 줄에 둬 터치 영역이 겹치지 않게 한다.
+const outfieldPickAreas = computed(() => {
+  const players = pickLineup.value.filter(p => p.slot !== GK_LINEUP_SLOT)
+  return formationPickAreas(players.map(p => p.slot)).map(area => ({ ...area, player: players[area.index]! }))
 })
-function pickTop(y: number) {
-  const ratio = (y - pickYRange.value.min) / pickYRange.value.span
-  return `calc(${PICK_EDGE_PX}px + (100% - ${PICK_EDGE_PX * 2}px) * ${ratio.toFixed(4)})`
-}
+const pickGoalkeeper = computed(() => pickLineup.value.find(p => p.slot === GK_LINEUP_SLOT))
 
 const subKey = (s: SubRecord) => (HALF_ORDER[s.half] ?? 0) * 100000 + s.seconds
 // 선수선택 창의 경기장 배치는 "그 기록 시각" 기준이다. 수정 화면에서 02:37 기록을 고르는데
@@ -2046,7 +2055,7 @@ function clickAct(actKey: string, isShot: boolean) {
   records.value.push(rec)
   markRecordDirty(rec.id)
   lastTap.value = { id: rec.id, key: actKey }
-  if (isEditMode) placeInsertedRecords([rec.id])
+  if (isEditMode || historyPinned.value) placeInsertedRecords([rec.id])
   if (isShot) {
     pendingShot.value = {
       id: rec.id,
@@ -2090,7 +2099,7 @@ function clickResult(res: 'X' | 'B') {
   if (!pendingPos.value) return
   // 수정 화면에서는 기록 사이에 끼워 넣으므로 맨 끝이 아니라, 새 결과가 놓일 시각 바로 앞의
   // 기록이 마감 대상이다(같은 초면 기존 기록 뒤에 놓이므로 <=).
-  const last = isEditMode
+  const last = isEditMode || historyPinned.value
     ? [...visibleRecords.value].reverse().find(r => r.seconds <= draftSeconds.value)
     : records.value[records.value.length - 1]
   if (last && last.res === 'O') {
@@ -2103,7 +2112,7 @@ function clickResult(res: 'X' | 'B') {
     markRecordDirty(last.id)
     lastTap.value = { id: last.id, key: res }
     for (const record of records.value) if (!beforeIds.has(record.id)) markRecordDirty(record.id)
-    if (isEditMode) {
+    if (isEditMode || historyPinned.value) {
       const resultRec = records.value[records.value.findIndex(r => r.id === last.id) + 1]
       if (resultRec) placeInsertedRecords([resultRec.id])
     }
@@ -2120,7 +2129,7 @@ function clickResult(res: 'X' | 'B') {
     records.value.push(rec)
     markRecordDirty(rec.id)
     lastTap.value = { id: rec.id, key: res }
-    if (isEditMode) placeInsertedRecords([rec.id])
+    if (isEditMode || historyPinned.value) placeInsertedRecords([rec.id])
     closePrecedingOpenAct(records.value, rec.id)
     const recIndex = records.value.findIndex(record => record.id === rec.id)
     const previous = recIndex > 0 ? records.value[recIndex - 1] : null
@@ -2270,6 +2279,7 @@ function selectOuterMiss(zone: 'LX' | 'HX' | 'RX') {
 
 // DAP 레코드의 선수 입력
 function openPlayerPick(recordId: string) {
+  pinHistory(recordId)
   playerPickFor.value = recordId
   pickedPlayerId.value = records.value.find(r => r.id === recordId)?.playerId ?? null
 }
@@ -2432,14 +2442,14 @@ async function finishHalf() {
   <div class="page">
     <div class="frameViewport">
       <div class="frame" :class="{ mirrored: game.mirrored }">
-        <section class="left" :style="{ paddingBottom: (tableExpanded ? 380 : 250) + 'px' }">
+        <section class="left" :style="{ paddingBottom: (tableExpanded ? 380 : 210) + 'px' }">
           <div class="statBar">
             <button class="cardIcon" :class="{ on: cardOpen }" title="카드 입력" @click="openCardPanel">🟨🟥</button>
-            <button class="stat" :disabled="!isPrimary" @click="stepSeconds(-3)">-3</button>
-            <button class="stat" :disabled="!isPrimary" @click="stepSeconds(-1)">-1</button>
+            <button class="stat" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(-3)">-3</button>
+            <button class="stat" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(-1)">-1</button>
             <div class="spacer" />
-            <button class="stat" :disabled="!isPrimary" @click="stepSeconds(1)">+1</button>
-            <button class="stat" :disabled="!isPrimary" @click="stepSeconds(3)">+3</button>
+            <button class="stat" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(1)">+1</button>
+            <button class="stat" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(3)">+3</button>
             <div ref="grassWrapRef" class="grassWrap">
               <button class="grassIcon" :class="{ on: grassOpen }" title="잔디 패턴" @click="grassOpen = !grassOpen"><span
                   class="grassSwatch" /></button>
@@ -2464,7 +2474,8 @@ async function finishHalf() {
             </div>
             <button class="swapIcon" :class="{ on: subOpen }" title="선수 교체" @click="openSubPanel">🔄</button>
             <div class="clockCtrl">
-              <button v-if="inputMode === '분석'" class="pauseBtn" :disabled="!isPrimary || isEditMode" :class="{ paused }"
+              <button v-if="historyPinned" class="pauseBtn followLatestBtn" :disabled="!!editingId || !!playerPickFor" @click="followLatestRecords">최신으로</button>
+              <button v-else-if="inputMode === '분석'" class="pauseBtn" :disabled="!isPrimary || isEditMode" :class="{ paused }"
                 @click="togglePause">{{ paused ? '▶' : '❚❚' }}</button>            </div>
             <div v-if="inputMode !== '분석'" class="modeTag">실시간</div>
           </div>
@@ -2474,13 +2485,13 @@ async function finishHalf() {
             <div class="score">{{ homeScore }}</div>
             <div class="halfBox">
               <div class="clockRow">
-                <button class="timeStep" :disabled="!isPrimary && !editingId" @click="stepSeconds(-1)">−</button>
+                <button class="timeStep" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(-1)">−</button>
                 <div class="halfLabel" :class="{ on: half === '전반', clickable: isEditMode }" @click="selectHalf('전반')">
                   전반</div>
                 <div class="clock" :class="{ paused }">{{ displayClock }}</div>
                 <div class="halfLabel" :class="{ on: half === '후반', clickable: isEditMode }" @click="selectHalf('후반')">
                   후반</div>
-                <button class="timeStep" :disabled="!isPrimary && !editingId" @click="stepSeconds(1)">+</button>
+                <button class="timeStep" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(1)">+</button>
               </div>
             </div>
             <div class="score">{{ awayScore }}</div>
@@ -2518,20 +2529,18 @@ async function finishHalf() {
               @click="deleteRangeRecords">삭제</button><button class="rangeCancel" @click="cancelRangeEdit">취소</button>
           </div>
           <div ref="tableEl" class="table" :class="{ expanded: tableExpanded }"
-            @mousedown.capture="closeOverlayPanelsOnOutsideTouch"
-            @touchstart.capture="closeOverlayPanelsOnOutsideTouch">
+            @pointerdown.capture="closeOverlayPanelsOnOutsideTouch">
             <div class="thead">
               <span>No.</span><span>Time</span><span>Act</span><span>Result</span><span>Area</span><span>Player</span>
             </div>
             <div class="tbody">
               <div v-for="r in rows" :key="r.id" class="trow" :data-row-id="r.id"
                 :class="{ pending: r.isDap, editing: editingId === r.id, peeking: peekId === r.id, edited: recentlyEditedIds.has(r.id), rangeSel: rangeMode && rangeSelectedIds.has(r.id), rangeAnchor: rangeMode && r.id === rangeStartId && !rangeEndId, draft: r.draft }"
-                @mousedown="!r.draft && startPress(r.id)" @mouseup="!r.draft && endPress(r.id)"
-                @mouseleave="cancelPress" @touchstart="!r.draft && startPress(r.id, true)" @touchmove="handleTouchMove"
-                @touchend="!r.draft && endPress(r.id, true)" @contextmenu.prevent>
+                @pointerdown="!r.draft && startPress(r.id, $event)" @pointerup="!r.draft && endPress(r.id, $event)"
+                @pointermove="movePress" @pointercancel="cancelPress" @lostpointercapture="cancelPress" @contextmenu.prevent>
                 <template v-if="editingId === r.id">
                   <!-- 수정 중인 행의 빈 곳을 한 번 더 누르면 취소와 같이 수정모드를 닫는다 (버튼·숫자 위는 제외) -->
-                  <div class="editTimeRow" @mousedown.stop @touchstart.stop @click.self="cancelEdit">
+                  <div class="editTimeRow" @pointerdown.stop @click.self="cancelEdit">
                     <div class="editClock" @click.self="cancelEdit">
                       <span class="editUnit"><button class="editStep" @click.stop="stepEditMinute(-1)">−</button><b>{{
                         String(editMinute).padStart(2, '0') }}</b><button class="editStep"
@@ -2548,7 +2557,7 @@ async function finishHalf() {
                         @click.stop="cancelEdit">취소</button>
                     </div>
                     <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn"
-                      :class="{ assigned: !!r.playerName }" @mousedown.stop @touchstart.stop
+                      :class="{ assigned: !!r.playerName }" @pointerdown.stop
                       @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select' }}</button>
                   </div>
                 </template>
@@ -2556,8 +2565,8 @@ async function finishHalf() {
                   <span>{{ r.no }}</span><span>{{ r.time }}</span><span>{{ r.act }}</span><span>{{ r.result
                   }}</span><span>{{ r.area }}</span>
                   <span>
-                    <button v-if="r.isDap" class="playerBtn" :class="{ assigned: !!r.playerName }" @mousedown.stop
-                      @touchstart.stop @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select'
+                    <button v-if="r.isDap" class="playerBtn" :class="{ assigned: !!r.playerName }" @pointerdown.stop
+                      @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select'
                       }}</button>
                   </span>
                 </template>
@@ -2826,20 +2835,31 @@ async function finishHalf() {
           <!-- 선수선택: PPT 대로 액트 입력창 자리에서 UI 를 전환한다 -->
           <div v-if="!cardOpen && !subOpen && playerPickFor" class="group pickGroup">
             <div class="pickField">
-              <button class="pickLineBtn pickReset" :style="{ top: pickTop(GK_LINEUP_SLOT.y) }"
-                @click="resetPlayerPick">Reset</button>
-              <button class="pickLineBtn pickSubmitToggle" :class="{ on: pickSubmitOn }"
-                :style="{ top: pickTop(GK_LINEUP_SLOT.y) }" @click="togglePickSubmit">
-                Submit<br>{{ pickSubmitOn ? 'ON' : 'OFF' }}
-              </button>
-              <button v-for="p in pickLineup" :key="p.playerId" class="jersey"
-                :class="{ on: pickedPlayerId === p.playerId }" :style="{ left: p.slot.x + '%', top: pickTop(p.slot.y) }"
-                :disabled="isPickGone(p.playerId)" @click="pickPlayer(p.playerId)">
-                <span class="shirtWrap"><span class="shirt">{{ p.no }}</span><span v-if="pickSubbedIn.has(p.playerId)"
-                    class="shirtTag">In</span><i v-if="pickCardMark(p.playerId)" class="cardMark"
-                    :class="pickCardMark(p.playerId)!" /></span>
-                <span class="jname">{{ p.name }}</span>
-              </button>
+              <div class="pickOutfield">
+                <button v-for="area in outfieldPickAreas" :key="area.player.playerId" class="jersey pickTarget"
+                  :class="{ on: pickedPlayerId === area.player.playerId }"
+                  :style="{ left: area.left + '%', top: area.top + '%', width: area.width + '%', height: area.height + '%' }"
+                  :disabled="isPickGone(area.player.playerId)" @click="pickPlayer(area.player.playerId)">
+                  <span class="shirtWrap"><span class="shirt">{{ area.player.no }}</span><span v-if="pickSubbedIn.has(area.player.playerId)"
+                    class="shirtTag">In</span><i v-if="pickCardMark(area.player.playerId)" class="cardMark"
+                    :class="pickCardMark(area.player.playerId)!" /></span>
+                  <span class="jname">{{ area.player.name }}</span>
+                </button>
+              </div>
+              <div class="pickGoalkeeperRow">
+                <button class="pickLineBtn pickReset" @click="resetPlayerPick">Reset</button>
+                <button v-if="pickGoalkeeper" class="jersey goalkeeperTarget"
+                  :class="{ on: pickedPlayerId === pickGoalkeeper.playerId }"
+                  :disabled="isPickGone(pickGoalkeeper.playerId)" @click="pickPlayer(pickGoalkeeper.playerId)">
+                  <span class="shirtWrap"><span class="shirt">{{ pickGoalkeeper.no }}</span><span v-if="pickSubbedIn.has(pickGoalkeeper.playerId)" class="shirtTag">In</span>
+                    <i v-if="pickCardMark(pickGoalkeeper.playerId)" class="cardMark" :class="pickCardMark(pickGoalkeeper.playerId)!" /></span>
+                  <span class="jname">{{ pickGoalkeeper.name }}</span>
+                </button>
+                <span v-else />
+                <button class="pickLineBtn pickSubmitToggle" :class="{ on: pickSubmitOn }" @click="togglePickSubmit">
+                  Submit<br>{{ pickSubmitOn ? 'ON' : 'OFF' }}
+                </button>
+              </div>
             </div>
             <div v-if="subPickPlayers.length || pickOwnGoalAllowed" class="pickSubs">
               <span class="pickSubsLabel">교체<br>OUT</span>
@@ -3007,7 +3027,7 @@ button {
   background: #1b1e22;
   display: flex;
   flex-direction: column;
-  padding-bottom: 250px
+  padding-bottom: 210px
 }
 
 .statBar {
@@ -3015,7 +3035,7 @@ button {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
   padding: 8px 10px;
   border-bottom: 1px solid rgba(255, 255, 255, .08)
 }
@@ -3284,8 +3304,10 @@ button {
 }
 
 .stat {
-  height: 26px;
-  padding: 0 10px;
+  height: 44px;
+  min-width: 48px;
+  padding: 0 12px;
+  font-size: 17px;
   border-radius: 4px;
   border: 1px solid rgba(255, 255, 255, .15);
   background: rgba(255, 255, 255, .06);
@@ -3300,8 +3322,8 @@ button {
 
 .grassIcon,
 .swapIcon {
-  width: 44px;
-  height: 26px;
+  width: 48px;
+  height: 44px;
   display: grid;
   place-items: center;
   border-radius: 4px;
@@ -3334,7 +3356,7 @@ button {
 .grassPop {
   position: absolute;
   z-index: 30;
-  top: 32px;
+  top: 50px;
   right: 0;
   width: 250px;
   padding: 10px;
@@ -3474,12 +3496,12 @@ button {
 .clockRow {
   display: flex;
   align-items: center;
-  gap: 18px
+  gap: 12px
 }
 
 .timeStep {
-  width: 27px;
-  height: 23px;
+  width: 40px;
+  height: 36px;
   border-radius: 3px;
   border: 1px solid rgba(255, 255, 255, .3);
   background: rgba(255, 255, 255, .1);
@@ -3540,8 +3562,8 @@ button {
 }
 
 .pauseBtn {
-  width: 112px;
-  height: 35px;
+  width: 104px;
+  height: 44px;
   border-radius: 4px;
   border: 1px solid rgba(255, 255, 255, .15);
   background: rgba(255, 255, 255, .06);
@@ -3563,6 +3585,11 @@ button {
   font-weight: 800;
   color: rgba(255, 255, 255, .35);
   letter-spacing: .05em
+}
+
+.followLatestBtn {
+  border: 1px solid #f0b429;
+  font-weight: 800
 }
 
 .pitch {
@@ -3782,7 +3809,7 @@ button {
   left: 0;
   right: 0;
   bottom: 0;
-  height: 250px;
+  height: 210px;
   box-sizing: border-box;
   padding-bottom: 10px;
   overflow-y: auto;
@@ -3833,6 +3860,7 @@ button {
 
 .trow {
   color: #ddd;
+  padding: 4px 10px;
   font-size: 14px;
   min-height: 42px;
   align-items: center;
@@ -4033,6 +4061,46 @@ button {
   background: rgba(255, 255, 255, .02)
 }
 
+.pickOutfield {
+  position: absolute;
+  inset: 0 0 100px
+}
+
+.pickGoalkeeperRow {
+  position: absolute;
+  inset: auto 0 0;
+  height: 100px;
+  display: grid;
+  grid-template-columns: 1fr 1.4fr 1fr;
+  align-items: center;
+  border-top: 1px solid rgba(255, 255, 255, .18)
+}
+
+.pickField .pickTarget,
+.pickField .goalkeeperTarget {
+  transform: none;
+  min-width: 0;
+  padding: 6px;
+  justify-content: center;
+  border-radius: 0;
+  border-color: rgba(255, 255, 255, .14);
+  touch-action: manipulation
+}
+
+.pickField .goalkeeperTarget {
+  position: relative;
+  height: 100%;
+  width: 100%
+}
+
+.pickField .jname {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 14px;
+  font-weight: 700
+}
+
 .jersey {
   position: absolute;
   transform: translate(-50%, -50%);
@@ -4090,8 +4158,10 @@ button {
 
 /* 골키퍼 라인 양 끝: 왼쪽 Reset, 오른쪽 터치 닫기 토글 */
 .pickLineBtn {
-  position: absolute;
-  transform: translateY(-50%);
+  position: relative;
+  transform: none;
+  margin: 0 10px;
+  min-height: 48px;
   z-index: 1;
   min-width: 72px;
   padding: 8px 10px;
@@ -4106,17 +4176,12 @@ button {
 }
 
 .pickReset {
-  left: 8px;
   border-color: #e5484d;
   color: #e5484d
 }
 
 .pickReset:hover {
   background: rgba(229, 72, 77, .15)
-}
-
-.pickSubmitToggle {
-  right: 8px
 }
 
 .pickSubmitToggle.on {
@@ -4224,12 +4289,7 @@ button {
   padding: 10px 14px
 }
 
-/* 경기장 위 선수는 카드 범위와 유니폼을 크게 — 교체OUT 줄은 기본 크기 유지 */
-.pickField .jersey {
-  min-width: 108px;
-  padding: 16px 22px
-}
-
+/* The entire formation cell is selectable; shirts stay centered within it. */
 .pickField .shirt {
   width: 50px;
   height: 44px;
@@ -4287,14 +4347,14 @@ button {
 
 .finishBtn,
 .lobbyExitBtn {
-  height: 26px;
+  height: 40px;
   padding: 0 12px;
   border-radius: 4px;
   border: 1px solid rgba(255, 255, 255, .16);
   background: rgba(255, 255, 255, .06);
   color: #ddd;
   font-weight: 700;
-  font-size: 11px;
+  font-size: 13px;
   cursor: pointer
 }
 
@@ -4310,8 +4370,8 @@ button {
 }
 
 .mirrorIcon {
-  width: 26px;
-  height: 26px;
+  width: 40px;
+  height: 40px;
   display: grid;
   place-items: center;
   border-radius: 4px;
@@ -4438,9 +4498,13 @@ section.right {
 
 section.right h1 {
   margin: 0;
-  text-align: center;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  padding-left: 46px;
   color: #fff;
-  font-size: 20px
+  font-size: 18px
 }
 
 .group {
@@ -4465,13 +4529,13 @@ section.right h1 {
 
 .kickGrid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  grid-template-rows: 96px 66px;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  grid-template-rows: 110px 72px;
   gap: 5px
 }
 
 .stacked {
-  grid-column: 5/7;
+  grid-column: 7/9;
   grid-row: 1;
   min-width: 0;
   display: grid;
@@ -4487,7 +4551,7 @@ section.right h1 {
   align-items: center;
   justify-content: center;
   gap: 2px;
-  height: 76px;
+  height: 84px;
   border-radius: 0;
   border: 1px solid rgba(255, 255, 255, .18);
   background: linear-gradient(135deg, rgba(255, 255, 255, .075), rgba(255, 255, 255, .035));
@@ -4510,32 +4574,32 @@ section.right h1 {
 }
 
 .kickPrimary {
-  height: 96px
+  height: 110px
 }
 
 .kick-c {
-  grid-column: 1/3;
+  grid-column: 1/4;
   grid-row: 1
 }
 
 .kick-p {
-  grid-column: 3/5;
+  grid-column: 4/7;
   grid-row: 1
 }
 
 .kickResult {
-  height: 66px;
+  height: 72px;
   flex-direction: row;
   gap: 16px
 }
 
 .kick-x {
-  grid-column: 1/4;
+  grid-column: 1/5;
   grid-row: 2
 }
 
 .kick-b {
-  grid-column: 4/7;
+  grid-column: 5/9;
   grid-row: 2
 }
 
@@ -4663,7 +4727,7 @@ section.right h1 {
 
 .goal {
   position: relative;
-  flex: 0 0 285px;
+  flex: 1 1 240px;
   min-height: 0;
   margin-top: 0;
   opacity: .5;

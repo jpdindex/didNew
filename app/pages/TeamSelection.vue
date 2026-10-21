@@ -176,7 +176,9 @@ function applyInputSetup(setup: InputSetup | null | undefined) {
   nextTick(() => { applyingRemoteSetup = false })
 }
 
-function startLobbyCollaboration() {
+async function startLobbyCollaboration() {
+  if (lobbyJoinPromise) await lobbyJoinPromise
+  if (!isCurrentLobby()) return false
   const targetMatchId = game.value.matchId
   const targetTeam = game.value.team
   const targetRole = game.value.participantRole
@@ -184,6 +186,7 @@ function startLobbyCollaboration() {
   const isCurrentLobbySession = () => game.value.matchId === targetMatchId && game.value.team === targetTeam
 
   return startCollaboration(game.value, {
+    readOnly: joinedLobbyRole === undefined,
     resetPending: () => {
       pendingSetupFingerprint = ''
       if (formationSaveTimer) clearTimeout(formationSaveTimer)
@@ -227,8 +230,13 @@ function ensureLobbyParticipant(role = game.value.participantRole) {
   if (joinedLobbyRole === role) return Promise.resolve()
   if (lobbyJoinPromise) return lobbyJoinPromise
   const join = joinCollaboration(game.value, role)
-    .then(() => {
+    .then(async () => {
       joinedLobbyRole = game.value.participantRole
+      // Replace the lobby's recovery reader with a participant connection.
+      // Clear the in-flight join before starting so it cannot await itself.
+      if (lobbyJoinPromise === join) lobbyJoinPromise = undefined
+      lobbyHistoryPromise = undefined
+      await ensureLobbyHistory()
     })
     .finally(() => {
       if (lobbyJoinPromise === join) lobbyJoinPromise = undefined

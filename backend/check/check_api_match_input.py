@@ -17,6 +17,102 @@ def test_draft_snapshot_busy_is_503_and_never_a_missing_draft(monkeypatch):
     assert error.value.code == 'draft_snapshot_busy'
 
 
+def test_live_socket_rejects_unjoined_user_without_crash_or_presence_cleanup(monkeypatch, caplog):
+    import asyncio
+    import json
+    import logging
+    from backend.system.system_firestore import BackendError
+    caplog.set_level(logging.INFO, logger='backend.system.system_live_room')
+
+    class Data:
+        def get_match(self, gm_id):
+            return object()
+
+    async def user(socket):
+        return CurrentUser(uid='p', claims={})
+
+    presence_calls = []
+    def presence(*args):
+        presence_calls.append(args[-1])
+        raise BackendError('Join the Draft first', status_code=403, code='participant_required')
+
+    class Socket:
+        def __init__(self):
+            self.messages = []
+            self.close_code = None
+        async def accept(self):
+            pass
+        async def send_json(self, message):
+            self.messages.append(message)
+        async def close(self, code):
+            self.close_code = code
+
+    monkeypatch.setattr(api_match_input, 'JpdDidData', Data)
+    monkeypatch.setattr(api_match_input, '_socket_user', user)
+    monkeypatch.setattr(api_match_input, 'update_presence', presence)
+    monkeypatch.setattr(api_match_input, 'draft_sockets', DraftSocketHub())
+    socket = Socket()
+    asyncio.run(api_match_input.live_draft_socket(socket, 'm', 'A'))
+    assert socket.messages[0]['code'] == 'participant_required'
+    assert socket.messages[0]['status'] == 403
+    assert socket.close_code == 1008
+    assert presence_calls == [True]
+    assert 'crashed' not in caplog.text
+    assert 'Presence expires automatically' not in caplog.text
+    events = [json.loads(record.message.split('Draft admission ', 1)[1])
+              for record in caplog.records if record.message.startswith('Draft admission ')]
+    rejection = next(event for event in events if event['event'] == 'socket_rejected')
+    authenticated = next(event for event in events if event['event'] == 'socket_authenticated')
+    assert rejection['uid'] == 'p'
+    assert rejection['stage'] == 'presence_register'
+    assert rejection['sessionId'] == authenticated['sessionId']
+
+
+@pytest.mark.parametrize('fails', [False, True])
+def test_join_diagnostics_correlate_authenticated_user_and_result(caplog, monkeypatch, fails):
+    import json
+    import logging
+    from backend.system.system_firestore import BackendError
+    caplog.set_level(logging.INFO, logger='backend.system.system_live_room')
+    monkeypatch.setenv('RENDER_GIT_COMMIT', 'test-build')
+    class Data:
+        def join_input_draft_participant(self, gm_id, side, **kwargs):
+            assert kwargs['user_id'] == 'verified-uid'
+            if fails:
+                raise BackendError('seat taken', status_code=409, code='primary_already_assigned')
+            return {'participants': {'verified-uid': {'role': 'primary', 'name': 'private name'}}, 'revision': 3}
+    request = ParticipantJoinRequest(role='primary', displayName='private name')
+    user = CurrentUser(uid='verified-uid', claims={'token': 'never-log-this'})
+    if fails:
+        with pytest.raises(BackendError):
+            api_match_input._join_draft_with_diagnostics(Data(), 'm', 'A', request, user, source='enter')
+    else:
+        api_match_input._join_draft_with_diagnostics(Data(), 'm', 'A', request, user, source='enter')
+    events = [json.loads(record.message.split('Draft admission ', 1)[1]) for record in caplog.records]
+    assert [event['event'] for event in events] == ['join_started', 'join_failed' if fails else 'join_succeeded']
+    assert events[0]['attemptId'] == events[1]['attemptId']
+    assert events[1]['uid'] == 'verified-uid'
+    assert events[1]['build'] == 'test-build'
+    if fails:
+        assert events[1]['code'] == 'primary_already_assigned'
+    else:
+        assert events[1]['participantPresent'] is True
+    assert 'never-log-this' not in caplog.text
+    assert 'private name' not in caplog.text
+
+
+@pytest.mark.parametrize('role,primary_uid,expected', [('assistant', None, False), ('manager', None, True), ('primary', 'u', True), ('manager', 'p', False)])
+def test_join_control_matches_server_ownership_rule(monkeypatch, role, primary_uid, expected):
+    class Data:
+        def get_match(self, *_):
+            return object()
+        def join_input_draft_participant(self, *args, **kwargs):
+            return {'primaryUid': primary_uid, 'participants': {'u': {'role': role}}}
+    monkeypatch.setattr(api_match_input, 'JpdDidData', Data)
+    result = api_match_input.join_draft_participant('m', 'H', ParticipantJoinRequest(role=role), CurrentUser(uid='u', claims={}))
+    assert result['control'] is expected
+
+
 def test_live_socket_relays_root_delta_and_requests_resync_for_a_gap(monkeypatch):
     import asyncio
     import json

@@ -255,6 +255,26 @@ def test_presence_leases_are_per_connection_and_expire(data):
     assert not live.room_state(data, 'm', 'H')['participants']['p']['online']
 
 
+@pytest.mark.parametrize('missing', [False, True])
+def test_rejected_presence_logs_actual_draft_snapshot_without_writing(data, caplog, missing):
+    import json
+    import logging
+    caplog.set_level(logging.INFO, logger='backend.system.system_live_room')
+    if missing:
+        del data.db.documents['inputDrafts/m_H']
+    with pytest.raises(BackendError) as caught:
+        live.update_presence(data, 'm', 'H', 'unjoined', 'socket-1', True)
+    assert caught.value.code == 'participant_required'
+    event = json.loads(caplog.records[-1].message.split('Draft admission ', 1)[1])
+    assert event['event'] == 'presence_rejected'
+    assert event['uid'] == 'unjoined'
+    assert event['sessionId'] == 'socket-1'
+    assert event['draftExists'] is not missing
+    assert event['participantUids'] == ([] if missing else ['a', 'p'])
+    assert event['draftPath'] == 'inputDrafts/m_H'
+    assert 'inputDrafts/m_H/presence/socket-1' not in data.db.documents
+
+
 def test_final_update_freezes_edits_closes_room_and_deduplicates(data):
     request = FinalizeCommandRequest(commandId='final', baseRevision=0, roomEpoch=0)
     calls = []
@@ -624,6 +644,39 @@ def test_newer_time_does_not_grant_assistant_setup_or_state_authority(data):
     setup = InputSetupWriteRequest(commandId='setup', baseRevision=0, roomEpoch=0, payload=payload(), clientState={}, edit=edit(999999))
     with pytest.raises(BackendError) as caught:
         live.execute_command(data, 'm', 'H', 'setup', setup, 'a')
+    assert caught.value.code == 'primary_required'
+
+
+@pytest.mark.parametrize('kind,scope,uid,code', [
+    ('draft', 'state', 'a', 'primary_required'),
+    ('draft', 'checkpoint', 'a', 'primary_required'),
+    ('draft', 'records', 'unjoined', 'participant_required'),
+    ('setup', 'setup', 'a', 'primary_required'),
+    ('setup', 'substitutions', 'unjoined', 'participant_required'),
+])
+def test_legacy_api_cannot_bypass_participant_or_primary_checks(data, monkeypatch, kind, scope, uid, code):
+    from backend.api import api_match_input as api
+    from backend.system.system_firestore import CurrentUser
+    before = deepcopy(data.db.documents)
+    monkeypatch.setattr(api, 'JpdDidData', lambda: data)
+    data.get_match = lambda *_: None
+    data.get_input_draft = lambda *_: deepcopy(data.db.documents['inputDrafts/m_H'])
+    data.save_input_draft = lambda *args, **kwargs: pytest.fail('rejected mutation must never write')
+    data.save_input_setup = lambda *args, **kwargs: pytest.fail('rejected mutation must never write')
+    user = CurrentUser(uid=uid, claims={})
+    request = (command(scope=scope) if kind == 'draft' else InputSetupWriteRequest(payload=payload(), clientState={}, syncScope=scope))
+    request = request.model_copy(update={'commandId': None})
+    with pytest.raises(BackendError) as caught:
+        (api._save_draft_mutation if kind == 'draft' else api._save_setup_mutation)('m', 'H', request, user)
+    assert caught.value.code == code
+    assert data.db.documents == before
+
+
+def test_participant_role_alone_never_grants_lifecycle_control(data):
+    current = data.db.documents['inputDrafts/m_H']
+    current['participants']['a']['role'] = 'primary'
+    with pytest.raises(BackendError) as caught:
+        live.require_draft_writer(current, 'a', control=True)
     assert caught.value.code == 'primary_required'
 
 

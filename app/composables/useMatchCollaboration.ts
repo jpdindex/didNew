@@ -267,7 +267,7 @@ export function useMatchCollaboration() {
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role, displayName: user?.displayName || user?.email || undefined }) },
     )
     game.participantRole = response.role ?? role
-    game.lifecycleControl = response.control ?? game.participantRole === 'primary'
+    game.lifecycleControl = response.control === true
     game.participantName = user?.displayName || user?.email || ''
     if (typeof response.revision === 'number') await liveRoom.observe(game.matchId, sideFor(game), response.revision, response.roomEpoch || 0)
     return response
@@ -280,7 +280,7 @@ export function useMatchCollaboration() {
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role, displayName: user?.displayName || user?.email || undefined }) },
     )
     game.participantRole = response.participant.role ?? role
-    game.lifecycleControl = response.participant.control ?? game.participantRole === 'primary'
+    game.lifecycleControl = response.participant.control === true
     game.participantName = user?.displayName || user?.email || ''
     return response
   }
@@ -344,6 +344,7 @@ export function useMatchCollaboration() {
     applySetup?: (setup: NonNullable<DraftResponse['inputSetup']>) => void
     snapshotReady?: () => void
     resetPending?: () => void
+    readOnly?: boolean
   }, initial?: DraftResponse | null) {
     stop()
     const current = session
@@ -357,7 +358,7 @@ export function useMatchCollaboration() {
     const side = sideFor(game)
     // Only durable commands are pending. A device checkpoint must never make
     // already saved rows immune to legitimate remote edits/deletions.
-    const queued = await liveRoom.pending(gmId, side)
+    const queued = handlers.readOnly ? [] : await liveRoom.pending(gmId, side)
     if (current !== session || stopped) return false
     function restorePendingCommands(commands: typeof queued) {
       for (const command of commands) {
@@ -611,9 +612,9 @@ export function useMatchCollaboration() {
         if (message.type === 'room' && message.room && roomStatus.value) {
           roomStatus.value.participants = message.room.participants
           const participant = message.room.participants[$auth.currentUser!.uid]
+          game.lifecycleControl = Boolean(participant?.role) && (message.room.primaryUid === $auth.currentUser!.uid || (participant?.role === 'manager' && !message.room.primaryUid))
           if (participant?.role) {
             game.participantRole = participant.role
-            game.lifecycleControl = message.room.primaryUid === $auth.currentUser!.uid || (participant.role === 'manager' && !message.room.primaryUid)
           }
           return
         }
@@ -692,10 +693,11 @@ export function useMatchCollaboration() {
           pollTimer = undefined
           // The subscription reports a gap when recovery needs a full read.
         } else socket.close()
-      } catch {
+      } catch (error: any) {
         if (stopped || current !== session) return
         if (roomStatus.value) roomStatus.value.connection = 'offline'
         followParticipants(2)
+        if (error?.code === 'participant_required') return
         const delay = Math.min(4_000, 250 * 2 ** reconnectAttempts++)
         reconnectTimer = setTimeout(() => { void connectSocket() }, delay)
       }
@@ -705,6 +707,12 @@ export function useMatchCollaboration() {
     // legacy callers still establish the boundary through poll().
     const hasInitialDraft = Boolean(initial && initial.status === 'ok')
     if (initial) applyDraftResponse(initial)
+    if (handlers.readOnly) {
+      await poll()
+      if (current !== session || stopped) return false
+      followParticipants(2)
+      return true
+    }
     const attached = await liveRoom.attach(gmId, side, (response) => {
       if (stopped || current !== session) return
       if (response.finalized) {

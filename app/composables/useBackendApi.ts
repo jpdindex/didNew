@@ -101,8 +101,12 @@ export function useBackendApi() {
       socket.onerror = () => failBeforeReady(new Error('실시간 협업 연결에 실패했습니다.'))
       socket.onmessage = (event) => {
         try {
-          const data = JSON.parse(String(event.data)) as T & { type?: string }
+          const data = JSON.parse(String(event.data)) as T & { type?: string; code?: string; status?: number; message?: string }
           if (settled && !ready) return
+          if (!ready && data.type === 'error') {
+            failBeforeReady(Object.assign(new Error(data.message || '실시간 협업 연결이 거절되었습니다.'), { code: data.code, status: data.status }))
+            return
+          }
           if (data.type === 'ready') {
             ready = true
             settled = true

@@ -106,6 +106,175 @@ function environment(transport, indexedDB = fakeIndexedDB(), nativeBatch = false
 
 async function settle() { for (let i = 0; i < 40; i++) await Promise.resolve() }
 
+function inputPageEnvironment() {
+  const vue = require('vue')
+  const text = fs.readFileSync(path.resolve(__dirname, '../pages/DidInput.vue'), 'utf8')
+  const script = text.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
+  const timers = [], watchers = []
+  const globals = {
+    ...vue, onMounted() {}, onUnmounted() {}, onBeforeRouteLeave() {},
+    watch: (...args) => { const stop = vue.watch(...args); watchers.push(stop); return stop },
+    useRoute: () => ({ query: { matchId: 'm', role: 'assistant', mode: '분석', resumeHalf: '전반' } }),
+    useBackendApi: () => ({ request: async () => ({}) }),
+    useMatchDraft: () => ({ saveLocal: async () => true }),
+    useReturnNavigation: () => () => {},
+    setTimeout: (callback, delay) => { const timer = { callback, delay }; timers.push(timer); return timer },
+    clearTimeout: timer => { const index = timers.indexOf(timer); if (index >= 0) timers.splice(index, 1) },
+    useMatchCollaboration: () => ({
+      mergeRemoteRecords: remote => remote, roomStatus: vue.ref(null), markLocalRecords() {}, markLocalCards() {},
+    }),
+  }
+  const state = load('composables/useMatchState.ts', { useState: (key, factory) => vue.ref(factory()) })
+  const game = state.useMatchState()
+  const formation = load('utils/formationLayout.ts', {})
+  Object.assign(game.value, { matchId: 'm', formationKey: '3-4-2-1', participantRole: 'assistant', lifecycleControl: false, seconds: 1000,
+    records: Array.from({ length: 8 }, (_, index) => ({ id: `r${index}`, seconds: index * 10, seq: index, half: 'H1', act: 'P', res: 'O', area: 2, posX: 20, posY: 30 })),
+  })
+  const players = [5, 30, 24, 3, 22, 4, 2, 19, 18, 9, 1].map(no => ({ no: String(no), playerId: `p${no}`, name: `선수 ${no}`, pos: no === 1 ? 'GK' : 'MF' }))
+  game.value.squads.home = players
+  game.value.assigned = Object.fromEntries(players.map((p, index) => [index === 10 ? 'gk' : `o${index}`, p.playerId]))
+  globals.useMatchState = () => game
+  const imports = {
+    '~/utils/didLogic': load('utils/didLogic.ts', {}), '~/utils/formationLayout': formation,
+    '~/utils/grass': load('utils/grass.ts', {}), '~/utils/goalCoordinates': load('utils/goalCoordinates.ts', {}),
+    '~/utils/card': load('utils/card.ts', {}),
+    '~/composables/useInputPreview': { useInputPreview: () => ({ preview: records => ({ flags: new Map(records.map(r => [r.id, { isDap: true }])) }), schedule() {} }) },
+  }
+  const context = vm.createContext({ ...globals, console, module: { exports: {} }, exports: {}, require: name => {
+    if (name in imports) return imports[name]
+    throw new Error(`Unexpected page import ${name}`)
+  } })
+  vm.runInContext(transformSync(script, { loader: 'ts', format: 'cjs', target: 'es2022' }).code, context)
+  const api = vm.runInContext('({ clickRecord, pinHistory, followLatestRecords, openPlayerPick, openEdit, startPress, movePress, endPress, cancelPress, stepSeconds, clickPitch, clickAct, records, rows, peekId, historyPinned, anchorSeconds, clockSeconds, seconds, editingId, playerPickFor, outfieldPickAreas, pickGoalkeeper, subPickPlayers, pendingPos, isPrimary, tableEl })', context)
+  const receive = text.match(/applyRecords: \(remoteRecords\) => \{([\s\S]*?)\r?\n    },\r?\n    applyCards/)[1]
+  vm.runInContext(`globalThis.receiveRemoteRecords = (remoteRecords) => { const isCurrentSession = () => true; ${receive} }`, context)
+  return { ...api, game, timers, receive: context.receiveRemoteRecords, tick: vue.nextTick,
+    dispose: () => { api.cancelPress(); watchers.forEach(stop => stop()) } }
+}
+
+test('assistant stays on a historical time and row while live records continue arriving', async () => {
+  const env = inputPageEnvironment()
+  try {
+    env.tableEl.value = { scrollTop: 30, scrollHeight: 900 }
+    env.clickRecord('r2')
+    assert.equal(env.historyPinned.value, true)
+    assert.equal(env.clockSeconds.value, 20)
+    env.seconds.value = 1100
+    env.receive([...env.records.value, { ...env.records.value[0], id: 'live', seconds: 1100 }])
+    await env.tick()
+    assert.equal(env.records.value.at(-1).id, 'live')
+    assert.equal(env.peekId.value, 'r2')
+    assert.equal(env.tableEl.value.scrollTop, 30)
+    assert.equal(env.clockSeconds.value, 20)
+    env.stepSeconds(1)
+    assert.equal(env.clockSeconds.value, 21)
+    assert.equal(env.game.value.seconds, 1000)
+    const pointer = { currentTarget: { getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }) }, clientX: 10, clientY: 20 }
+    env.clickPitch(pointer)
+    env.clickAct('P', false)
+    assert.ok(env.records.value.some(r => r.seconds === 21))
+    assert.equal(env.records.value.at(-1).id, 'live')
+    await env.followLatestRecords()
+    assert.equal(env.historyPinned.value, false)
+    assert.equal(env.clockSeconds.value, 1100)
+    assert.equal(env.tableEl.value.scrollTop, 900)
+  } finally { env.dispose() }
+})
+
+test('unselected row opens directly on a pen hold, while movement and pointer cancellation do not edit', () => {
+  const env = inputPageEnvironment()
+  const pointer = { pointerId: 4, isPrimary: true, button: 0, clientX: 10, clientY: 10, currentTarget: { setPointerCapture() {} } }
+  try {
+    env.clickRecord('r1')
+    env.startPress('r3', pointer)
+    env.movePress({ ...pointer, clientX: 13 })
+    env.timers.find(timer => timer.delay === 500).callback()
+    env.endPress('r3', pointer)
+    assert.equal(env.editingId.value, 'r3')
+    assert.equal(env.peekId.value, null)
+    env.startPress('r4', pointer)
+    env.movePress({ ...pointer, clientY: 40 })
+    env.endPress('r4', pointer)
+    assert.equal(env.editingId.value, 'r3')
+    env.startPress('r5', pointer)
+    env.cancelPress()
+    env.endPress('r5', pointer)
+    assert.equal(env.editingId.value, 'r3')
+  } finally { env.dispose() }
+})
+
+test('formation picker covers each outfield row evenly and isolates the goalkeeper', () => {
+  const env = inputPageEnvironment()
+  try {
+    const areas = env.outfieldPickAreas.value
+    assert.deepEqual(Array.from(areas.map(a => a.player.no)), ['9', '19', '18', '3', '22', '4', '2', '5', '30', '24'])
+    const widths = [100, 50, 50, 25, 25, 25, 25, 100 / 3, 100 / 3, 100 / 3]
+    areas.forEach((area, index) => { assert.equal(area.width, widths[index]); assert.equal(area.height, 25) })
+    assert.equal(env.pickGoalkeeper.value.no, '1')
+    env.openPlayerPick('r1')
+    assert.equal(env.historyPinned.value, true)
+    assert.equal(env.anchorSeconds.value, 10)
+    const { FORMATIONS, formationPickAreas } = load('utils/formationLayout.ts', {})
+    for (const [key, formation] of Object.entries(FORMATIONS)) {
+      const targets = formationPickAreas(formation.slots)
+      for (let y = 1; y < 100; y += 2) for (let x = 1; x < 100; x += 2) {
+        assert.equal(targets.filter(a => x >= a.left && x < a.left + a.width && y >= a.top && y < a.top + a.height).length, 1, `${key} ${x}/${y}`)
+      }
+    }
+  } finally { env.dispose() }
+})
+
+for (const slot of ['o9', 'gk']) test(`record-time lineup and enlarged touch targets agree before and after substitution of ${slot}`, () => {
+  const env = inputPageEnvironment()
+  try {
+    const outgoing = env.game.value.assigned[slot]
+    env.game.value.squads.home.push({ playerId: 'p99', no: '99', name: '교체 선수', pos: slot === 'gk' ? 'GK' : 'FW' })
+    env.game.value.assigned[slot] = 'p99'
+    env.game.value.subs = [{ id: 'sub-1', half: 'H1', seconds: 35, outPlayer: outgoing, inPlayer: 'p99' }]
+    const selectedTarget = () => slot === 'gk' ? env.pickGoalkeeper.value : env.outfieldPickAreas.value.find(area => area.player.slot.y === 11)?.player
+
+    env.openPlayerPick('r2') // 00:20, before the substitution
+    assert.equal(selectedTarget().playerId, outgoing)
+    assert.ok(!env.subPickPlayers.value.some(player => player.playerId === 'p99'))
+
+    env.records.value.push({ ...env.records.value[0], id: 'same-time', seconds: 35 })
+    env.openPlayerPick('same-time')
+    assert.equal(selectedTarget().playerId, outgoing)
+    assert.ok(env.subPickPlayers.value.some(player => player.playerId === 'p99' && player.tag === 'IN'))
+
+    env.openPlayerPick('r4') // 00:40, after the substitution
+    assert.equal(selectedTarget().playerId, 'p99')
+    assert.ok(env.subPickPlayers.value.some(player => player.playerId === outgoing && player.tag === 'OUT'))
+  } finally { env.dispose() }
+})
+
+test('requested primary role does not override a server-denied lifecycle permission', () => {
+  const env = inputPageEnvironment()
+  try {
+    env.game.value.participantRole = 'primary'
+    assert.equal(env.isPrimary.value, false)
+    env.stepSeconds(3)
+    assert.equal(env.seconds.value, 1000)
+    env.game.value.lifecycleControl = true
+    assert.equal(env.isPrimary.value, true)
+  } finally { env.dispose() }
+})
+
+test('room membership updates revoke stale lifecycle authority without removing record access', async () => {
+  const env = collaborationEnvironment()
+  try {
+    await env.collaboration.start(env.game, env.handlers, env.initial)
+    await settle()
+    env.receive({ type: 'room', room: { primaryUid: 'other', participants: { p: { role: 'assistant' } } } })
+    assert.equal(env.game.lifecycleControl, false)
+    assert.equal(env.game.participantRole, 'assistant')
+    env.receive({ type: 'room', room: { primaryUid: 'p', participants: { p: { role: 'primary' } } } })
+    assert.equal(env.game.lifecycleControl, true)
+    env.receive({ type: 'room', room: { primaryUid: 'other', participants: {} } })
+    assert.equal(env.game.lifecycleControl, false)
+  } finally { env.collaboration.stop() }
+})
+
 function socketEnvironment() {
   const sockets = [], timers = []
   class Socket {
@@ -139,6 +308,17 @@ test('socket authentication tolerates a delayed ready response and closes a fail
   assert.equal(env.sockets[1].closes, 1)
   env.sockets[1].onmessage({ data: JSON.stringify({ type: 'ready' }) })
   assert.equal(env.sockets[1].closes, 1)
+})
+
+test('participant rejection preserves its code and closes the handshake immediately', async () => {
+  const env = socketEnvironment()
+  const opened = env.api.openSocket('/live', () => {})
+  const rejected = assert.rejects(opened, error => error.code === 'participant_required' && error.status === 403)
+  await settle()
+  env.sockets[0].onmessage({ data: JSON.stringify({ type: 'error', code: 'participant_required', status: 403, message: 'Join the Draft first' }) })
+  await rejected
+  assert.equal(env.sockets[0].closes, 1)
+  assert.equal(env.timers.length, 0)
 })
 
 test('rapid same-record edits retain their time, order and local previous values', async () => {
@@ -554,6 +734,22 @@ function collaborationEnvironment(queued = [], snapshotReader) {
   }
   return { game, initial, collaboration, handlers, commands, recoveryTimers, intervals, socketState, advance: ms => { now += ms }, receive: event => receive(event), receiveRoom: event => receiveRoom(event) }
 }
+
+test('unjoined lobby reads history without opening a socket and upgrades after joining', async () => {
+  const env = collaborationEnvironment()
+  try {
+    await env.collaboration.start(env.game, { ...env.handlers, readOnly: true })
+    await settle()
+    assert.equal(env.game.records[0].id, 'r')
+    assert.equal(env.socketState.opens, 0)
+    assert.equal(env.commands.length, 0)
+    assert.ok(env.intervals.some(timer => timer.delay === 2_000))
+    await env.collaboration.start(env.game, env.handlers, env.initial)
+    await settle()
+    assert.equal(env.socketState.opens, 1)
+    assert.ok(!env.intervals.some(timer => timer.delay === 2_000))
+  } finally { env.collaboration.stop() }
+})
 
 test('idle input keeps its socket alive through heartbeats without ACT writes', async () => {
   const env = collaborationEnvironment()
