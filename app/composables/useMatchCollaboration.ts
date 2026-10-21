@@ -352,15 +352,19 @@ export function useMatchCollaboration() {
     await $authReady
     if (current !== session || !$auth.currentUser || !game.matchId) return false
     stopped = false
+    // Viewing a lobby uses its compact bootstrap and version checks, never a
+    // full Draft read, a missing-RAW probe, or an outbox subscription.
+    if (handlers.readOnly) return true
     // Fix the target at start. The shared game object can later hold another
     // match; this session must keep reading only the Draft it was started for.
     const gmId = game.matchId
     const side = sideFor(game)
     // Only durable commands are pending. A device checkpoint must never make
     // already saved rows immune to legitimate remote edits/deletions.
-    const queued = handlers.readOnly ? [] : await liveRoom.pending(gmId, side)
+    const queued = await liveRoom.pending(gmId, side)
     if (current !== session || stopped) return false
     function restorePendingCommands(commands: typeof queued) {
+      if (!commands.length) return
       for (const command of commands) {
         if (initial && command.request.roomEpoch != null && command.request.roomEpoch !== (initial.roomEpoch || 0)) continue
         const body = command.request
@@ -550,6 +554,7 @@ export function useMatchCollaboration() {
         recoveryTimer = undefined
         if (response.status === 'missing') {
           void liveRoom.seed(gmId, side, response)
+          if (game.halfStatus === 'ready') return
           // Final promotion deletes the Draft. Check final RAW once so an
           // assistant that polls just after deletion still leaves this screen.
           try {
@@ -707,12 +712,6 @@ export function useMatchCollaboration() {
     // legacy callers still establish the boundary through poll().
     const hasInitialDraft = Boolean(initial && initial.status === 'ok')
     if (initial) applyDraftResponse(initial)
-    if (handlers.readOnly) {
-      await poll()
-      if (current !== session || stopped) return false
-      followParticipants(2)
-      return true
-    }
     const attached = await liveRoom.attach(gmId, side, (response) => {
       if (stopped || current !== session) return
       if (response.finalized) {

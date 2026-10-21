@@ -2730,6 +2730,7 @@ class JpdDidData:
 
     def build_input_bootstrap(self, gm_id: str, side: Side) -> dict[str, Any]:
         """Return the lobby-critical data in one response with parallel independent reads."""
+        lobby_versions = None
         match = self.get_match(gm_id)
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="input-bootstrap") as executor:
             squads_future = executor.submit(self._get_or_create_input_squads_snapshot, gm_id, match)
@@ -2775,8 +2776,9 @@ class JpdDidData:
         else:
             # Setup/clock is enough to paint the lobby. Do not hydrate records,
             # cards or calculate KPI before returning the initial response.
-            from backend.system.system_live_room import read_lobby_snapshot
+            from backend.system.system_live_room import read_lobby_snapshot, lobby_head_state
             heads, input_setup = read_lobby_snapshot(self, gm_id)
+            lobby_versions = {item: lobby_head_state(heads[item]) for item in ('H', 'A')}
             head = heads[side]
             payload = head.get("payload") if isinstance(head.get("payload"), dict) else {}
             shared = head.get("sharedState") if isinstance(head.get("sharedState"), dict) else {}
@@ -2811,6 +2813,7 @@ class JpdDidData:
             },
             "inputSetup": input_setup,
             "session": session,
+            **({'lobbyState': lobby_versions} if lobby_versions is not None else {}),
             "dashboardKpiHalves": bootstrap_kpi_halves,
             "dashboardKpis": dashboard_kpis,
         }

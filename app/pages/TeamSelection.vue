@@ -44,6 +44,10 @@ const dashboardKpiLoaded = reactive<Record<'all' | 'H1' | 'H2', boolean>>({
   H2: false,
 })
 let dashboardKpiTimer: ReturnType<typeof setInterval> | undefined
+let lobbyKpiRefreshTimer: ReturnType<typeof setTimeout> | undefined
+let lobbyRefreshBusy = false
+let lastLobbyVersions = ''
+const lobbySetupRevisions = { H: 0, A: 0 }
 const dashboardKpiLoading = new Set<'all' | 'H1' | 'H2'>()
 let appliedSetupFingerprint = ''
 let appliedSetupRevision = -1
@@ -140,6 +144,15 @@ type InputBootstrap = {
   session: InputBootstrapSession
   dashboardKpiHalves?: Array<'all' | 'H1' | 'H2'>
   dashboardKpis: { H: Record<'all' | 'H1' | 'H2', DashboardKpi>; A: Record<'all' | 'H1' | 'H2', DashboardKpi> }
+  lobbyState?: Record<'H' | 'A', LobbySideState>
+}
+
+type LobbySideState = {
+  revision: number
+  roomEpoch: number
+  setupRevision: number
+  closed: boolean
+  sharedState: Partial<MatchState>
 }
 
 function applyInputSetup(setup: InputSetup | null | undefined) {
@@ -178,7 +191,7 @@ function applyInputSetup(setup: InputSetup | null | undefined) {
 
 async function startLobbyCollaboration() {
   if (lobbyJoinPromise) await lobbyJoinPromise
-  if (!isCurrentLobby()) return false
+  if (!isCurrentLobby() || joinedLobbyRole === undefined) return false
   const targetMatchId = game.value.matchId
   const targetTeam = game.value.team
   const targetRole = game.value.participantRole
@@ -186,7 +199,6 @@ async function startLobbyCollaboration() {
   const isCurrentLobbySession = () => game.value.matchId === targetMatchId && game.value.team === targetTeam
 
   return startCollaboration(game.value, {
-    readOnly: joinedLobbyRole === undefined,
     resetPending: () => {
       pendingSetupFingerprint = ''
       if (formationSaveTimer) clearTimeout(formationSaveTimer)
@@ -206,7 +218,7 @@ async function startLobbyCollaboration() {
       game.value.records = records
       // The lobby has a server KPI view. Refresh it after a peer event instead
       // of waiting for its recovery timer.
-      if (!initialKpisLoading) void loadDashboardKpis(kpiHalf.value).catch(() => false)
+      if (lobbyHistoryLoaded) queueLobbyKpiRefresh()
     },
     applyCards: (cards) => {
       if (!isCurrentLobbySession()) return
@@ -236,6 +248,7 @@ function ensureLobbyParticipant(role = game.value.participantRole) {
       // Clear the in-flight join before starting so it cannot await itself.
       if (lobbyJoinPromise === join) lobbyJoinPromise = undefined
       lobbyHistoryPromise = undefined
+      lobbyHistoryLoaded = false
       await ensureLobbyHistory()
     })
     .finally(() => {
@@ -287,6 +300,7 @@ async function loadBootstrap() {
 }
 
 function applyBootstrap(payload: InputBootstrap) {
+  if (payload.lobbyState) lastLobbyVersions = lobbyVersionKey(payload.lobbyState)
   game.value.squads = { home: payload.H, away: payload.A }
   game.value.matchSnapshot = payload.matchSnapshot
   inputStatus.value = payload.inputStatus
@@ -360,6 +374,67 @@ async function loadDashboardKpis(half: 'all' | 'H1' | 'H2' = kpiHalf.value) {
   }
 }
 
+function queueLobbyKpiRefresh() {
+  if (!isCurrentLobby() || initialKpisLoading || lobbyKpiRefreshTimer) return
+  // Coalesce peer events and the two-sided version check into one refresh.
+  lobbyKpiRefreshTimer = setTimeout(() => {
+    lobbyKpiRefreshTimer = undefined
+    if (!isCurrentLobby()) return
+    if (typeof document !== 'undefined' && document.hidden) { lastLobbyVersions = ''; return }
+    void loadDashboardKpis(kpiHalf.value).catch(() => { lastLobbyVersions = '' })
+  }, 1200)
+}
+
+function lobbyVersionKey(sides: Record<'H' | 'A', LobbySideState>) {
+  return JSON.stringify((['H', 'A'] as const).map(side => {
+    const state = sides[side]
+    return [state.revision, state.roomEpoch, state.closed]
+  }))
+}
+
+async function refreshLobbyState() {
+  if (!isCurrentLobby() || initialKpisLoading || lobbyRefreshBusy || (typeof document !== 'undefined' && document.hidden)) return
+  lobbyRefreshBusy = true
+  try {
+    const response = await request<{ sides: Record<'H' | 'A', LobbySideState> }>(
+      `/api/v1/match-input/matches/${encodeURIComponent(lobbyMatchId)}/lobby-state`,
+    )
+    if (!isCurrentLobby()) return
+    const selectedSide = lobbyTeam === 'away' ? 'A' : 'H'
+    const selected = response.sides[selectedSide]
+    if (joinedLobbyRole === undefined && inputStatus.value[selectedSide].rawStatus !== 'final') {
+      // Only server-owned clock/score/lifecycle fields are returned here.
+      Object.assign(game.value, selected.sharedState)
+    }
+    for (const side of ['H', 'A'] as const) {
+      const state = response.sides[side]
+      if (state.closed) {
+        inputStatus.value[side] = { ...inputStatus.value[side], rawStatus: 'final', completed: true, lifecycleStatus: 'final' }
+      } else if (state.sharedState.halfStatus && inputStatus.value[side].rawStatus !== 'final') {
+        inputStatus.value[side].lifecycleStatus = state.sharedState.halfStatus
+      }
+    }
+    const needsSetup = (['H', 'A'] as const).some(side => response.sides[side].setupRevision > lobbySetupRevisions[side])
+    if (needsSetup) {
+      const setupResponse = await request<{ inputSetup: { H: InputSetup | null; A: InputSetup | null } }>(
+        `/api/v1/match-input/matches/${encodeURIComponent(lobbyMatchId)}/input-setup`,
+      )
+      if (!isCurrentLobby()) return
+      applySetupFieldSides(setupResponse.inputSetup)
+      applyInputSetup(setupResponse.inputSetup[selectedSide])
+    }
+    const versions = lobbyVersionKey(response.sides)
+    if (versions !== lastLobbyVersions || !dashboardKpiLoaded[kpiHalf.value]) {
+      lastLobbyVersions = versions
+      queueLobbyKpiRefresh()
+    }
+  } catch {
+    // Keep the painted setup. The next lightweight check retries recovery.
+  } finally {
+    lobbyRefreshBusy = false
+  }
+}
+
 async function loadInitialKpis() {
   const half = game.value.halfStatus.startsWith('H1') ? 'H1'
     : game.value.halfStatus.startsWith('H2') ? 'H2' : null
@@ -389,6 +464,7 @@ async function loadInitialKpis() {
 
 async function ensureLobbyHistory() {
   if (!isCurrentLobby() || inputStatus.value[lobbyTeam === 'away' ? 'A' : 'H'].rawStatus === 'final') return Promise.resolve()
+  if (joinedLobbyRole === undefined && !lobbyJoinPromise && game.value.halfStatus === 'ready') return
   if (!lobbyHistoryPromise) {
     lobbyHistoryPromise = startLobbyCollaboration().catch(error => {
       lobbyHistoryPromise = undefined
@@ -418,6 +494,7 @@ function applyOpponentFieldSideDefault(team: 'home' | 'away') {
 
 function applySetupFieldSides(setups: { H: InputSetup | null; A: InputSetup | null }) {
   for (const side of ['H', 'A'] as const) {
+    if (setups[side]) lobbySetupRevisions[side] = Math.max(lobbySetupRevisions[side], setups[side]!.revision || 0)
     const fieldSide = setups[side]?.fieldSide
     if (fieldSide === 'left' || fieldSide === 'right') inputStatus.value[side].fieldSide = fieldSide
   }
@@ -1180,13 +1257,12 @@ onMounted(async () => {
       game.value.seconds = Math.max(game.value.seconds, Math.floor((Date.now() - game.value.clockStartedAt) / 1000))
     }
   }, 250)
-  // The selected team is calculated locally for instant feedback. Refresh the
-  // server's two-sided view while either side is live so the opposite team's
-  // KPI does not remain at the value from lobby entry.
+  // Check only two compact head versions after the initial paint. Fetch KPI
+  // or setup only after a change; never scan full Drafts just for viewing.
   if (selectedState.rawStatus !== 'final') {
     dashboardKpiTimer = setInterval(() => {
-      if (!initialKpisLoading) void loadDashboardKpis(kpiHalf.value).catch(() => false)
-    }, 1200)
+      void refreshLobbyState()
+    }, 5000)
   }
 })
 
@@ -1195,6 +1271,7 @@ onUnmounted(() => {
   if (formationSaveTimer) clearTimeout(formationSaveTimer)
   if (lobbyClockTimer) clearInterval(lobbyClockTimer)
   if (dashboardKpiTimer) clearInterval(dashboardKpiTimer)
+  if (lobbyKpiRefreshTimer) clearTimeout(lobbyKpiRefreshTimer)
   stopCollaboration()
 })
 
