@@ -9,6 +9,9 @@ async function logout() {
   await navigateTo('/login')
 }
 
+// 달력 위에 표시할 로그인 계정. 짧은 ID로 가입한 계정은 내부용 이메일 꼬리를 떼고 보여준다.
+const loginAccount = ($auth.currentUser?.email || '').replace(/@jpd-did\.internal$/, '')
+
 
 
 type MatchItem = {
@@ -581,6 +584,10 @@ function onCancel() {
       <div class="body">
         <!-- LEFT: Calendar -->
         <section class="left">
+          <div v-if="loginAccount" class="loginAccount">
+            <span class="loginAccountLabel">로그인</span>
+            <span class="loginAccountId">{{ loginAccount }}</span>
+          </div>
           <div class="toolbar">
             <div class="calendarFilter" aria-label="조회 조건">
               <select v-model="selectedLeague" aria-label="리그" @change="applyLeagueFilter">
@@ -826,9 +833,15 @@ function onCancel() {
   border-right: 1px solid rgba(255,255,255,0.06);
   padding: 16px;
   display: grid;
-  grid-template-rows: 44px 24px 1fr;
+  grid-template-rows: auto 44px 24px 1fr;
   gap: 10px;
 }
+.loginAccount { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 14px; }
+.loginAccountLabel {
+  flex: none; padding: 2px 8px; border-radius: 4px;
+  background: rgba(118,215,232,.14); color: #76d7e8; font-weight: 750; font-size: 12px;
+}
+.loginAccountId { color: rgba(255,255,255,.85); font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .calendarFilter { display: flex; align-items: center; gap: 8px; }

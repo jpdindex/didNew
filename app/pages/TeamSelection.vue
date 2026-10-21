@@ -73,6 +73,8 @@ const { join: joinCollaboration, enter: enterCollaboration, start: startCollabor
 const preparedInput = usePreparedInput()
 const savedEntryFingerprint = ref('')
 const restoredSetupSaved = ref(false)
+// 서버 세팅과 저장 여부를 확인하기 전에는 이전에 남아 있던 화면을 보여주지 않는다.
+const lobbyReady = ref(false)
 let bootstrapPrimaryUid: string | null = null
 const lobbyAuth = useNuxtApp().$auth
 const lifecycleBusy = ref(false)
@@ -1248,10 +1250,20 @@ onMounted(async () => {
       if (state.lifecycleStatus) game.value.halfStatus = state.lifecycleStatus
     } catch (fallbackError) {
       if (isCurrentLobby()) lifecycleError.value = fallbackError instanceof Error ? fallbackError.message : '선수 명단을 불러오지 못했습니다.'
+      lobbyReady.value = true
       return
     }
   }
   bootstrapApplied.value = true
+  // 이미 세팅 저장으로 주 분석관이 된 경기라면, 다시 저장하지 않고 저장된 화면으로 연다.
+  // 첫 화면을 그리기 전에 판단해 저장 전 화면이 잠깐 보이지 않게 한다.
+  if (requestedRole === 'primary' && (game.value.halfStatus === 'ready' || game.value.halfStatus === 'H1_done') &&
+    canStart.value && bootstrapPrimaryUid && bootstrapPrimaryUid === lobbyAuth.currentUser?.uid) {
+    activeSlot.value = null
+    savedEntryFingerprint.value = entryFingerprint.value
+    restoredSetupSaved.value = true
+  }
+  lobbyReady.value = true
   await nextTick()
   if (!isCurrentLobby()) return
   void loadInitialKpis()
@@ -1275,15 +1287,8 @@ onMounted(async () => {
   // 현재 팀에 저장된 세션이 없는 신규 입력이라면, 이미 RAW가 있는 상대 팀의
   // 진영을 기준으로 자동 반대 진영을 지정한다. 저장된 세션의 값은 절대 덮지 않는다.
   if (!recovered && game.value.halfStatus === 'ready') applyOpponentFieldSideDefault(game.value.team)
-  if (game.value.halfStatus === 'ready' && game.value.formationKey && !activeSlot.value) {
+  if (game.value.halfStatus === 'ready' && game.value.formationKey && !activeSlot.value && !setupSaved.value) {
     activeSlot.value = firstEmptyLineupSlot()
-  }
-  // 이미 세팅 저장으로 주 분석관이 된 경기라면, 다시 저장하지 않고 저장된 화면으로 연다.
-  if (requestedRole === 'primary' && (game.value.halfStatus === 'ready' || game.value.halfStatus === 'H1_done') &&
-    canStart.value && bootstrapPrimaryUid && bootstrapPrimaryUid === lobbyAuth.currentUser?.uid) {
-    activeSlot.value = null
-    savedEntryFingerprint.value = entryFingerprint.value
-    restoredSetupSaved.value = true
   }
   lobbyClockTimer = setInterval(() => {
     if ((game.value.halfStatus === 'H1' || game.value.halfStatus === 'H2') && game.value.clockStartedAt) {
@@ -1721,7 +1726,11 @@ function undoSub(index: number) {
 <template>
   <div class="page">
     <div class="bg" />
-    <button type="button" class="topBack" @click="returnTo('/schedule')">← 경기 선택</button>
+    <button type="button" class="topBack" :class="{ overLoading: !lobbyReady }" @click="returnTo('/schedule')">← 경기 선택</button>
+    <div v-if="!lobbyReady" class="lobbyLoading" role="status" aria-live="polite">
+      <span class="lobbySpinner" />
+      <span>경기 정보를 불러오는 중…</span>
+    </div>
     <div class="frame">
       <aside class="sidebar">
         <div class="sidebarFixed">
@@ -2166,6 +2175,43 @@ button {
   position: absolute;
   inset: 0;
   background: radial-gradient(1200px 500px at 50% 25%, rgba(255, 255, 255, .08), transparent 60%), radial-gradient(900px 400px at 20% 70%, rgba(111, 159, 186, .09), transparent 55%), radial-gradient(900px 400px at 80% 70%, rgba(241, 180, 0, .08), transparent 55%), linear-gradient(180deg, rgba(0, 0, 0, .04), rgba(0, 0, 0, .12))
+}
+
+.lobbyLoading {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  /* 화면 위에 반투명으로 덮어 뒤 화면은 보이되 누를 수는 없게 한다. */
+  background: rgba(24, 25, 28, .62);
+  backdrop-filter: blur(1.5px);
+  color: rgba(255, 255, 255, .86);
+  font-size: 15px;
+  font-weight: 700
+}
+
+.lobbySpinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid rgba(255, 255, 255, .15);
+  border-top-color: #f0b429;
+  border-radius: 50%;
+  animation: lobbySpin .8s linear infinite
+}
+
+@keyframes lobbySpin {
+  to {
+    transform: rotate(360deg)
+  }
+}
+
+/* 로딩이 길어져도 일정 화면으로 나갈 수 있게 로딩 화면 위에 둔다. */
+.topBack.overLoading {
+  z-index: 41
 }
 
 .topBack {
