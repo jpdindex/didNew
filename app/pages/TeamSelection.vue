@@ -30,7 +30,7 @@ const match = computed(() => ({
   stadium: String(route.query.stadium ?? '') || 'Fubol de Vallecas',
   home: String(route.query.home ?? '') || 'Vallecano', away: String(route.query.away ?? '') || 'Real Madrid',
 }))
-const kpis = ['TAP', 'DAP', 'DTP', 'Shoot', 'Goal', 'SSR', 'BAP', 'ASR']
+const kpis = ['TAP', 'DAP', 'DTP', 'Shoot', 'Goal', 'SSR', 'ASR', 'BAP']
 const kpiHalf = ref<'all' | 'H1' | 'H2'>('all')
 type DashboardKpi = Record<(typeof kpis)[number], number>
 const emptyDashboardKpi = (): DashboardKpi => ({ TAP: 0, DAP: 0, DTP: 0, Shoot: 0, Goal: 0, SSR: 0, BAP: 0, ASR: 0 })
@@ -1511,6 +1511,39 @@ const kpiErrors = computed(() => {
 
   return { eTime: timeList.length, ePlayer: playerList.length, timeList, playerList }
 })
+// KPI 표의 DTP/Shoot/Goal 행을 누르면 DTP 루트·슈팅(S/H/R)·골(결과 GOAL) 기록 시간을 펼쳐 보여준다.
+// 이 기기에서 입력 중인 팀 기록 기준이다.
+const KPI_DETAIL_KEYS = ['DTP', 'Shoot', 'Goal'] as const
+type KpiDetailKey = (typeof KPI_DETAIL_KEYS)[number]
+const kpiDetailOpen = ref<KpiDetailKey | null>(null)
+const kpiDetailTimes = computed(() => {
+  const kind = kpiDetailOpen.value
+  if (!kind) return []
+  if (kind === 'DTP') {
+    // DTP 는 루트 단위라, 루트가 DTP 로 확정되는 마지막 기록(슈팅)의 시간을 보여준다.
+    const byId = new Map(game.value.records.map(record => [record.id, record]))
+    return currentPreview.value.paths
+      .filter(path => path.type === 'DTP')
+      .map(path => byId.get(path.recordIds[path.recordIds.length - 1] ?? ''))
+      .filter((record): record is NonNullable<typeof record> => !!record)
+      .sort((a, b) => ((a.half ?? 'H1') === (b.half ?? 'H1') ? a.seconds - b.seconds : (a.half ?? 'H1') === 'H1' ? -1 : 1))
+      .map(record => ({ half: record.half ?? 'H1', time: fmtErrTime(record.seconds) }))
+  }
+  const halves = kpiHalf.value === 'all' ? (['H1', 'H2'] as const) : [kpiHalf.value]
+  return halves.flatMap(halfKey => game.value.records
+    .filter(record => (record.half ?? 'H1') === halfKey && (kind === 'Goal'
+      ? record.res === 'GOAL'
+      : record.act === 'S' || record.act === 'H' || record.act === 'R'))
+    .sort((a, b) => a.seconds - b.seconds)
+    .map(record => ({ half: halfKey, time: fmtErrTime(record.seconds) })))
+})
+function isKpiDetailKey(key: string): key is KpiDetailKey {
+  return (KPI_DETAIL_KEYS as readonly string[]).includes(key)
+}
+function toggleKpiDetail(key: string) {
+  if (!isKpiDetailKey(key)) return
+  kpiDetailOpen.value = kpiDetailOpen.value === key ? null : key
+}
 // 사이드바에서 E-Time/E-Player 행을 누르면 오류난 시간대/No.를 펼쳐 보여준다.
 const errorDetailOpen = ref<'time' | 'player' | null>(null)
 function toggleErrorDetail(kind: 'time' | 'player') {
@@ -1776,36 +1809,48 @@ function undoSub(index: number) {
       <aside class="sidebar">
         <div class="sidebarFixed">
           <div class="matchDate">{{ match.date.replaceAll('-', '.') }}</div>
-          <div class="teamPick">입력할 팀 선택</div>
+          <!-- 날짜 아래에 경기 시간·리그·라운드와 경기장을 모아 보여준다 -->
+          <div class="teamPick">{{ match.time }} · {{ match.league }} · {{ match.round }}</div>
+          <div class="teamPick teamPickStadium">{{ match.stadium }}</div>
           <div class="teams">
             <button class="club" :class="{ active: game.team === 'home' }"
               :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('home')">
               <div class="crest homeCrest">V</div><span>{{ match.home }}</span>
             </button>
-            <span class="versus">VS</span>
+            <!-- 가운데 VS 자리에 스코어와 경기 상태(전반 종료 등)를 둔다 -->
+            <div class="versus">
+              <div class="score">{{ game.homeScore }} : {{ game.awayScore }}</div>
+              <div class="status">{{ statusLabel }}</div>
+            </div>
             <button class="club" :class="{ active: game.team === 'away' }"
               :disabled="!canSwitchInputTeam || lifecycleBusy" @click="pickTeam('away')">
               <div class="crest awayCrest">RM</div><span>{{ match.away }}</span>
             </button>
           </div>
-          <div class="score">{{ game.homeScore }} : {{ game.awayScore }}</div>
-          <div class="status">{{ statusLabel }}</div>
-          <div class="matchMeta">{{ match.time }} | {{ match.league }} | {{ match.round }}</div>
-          <div class="stadium">{{ match.stadium }}</div>
           <div class="kpiHalfToggle">
             <button :class="{ active: kpiHalf === 'all' }" @click="kpiHalf = 'all'">전체</button>
             <button :class="{ active: kpiHalf === 'H1' }" @click="kpiHalf = 'H1'">전반</button>
             <button :class="{ active: kpiHalf === 'H2' }" @click="kpiHalf = 'H2'">후반</button>
           </div>
           <div class="kpis">
-            <div v-for="key in kpis" :key="key" class="kpiRow">
-              <span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.H[key] : 0 }}</span><b>{{ key }}</b><span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.A[key] : 0 }}</span>
-            </div>
+            <template v-for="key in kpis" :key="key">
+              <div class="kpiRow" :class="{ clickable: isKpiDetailKey(key), open: kpiDetailOpen === key }"
+                @click="toggleKpiDetail(key)">
+                <span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.H[key] : 0 }}</span><b>{{ key }}<i v-if="isKpiDetailKey(key)" class="toggleArrow" :class="{ open: kpiDetailOpen === key }">▾</i></b><span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.A[key] : 0 }}</span>
+              </div>
+              <div v-if="kpiDetailOpen === key" class="errDetail shotDetail">
+                <div v-if="kpiDetailTimes.length" class="errDetailGrid">
+                  <span v-for="(g, i) in kpiDetailTimes" :key="i" class="errDetailItem">{{ g.half }} {{ g.time }}{{ i <
+                    kpiDetailTimes.length - 1 ? ',' : '' }}</span>
+                </div>
+                <span v-else class="errDetailEmpty">{{ key === 'Goal' ? '골 기록 없음' : key === 'DTP' ? 'DTP 기록 없음' : '슈팅 기록 없음' }}</span>
+              </div>
+            </template>
           </div>
         </div>
         <div class="kpiErrors">
           <div class="errRow" :class="{ has: kpiErrors.eTime > 0, open: errorDetailOpen === 'time' }"
-            @click="toggleErrorDetail('time')"><span>E-Time</span><b>{{ kpiErrors.eTime }}개</b></div>
+            @click="toggleErrorDetail('time')"><span>Error-Time<i class="toggleArrow" :class="{ open: errorDetailOpen === 'time' }">▾</i></span><b>{{ kpiErrors.eTime }}개</b></div>
           <div v-if="errorDetailOpen === 'time'" class="errDetail">
             <div v-if="kpiErrors.timeList.length" class="errDetailGrid">
               <span v-for="(g, i) in kpiErrors.timeList" :key="i" class="errDetailItem">{{ g.half }} {{ g.time }}{{ i <
@@ -1814,7 +1859,7 @@ function undoSub(index: number) {
             <span v-else class="errDetailEmpty">중복된 시간 없음</span>
           </div>
           <div class="errRow" :class="{ has: kpiErrors.ePlayer > 0, open: errorDetailOpen === 'player' }"
-            @click="toggleErrorDetail('player')"><span>E-Player</span><b>{{ kpiErrors.ePlayer }}개</b></div>
+            @click="toggleErrorDetail('player')"><span>Error-Player<i class="toggleArrow" :class="{ open: errorDetailOpen === 'player' }">▾</i></span><b>{{ kpiErrors.ePlayer }}개</b></div>
           <div v-if="errorDetailOpen === 'player'" class="errDetail">
             <div v-if="kpiErrors.playerList.length" class="errDetailGrid">
               <span v-for="(p, i) in kpiErrors.playerList" :key="i" class="errDetailItem">{{ p.half }} {{ p.time }}{{ i
@@ -2309,6 +2354,11 @@ button {
   min-height: 0
 }
 
+/* 분석관 등급·역할·저장 상태는 남는 공간 아래, 사이드바 맨 아래에 붙인다 */
+.sidebarFooter {
+  margin-top: auto
+}
+
 .sidebarRoomStatus {
   margin-top: 6px;
   max-height: 96px;
@@ -2341,10 +2391,15 @@ button {
   color: rgba(255, 255, 255, .7)
 }
 
+.teamPickStadium {
+  margin-top: 2px
+}
+
 .teams {
   height: 92px;
   display: grid;
-  grid-template-columns: 1fr 22px 1fr;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 6px;
   align-items: center;
   border-bottom: 1px solid rgba(255, 255, 255, .08)
 }
@@ -2362,6 +2417,9 @@ button {
   border: 1px solid transparent;
   border-radius: 6px;
   padding: 6px 4px;
+  /* 선택 테두리가 칸 끝까지 꽉 차 보이지 않게 가로만 살짝 줄인다 */
+  width: 88%;
+  justify-self: center;
   cursor: pointer
 }
 
@@ -2398,20 +2456,14 @@ button {
 }
 
 .versus {
-  width: 21px;
-  height: 21px;
   display: grid;
-  place-items: center;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, .9);
-  color: #222;
-  font-size: 8px;
-  font-weight: 900
+  justify-items: center;
+  gap: 2px
 }
 
 .score {
-  margin-top: 12px;
   text-align: center;
+  white-space: nowrap;
   font-size: 20px;
   line-height: 24px;
   font-weight: 900;
@@ -2421,20 +2473,9 @@ button {
 .status {
   color: rgba(241, 180, 0, .95);
   text-align: center;
+  white-space: nowrap;
   font-size: 12px;
   font-weight: 800
-}
-
-.matchMeta,
-.stadium {
-  margin-top: 8px;
-  text-align: center;
-  color: rgba(255, 255, 255, .45);
-  font-size: 11px
-}
-
-.stadium {
-  margin-top: 2px
 }
 
 .kpiHalfToggle {
@@ -2445,13 +2486,13 @@ button {
 }
 
 .kpiHalfToggle button {
-  height: 22px;
+  height: 26px;
   border-radius: 4px;
   border: 1px solid rgba(255, 255, 255, .1);
   background: rgba(255, 255, 255, .03);
   color: rgba(255, 255, 255, .55);
   cursor: pointer;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: .03em
 }
@@ -2469,7 +2510,7 @@ button {
 }
 
 .kpiRow {
-  height: 32px;
+  height: 35px;
   display: grid;
   grid-template-columns: 1fr 1.15fr 1fr;
   place-items: center;
@@ -2477,28 +2518,63 @@ button {
   border: 1px solid rgba(255, 255, 255, .07);
   border-radius: 4px;
   color: rgba(255, 255, 255, .7);
-  font-size: 14px
+  font-size: 15px
+}
+
+.kpiRow.clickable {
+  cursor: pointer
+}
+
+.kpiRow.open {
+  border-color: rgba(240, 180, 41, .5)
+}
+
+.shotDetail {
+  margin: 0
+}
+
+/* 눌러서 시간 목록을 펼칠 수 있는 줄(DTP/Shoot/Goal, Error-Time/Player) 이름 옆 표시. 열리면 뒤집는다
+   이름 글자 폭에 끼지 않게 오른쪽 바깥에 띄워, 이름이 다른 줄과 같은 가운데 정렬을 유지하게 한다. */
+.kpiRow b,
+.errRow span {
+  position: relative
+}
+
+.toggleArrow {
+  position: absolute;
+  left: calc(100% + 5px);
+  top: 50%;
+  transform: translateY(-50%);
+  font-style: normal;
+  font-size: 15px;
+  line-height: 1;
+  opacity: .85
+}
+
+/* ▴ 글자는 폰트마다 ▾ 와 크기가 달라 보여, 같은 ▾ 를 뒤집어서 쓴다 */
+.toggleArrow.open {
+  transform: translateY(-50%) rotate(180deg)
 }
 
 .kpiRow b {
-  font-size: 13px;
+  font-size: 14px;
   letter-spacing: .04em;
   color: rgba(255, 255, 255, .55)
 }
 
 .kpiErrors {
-  margin-top: 6px;
+  margin-top: 18px;
   display: flex;
   flex: 0 1 auto;
   flex-direction: column;
   min-height: 0;
-  gap: 4px;
+  gap: 6px;
   overflow: hidden
 }
 
 .errRow {
-  flex: 0 0 26px;
-  height: 26px;
+  flex: 0 0 30px;
+  height: 30px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2507,13 +2583,13 @@ button {
   border: 1px solid rgba(255, 255, 255, .07);
   border-radius: 4px;
   color: rgba(255, 255, 255, .45);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   cursor: pointer
 }
 
 .errRow b {
-  font-size: 12px;
+  font-size: 13px;
   color: rgba(255, 255, 255, .45)
 }
 
@@ -2535,7 +2611,7 @@ button {
   flex: 0 1 auto;
   min-height: 0;
   margin: -2px 0 2px;
-  padding: 4px 8px;
+  padding: 6px 10px;
   max-height: 118px;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -2555,12 +2631,12 @@ button {
 
 .errDetailGrid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 2px 4px
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px 6px
 }
 
 .errDetailItem {
-  font-size: 10px;
+  font-size: 13px;
   color: rgba(255, 255, 255, .6);
   white-space: nowrap;
   overflow: hidden;
@@ -2569,7 +2645,7 @@ button {
 
 .errDetailEmpty {
   display: block;
-  font-size: 10px;
+  font-size: 13px;
   color: rgba(255, 255, 255, .3);
   text-align: center;
   padding: 2px 0

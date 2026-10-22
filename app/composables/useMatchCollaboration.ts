@@ -810,6 +810,7 @@ export function useMatchCollaboration() {
     deletedRecordIds: string[] = [],
     clearedRecordPlayerIds: string[] = [],
     changedRecords?: DidRecord[],
+    scoreOnly = false,
   ) {
     const { $auth } = useNuxtApp()
     if (!$auth.currentUser || !game.matchId) return false
@@ -871,7 +872,7 @@ export function useMatchCollaboration() {
     } else payload.cards = []
     return await liveRoom.submit(payload.gmId, payload.side, 'draft', {
       payload, clientState, syncScope, deletedRecordIds, deletedCardIds, clearedRecordPlayerIds,
-    })
+    }, { scoreOnly: scoreOnly && syncScope !== 'records' && syncScope !== 'cards' })
   }
 
   async function syncState(game: MatchState) {
@@ -886,13 +887,17 @@ export function useMatchCollaboration() {
     return await sync(game, 'records')
   }
 
-  async function syncStateRecords(game: MatchState, records: DidRecord[], clearedRecordPlayerIds: string[] = [], includeState = true) {
-    if (!records.length && !clearedRecordPlayerIds.length) return includeState ? await syncState(game) : true
-    return await sync(game, includeState && game.lifecycleControl ? 'state_records' : 'records', [], clearedRecordPlayerIds, records)
+  // includeState === 'score': 수정 화면처럼 시계·반 상태는 건드리지 않고 점수만 같이 보낸다.
+  // 서버가 점수만 합치므로 주 분석관이 아니어도(보조 분석관·매니저) 보낸다.
+  async function syncStateRecords(game: MatchState, records: DidRecord[], clearedRecordPlayerIds: string[] = [], includeState: boolean | 'score' = true) {
+    if (!records.length && !clearedRecordPlayerIds.length) return includeState === true ? await syncState(game) : true
+    return await sync(game, includeState === 'score' || (includeState && game.lifecycleControl) ? 'state_records' : 'records', [],
+      clearedRecordPlayerIds, records, includeState === 'score')
   }
 
-  async function removeRecord(game: MatchState, recordId: string, includeState = false) {
-    return await sync(game, includeState && game.lifecycleControl ? 'state_records' : 'records', [recordId])
+  async function removeRecord(game: MatchState, recordId: string, includeState: boolean | 'score' = false) {
+    return await sync(game, includeState === 'score' || (includeState && game.lifecycleControl) ? 'state_records' : 'records',
+      [recordId], [], undefined, includeState === 'score')
   }
 
   async function syncCards(game: MatchState) {

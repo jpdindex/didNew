@@ -890,3 +890,27 @@ def test_lobby_setup_snapshot_retries_with_a_fresh_consistent_revision(sdk_data,
     assert setups['H']['fieldSide'] == 'right'
     assert rpc.transaction_modes == ['read_only', 'read_only']
     assert not any(path.endswith(('/records', '/cards')) for path in rpc.queries)
+
+
+def _score_command(key, home, away, *, status='H1', seconds=99, base=0):
+    body = payload([record('goal')])
+    body.update(homeScore=home, awayScore=away, status=status, halves={'H1': {'seconds': seconds}, 'H2': {'seconds': 0}})
+    return DraftWriteRequest(commandId=key, baseRevision=base, roomEpoch=0, payload=body,
+        clientState={'seconds': seconds, 'h1Seconds': seconds, 'halfStatus': status, 'homeScore': home, 'awayScore': away},
+        syncScope='state_records', scoreOnly=True)
+
+
+@pytest.mark.parametrize('uid', ['p', 'a'])
+def test_score_only_correction_changes_score_but_never_the_clock(data, uid):
+    live.execute_command(data, 'm', 'H', 'draft', DraftWriteRequest(commandId='done', baseRevision=0, roomEpoch=0,
+            payload={**payload(), 'status': 'H1_done', 'halves': {'H1': {'seconds': 2700}, 'H2': {'seconds': 0}}},
+            clientState={'seconds': 2700, 'h1Seconds': 2700, 'halfStatus': 'H1_done'}, syncScope='state'), 'p')
+    # The correction screen's own clock (H1, 99s) must not replace the finished half.
+    live.execute_command(data, 'm', 'H', 'draft', _score_command('goal', 1, 0, base=1), uid)
+    draft = data.get_input_draft('m', 'H')
+    assert (draft['sharedState']['homeScore'], draft['sharedState']['awayScore']) == (1, 0)
+    assert draft['sharedState']['halfStatus'] == 'H1_done'
+    assert draft['sharedState']['h1Seconds'] == 2700
+    assert draft['payload']['status'] == 'H1_done'
+    assert draft['status'] == 'H1_done'
+    assert draft['payload']['homeScore'] == 1

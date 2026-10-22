@@ -269,7 +269,7 @@ def _ordered_fields(previous, incoming, before, versions, stamp):
     return result, orders
 
 
-def _merge_command_order(data, store, root, current, body, kind, scope, control, revision, previous_writes):
+def _merge_command_order(data, store, root, current, body, kind, scope, control, revision, previous_writes, score_only=False):
     """Keep the existing write pipeline; replace only its conflict decision.
 
     All comparisons use documents already read by the command transaction.
@@ -320,14 +320,16 @@ def _merge_command_order(data, store, root, current, body, kind, scope, control,
 
     saved = deepcopy(store.writes[root.path][1])
     root_orders = deepcopy(current.get('_editVersions') or {})
-    if kind == 'draft' and scope in {'state', 'state_records', 'checkpoint'} and control:
+    if kind == 'draft' and scope in {'state', 'state_records', 'checkpoint'} and (control or score_only):
         old = current.get('sharedState') or {}
         wanted = saved.get('sharedState') or {}
         # These clock/lifecycle values form one coherent state, not separate
         # independently mixable timestamps and elapsed-second values.
         clock_keys = ('halfStatus', 'seconds', 'h1Seconds', 'h2Seconds', 'clockStartedAt')
-        grouped = {'clock': {key: wanted.get(key) for key in clock_keys},
-                   **{key: wanted.get(key) for key in ('homeScore', 'awayScore')}}
+        # A score-only command never proposes the clock: the stored clock stays as is.
+        score_source = body['payload'] if score_only else wanted
+        grouped = {**({} if score_only else {'clock': {key: wanted.get(key) for key in clock_keys}}),
+                   **{key: score_source.get(key) for key in ('homeScore', 'awayScore')}}
         prior = {'clock': {key: old.get(key) for key in clock_keys},
                  **{key: old.get(key) for key in ('homeScore', 'awayScore')}}
         baseline = before.get('state')
@@ -349,6 +351,9 @@ def _merge_command_order(data, store, root, current, body, kind, scope, control,
             if shared.get(key) is not None:
                 halves[half] = {**halves.get(half, {}), 'seconds': shared[key]}
         saved['payload']['halves'] = halves
+        if score_only:
+            # The pre-merge Draft write used the sender's status; keep the stored lifecycle.
+            saved['status'] = shared.get('halfStatus') or current.get('status') or saved.get('status')
     if kind == 'setup' and scope == 'setup' and saved.get('setup'):
         names = ('formationKey', 'fieldSide', 'lineup', 'inputMode')
         old = current.get('setup') or {}
@@ -378,6 +383,8 @@ def _execute_in_store(data, store, gm_id, side, kind, request, user_id, batch_ve
         body.pop('predecessorCommands', None)
     if not body.get('edit'):
         body.pop('edit', None)
+    if not body.get('scoreOnly'):
+        body.pop('scoreOnly', None)
     digest = sha256(json.dumps({'kind': kind, 'body': body}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     root = store.collection('inputDrafts').document(data._input_draft_id(gm_id, side))
@@ -391,9 +398,10 @@ def _execute_in_store(data, store, gm_id, side, kind, request, user_id, batch_ve
     control = require_draft_writer(current, user_id)
     participant = current['participants'][user_id]
     scope = body.get('syncScope', 'checkpoint' if kind == 'draft' else 'setup')
+    score_only = kind == 'draft' and bool(body.get('scoreOnly')) and scope in {'state', 'state_records'}
     if kind == 'setup' and scope == 'setup' and not control:
         raise BackendError('Only the primary analyst can change setup', status_code=403, code='primary_required')
-    if kind == 'draft' and scope in {'state', 'checkpoint'} and not control:
+    if kind == 'draft' and scope in {'state', 'checkpoint'} and not control and not score_only:
         raise BackendError('Only the primary analyst can change lifecycle', status_code=403, code='primary_required')
     payload = body['payload']
     if payload.get('recorderLevel') != participant.get('level', 'advanced'):
@@ -416,7 +424,7 @@ def _execute_in_store(data, store, gm_id, side, kind, request, user_id, batch_ve
         raise BackendError('요청의 기준 버전이 서버보다 앞섭니다.', status_code=409, code='draft_version_ahead')
     targets = []
     if kind == 'draft':
-        if scope in {'state', 'state_records', 'checkpoint'} and control:
+        if scope in {'state', 'state_records', 'checkpoint'} and (control or score_only):
             targets.append(('state', int(current.get('stateRevision') or 0), current.get('stateUpdatedBy'), current.get('stateCommandId')))
         if scope in {'records', 'state_records', 'checkpoint'}:
             ids = {str(item['id']) for item in payload['records'] if item.get('id')} | set(body.get('deletedRecordIds', []))
@@ -447,7 +455,7 @@ def _execute_in_store(data, store, gm_id, side, kind, request, user_id, batch_ve
         document = working.save_input_draft(gm_id, side, payload=payload, client_state=body['clientState'], user_id=user_id,
             sync_scope=scope, deleted_record_ids=body.get('deletedRecordIds'), deleted_card_ids=body.get('deletedCardIds'),
             cleared_record_player_ids=body.get('clearedRecordPlayerIds'), include_events=False, delta_only=True)
-        if scope in {'state', 'state_records', 'checkpoint'} and control:
+        if scope in {'state', 'state_records', 'checkpoint'} and (control or score_only):
             root.set({'stateRevision': revision + 1, 'stateUpdatedBy': user_id, 'stateCommandId': command_id}, merge=True)
     else:
         working.save_input_setup(gm_id, side, payload=payload, client_state=body['clientState'],
@@ -456,7 +464,7 @@ def _execute_in_store(data, store, gm_id, side, kind, request, user_id, batch_ve
         if scope == 'setup':
             root.set({'setupCommandRevision': revision + 1, 'setupUpdatedBy': user_id, 'setupCommandId': command_id}, merge=True)
         document = root.get().to_dict()
-    acknowledged_paths = _merge_command_order(data, store, root, current, body, kind, scope, control, revision, previous_writes)
+    acknowledged_paths = _merge_command_order(data, store, root, current, body, kind, scope, control, revision, previous_writes, score_only)
     changed_writes = {path: item for path, item in store.writes.items() if path in acknowledged_paths or path not in previous_writes or item[1] != previous_writes[path][1]}
     for path, (reference, values) in list(changed_writes.items()):
         if path.rsplit('/', 2)[-2] in {'records', 'cards', 'substitutions'}:
@@ -479,7 +487,7 @@ def _execute_in_store(data, store, gm_id, side, kind, request, user_id, batch_ve
         setup = working._normalise_input_setup(saved_root.get('setup'))
         if setup:
             event['setup'] = {key: value for key, value in setup.items() if key != 'subs'}
-    if kind == 'draft' and scope in {'state', 'state_records', 'checkpoint'} and control:
+    if kind == 'draft' and scope in {'state', 'state_records', 'checkpoint'} and (control or score_only):
         event['sharedState'] = saved_root.get('sharedState') or {}
     receipt = {'commandId': command_id, 'savedRevision': revision + 1, 'uid': user_id, 'digest': digest,
                'savedAt': utc_now(), 'event': event, 'roomEpoch': event['roomEpoch']}

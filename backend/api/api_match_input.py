@@ -182,6 +182,10 @@ class DraftWriteRequest(BaseModel):
     deletedRecordIds: list[str] = Field(default_factory=list)
     deletedCardIds: list[str] = Field(default_factory=list)
     clearedRecordPlayerIds: list[str] = Field(default_factory=list)
+    # A finished-half correction changes goals without touching the clock or
+    # lifecycle. Its `state` part then carries only homeScore/awayScore, which
+    # every participant (primary, assistant, manager) may write.
+    scoreOnly: bool = False
 
 
 class InputSetupWriteRequest(BaseModel):

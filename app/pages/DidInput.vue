@@ -461,7 +461,6 @@ onUnmounted(() => {
   if (timer) clearInterval(timer)
   if (flashTimer) clearTimeout(flashTimer)
   if (draftSaveTimer) clearTimeout(draftSaveTimer)
-  for (const t of editedTimers.values()) clearTimeout(t)
   stopCollaboration()
 })
 
@@ -602,10 +601,11 @@ function queueDraftSave(shared = true) {
     for (const [id, fingerprint] of sentFingerprints) recordSavesInFlight.set(id, fingerprint)
     // Ordinary ACTs do not carry clock/lifecycle. A local goal/result change
     // still saves its derived score atomically with the affected record.
-    const sendScore = sharedScoreDirty && !isEditMode
+    // 수정 화면은 시계·반 상태를 보내면 안 되므로 점수만 보낸다('score').
+    const sendScore = sharedScoreDirty
     const sentScoreRevision = scoreEditRevision
     saveToStore()
-    const save = syncStateRecords(game.value, changedRecords, clearedPlayerIds, sendScore)
+    const save = syncStateRecords(game.value, changedRecords, clearedPlayerIds, sendScore && isEditMode ? 'score' : sendScore)
     void save.then((ok) => {
       if (!ok) return
       if (sendScore && scoreEditRevision === sentScoreRevision) sharedScoreDirty = false
@@ -735,6 +735,8 @@ const rows = computed(() => {
       // 자책골(OWN)은 TAP·DAP 집계에서 빠지지만, 지정을 고치거나 지울 수 있게 선수 버튼은 남긴다.
       isDap: (flags.get(r.id)?.isDap ?? false) || r.playerId === 'OWN',
       playerName: r.playerId === 'OWN' ? 'OWN' : squad.value.find(p => p.playerId === r.playerId)?.name ?? '',
+      // 한 번이라도 수정된 기록은 No 옆에 점으로 계속 표시한다(이 브라우저에 남긴 id 기준).
+      edited: editedIds.value.has(r.id),
       draft: false,
     }))
   // 위치만 찍고 아직 액트를 안 고른 상태 — 확정 레코드가 아니라 표시 전용 "가안" 행이다.
@@ -751,7 +753,7 @@ const rows = computed(() => {
     list.splice(at, 0, {
       id: '__draft__', no: at + 1, time: fmtTime(draftSeconds.value),
       act: '', result: '', area: areaFromPos(pendingPos.value),
-      isDap: false, playerName: '', draft: true,
+      isDap: false, playerName: '', edited: false, draft: true,
     })
     for (let i = at + 1; i < list.length; i++) list[i]!.no = i + 1
   }
@@ -791,21 +793,26 @@ function tapRangeRow(id: string) {
   if (!rangeStartId.value || rangeEndId.value) { rangeStartId.value = id; rangeEndId.value = null }
   else rangeEndId.value = id
 }
-// 수정된 기록은 10초 동안만 초록색으로 표시하고 다시 기본색으로 돌린다.
-// 저장되는 edited 플래그와 별개로 이 화면에서만 쓰는 표시 상태라, 다시 불러온 기록은 초록색이 아니다.
-const EDITED_HIGHLIGHT_MS = 10_000
-const editedTimers = new Map<string, ReturnType<typeof setTimeout>>()
-const recentlyEditedIds = reactive(new Set<string>())
+// 수정된 기록은 기록표 No 옆에 청록색 점을 계속 표시한다. 서버에는 저장하지 않고 이 브라우저에만
+// 경기·팀별로 id 를 남긴다 — 레코드의 edited 필드는 서버 동기화로 레코드가 다시 들어오면 빠지기 때문이다.
+const editedIds = ref(new Set<string>())
+const editedStorageKey = computed(() => `cid-edited:${previewScope.value}`)
+watch(editedStorageKey, key => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || '[]')
+    editedIds.value = new Set(Array.isArray(saved) ? saved.map(String) : [])
+  } catch {
+    editedIds.value = new Set()
+  }
+}, { immediate: true })
 function markEdited(rec: { id: string; edited?: boolean }) {
   rec.edited = true
   markRecordDirty(rec.id)
-  recentlyEditedIds.add(rec.id)
-  const prev = editedTimers.get(rec.id)
-  if (prev) clearTimeout(prev)
-  editedTimers.set(rec.id, setTimeout(() => {
-    editedTimers.delete(rec.id)
-    recentlyEditedIds.delete(rec.id)
-  }, EDITED_HIGHLIGHT_MS))
+  if (editedIds.value.has(rec.id)) return
+  editedIds.value = new Set(editedIds.value).add(rec.id)
+  try {
+    localStorage.setItem(editedStorageKey.value, JSON.stringify([...editedIds.value]))
+  } catch { /* 저장 공간을 못 쓰면 이 화면에서만 표시한다 */ }
 }
 function openRangeEdit() { if (rangeIndices.value) { rangeDelta.value = 0; rangeEditingOpen.value = true } }
 function stepRangeDelta(delta: number) { rangeDelta.value += delta }
@@ -829,16 +836,10 @@ function deleteRangeRecords() {
   syncOwnScore()
   saveToStore()
   game.value.records = records.value
-  for (const id of ids) {
-    const timer = editedTimers.get(id)
-    if (timer) clearTimeout(timer)
-    editedTimers.delete(id)
-    recentlyEditedIds.delete(id)
-  }
   if (peekId.value && ids.has(peekId.value)) peekId.value = null
   if (playerPickFor.value && ids.has(playerPickFor.value)) playerPickFor.value = null
   if (pendingShot.value && ids.has(pendingShot.value.id)) pendingShot.value = null
-  void Promise.all([...ids].map(id => removeRecord(game.value, id, deletesGoal && !isEditMode))).catch(() => false)
+  void Promise.all([...ids].map(id => removeRecord(game.value, id, deletesGoal && (isEditMode ? 'score' : true)))).catch(() => false)
   toggleRangeMode()
 }
 
@@ -1021,6 +1022,23 @@ function stepEditMinute(delta: number) {
 function stepEditSecond(delta: number) {
   editSeconds.value = Math.max(0, editSeconds.value + delta)
 }
+// 기록표의 수정 중인 줄에 "적용하면 이렇게 바뀐다"를 미리 보여준다. applyEdit() 와 같은 규칙으로
+// act/res/area 만 계산하고 실제 레코드는 건드리지 않는다.
+const editPreview = computed(() => {
+  const rec = records.value.find(r => r.id === editingId.value)
+  if (!rec) return null
+  let act: string = editAct.value
+  let res: string = rec.res
+  if (editResClearable.value && !editRes.value && (res === 'X' || res === 'B')) res = 'O'
+  else if (editRes.value && (res === 'X' || res === 'B')) res = editRes.value
+  if (editActConvertible.value && editAct.value && !editRes.value && (res === 'X' || res === 'B')) res = 'O'
+  if (editResConvertible.value && editRes.value) {
+    act = ''
+    res = editRes.value
+  }
+  const area = editPos.value ? areaFromPos(editPos.value) : String(rec.area)
+  return { act, result: res, area }
+})
 function applyEdit() {
   const rec = records.value.find(r => r.id === editingId.value)
   if (rec) {
@@ -1049,6 +1067,12 @@ function applyEdit() {
     if (editActConvertible.value && editAct.value && !editRes.value) {
       if (rec.res === 'X' || rec.res === 'B') rec.res = 'O'
       rec.isShot = editAct.value === 'S' || editAct.value === 'H' || editAct.value === 'R'
+      // 이 X/B 로 마감됐던 바로 위 짝 액트(예: P|B)는 결과가 사라졌으니, 삭제할 때와 같이 진행중('O')으로 되돌린다.
+      const paired = records.value.find(r => r.id === editPairedId.value)
+      if (paired && paired.act && (paired.res === 'X' || paired.res === 'B')) {
+        paired.res = 'O'
+        markEdited(paired)
+      }
     }
     // 액트 레코드를 X/B 로 바꾸면 짝 레코드를 만들지 않고, 이 레코드 자체를 액트 없는
     // X/B 단독 레코드로 바꾼다. 슛이었다면 골대 좌표·슛 표시도 같이 지운다.
@@ -1081,7 +1105,7 @@ function applyEdit() {
     }
     game.value.records = records.value
     // 시간을 앞으로 당기면 그 줄은 위쪽(화면 밖)으로 옮겨가서 사라진 것처럼 보인다.
-    // 옮겨간 자리로 표를 스크롤해 바로 확인할 수 있게 한다(초록 표시와 함께 보인다).
+    // 옮겨간 자리로 표를 스크롤해 바로 확인할 수 있게 한다(No 옆 청록색 점과 함께 보인다).
     scrollRowIntoView(rec.id)
   }
   editingId.value = null
@@ -1114,7 +1138,7 @@ function deleteEdit() {
   records.value = records.value.filter(r => r.id !== deletedId)
   syncOwnScore()
   saveToStore()
-  void removeRecord(game.value, deletedId, deleted?.res === 'GOAL' && !isEditMode).catch(() => false)
+  void removeRecord(game.value, deletedId, deleted?.res === 'GOAL' && (isEditMode ? 'score' : true)).catch(() => false)
   editingId.value = null
 }
 function cancelEdit() {
@@ -1579,6 +1603,22 @@ const canSubmitSub = computed(() => subOutSlot.value !== null && subInSlot.value
 // 교체 기록을 "수정" 중이면 그 인덱스를 들고 있는다 — null 이면 새 교체를 추가하는 중.
 // 수정 중에도 game.subs 에서 지우지 않아서 목록에 계속 보인다.
 const editingSubIndex = ref<number | null>(null)
+
+// 수정 중에는 ⇄ 버튼 자리에 적용 버튼이 있어서, 적용을 연달아 누르면 수정이 닫히자마자 나타난
+// ⇄ 버튼까지 눌린다. 수정(기록·카드·교체)이 끝난 직후 잠깐은 ⇄ 버튼 터치를 무시한다.
+const MIRROR_LOCK_MS = 800
+const mirrorLocked = ref(false)
+let mirrorLockTimer: ReturnType<typeof setTimeout> | undefined
+watch(
+  () => !!editingId.value || !!cardPlayerEditTarget.value || editingSubIndex.value !== null,
+  (editing, wasEditing) => {
+    if (editing || !wasEditing) return
+    mirrorLocked.value = true
+    clearTimeout(mirrorLockTimer)
+    mirrorLockTimer = setTimeout(() => { mirrorLocked.value = false }, MIRROR_LOCK_MS)
+  },
+)
+onBeforeUnmount(() => clearTimeout(mirrorLockTimer))
 
 /** outPlayer·inPlayer 가 지금 있는 자리를 맞바꾼다. 같은 쌍으로 두 번 부르면 원래대로 돌아온다. */
 function swapPlayers(outPlayer: string, inPlayer: string) {
@@ -2564,10 +2604,19 @@ async function finishHalf() {
             </div>
             <div class="tbody">
               <div v-for="r in rows" :key="r.id" class="trow" :data-row-id="r.id"
-                :class="{ pending: r.isDap, editing: editingId === r.id, peeking: peekId === r.id, edited: recentlyEditedIds.has(r.id), rangeSel: rangeMode && rangeSelectedIds.has(r.id), rangeAnchor: rangeMode && r.id === rangeStartId && !rangeEndId, draft: r.draft }"
+                :class="{ pending: r.isDap, editing: editingId === r.id, peeking: peekId === r.id, rangeSel: rangeMode && rangeSelectedIds.has(r.id), rangeAnchor: rangeMode && r.id === rangeStartId && !rangeEndId, draft: r.draft }"
                 @pointerdown="!r.draft && startPress(r.id, $event)" @pointerup="!r.draft && endPress(r.id, $event)"
                 @pointermove="movePress" @pointercancel="cancelPress" @lostpointercapture="cancelPress" @contextmenu.prevent>
                 <template v-if="editingId === r.id">
+                  <!-- 수정 중에도 Act/Result/Area 가 보이도록 원래 줄을 그대로 두고, 시간 조정·적용/삭제/취소는 그 아래 줄에 둔다 -->
+                  <div class="editInfoRow" @pointerdown.stop @click="cancelEdit">
+                    <span class="noCell"><i v-if="r.edited" class="editedDot" />{{ r.no }}</span><span>{{ fmtTime(editSeconds) }}</span><span>{{ editPreview?.act ?? r.act }}</span><span>{{
+                      editPreview?.result ?? r.result }}</span><span>{{ editPreview?.area ?? r.area }}</span>
+                    <span>
+                      <button v-if="editPlayerEligible" class="playerBtn" :class="{ assigned: !!r.playerName }"
+                        @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select' }}</button>
+                    </span>
+                  </div>
                   <!-- 수정 중인 행의 빈 곳을 한 번 더 누르면 취소와 같이 수정모드를 닫는다 (버튼·숫자 위는 제외) -->
                   <div class="editTimeRow" @pointerdown.stop @click.self="cancelEdit">
                     <div class="editClock" @click.self="cancelEdit">
@@ -2585,13 +2634,10 @@ async function finishHalf() {
                       <button class="editCancel editCancelInline" @mousedown.stop @touchstart.stop
                         @click.stop="cancelEdit">취소</button>
                     </div>
-                    <button v-if="editPlayerEligible" class="playerBtn editPlayerBtn"
-                      :class="{ assigned: !!r.playerName }" @pointerdown.stop
-                      @click.stop="openPlayerPick(r.id)">{{ r.playerName || 'Select' }}</button>
                   </div>
                 </template>
                 <template v-else>
-                  <span>{{ r.no }}</span><span>{{ r.time }}</span><span>{{ r.act }}</span><span>{{ r.result
+                  <span class="noCell"><i v-if="r.edited" class="editedDot" />{{ r.no }}</span><span>{{ r.time }}</span><span>{{ r.act }}</span><span>{{ r.result
                   }}</span><span>{{ r.area }}</span>
                   <span>
                     <button v-if="r.isDap" class="playerBtn" :class="{ assigned: !!r.playerName }" @pointerdown.stop
@@ -2643,10 +2689,11 @@ async function finishHalf() {
           <!-- 제목을 왼쪽에 두고 좌우 반전(⇄) 버튼은 제목 바로 오른쪽에 붙인다. -->
           <div class="titleRow">
             <h1 :class="{ editTitle: !!editingId || cardOpen || subOpen }">{{
-              subOpen ? '선수교체' : playerPickFor ? '선수선택' : 'DID-INPUT' }}</h1>
+              !subOpen && playerPickFor ? '선수선택' : '' }}</h1>
             <div v-if="!editingId && !cardPlayerEditTarget && editingSubIndex === null" ref="mirrorWrapRef"
               class="mirrorWrap">
-              <button class="mirrorIcon" :class="{ on: mirrorOpen }" @click="openMirrorPopup">⇄</button>
+              <button class="mirrorIcon" :class="{ on: mirrorOpen, locked: mirrorLocked }" :disabled="mirrorLocked"
+                @click="openMirrorPopup">⇄</button>
               <div v-if="mirrorOpen" class="mirrorPop">
                 <div class="popRow">
                   <span class="popLabel">좌우 반전</span>
@@ -2798,7 +2845,7 @@ async function finishHalf() {
 
           <template v-else-if="!cardOpen && !subOpen && !playerPickFor">
             <div class="group">
-              <div class="groupTitle">Kick</div>
+              <div class="groupTitle">CID-INPUT(Kick)</div>
               <div class="kickGrid">
                 <button v-for="a in kickActs" :key="a.k" class="actBtn kickPrimary"
                   :class="[`kick-${a.k.toLowerCase()}`, { on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k }]"
@@ -2816,7 +2863,7 @@ async function finishHalf() {
             </div>
 
             <div class="group">
-              <div class="groupTitle">Shooting</div>
+              <div class="groupTitle">CID-INPUT(Shooting)</div>
               <div class="shootGrid">
                 <button v-for="a in shootActs" :key="a.k" class="actBtn"
                   :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k }"
@@ -3963,7 +4010,9 @@ button {
   font-weight: 800;
   font-size: 13px;
   position: sticky;
-  top: 0
+  top: 0;
+  /* No 칸(.noCell)이 position:relative 라, z-index 가 없으면 스크롤된 행 번호가 헤더 위로 비친다 */
+  z-index: 2
 }
 
 .trow {
@@ -4053,8 +4102,12 @@ button {
   min-width: 0
 }
 
+.editInfoRow {
+  display: contents
+}
+
 .editClock {
-  grid-column: 1 / 5;
+  grid-column: 1 / -1;
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -4083,12 +4136,6 @@ button {
   color: #f0b429;
   font-weight: 900;
   font-size: 18px
-}
-
-.editPlayerBtn {
-  grid-column: 6;
-  justify-self: center;
-  min-width: 72px
 }
 
 .editStep {
@@ -4496,6 +4543,11 @@ button {
   font-size: 13px;
   padding: 0;
   cursor: pointer
+}
+
+.mirrorIcon.locked {
+  opacity: .35;
+  pointer-events: none
 }
 
 .mirrorIcon.on {
@@ -5096,6 +5148,7 @@ section.right h1 {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  flex: 1;
   min-height: 0;
   animation: pickGroupSlideIn .28s cubic-bezier(.22, .8, .3, 1) both
 }
@@ -5230,17 +5283,12 @@ section.right h1 {
   border-radius: 6px;
   display: flex;
   flex-direction: column;
-  /* 교체가 많아져도 잘리지 않게 남는 높이 안에서 스크롤한다(헤더는 고정) */
-  flex: 0 1 auto;
-  min-height: 232px;
-  overflow-y: auto
-}
-
-/* 수정 바가 생기면 고정 높이를 고집하지 않고 이력 영역이 남은 높이에 맞춰 줄어든다.
-   우측 패널은 overflow:hidden 이므로, 이 처리가 없으면 맨 아래 액션 버튼이 화면 밖으로 잘린다. */
-.subGroup.editingSub .subHistory {
+  /* 교체가 많아져도 잘리지 않게 남는 높이 안에서 스크롤한다(헤더는 고정).
+     고정 높이를 고집하지 않고 남은 높이에 맞춰 줄어든다 — 우측 패널은 overflow:hidden 이라
+     그러지 않으면 맨 아래 Close·목록추가 버튼이 화면 밖으로 잘린다. */
   flex: 1 1 96px;
-  min-height: 96px
+  min-height: 96px;
+  overflow-y: auto
 }
 
 .subHistHead,
@@ -5466,11 +5514,21 @@ section.right h1 {
   outline: 1px solid rgba(120, 197, 138, .8);
   outline-offset: -1px;
 }
-</style>
 
-<style scoped>
-/* 수정된 기록은 배경을 바꾸지 않고 잠시 초록색으로만 구분한다. */
-.trow.edited {
-  color: #78c58a;
+/* 수정된 기록은 배경·글자색을 바꾸지 않고 No 옆 청록색 점으로만 구분한다. */
+.trow span.noCell {
+  position: relative;
+  overflow: visible
+}
+
+.editedDot {
+  position: absolute;
+  top: 50%;
+  right: calc(50% + 1.4em);
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #2ec4b6;
+  transform: translateY(-50%)
 }
 </style>

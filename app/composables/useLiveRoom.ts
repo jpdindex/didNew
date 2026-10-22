@@ -393,9 +393,13 @@ export function useLiveRoom() {
     }
   }
 
-  async function submit(gmId: string, side: 'H' | 'A', kind: LiveCommand['kind'], body: Record<string, unknown>) {
+  async function submit(gmId: string, side: 'H' | 'A', kind: LiveCommand['kind'], body: Record<string, unknown>,
+    options: { scoreOnly?: boolean } = {}) {
     const localEditedAt = Date.now()
     const { room, key, uid } = await roomFor(gmId, side)
+    // 점수만 바꾸는 상태 전송(수정 화면): 서버는 scoreOnly 명령에서 시계·반 상태를 무시하고
+    // homeScore/awayScore 만 합친다. 이 경우엔 보조 분석관·매니저도 보낼 수 있다.
+    if (options.scoreOnly) body = { ...body, scoreOnly: true }
     const commandId = crypto.randomUUID()
     const changedAtMs = room.lastEditAt = Math.max(room.lastEditAt, localEditedAt + room.clockOffset)
     const command: LiveCommand = { commandId, key, uid, gmId, side, kind,
