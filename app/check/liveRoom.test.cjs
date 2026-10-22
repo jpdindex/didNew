@@ -110,7 +110,7 @@ function inputPageEnvironment() {
   const vue = require('vue')
   const text = fs.readFileSync(path.resolve(__dirname, '../pages/DidInput.vue'), 'utf8')
   const script = text.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
-  const timers = [], watchers = []
+  const timers = [], watchers = [], sentRecords = []
   const globals = {
     ...vue, onMounted() {}, onUnmounted() {}, onBeforeRouteLeave() {},
     watch: (...args) => { const stop = vue.watch(...args); watchers.push(stop); return stop },
@@ -122,6 +122,7 @@ function inputPageEnvironment() {
     clearTimeout: timer => { const index = timers.indexOf(timer); if (index >= 0) timers.splice(index, 1) },
     useMatchCollaboration: () => ({
       mergeRemoteRecords: remote => remote, roomStatus: vue.ref(null), markLocalRecords() {}, markLocalCards() {},
+      syncStateRecords: async (game, records) => { sentRecords.push(JSON.parse(JSON.stringify(records))); return true },
     }),
   }
   const state = load('composables/useMatchState.ts', { useState: (key, factory) => vue.ref(factory()) })
@@ -148,8 +149,157 @@ function inputPageEnvironment() {
   const api = vm.runInContext('({ clickRecord, pinHistory, followLatestRecords, openPlayerPick, openEdit, startPress, movePress, endPress, cancelPress, stepSeconds, clickPitch, clickAct, records, rows, peekId, historyPinned, anchorSeconds, clockSeconds, seconds, editingId, playerPickFor, outfieldPickAreas, pickGoalkeeper, subPickPlayers, pendingPos, isPrimary, tableEl })', context)
   const receive = text.match(/applyRecords: \(remoteRecords\) => \{([\s\S]*?)\r?\n    },\r?\n    applyCards/)[1]
   vm.runInContext(`globalThis.receiveRemoteRecords = (remoteRecords) => { const isCurrentSession = () => true; ${receive} }`, context)
-  return { ...api, game, timers, receive: context.receiveRemoteRecords, tick: vue.nextTick,
+  const shots = vm.runInContext('({ clickOuterZone, clickGoalFrame, selectOuterMiss, confirmGoalFrame, applyEdit, cancelEdit, confirmOuterPosition, cancelOuterPosition, pendingOuterResult, pendingShot, editSeconds, clearPendingEntry })', context)
+  return { ...api, ...shots, game, timers, sentRecords, receive: context.receiveRemoteRecords, tick: vue.nextTick,
+    enableSaves: () => vm.runInContext('draftReady = true', context),
     dispose: () => { api.cancelPress(); watchers.forEach(stop => stop()) } }
+}
+
+function shotPointer(x = 50, y = 20) {
+  const rect = { left: 0, top: 0, width: 100, height: 100 }
+  return { clientX: x, clientY: y, currentTarget: {
+    getBoundingClientRect: () => rect,
+    closest: () => ({ getBoundingClientRect: () => rect }),
+  } }
+}
+
+async function flushRecordSaves(env) {
+  await env.tick()
+  for (const timer of [...env.timers].filter(timer => timer.delay === 80)) {
+    env.timers.splice(env.timers.indexOf(timer), 1)
+    timer.callback()
+  }
+  await settle()
+}
+
+for (const zone of ['L', 'R', 'H']) {
+  test(`editing shot ${zone} keeps all position adjustments local until Apply`, async () => {
+    const env = inputPageEnvironment()
+    try {
+      const rec = env.records.value[0]
+      Object.assign(rec, { act: 'S', isShot: true, res: 'GOAL', shootPosX: 300, shootPosY: 150 })
+      await env.tick()
+      env.enableSaves()
+      env.openEdit(rec.id)
+      const before = JSON.stringify(rec)
+      for (const x of [10, 20, 30]) {
+        env.clickOuterZone(shotPointer(x), zone)
+        await flushRecordSaves(env)
+        assert.equal(JSON.stringify(rec), before)
+        assert.equal(env.sentRecords.length, 0)
+      }
+      const finalPoint = { ...env.pendingOuterResult.value.point }
+      env.editSeconds.value = 12
+      env.applyEdit()
+      await flushRecordSaves(env)
+      assert.equal(env.sentRecords.length, 1)
+      assert.equal(env.sentRecords[0].length, 1)
+      assert.equal(env.sentRecords[0][0].res, zone)
+      assert.equal(rec.shootPosX, finalPoint.x)
+      assert.equal(rec.shootPosY, finalPoint.y)
+      assert.equal(rec.seconds, 12)
+      assert.equal(env.editingId.value, null)
+    } finally { env.dispose() }
+  })
+
+  test(`new shot ${zone} sends no intermediate coordinates and commits only on Apply`, async () => {
+    const env = inputPageEnvironment()
+    try {
+      env.enableSaves()
+      env.clickPitch(shotPointer())
+      env.clickAct('S', true)
+      await flushRecordSaves(env)
+      const rec = env.records.value.find(rec => rec.id === env.pendingShot.value.id)
+      env.sentRecords.length = 0
+      for (const x of [10, 20, 30]) {
+        env.clickOuterZone(shotPointer(x), zone)
+        await flushRecordSaves(env)
+        assert.equal(rec.res, 'O')
+        assert.equal(rec.shootPosX, undefined)
+        assert.equal(env.sentRecords.length, 0)
+      }
+      env.confirmOuterPosition()
+      await flushRecordSaves(env)
+      assert.equal(rec.res, zone)
+      assert.equal(env.sentRecords.length, 1)
+      assert.equal(env.sentRecords[0][0].res, zone)
+      assert.equal(env.pendingShot.value, null)
+    } finally { env.dispose() }
+  })
+}
+
+test('canceling or leaving a shot discards its unconfirmed outer coordinates', async () => {
+  const env = inputPageEnvironment()
+  try {
+    const rec = env.records.value[0]
+    Object.assign(rec, { act: 'S', isShot: true, res: 'L', shootPosX: 50, shootPosY: 100 })
+    await env.tick()
+    env.enableSaves()
+    env.openEdit(rec.id)
+    const before = JSON.stringify(rec)
+    env.clickOuterZone(shotPointer(), 'H')
+    env.cancelEdit()
+    await flushRecordSaves(env)
+    assert.equal(JSON.stringify(rec), before)
+    assert.equal(env.sentRecords.length, 0)
+    env.openEdit(rec.id)
+    env.applyEdit()
+    await flushRecordSaves(env)
+    assert.equal(rec.res, 'L')
+    assert.equal(rec.shootPosX, 50)
+    env.sentRecords.length = 0
+    env.clickPitch(shotPointer())
+    env.clickAct('S', true)
+    await flushRecordSaves(env)
+    env.sentRecords.length = 0
+    env.clickOuterZone(shotPointer(), 'R')
+    env.cancelOuterPosition()
+    env.confirmOuterPosition()
+    await flushRecordSaves(env)
+    assert.equal(env.sentRecords.length, 0)
+    assert.equal(env.pendingShot.value !== null, true)
+    env.clickOuterZone(shotPointer(), 'H')
+    env.clearPendingEntry()
+    env.confirmOuterPosition()
+    await flushRecordSaves(env)
+    assert.equal(env.sentRecords.length, 0)
+  } finally { env.dispose() }
+})
+
+for (const result of ['LX', 'RX', 'HX', 'B', 'GOAL', 'X']) {
+  for (const editing of [false, true]) {
+    test(`${result} still commits immediately after an outer preview (${editing ? 'edit' : 'new'})`, async () => {
+      const env = inputPageEnvironment()
+      try {
+        let rec = env.records.value[0]
+        if (editing) {
+          Object.assign(rec, { act: 'S', isShot: true, res: 'L', shootPosX: 50, shootPosY: 100 })
+          await env.tick()
+          env.enableSaves()
+          env.openEdit(rec.id)
+        } else {
+          env.enableSaves()
+          env.clickPitch(shotPointer())
+          env.clickAct('S', true)
+          await flushRecordSaves(env)
+          rec = env.records.value.find(rec => rec.id === env.pendingShot.value.id)
+        }
+        env.sentRecords.length = 0
+        env.clickOuterZone(shotPointer(), 'H')
+        if (['LX', 'RX', 'HX'].includes(result)) env.selectOuterMiss(result)
+        else {
+          env.clickGoalFrame(shotPointer())
+          env.confirmGoalFrame(result)
+        }
+        await flushRecordSaves(env)
+        assert.equal(rec.res, result === 'B' ? 'GB' : result === 'X' ? 'GX' : result)
+        assert.equal(env.sentRecords.length, 1)
+        assert.equal(env.pendingOuterResult.value, null)
+        assert.equal(env.editingId.value, null)
+        if (['LX', 'RX', 'HX'].includes(result)) assert.equal(rec.shootPosX, undefined)
+      } finally { env.dispose() }
+    })
+  }
 }
 
 test('assistant stays on a historical time and row while live records continue arriving', async () => {

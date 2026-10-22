@@ -24,6 +24,7 @@ from backend.system.system_aifootballx import (
     resolve_team_code,
     season_label,
     tactic_projection,
+    tactic_record_ids,
     build_preview,
     bucket,
     dotted_date,
@@ -615,10 +616,13 @@ def test_swagger_routes_validate_scope_and_require_operator(service, monkeypatch
     response=client.get('/api/v1/aifootballx/send/status').json()
     assert response['validationPassed'] and response['status']=='ready'
     paths=app.openapi()['paths']
-    assert list(paths)==['/api/v1/aifootballx/send/status','/api/v1/aifootballx/preview','/api/v1/aifootballx/send']
+    assert list(paths)==['/api/v1/aifootballx/send/status','/api/v1/aifootballx/preview',
+                         '/api/v1/aifootballx/send/matches','/api/v1/aifootballx/send/all','/api/v1/aifootballx/send/latest']
     assert not paths['/api/v1/aifootballx/send/status']['get'].get('parameters')
-    assert 'application/x-www-form-urlencoded' in paths['/api/v1/aifootballx/send']['post']['requestBody']['content']
-    assert not paths['/api/v1/aifootballx/send']['post'].get('parameters')
+    for path in ('matches','all','latest'):
+        endpoint=paths['/api/v1/aifootballx/send/'+path]['post']
+        assert 'application/x-www-form-urlencoded' in endpoint['requestBody']['content']
+        assert not endpoint.get('parameters')
     with pytest.raises(BackendError) as rejected:
         api_aifootballx.delivery_operator(CurrentUser(uid='u', claims={'auth': 'local_frontend'}))
     assert rejected.value.status_code == 403
@@ -925,6 +929,68 @@ class SeasonAcceptanceTests(unittest.TestCase):
 # ==========================================================================
 # sql_details
 # ==========================================================================
+
+def test_tactic_selection_keeps_complete_shot_and_goal_sequences_only():
+    evidence, _ = preview_fixture()
+    item = evidence['source_recordings'][0]
+    cases = [
+        ('possession', 'ordinary', 'UTP', 'P', {}),
+        ('flag-only', 'stale-dtp', 'DTP', 'P', {}),
+        ('isolated-shot', 'stp', 'STP', 'S', {'shot': True}),
+        ('orphan-pass', 'missing-master', None, 'P', {}),
+        ('orphan-shot', 'missing-master', None, 'S', {'shot': True}),
+        ('own', 'own-path', 'UPP', 'S', {'goal': True}),
+    ]
+    item['children']['records'] = [
+        {'id': ident, 'data': {'half': 'H1', 'halfSeconds': 10+n, 'seq': n,
+         'act': act, 'res': 'G' if ident == 'own' else 'O', 'area': 2,
+         'playerId': 'OWN' if ident == 'own' else None,
+         'legacyPathId': path, 'legacyPathType': kind, 'legacyKpiFlags': flags}}
+        for n, (ident, path, kind, act, flags) in enumerate(cases)]
+    records = source_records(item)
+    assert tactic_record_ids(records, calculate_kpis(records)) == {
+        'isolated-shot', 'orphan-pass', 'orphan-shot', 'own'}
+    own = item['children']['records'][-1]
+    assert tactic_projection(item, own, '69157471581173.21631899')['p_id'] == 'OWN'
+    assert tactic_projection(item, own, '69157471581173.21631899')['gt_id'] == '69157471581173.21631899'
+
+
+def test_tactic_binding_preserves_distinct_simultaneous_positions():
+    evidence, mid = preview_fixture()
+    old = next(d for d in build(evidence, mid)['documents']
+               if d['collection'] == 'TACTIC' and d['data']['gr_act_code'] == 'P'
+               and d['data']['t_code'] == 'HX')
+    evidence['target_existing']['TACTIC'] = [{'id': 'legacy-pass', 'data': old['data']}]
+    item = next(i for i in evidence['source_recordings'] if i['side'] == 'H')
+    duplicate = deepcopy(item['children']['records'][0])
+    duplicate['id'] = 'pass-other'
+    duplicate['data']['posX'] = 99
+    item['children']['records'].append(duplicate)
+    kpi = calculate_kpis(source_records(item)).team_kpi
+    item['recording']['kpi'] = kpi
+    item['recording']['teamRating'].update(apx=kpi['DAP']/4, tpx=kpi['DTP']/12*100,
+        fpx=(min(kpi['SHOT']/15*100,99.9)+min(kpi['GOAL']/3*100,99.9))/2)
+    report = build(evidence, mid)
+    assert report['validation_passed'], report['errors']
+    passes = [d for d in report['documents'] if d['collection'] == 'TACTIC'
+              and d['data']['t_code'] == 'HX' and d['data']['gr_act_code'] == 'P']
+    assert len(passes) == 2
+    assert len({d['document_id'] for d in passes}) == 2
+    assert any(d['document_id'] == 'legacy-pass' for d in passes)
+
+
+def test_sql_tactic_excludes_non_shooting_paths_but_preserves_own_identity():
+    game, infos, children, codes = sql_fixture()
+    goal = children['H']['ff_game_record'][0]
+    goal['p_id'] = 'OWN'
+    children['H']['ff_game_record'].append({**goal, 'gr_id': 'ordinary', 'gt_id': 'ordinary',
+        'p_id': '0000000001', 'gr_is_sht': 0, 'gr_is_gol': 0})
+    children['H']['ff_game_path'].append({'gt_id': 'ordinary', 'gt_utp': 1})
+    report = build_details(game, infos, children, codes)
+    assert report['available_source_validation_passed'], report['errors']
+    tactic = [d['data'] for d in report['documents'] if d['collection'] == 'TACTIC']
+    assert len(tactic) == 1
+    assert tactic[0]['p_id'] == 'OWN'
 
 
 def sql_fixture():
@@ -1336,6 +1402,481 @@ def run_self_tests() -> int:
 
 def test_mapping_rules():
     assert run_self_tests() == 0
+
+
+def master_fixture():
+    evidence, _ = preview_fixture()
+    evidence.update(teams={'E-H':{'name':'Home'},'E-A':{'name':'Away'}},coach_rounds=[],coach_contracts=[])
+    evidence['player_profiles']={'0000000001':{'name':'Bench','currentTeamId':'E-H','currentNo':7}}
+    evidence['did_matches'].append({'id':'season-end','data':{**evidence['did_matches'][0]['data'],'date':'2024.06.30'}})
+    return evidence, {'documents':[],'new_season':False,'slots':{}}
+
+
+def test_master_all_includes_registered_nonparticipants_without_raw_or_ratings():
+    evidence,setup=master_fixture()
+    evidence['source_recordings']=[]
+    evidence['player_profiles']['unrelated-foreign-profile']={}
+    report=delivery.generate_masters(evidence,[],[],{},setup,'all')
+    assert report['validation_passed'], report['errors']
+    assert {d['collection'] for d in report['documents']}=={'Player','playerDB'}
+    assert docs(report,'Player')[0]['t_code']=='E-H'
+    assert not docs(report,'vibePlayer')
+
+
+def test_latest_compares_owned_values_preserves_ids_and_ignores_manual_changes():
+    evidence,setup=master_fixture()
+    original=delivery.generate_masters(evidence,[],[],{},setup,'all')
+    for doc in original['documents']:
+        evidence['target_existing'].setdefault(doc['collection'],[]).append(
+            {'id':'existing-'+doc['collection'],'data':{**doc['data'],'uid':'manual-uid','manualNote':'keep'}})
+    unchanged=delivery.generate_masters(evidence,[],[],{},setup,'latest')
+    assert unchanged['validation_passed'], unchanged['errors']
+    assert not unchanged['documents']
+    evidence['player_profiles']['0000000001']['name']='Renamed'
+    changed=delivery.generate_masters(evidence,[],[],{},setup,'latest')
+    assert changed['validation_passed'], changed['errors']
+    assert len(changed['documents'])==2
+    for doc in changed['documents']:
+        assert doc['document_id']=='existing-'+doc['collection']
+        assert doc['data']['uid']=='manual-uid'
+        assert 'manualNote' not in doc['data']
+        merged=delivery.decide_merge(doc,evidence['target_existing'][doc['collection']][0]['data'])
+        assert merged
+
+
+def test_latest_transfer_uses_season_end_and_clears_optional_contract_fields():
+    evidence,setup=master_fixture()
+    evidence['player_contracts']={'0000000001':[
+        {'teamId':'E-H','from':'2023.07.01','to':'2024.01.01','no':7},
+        {'teamId':'E-A','from':'2024.01.01','to':None,'no':None,'pos':None}]}
+    report=delivery.generate_masters(evidence,[],[],{},setup,'latest')
+    assert report['validation_passed'], report['errors']
+    player=docs(report,'Player')[0]
+    assert player['t_code']=='E-A' and player['pt_end']=='9999.99.99'
+    assert player['pt_num'] is None and player['pt_pos'] is None
+    assert docs(report,'playerDB')[0]['P-7']=='E-A'
+
+
+def test_master_manager_switch_uses_scheduled_fixture_without_raw():
+    evidence,setup=master_fixture()
+    evidence['player_profiles']={}
+    first=evidence['did_matches'][0]
+    second={'id':'next-game','data':{**first['data'],'date':'2024.02.01','round':2}}
+    def contract(team,coach,start,end=None):
+        return {'data':{'teamId':team,'coachId':coach,'coachName':coach,'coachNameEn':coach,
+                        'from':start,'to':end,'status':'MANAGER'}}
+    evidence['coach_contracts']=[contract('E-H','old','2023.07.01','2024.01.01'),
+        contract('E-H','new','2024.01.02'),contract('E-A','away','2023.07.01')]
+    report=delivery.generate_masters(evidence,[first,second],[],{},setup,'all')
+    assert report['validation_passed'], report['errors']
+    home=sorted((d for d in docs(report,'Manager') if d['T_Code']=='E-H'),key=lambda d:d['Round'])
+    assert len(home)==2 and home[0]['e_date']=='2024.01.01'
+    assert home[1]['Manager_EN']=='new' and home[1]['e_date']=='9999.99.99'
+    assert home[0]['m_id']!=home[1]['m_id']
+
+
+def test_active_coach_without_round_context_is_reported_instead_of_silently_omitted():
+    evidence,setup=master_fixture()
+    evidence['coach_contracts']=[{'data':{'teamId':'E-H','coachId':'new-coach','from':'2024.01.01','to':None}}]
+    report=delivery.generate_masters(evidence,[],[],{},setup,'latest')
+    assert not report['validation_passed']
+    assert any('round mapping' in error for error in report['errors'])
+
+
+def test_master_partial_source_cannot_overwrite_existing_season_aggregates():
+    evidence,setup=master_fixture()
+    evidence['target_existing']['dMST']=[{'id':'missing','data':{'gm_round':38,'t_code':'E-A'}}]
+    report=delivery.generate_masters(evidence,[],[],{},setup,'all')
+    assert report['validation_passed'],report['errors']
+    assert report['aggregate_status']=='blocked' and report['blocked_groups']==['aggregates']
+    assert any('coverage incomplete' in e for e in report['warnings'])
+    assert {d['collection'] for d in report['documents']}=={'Player','playerDB'}
+
+
+def test_match_scope_excludes_masters_managers_and_aggregates(monkeypatch):
+    evidence,mid=preview_fixture()
+    # Complete the rating snapshot required by production validation.
+    for item in evidence['source_recordings']:
+        item['recording']['teamRating'].update(apxGrade='F',tpxGrade='F',fpxGrade='F')
+    evidence['coach_rounds']=[{'data':{'teamId':'E-H','round':1,'plSeason':'2023-2024','coachId':'missing'}}]
+    def forbidden(*args,**kwargs): raise AssertionError('match mode must not generate season aggregates')
+    monkeypatch.setattr(delivery,'build_aggregates',forbidden)
+    report=delivery.generate_delivery(evidence,evidence['did_matches'],[],{},
+        {'documents':[],'new_season':False},match_only=True)
+    assert report['validation_passed'], (report['errors'],[c for c in report['checks'] if not c['passed']])
+    assert report['documents']
+    assert all(d['collection'] in delivery.MATCH_COLLECTIONS for d in report['documents'])
+    assert not {d['collection'] for d in report['documents']}&delivery.MASTER_COLLECTIONS
+
+
+@pytest.mark.parametrize('mode',['all','latest'])
+def test_nonmatch_scope_is_season_only_and_never_split_by_round(mode):
+    scope={'seasonId':'20232024','mode':mode}
+    source=object.__new__(delivery.SourceCapture)
+    assert source.split_scopes(scope)==[scope]
+    for field in ('roundFrom','roundTo','matchId'):
+        with pytest.raises(BackendError,match='season only'):
+            delivery.delivery_mode({**scope,field:1})
+
+
+def test_all_posts_queue_work_before_source_or_writer_is_created(service,monkeypatch):
+    svc,_,_,calls=service
+    submitted=[]
+    svc.pool=SimpleNamespace(submit=lambda *args:submitted.append(args))
+    svc.source_factory=lambda:pytest.fail('request handler performed source reads')
+    svc.writer_factory=lambda:pytest.fail('request handler constructed a Firestore writer')
+    monkeypatch.setattr(api_aifootballx,'delivery_service',lambda:svc)
+    app=FastAPI()
+    app.include_router(api_aifootballx.router,prefix='/api/v1')
+    app.dependency_overrides[api_aifootballx.delivery_operator]=lambda:CurrentUser(uid='operator',claims={})
+    client=TestClient(app)
+    for path in ('preview','send/matches','send/all','send/latest'):
+        response=client.post('/api/v1/aifootballx/'+path,data={'season':'2023-2024'})
+        assert response.status_code==202
+        assert response.json()['status']=='queued'
+    assert len(submitted)==4 and not calls
+    schema=app.openapi()
+    for mode in ('all','latest'):
+        body=schema['paths']['/api/v1/aifootballx/send/'+mode]['post']['requestBody']['content']['application/x-www-form-urlencoded']['schema']
+        form=schema['components']['schemas'][body['$ref'].split('/')[-1]]
+        assert set(form['properties'])=={'season'}
+
+
+def test_latest_no_changes_completes_without_writer(service):
+    svc,source,_,calls=service
+    def capture(*args):
+        return delivery.finish_delivery([],[],[],{},'latest'),{'documents':{},'queries':[]}
+    source.capture=capture
+    svc.writer_factory=lambda:pytest.fail('unchanged latest must not construct a writer')
+    ident=svc.send_scope({'seasonId':'20232024','mode':'latest'},'operator')
+    assert svc.store.job(ident,'operator')['state']=='complete'
+    assert svc.public_status('operator')['mode']=='latest'
+    assert not calls
+
+
+def test_contract_group_guard_detects_changes_by_full_path():
+    source=object.__new__(delivery.SourceCapture)
+    def snap(path,version):
+        return SimpleNamespace(id='shared-id',reference=SimpleNamespace(path=path),exists=True,
+                               update_time=SimpleNamespace(isoformat=lambda:version))
+    snapshots=[snap('players/a/contracts/shared-id','one'),snap('players/b/contracts/shared-id','two')]
+    query=SimpleNamespace(limit=lambda n:SimpleNamespace(stream=lambda **kwargs:snapshots))
+    source.did=SimpleNamespace(collection_group=lambda name:query)
+    guards={'documents':{},'queries':[{'group':'contracts','bound':10,
+            'versions':{s.reference.path:source.version(s) for s in snapshots}}]}
+    source.assert_fresh(guards)
+    snapshots.pop()
+    with pytest.raises(BackendError) as changed: source.assert_fresh(guards)
+    assert changed.value.code=='aifootballx_source_changed'
+
+
+def test_send_enabled_by_default():
+    from backend.system.system_firestore import Settings
+    assert Settings.model_fields['aifootballx_write_enabled'].default is True
+
+
+@pytest.mark.parametrize('bad_slot',[False,True])
+@pytest.mark.parametrize('with_fixtures',[False,True])
+def test_master_capture_reads_registration_without_match_children(monkeypatch,tmp_path,bad_slot,with_fixtures):
+    evidence,_=master_fixture()
+    source=object.__new__(delivery.SourceCapture)
+    source.documents={};source.queries=[]
+    empty=SimpleNamespace(limit=lambda n:SimpleNamespace(stream=lambda **kwargs:[]))
+    source.did=SimpleNamespace(collection_group=lambda name:SimpleNamespace(where=lambda **kwargs:empty),
+        document=lambda path:SimpleNamespace(path=path),
+        get_all=lambda refs,**kwargs:[SimpleNamespace(reference=ref,exists=False,to_dict=lambda:None) for ref in refs])
+    source.target=object()
+    paths=[]
+    def rows(client,path,filters=(),**kwargs):
+        paths.append(path)
+        assert not any(part in path for part in ('/records','/paths','/playerStats','/cards'))
+        if path in ('players','coachContracts'):
+            assert filters and filters[0][0] in ('currentTeamId','teamId')
+        if client is source.target and path in ('Player','playerDB'):
+            assert filters and filters[0][0] in ('PlSeason','`P-6`','P-6')
+        if client is source.did:
+            if path=='matches' and with_fixtures: return evidence['did_matches']
+            if path=='players': return [{'id':k,'data':v} for k,v in evidence['player_profiles'].items()]
+            if path=='teams': return [{'id':k,'data':{**v,'currentLeagueId':'EPL'}} for k,v in evidence['teams'].items()]
+            if path=='coachContracts' and with_fixtures:
+                return [{'id':tid,'data':{'teamId':tid,'coachId':tid,'coachName':tid,'coachNameEn':tid,
+                    'from':'2023.07.01','to':None,'status':'MANAGER'}} for tid in evidence['teams']]
+        if client is source.target and path=='code':
+            return [{'id':str(n),**r} for n,r in enumerate(evidence['ai_samples']['code'])]
+        return []
+    source.rows=rows
+    source.get=lambda path:{}
+    source.get_many=lambda paths:{p:evidence['teams'][p.split('/')[-1]] for p in paths if p.startswith('teams/')}
+    source.assert_fresh=lambda guards:None
+    slot_path=tmp_path/'bad-slots.json' if bad_slot else None
+    if slot_path: slot_path.write_text('{',encoding='utf-8')
+    report,guards=source.capture({'seasonId':'20232024','mode':'latest'},slot_path)
+    assert report['validation_passed'],report['errors']
+    assert len(report['documents'])==(4 if with_fixtures else 2)
+    assert guards['queries'][0]['group']=='contracts'
+    assert 'coachContracts' in paths and 'coaches' not in paths
+    assert ('coachRounds' in paths) is (not with_fixtures)
+    if bad_slot:
+        assert report['aggregate_status']=='blocked' and report['warnings']
+        assert 'slot_file' not in guards
+
+
+def test_master_all_generates_all_six_aggregates_without_match_detail():
+    items,codes,slots=aggregate_fixture()
+    fixtures=[{'id':i['match_id'],'data':i['match']} for i in items if i['side']=='H']
+    contracts=[{'data':{'teamId':r['data']['TCODE'],'coachId':str(n),'coachName':'감독'+str(n),
+                'coachNameEn':'Coach '+str(n),'from':'2024.07.01','to':None,'status':'MANAGER'}}
+               for n,r in enumerate(codes,1)]
+    evidence={'did_matches':fixtures,'ai_samples':{'code':codes},'target_existing':{},'player_profiles':{},
+              'teams':{},'coach_contracts':contracts}
+    report=delivery.generate_masters(evidence,fixtures,items,slots,
+        {'documents':[],'new_season':False},'all')
+    assert report['validation_passed'],report['errors']
+    collections={d['collection'] for d in report['documents']}
+    assert set(delivery.AGGREGATES)<=collections
+    assert not collections&delivery.MATCH_COLLECTIONS
+    assert report['aggregate_validation']['passed']
+
+
+def test_match_new_season_can_send_without_nonmatch_setup():
+    evidence,_=preview_fixture()
+    for item in evidence['source_recordings']:
+        item['recording']['teamRating'].update(apxGrade='F',tpxGrade='F',fpxGrade='F')
+    report=delivery.generate_delivery(evidence,evidence['did_matches'],[],{},
+        {'documents':[{'collection':'code','document_id':'season-code','data':{'PlSeason':'2023-2024'}}],
+         'new_season':True},match_only=True)
+    assert report['validation_passed'],report['errors']
+    assert report['documents']
+    assert all(doc['collection'] in delivery.MATCH_COLLECTIONS for doc in report['documents'])
+
+
+def test_match_capture_does_not_require_season_code_or_slot_setup(monkeypatch,tmp_path):
+    evidence,_=preview_fixture()
+    source=object.__new__(delivery.SourceCapture)
+    source.did=object();source.target=SimpleNamespace(collection=lambda col:SimpleNamespace(
+        limit=lambda n:SimpleNamespace(stream=lambda **kwargs:[])))
+    source.documents={};source.queries=[]
+    recordings={f'matches/{i["match_id"]}/recordings/{i["side"]}':i for i in evidence['source_recordings']}
+    class Did:
+        def document(self,path): return SimpleNamespace(path=path)
+        def get_all(self,refs,**kwargs):
+            return [SimpleNamespace(reference=ref,exists=True,
+                    update_time=SimpleNamespace(isoformat=lambda:'version'),
+                    to_dict=lambda p=ref.path:recordings[p]['recording']) for ref in refs]
+    source.did=Did()
+    def rows(client,path,filters=(),**kwargs):
+        if client is source.did:
+            if path=='matches': return evidence['did_matches']
+            parent,_,child=path.rpartition('/')
+            if parent in recordings: return recordings[parent]['children'].get(child,[])
+        if client is source.target and path=='code':
+            return [{'id':str(n),**row} for n,row in enumerate(evidence['ai_samples']['code'])]
+        return []
+    source.rows=rows;source.get=lambda path:{};source.assert_fresh=lambda guards:None
+    monkeypatch.setattr(delivery,'plan_new_season',lambda *a,**k:pytest.fail('Match delivery attempted season setup'))
+    for item in evidence['source_recordings']:
+        item['recording']['teamRating'].update(apxGrade='F',tpxGrade='F',fpxGrade='F')
+    report,guards=source.capture({'seasonId':'20232024','mode':'matches','roundFrom':1,'roundTo':1},
+                                tmp_path/'missing-aggregate-slots.json')
+    assert report['validation_passed'],report['errors']
+    assert 'slot_file' not in guards and guards['new_code']=={}
+
+
+def test_match_first_then_all_can_create_missing_season_code_and_slots():
+    items,codes,_=aggregate_fixture()
+    fixtures=[{'id':i['match_id'],'data':i['match']} for i in items if i['side']=='H']
+    for row in codes: row['data']['PlSeason']=None
+    original=plan_new_season('2024-2025',fixtures,codes,{}, {'seasonSlotMappings':{}})
+    after_matches=plan_new_season('2024-2025',fixtures,codes,
+        {'dMST':[{'id':'match-already-sent'}]}, {'seasonSlotMappings':{}})
+    assert after_matches==original
+    assert len(after_matches['documents'])==20
+    assert '2024-2025' in after_matches['slots']['seasonSlotMappings']
+    contracts=[{'data':{'teamId':r['data']['TCODE'],'coachId':str(n),'coachName':'Coach '+str(n),
+        'coachNameEn':'Coach '+str(n),'from':'2024.07.01','to':None,'status':'MANAGER'}} for n,r in enumerate(codes,1)]
+    evidence={'did_matches':fixtures,'ai_samples':{'code':codes+after_matches['code_rows']},
+        'target_existing':{'dMST':[{'id':'already-sent','data':{'gm_round':1,'t_code':'T01'}}]},
+        'player_profiles':{},'teams':{},'coach_contracts':contracts}
+    report=delivery.generate_masters(evidence,fixtures,items,after_matches['slots'],after_matches,'all')
+    assert report['validation_passed'],report['errors']
+    assert report['aggregate_status']=='ready' and not report['warnings']
+    assert len(docs(report,'code'))==20
+    assert set(delivery.AGGREGATES)<={d['collection'] for d in report['documents']}
+
+
+def test_new_season_setup_preserves_existing_explicit_slot_order():
+    items,codes,_=aggregate_fixture()
+    fixtures=[{'id':i['match_id'],'data':i['match']} for i in items if i['side']=='H']
+    for row in codes: row['data']['PlSeason']=None
+    slots={'seasonSlotMappings':{'2024-2025':{'cavgSlotToCodeTeamCodeMapping':{
+        str(n):{'codeTeamCode':21-n} for n in range(1,21)}}}}
+    setup=plan_new_season('2024-2025',fixtures,codes,{'dMST':[{'id':'match'}]},slots)
+    assert setup['slots']==slots and len(setup['documents'])==20
+    assert all(d['data']['DID_CAVG_SLOT']==21-d['data']['Team Code'] for d in setup['documents'])
+
+
+@pytest.mark.parametrize('mode',['all','latest'])
+def test_invalid_season_rating_blocks_only_aggregates_not_player_master(mode):
+    evidence,setup=master_fixture()
+    items,codes,slots=aggregate_fixture()
+    evidence['ai_samples']['code']+=codes
+    items[0]['recording']['ratingBasedOn']=999
+    report=delivery.generate_masters(evidence,[],items,slots,setup,mode)
+    assert report['validation_passed'],report['errors']
+    assert report['aggregate_status']=='blocked' and report['warnings']
+    assert {d['collection'] for d in report['documents']}=={'Player','playerDB'}
+    assert not {d['collection'] for d in report['documents']}&set(delivery.AGGREGATES)
+
+
+def test_aggregate_builder_failure_is_reported_without_losing_master_candidates(monkeypatch):
+    evidence,setup=master_fixture()
+    items,_,_=aggregate_fixture()
+    def broken(*args,**kwargs): raise ValueError('bad aggregate source')
+    monkeypatch.setattr(delivery,'build_aggregates',broken)
+    report=delivery.generate_masters(evidence,[],items,{},setup,'latest')
+    assert report['validation_passed'] and report['aggregate_status']=='blocked'
+    assert len(report['documents'])==2 and report['warnings']
+
+
+def test_master_transmission_completes_even_when_aggregate_group_is_blocked(service):
+    svc,source,_,calls=service
+    def capture(scope,*args):
+        evidence,setup=master_fixture()
+        evidence['target_existing']['dMST']=[{'id':'missing','data':{'gm_round':38,'t_code':'E-A'}}]
+        report=delivery.generate_masters(evidence,[],[],{},setup,scope['mode'])
+        return report,{'documents':{},'queries':[]}
+    source.capture=capture
+    svc.send_scope({'seasonId':'20232024','mode':'latest'},'operator')
+    status=svc.public_status('operator')
+    assert len(calls)==2 and status['counts']=={'success':2}
+    assert status['validationPassed'] is True
+    assert status['status']=='fail' and status['blockedGroups']==['aggregates']
+    assert status['aggregateStatus']=='blocked' and 'coverage incomplete' in status['reason']
+    assert status['warnings'] and not status['failures']
+
+
+def test_invalid_master_still_prevents_delivery_despite_independent_aggregates(service):
+    svc,source,_,calls=service
+    def capture(scope,*args):
+        evidence,setup=master_fixture()
+        evidence['player_profiles']['0000000001']['name']=None
+        return delivery.generate_masters(evidence,[],[],{},setup,scope['mode']),{'documents':{},'queries':[]}
+    source.capture=capture
+    svc.send_scope({'seasonId':'20232024','mode':'latest'},'operator')
+    assert svc.public_status('operator')['validationPassed'] is False
+    assert not calls
+
+
+def test_season_scoped_contract_guard_ignores_unrelated_history_and_detects_new_registration():
+    source=object.__new__(delivery.SourceCapture)
+    def snap(pid,start,end,version):
+        return SimpleNamespace(id=pid,reference=SimpleNamespace(path=f'players/{pid}/contracts/c'),exists=True,
+            update_time=SimpleNamespace(isoformat=lambda:version),
+            to_dict=lambda:{'teamId':'T01','from':start,'to':end})
+    snapshots=[snap('relevant','2024.07.01',None,'v1'),snap('old','2000.07.01','2001.06.30','v1')]
+    filters=[]
+    class Query:
+        def where(self,**kwargs): filters.append(kwargs['filter']);return self
+        def select(self,fields): assert fields==['from','to'];return self
+        def limit(self,n): return self
+        def stream(self,**kwargs): return snapshots
+    source.did=SimpleNamespace(collection_group=lambda group:Query())
+    guard={'group':'contracts','filters':[('teamId','in',['T01'])],'bound':50,
+           'season_range':['20240701','20250630'],'membership_only':True}
+    guard['versions']=source.guard_versions(snapshots,guard)
+    assert set(guard['versions'])=={'players/relevant/contracts/c'}
+    snapshots[1]=snap('old','2000.07.01','2001.06.30','v2')
+    source.assert_fresh({'documents':{},'queries':[guard]})
+    assert filters[0].field_path=='teamId' and filters[0].value==['T01']
+    snapshots.append(snap('new','2024.08.01',None,'v1'))
+    with pytest.raises(BackendError) as changed: source.assert_fresh({'documents':{},'queries':[guard]})
+    assert changed.value.code=='aifootballx_source_changed'
+
+
+def test_code_guard_ignores_other_season_but_rejects_relevant_mapping_changes():
+    source=object.__new__(delivery.SourceCapture)
+    code=[{'id':'global','data':{'TCODE':'T01','IDX_NAME':'ONE'}},
+          {'id':'other-season','data':{'TCODE':'T01','PlSeason':'2030-2031','IDX_NAME':'FUTURE'}}]
+    scope={'season':'2024-2025','teams':['T01']}
+    guard={'documents':{},'queries':[],'code_scope':scope,'reference_code':delivery.code_reference(code,scope)}
+    source.target=object();source.rows=lambda *args,**kwargs:code
+    code[1]['data']['IDX_NAME']='FUTURE-CHANGED'
+    source.assert_fresh(guard)
+    code[0]['data']={**code[0]['data'],'IDX_NAME':'CHANGED'}
+    with pytest.raises(BackendError) as changed: source.assert_fresh(guard)
+    assert changed.value.code=='aifootballx_source_changed'
+
+
+def test_unchanged_latest_checks_source_once_and_never_creates_writer(service):
+    svc,source,_,calls=service
+    validations=[]
+    source.assert_fresh=lambda guards:validations.append(guards)
+    source.capture=lambda *args:(delivery.finish_delivery([],[],[],{},'latest'),{'documents':{},'queries':[]})
+    svc.writer_factory=lambda:pytest.fail('No changed documents')
+    svc.send_scope({'seasonId':'20232024','mode':'latest'},'operator')
+    assert len(validations)==1 and not calls
+
+
+def test_retry_checks_source_once_and_reuses_failed_document_only(service):
+    svc,source,writer,calls=service
+    validations=[]
+    source.assert_fresh=lambda guards:validations.append(guards)
+    scope={'seasonId':'20232024','mode':'matches'}
+    svc.send_scope(scope,'operator')
+    assert len(validations)==2 and calls==['one','two']
+    writer.fail_two=False
+    validations.clear()
+    svc.send_scope(scope,'operator')
+    assert validations==[{'documents':{},'queries':[]}]
+    assert calls==['one','two','two'] and svc.public_status('operator')['status']=='complete'
+
+
+def chelsea_fpx_waiver_fixture():
+    evidence,_=preview_fixture()
+    mid='20232024eplj2rgn13na28rd2b8q0009'
+    match=evidence['did_matches'][0]
+    match['id']=mid
+    match['data'].update(homeTeamId='E-CH',awayTeamId='E-LI')
+    for item in evidence['source_recordings']:
+        item['match_id']=mid;item['match']=deepcopy(match['data'])
+        item['recording']['teamId']='E-CH' if item['side']=='H' else 'E-LI'
+        if item['side']=='H':
+            item['children']['records'] += [{'id':f'miss-{n}','data':{'half':'H1','halfSeconds':400+n*10,
+                'seq':3+n,'act':'S','res':'R','area':2,'posX':0,'posY':100}} for n in range(9)]
+            kpi=calculate_kpis(source_records(item)).team_kpi
+            item['recording']['kpi']=kpi
+            item['recording']['teamRating'].update(apx=kpi['DAP']/4,tpx=kpi['DTP']/12*100,fpx=50.0,fpxGrade='F')
+    for row,team in zip(evidence['ai_samples']['code'],('E-CH','E-LI'),strict=True): row['data']['TCODE']=team
+    return evidence,mid
+
+
+def test_approved_chelsea_fpx_snapshot_can_be_delivered_with_auditable_exception():
+    evidence,mid=chelsea_fpx_waiver_fixture()
+    report=build_preview(evidence,mid,covers=JpdDidData._contract_covers_match_date,match_only=True)
+    assert report['validation_passed'],(report['errors'],[c for c in report['checks'] if not c['passed']])
+    waived=[c for c in report['checks'] if c.get('waived')]
+    assert len(waived)==1 and waived[0]['name']=='H:source-FPX-grade'
+    assert waived[0]['actual_passed'] is False and waived[0]['stored']=='F' and waived[0]['expected']=='D'
+    assert evidence['source_recordings'][0]['recording']['teamRating']['fpxGrade']=='F'
+    strict=build_preview(evidence,mid,covers=JpdDidData._contract_covers_match_date)
+    assert not strict['validation_passed']
+
+
+@pytest.mark.parametrize('change',['match','team','opponent','score','grade'])
+def test_chelsea_fpx_exception_does_not_disable_other_rating_validation(change):
+    evidence,mid=chelsea_fpx_waiver_fixture()
+    home=evidence['source_recordings'][0]
+    if change=='match':
+        mid='20232024eplj2rgn13na28rd2b8q0010'
+        evidence['did_matches'][0]['id']=mid
+        for item in evidence['source_recordings']: item['match_id']=mid
+    if change=='team': home['recording']['teamId']='E-LI'
+    if change=='opponent': home['match']['awayTeamId']='E-H'
+    if change=='score': home['recording']['teamRating']['fpx']=50.1
+    if change=='grade': home['recording']['teamRating']['fpxGrade']='C'
+    report=build_preview(evidence,mid,covers=JpdDidData._contract_covers_match_date,match_only=True)
+    assert not report['validation_passed']
+    assert not any(c.get('waived') for c in report['checks'])
 
 
 if __name__ == '__main__':

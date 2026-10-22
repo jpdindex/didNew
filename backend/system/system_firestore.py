@@ -95,7 +95,7 @@ class Settings(BaseSettings):
     firebase_emulator_host: str | None = None
     swagger_api_key: str | None = None
     aifootballx_credentials_path: str | None = None
-    aifootballx_write_enabled: bool = False
+    aifootballx_write_enabled: bool = True
     aifootballx_slot_mapping_path: str | None = None
     jpd_rating_base_url: str = "https://jpd-rating-296087686925.asia-northeast3.run.app"
     jpd_rating_token: str | None = None

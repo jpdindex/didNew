@@ -1297,7 +1297,7 @@ def main_preview():
     else:
         evidence = json.loads(args.snapshot.read_text(encoding='utf-8'))
     from backend.system.system_firestore import JpdDidData
-    report = build_preview(evidence, args.match_id, covers=JpdDidData._contract_covers_match_date)
+    report = build_preview(evidence, args.match_id, covers=JpdDidData._contract_covers_match_date, match_only=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output = args.output_dir / f'{args.match_id}-preview.json'
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
@@ -1684,6 +1684,10 @@ def build_details(game, infos, children, codes):
         wide = {**common, 'gm_date': dotted_date(game['gm_date']), 't_code': idx, 'team_type': 'HOME' if side == 'H' else 'AWAY'}
         base_wide = dict(wide)
         records, paths = source.get('ff_game_record', []), source.get('ff_game_path', [])
+        tactic_paths = {r.get('gt_id') for r in records
+                        if r.get('gt_id') and (r.get('gr_is_sht') or r.get('gr_is_gol'))}
+        tactic_ids = {r['gr_id'] for r in records if r.get('gt_id') in tactic_paths
+                      or (not r.get('gt_id') and (r.get('gr_is_sht') or r.get('gr_is_gol')))}
         members = defaultdict(list)
         bins = {m: [0] * 20 for m in ('DAP','DTP','BAP','SHOT','GOAL','SSR')}
         own_goals, goal_times = 0, []
@@ -1711,8 +1715,11 @@ def build_details(game, infos, children, codes):
                          'gr_pos_y': row.get('gr_pos_y') if row.get('gr_pos_y') is not None else '\\N',
                          'gr_shoot_pos_x': row.get('gr_shoot_pos_x') if row.get('gr_shoot_pos_x') is not None else '\\N',
                          'gr_shoot_pos_y': row.get('gr_shoot_pos_y') if row.get('gr_shoot_pos_y') is not None else '\\N',
-                         'p_id': str(int(row['p_id'])) if str(row.get('p_id') or '').isdigit() else '\\N', 'gt_id': row.get('gt_id') or '\\N'}
-            emit('TACTIC', projected, (mid, side, row['gr_id']))
+                         'p_id': ('OWN' if row.get('p_id') == 'OWN' else
+                                  str(int(row['p_id'])) if str(row.get('p_id') or '').isdigit() else '\\N'),
+                         'gt_id': str(row['gt_id']) if row.get('gt_id') else '\\N'}
+            if row['gr_id'] in tactic_ids:
+                emit('TACTIC', projected, (mid, side, row['gr_id']))
             check(side + ':record-position-' + row['gr_id'], projected['gr_pos_x'], row.get('gr_pos_x') if row.get('gr_pos_x') is not None else '\\N')
             for role, field in [('DTA','gr_is_cta'),('DTB','gr_is_ctb'),('DTM','gr_is_ctm'),('DTS','gr_is_cts')]:
                 if row.get(field):
@@ -1767,7 +1774,7 @@ def build_details(game, infos, children, codes):
                 **{('gi_tmp' if k=='TAP' else {'DTB':'B','DTM':'M','DTA':'A','DTS':'S'}.get(k,k)):info[v] for k,v in TEAM_COLUMNS.items()},'OG':own_goals}
         emit('dMST',data)
         check(side+':player-count',sum(d['collection']=='playerMST' and d['data']['P-DB3']==side for d in documents),len(source.get('ff_game_player',[])))
-        check(side+':record-count',sum(d['collection']=='TACTIC' and d['data']['t_code']==idx for d in documents),len(records))
+        check(side+':TACTIC-selected-records',sum(d['collection']=='TACTIC' and d['data']['t_code']==idx for d in documents),len(tactic_ids))
     raw_records = [r for source in children.values() for r in source.get('ff_game_record', [])]
     selection = {'raw_records':len(raw_records),
                  'selected_records':sum(d['collection']=='TACTIC' for d in documents),

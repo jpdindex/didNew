@@ -484,7 +484,14 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
                 continue
             if isinstance(message, dict) and message.get("type") == "heartbeat":
                 stage = 'heartbeat'
-                await asyncio.to_thread(update_presence, JpdDidData(), gm_id, side, user.uid, session_id, True)
+                try:
+                    await asyncio.to_thread(update_presence, JpdDidData(), gm_id, side, user.uid, session_id, True)
+                except BackendError as exc:
+                    if exc.code != 'presence_busy':
+                        raise
+                    # A missed advisory lease refresh must not tear down input
+                    # transport. The next existing heartbeat retries membership
+                    # and presence; commands retain their own authority checks.
                 await draft_sockets.send(gm_id, side, websocket, {"type": "pong"})
                 continue
             if not isinstance(message, dict) or message.get("type") != "command":
@@ -555,7 +562,7 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
             'type': 'error', 'code': exc.code, 'status': exc.status_code, 'message': str(exc),
         })
         try:
-            await websocket.close(code=1008)
+            await websocket.close(code=1013 if exc.code == 'presence_busy' else 1008)
         except (WebSocketDisconnect, RuntimeError):
             pass
     except WebSocketDisconnect as exc:

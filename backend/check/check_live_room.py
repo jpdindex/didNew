@@ -255,6 +255,99 @@ def test_presence_leases_are_per_connection_and_expire(data):
     assert not live.room_state(data, 'm', 'H')['participants']['p']['online']
 
 
+def test_presence_reads_two_documents_without_locking_or_writing_match(data, monkeypatch):
+    reads, writes = [], []
+    before = deepcopy(data.db.documents['inputDrafts/m_H'])
+    get, set_values = MemoryReference.get, MemoryTransaction.set
+    def read(reference, **kwargs):
+        reads.append((reference.path, kwargs))
+        return get(reference, **kwargs)
+    def write(transaction, reference, values, **kwargs):
+        writes.append(reference.path)
+        return set_values(transaction, reference, values, **kwargs)
+    monkeypatch.setattr(MemoryReference, 'get', read)
+    monkeypatch.setattr(MemoryTransaction, 'set', write)
+    for connected in (True, True, False):
+        reads.clear()
+        live.update_presence(data, 'm', 'H', 'p', 'tab', connected)
+        assert [path for path, _ in reads] == ['inputDrafts/m_H', 'inputDrafts/m_H/presence/tab']
+        assert 'transaction' not in reads[0][1]
+        assert reads[0][1]['field_paths'] == ['participants', 'primaryUid', 'revision', 'roomEpoch', 'liveClosed']
+        assert reads[1][1]['transaction'] is not None
+    assert writes == ['inputDrafts/m_H/presence/tab'] * 3
+    assert data.db.documents['inputDrafts/m_H'] == before
+
+
+@pytest.mark.parametrize('failure', ['read', 'commit', 'wrapped_commit'])
+def test_presence_recovers_read_and_commit_contention_with_fresh_transaction(data, monkeypatch, failure):
+    from google.api_core.exceptions import Aborted
+    transactions, sleeps = [], []
+    get, commit = MemoryReference.get, MemoryTransaction.commit
+    def read(reference, **kwargs):
+        if reference.path.endswith('/presence/tab'):
+            transactions.append(kwargs['transaction'])
+            if failure == 'read' and len(transactions) == 1:
+                raise Aborted('read contention')
+        return get(reference, **kwargs)
+    def commit_once(transaction):
+        if failure != 'read' and len(transactions) == 1:
+            if failure == 'wrapped_commit':
+                raise ValueError('Failed to commit transaction in 1 attempts.') from Aborted('commit contention')
+            raise Aborted('commit contention')
+        return commit(transaction)
+    monkeypatch.setattr(MemoryReference, 'get', read)
+    monkeypatch.setattr(MemoryTransaction, 'commit', commit_once)
+    monkeypatch.setattr(live.time, 'sleep', sleeps.append)
+    live.update_presence(data, 'm', 'H', 'p', 'tab', True)
+    assert len(transactions) == 2 and transactions[0] is not transactions[1]
+    assert sleeps == [0.05]
+    assert data.db.documents['inputDrafts/m_H/presence/tab']['connected'] is True
+
+
+def test_presence_transient_retry_budget_is_bounded(data, monkeypatch):
+    from google.api_core.exceptions import Aborted
+    reads, sleeps = [], []
+    get = MemoryReference.get
+    def read(reference, **kwargs):
+        reads.append(reference.path)
+        if '/presence/' in reference.path:
+            raise Aborted('busy')
+        return get(reference, **kwargs)
+    monkeypatch.setattr(MemoryReference, 'get', read)
+    monkeypatch.setattr(live.time, 'sleep', sleeps.append)
+    with pytest.raises(BackendError) as caught:
+        live.update_presence(data, 'm', 'H', 'p', 'tab', True)
+    assert caught.value.code == 'presence_busy' and caught.value.status_code == 503
+    assert len(reads) == 6 and sleeps == [0.05, 0.1]
+    assert 'inputDrafts/m_H/presence/tab' not in data.db.documents
+
+
+@pytest.mark.parametrize('failure', ['membership', 'owner', 'revoked_on_retry', 'unrelated_value_error'])
+def test_presence_never_retries_authority_or_unrelated_errors(data, monkeypatch, failure):
+    from google.api_core.exceptions import Aborted
+    sleeps = []
+    monkeypatch.setattr(live.time, 'sleep', sleeps.append)
+    if failure == 'membership':
+        del data.db.documents['inputDrafts/m_H']['participants']['p']
+    elif failure == 'owner':
+        data.db.documents['inputDrafts/m_H/presence/tab'] = {'uid': 'a'}
+    else:
+        get = MemoryReference.get
+        def read(reference, **kwargs):
+            if '/presence/' in reference.path:
+                if failure == 'unrelated_value_error':
+                    raise ValueError('bad data')
+                del data.db.documents['inputDrafts/m_H']['participants']['p']
+                raise Aborted('revoked during contention')
+            return get(reference, **kwargs)
+        monkeypatch.setattr(MemoryReference, 'get', read)
+    with pytest.raises(ValueError if failure == 'unrelated_value_error' else BackendError) as caught:
+        live.update_presence(data, 'm', 'H', 'p', 'tab', True)
+    if failure != 'unrelated_value_error':
+        assert caught.value.code == ('session_owner_required' if failure == 'owner' else 'participant_required')
+    assert sleeps == ([0.05] if failure == 'revoked_on_retry' else [])
+
+
 @pytest.mark.parametrize('event_count', [0, 1000])
 def test_lobby_state_is_two_projected_heads_without_event_or_presence_scans(data, event_count):
     calls = []

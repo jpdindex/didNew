@@ -609,22 +609,46 @@ def update_presence(data, gm_id, side, uid, session_id, connected):
 
     @firestore.transactional
     def update(transaction):
-        snapshot = root.get(transaction=transaction)
-        draft = snapshot.to_dict() or {}
-        if uid not in (draft.get('participants') or {}):
-            context.update(draftExists=snapshot.exists, **draft_context(draft, uid))
-            raise BackendError('Join the Draft first', status_code=403, code='participant_required')
-        previous = reference.get(transaction=transaction).to_dict() or {}
+        # Only this connection's lease needs an atomic ownership check. Reading
+        # the match root inside this transaction also locks ordinary input saves.
+        previous = reference.get(transaction=transaction, retry=None, timeout=3).to_dict() or {}
         if previous and previous.get('uid') != uid:
             raise BackendError('Presence session belongs to another user', status_code=403, code='session_owner_required')
         now = utc_now()
         transaction.set(reference, {'uid': uid, 'connected': connected, 'lastSeenAt': now, 'expiresAt': now + timedelta(seconds=30)})
-    try:
-        update(data.db.transaction())
-    except BackendError as exc:
-        log_draft_event('presence_rejected', gm_id, side, uid=uid, sessionId=session_id,
-                        connected=connected, code=exc.code, **context)
-        raise
+    for attempt in range(3):
+        try:
+            # Presence is advisory, never write authority. Every input command
+            # still checks current membership/ownership in its own transaction.
+            # Recheck membership on every heartbeat and retry, without locking
+            # the shared match document or reading its event collections.
+            snapshot = root.get(field_paths=['participants', 'primaryUid', 'revision', 'roomEpoch', 'liveClosed'],
+                                retry=None, timeout=3)
+            draft = snapshot.to_dict() or {}
+            if uid not in (draft.get('participants') or {}):
+                context.update(draftExists=snapshot.exists, **draft_context(draft, uid))
+                raise BackendError('Join the Draft first', status_code=403, code='participant_required')
+            # The SDK retries commit aborts only; read-time aborts need a fresh
+            # transaction too. Bound both kinds with this single retry budget.
+            update(data.db.transaction(max_attempts=1))
+            return
+        except BackendError as exc:
+            log_draft_event('presence_rejected', gm_id, side, uid=uid, sessionId=session_id,
+                            connected=connected, code=exc.code, **context)
+            raise
+        except (Aborted, DeadlineExceeded, ServiceUnavailable, ValueError) as exc:
+            # The SDK wraps an exhausted commit Aborted in ValueError. Do not
+            # treat unrelated ValueErrors (bad data/programming errors) as busy.
+            cause = exc.__cause__ if isinstance(exc, ValueError) else exc
+            if not isinstance(cause, (Aborted, DeadlineExceeded, ServiceUnavailable)):
+                raise
+            if attempt == 2:
+                log_draft_event('presence_deferred', gm_id, side, level=logging.WARNING,
+                                uid=uid, sessionId=session_id, connected=connected,
+                                errorType=type(cause).__name__, attempts=3)
+                raise BackendError('접속 상태 등록이 일시적으로 지연되었습니다.',
+                                   status_code=503, code='presence_busy') from exc
+            time.sleep(0.05 * (attempt + 1))
 
 
 def lobby_head_state(document):

@@ -953,6 +953,7 @@ function clearPendingEntry() {
   // 레코드와 무관한 옛 좌표가 엉뚱하게 다시 적용된다.
   pendingFramePos.value = null
   pendingOuterScreenPos.value = null
+  pendingOuterResult.value = null
 }
 function clickRecord(id: string) {
   if (rangeMode.value) { tapRangeRow(id); return }
@@ -1045,6 +1046,14 @@ function applyEdit() {
     rec.seconds = editSeconds.value
     rec.act = editAct.value
     markEdited(rec)
+    const outer = pendingOuterResult.value
+    if (outer?.id === rec.id && ['S', 'H', 'R'].includes(editAct.value) && !editRes.value) {
+      rec.res = outer.zone
+      rec.shootPosX = outer.point.x
+      rec.shootPosY = outer.point.y
+      rec.shootDspRange = isWithinGoalOneMeter(outer.point)
+      rec.isShot = true
+    }
     if (editPos.value) {
       rec.posX = editPos.value.x
       rec.posY = editPos.value.y
@@ -1108,6 +1117,8 @@ function applyEdit() {
     // 옮겨간 자리로 표를 스크롤해 바로 확인할 수 있게 한다(No 옆 청록색 점과 함께 보인다).
     scrollRowIntoView(rec.id)
   }
+  pendingOuterResult.value = null
+  pendingOuterScreenPos.value = null
   editingId.value = null
 }
 async function scrollRowIntoView(id: string) {
@@ -1124,6 +1135,8 @@ async function scrollRowIntoView(id: string) {
 }
 function deleteEdit() {
   if (!editingId.value) return
+  pendingOuterResult.value = null
+  pendingOuterScreenPos.value = null
   const deletedId = editingId.value
   // 액트 없는 X/B 결과 레코드를 지우면, 그 결과로 마감됐던 바로 앞 짝 액트(예: P|X)를
   // 다시 진행중('O')으로 되돌린다 — 결과가 사라졌으니 액트도 아직 끝나지 않은 상태다.
@@ -1142,6 +1155,9 @@ function deleteEdit() {
   editingId.value = null
 }
 function cancelEdit() {
+  pendingOuterResult.value = null
+  pendingOuterScreenPos.value = null
+  pendingFramePos.value = null
   editingId.value = null
 }
 
@@ -2038,6 +2054,7 @@ function clickPitch(e: MouseEvent) {
   pendingShot.value = null
   pendingFramePos.value = null
   pendingOuterScreenPos.value = null
+  pendingOuterResult.value = null
 
   const nextCell = cellFromPos({ x, y })
   pendingPos.value = { x, y }
@@ -2190,6 +2207,8 @@ function clickResult(res: 'X' | 'B') {
 // 이미 확정 동작이라, 한 번 더 적용을 눌러야 하면 오히려 방금 한 조정이 아직 안 끝난
 // 것처럼 헷갈린다.
 function recordGoalResult(zone: Exclude<ResCode, 'O' | ''>, point?: { x: number; y: number }) {
+  // Immediate result buttons supersede an unconfirmed L/H/R position.
+  pendingOuterResult.value = null
   if (editingId.value) {
     editShootZone.value = zone as GoalZoneResult
     editShootPos.value = point ?? null
@@ -2238,12 +2257,13 @@ const GUIDE_TOP = FRAME_TOP - (FRAME_HEIGHT_FRAC / GOAL_TARGET.meters.height) //
 // 골문 프레임 안쪽 클릭: 바로 기록하지 않고 위치 마커만 세부 조정한다.
 // 확정은 아래 B/GOAL/X 버튼을 눌러야 이루어진다.
 const pendingFramePos = ref<{ x: number; y: number } | null>(null)
-// H/L/R은 결과 코드와 함께 실제로 누른 골대 주변 좌표도 저장한다.
-// 결과가 즉시 확정된 뒤에도 골문 안을 찍었을 때처럼 방금 누른 위치를 화면에 보여준다.
+// H/L/R positions stay local until Apply, for both new and edited shots.
+const pendingOuterResult = ref<{ id: string; zone: 'H' | 'L' | 'R'; point: { x: number; y: number } } | null>(null)
 const pendingOuterScreenPos = ref<{ left: string; top: string } | null>(null)
 function clickGoalFrame(e: MouseEvent) {
   const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
   pendingOuterScreenPos.value = null
+  pendingOuterResult.value = null
   pendingFramePos.value = {
     x: (e.clientX - rect.left) / rect.width,
     y: (e.clientY - rect.top) / rect.height,
@@ -2285,31 +2305,40 @@ function confirmGoalFrame(result: 'B' | 'GOAL' | 'X') {
   }
 }
 
-// 중앙 정렬된 골대 주변 영역(프레임 바깥)은 클릭 즉시 기록한다 — 버튼 필요 없음.
-// footballX의 전체 628×300 좌표로 남긴다.
-//
-// H/L/R은 골문 주변 1m 영역을 누른 정확한 좌표를 저장한다.
-// 좌표가 필요 없는 LX/HX/RX는 selectOuterMiss의 독립 버튼으로 분리한다.
+// Position adjustments are a local preview, never a durable record mutation.
 function clickOuterZone(e: MouseEvent, zone: 'H' | 'L' | 'R') {
+  const id = editingId.value ?? pendingShot.value?.id
+  if (!id) return
   const rect = (e.currentTarget as HTMLElement).closest('.goal')!.getBoundingClientRect()
   const x = (e.clientX - rect.left) / rect.width
   const y = (e.clientY - rect.top) / rect.height
 
-  // 바깥 존은 클릭 즉시 확정되므로, 그 전에 프레임 안에서 찍어둔(아직 B/GOAL/X 를
-  // 안 눌러 확정 안 된) 임시 위치가 남아 있었다면 여기서 버린다 — 안 지우면 나중에
-  // B/GOAL/X 를 눌렀을 때 방금 고른 바깥 존 위치 대신 그 옛 프레임 좌표가 되살아난다.
+  // Choosing an outer position replaces an unconfirmed frame position.
   pendingFramePos.value = null
 
   // L/H/R은 영역 이름만 고르는 버튼이 아니라 실제 위치 입력 영역이다.
   pendingOuterScreenPos.value = { left: `${x * 100}%`, top: `${y * 100}%` }
 
-  if (zone === 'H') {
-    recordGoalResult(zone, goalOuterPoint('HX', x, y / FRAME_TOP))
-  } else if (zone === 'L') {
-    recordGoalResult(zone, goalOuterPoint('LX', x / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP)))
-  } else {
-    recordGoalResult(zone, goalOuterPoint('RX', (x - (1 - FRAME_SIDE)) / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP)))
+  const point = zone === 'H' ? goalOuterPoint('HX', x, y / FRAME_TOP)
+    : zone === 'L' ? goalOuterPoint('LX', x / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP))
+    : goalOuterPoint('RX', (x - (1 - FRAME_SIDE)) / FRAME_SIDE, (y - FRAME_TOP) / (1 - FRAME_TOP))
+  pendingOuterResult.value = { id, zone, point }
+  if (editingId.value) {
+    editShootZone.value = zone
+    editShootPos.value = point
+    editShootDspRange.value = isWithinGoalOneMeter(point)
   }
+}
+
+function confirmOuterPosition() {
+  const outer = pendingOuterResult.value
+  if (!outer || editingId.value || pendingShot.value?.id !== outer.id) return
+  recordGoalResult(outer.zone, outer.point)
+}
+
+function cancelOuterPosition() {
+  pendingOuterResult.value = null
+  pendingOuterScreenPos.value = null
 }
 
 // LX/HX/RX는 좌표가 없는 결과 버튼이다. 골대 주변의 좁은 실측 영역에 버튼을 끼워 넣지 않고
@@ -2650,11 +2679,15 @@ async function finishHalf() {
           </div>
         </section>
 
-        <section class="right" :class="{ editing: !!editingId || !!cardPlayerEditTarget || editingSubIndex !== null }">
+        <section class="right" :class="{ editing: !!editingId || !!pendingOuterResult || !!cardPlayerEditTarget || editingSubIndex !== null }">
           <div v-if="editingId" class="editActions">
             <button class="editApply" @click="applyEdit">적용</button>
             <button class="editDelete" @click="deleteEdit">삭제</button>
             <button class="editCancel" @click="cancelEdit">취소</button>
+          </div>
+          <div v-else-if="pendingOuterResult && pendingShot?.id === pendingOuterResult.id" class="editActions">
+            <button class="editApply" @click="confirmOuterPosition">적용</button>
+            <button class="editCancel" @click="cancelOuterPosition">취소</button>
           </div>
           <!-- 카드 수정도 기록표 수정과 같은 자리(상단)에 적용·삭제·취소를 띄운다 -->
           <div v-else-if="cardPlayerEditTarget" class="editActions">
@@ -2669,7 +2702,7 @@ async function finishHalf() {
             <button class="editCancel" @click="cancelEditSub">취소</button>
           </div>
           <!-- 종료/복귀 액션. 일반 입력에서는 일시정지 여부와 관계없이 두 버튼을 항상 유지한다. -->
-          <div v-if="!editingId && !cardPlayerEditTarget && editingSubIndex === null" class="finishControls">
+          <div v-if="!editingId && !pendingOuterResult && !cardPlayerEditTarget && editingSubIndex === null" class="finishControls">
             <!-- 최종 RAW 수정은 같은 자리에서 바로 반영하고 final 상태로 되돌린다. -->
             <template v-if="isFinalCorrection">
               <button class="lobbyExitBtn" @click="exitFinalCorrection">퇴장하기</button>
@@ -2688,9 +2721,9 @@ async function finishHalf() {
                h1 은 보이지 않게(editTitle) 자리만 잡아, 수정 전/후 입력창 크기가 같게 한다. -->
           <!-- 제목을 왼쪽에 두고 좌우 반전(⇄) 버튼은 제목 바로 오른쪽에 붙인다. -->
           <div class="titleRow">
-            <h1 :class="{ editTitle: !!editingId || cardOpen || subOpen }">{{
+            <h1 :class="{ editTitle: !!editingId || !!pendingOuterResult || cardOpen || subOpen }">{{
               !subOpen && playerPickFor ? '선수선택' : '' }}</h1>
-            <div v-if="!editingId && !cardPlayerEditTarget && editingSubIndex === null" ref="mirrorWrapRef"
+            <div v-if="!editingId && !pendingOuterResult && !cardPlayerEditTarget && editingSubIndex === null" ref="mirrorWrapRef"
               class="mirrorWrap">
               <button class="mirrorIcon" :class="{ on: mirrorOpen, locked: mirrorLocked }" :disabled="mirrorLocked"
                 @click="openMirrorPopup">⇄</button>

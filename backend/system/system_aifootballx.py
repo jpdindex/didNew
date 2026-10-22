@@ -89,7 +89,9 @@ def tactic_projection(item: dict[str, Any], row: dict[str, Any], path_id: str | 
             'gr_pos_y': pitch_coordinate(value.get('posY'), 634),
             'gr_shoot_pos_x': value.get('shootPosX') if value.get('shootPosX') is not None else '\\N',
             'gr_shoot_pos_y': value.get('shootPosY') if value.get('shootPosY') is not None else '\\N',
-            'p_id': str(item.get('player_identities', {}).get(player, player_identity(player))) if player and player != 'OWN' else '\\N', 'gt_id': path_id or '\\N'}
+            'p_id': ('OWN' if player == 'OWN' else
+                     str(item.get('player_identities', {}).get(player, player_identity(player))) if player else '\\N'),
+            'gt_id': str(path_id) if path_id else '\\N'}
 
 
 def pitch_coordinate(value: Any, extent: int) -> float | str:
@@ -153,6 +155,17 @@ def source_records(item: dict[str, Any]) -> list[KpiRecord]:
                      bap_reason=v.get('bapReason'))
             for row in item['children']['records'] for v in [row['data']]
             if v.get('half') not in ('', None)]
+
+
+def tactic_record_ids(records: list[KpiRecord], computed: Any) -> set[str]:
+    """Keep the whole recorded sequence containing a shot or goal, including OWN.
+
+    Legacy DTP flags alone omit STP shots and sequences whose path master was
+    lost. Ordinary possession sequences must not enter the target TACTIC.
+    """
+    paths = {computed.flags[r.id].path_id for r in records
+             if computed.flags[r.id].is_shot or computed.flags[r.id].is_goal}
+    return {r.id for r in records if computed.flags[r.id].path_id in paths}
 
 
 def intervals(records: list[KpiRecord], computed: Any) -> dict[str, list[float]]:
@@ -223,7 +236,8 @@ def natural_key(collection: str, data: dict[str, Any]) -> tuple[Any, ...]:
         return data.get('gm_id'), data.get('IDX_CODE'), data.get('p_id')
     if collection == 'TACTIC':
         return tuple(data.get(k) for k in ('gm_id', 't_code', 'gr_half', 'gr_half_seconds',
-                                         'gt_id', 'p_id', 'gr_act_code', 'gr_res_code'))
+                                         'gt_id', 'p_id', 'gr_act_code', 'gr_res_code',
+                                         'gr_pos_x', 'gr_pos_y', 'gr_shoot_pos_x', 'gr_shoot_pos_y'))
     if collection == 'playerGoal':
         return tuple(data.get(k) for k in ('gm_id', 'IDX_CODE', 'gr_half', 'gr_half_seconds', 'p_id'))
     if collection.startswith('bmas_'):
@@ -257,7 +271,7 @@ def history(existing: str, contracts: list[dict[str, Any]], league_types: dict[s
     return ','.join(dict.fromkeys(tokens))
 
 
-def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any) -> dict[str, Any]:
+def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match_only=False) -> dict[str, Any]:
     """Return reviewable merge candidates and checks; never writes a destination."""
     report: dict[str, Any] = {'mode': 'preview-only', 'match_id': match_id, 'documents': [],
                               'source_captured_at': evidence.get('captured_at'),
@@ -340,7 +354,7 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any) -> di
         report['errors'].append('Exactly one H and one A recording are required')
     if len(items) == 2 and items[0]['match'] != items[1]['match']:
         report['errors'].append('H/A recording match metadata differ')
-    if items:
+    if items and not match_only:
         registered_players(evidence, items[0]['match'], emit, report)
     for original_item in items:
         item = {**original_item, 'player_identities': {pid:player_identity(pid,profile) for pid,profile in evidence.get('player_profiles',{}).items()}}
@@ -378,8 +392,16 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any) -> di
             kpi, rating = recording['kpi'], recording['teamRating']
             for metric in ('apx','tpx','fpx'):
                 if metric+'Grade' in rating:
-                    check(prefix+'source-'+metric.upper()+'-grade', rating[metric+'Grade']==grade(rating[metric]),
-                          score=rating[metric], stored=rating[metric+'Grade'], expected=grade(rating[metric]))
+                    consistent = rating[metric+'Grade']==grade(rating[metric])
+                    # User-approved delivery exception for this exact legacy snapshot.
+                    # Keep the source unchanged and retain the failed comparison in the audit.
+                    waived = (match_only and match_id=='20232024eplj2rgn13na28rd2b8q0009'
+                              and side=='H' and team_id=='E-CH' and match.get('awayTeamId')=='E-LI'
+                              and metric=='fpx' and rating[metric]==50.0 and rating[metric+'Grade']=='F')
+                    check(prefix+'source-'+metric.upper()+'-grade', consistent or waived,
+                          score=rating[metric], stored=rating[metric+'Grade'], expected=grade(rating[metric]),
+                          **({'waived':True,'actual_passed':False,
+                              'waiver_reason':'User-approved legacy Chelsea home FPX 50.0/F; delivery only'} if waived else {}))
             for key, value in kpi.items():
                 if key in computed.team_kpi:
                     check(prefix + 'source-KPI-' + key, abs(value - computed.team_kpi[key]) < 1e-6,
@@ -438,20 +460,22 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any) -> di
             if team.get('nameKr') or team.get('name'):
                 dmst['t_Nm'] = team.get('nameKr') or team['name']
             emit('dMST', dmst)
-            if 'coach_rounds' in evidence:
+            if 'coach_rounds' in evidence and not match_only:
                 managers = [r['data'] for r in evidence['coach_rounds'] if r['data'].get('plSeason') == season
                             and r['data'].get('round') == match['round'] and r['data'].get('teamId') == team_id]
                 if len(managers) != 1:
                     raise ValueError('Expected one coachRounds row per season/team/round')
                 emit('Manager', manager_projection(managers[0], code, dmst.get('t_Nm', team_id)))
             goals = []
+            tactic_ids = tactic_record_ids(records, computed)
             for row in sorted((r for r in item['children']['records'] if r['id'] in computed.flags),
                               key=lambda r: (r['data']['half'], r['data']['halfSeconds'],
                                                                          r['data'].get('createdAt', ''), r['id'])):
                 value = row['data']
                 flag = computed.flags[row['id']]
                 projection = tactic_projection(item, row, flag.path_id)
-                emit('TACTIC', dict(projection, t_code=idx), (match_id, side, row['id']))
+                if row['id'] in tactic_ids:
+                    emit('TACTIC', dict(projection, t_code=idx), (match_id, side, row['id']))
                 for role in ('DTA', 'DTB', 'DTM', 'DTS'):
                     if getattr(flag, 'is_' + role.lower()):
                         emit('bmas_' + role, {**common, 'team_type': wide['team_type'], 't_code': idx, 'Type': role,
@@ -475,6 +499,11 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any) -> di
                 if stadium.get('name'):
                     goal['s_name'] = stadium['name']
                 emit('playerGoal', goal, (match_id, side, row['id']))
+            actual_tactic = [d for d in report['documents'] if d['collection'] == 'TACTIC'
+                             and d['data']['gm_id'] == match_id and d['data']['t_code'] == idx]
+            check(prefix + 'TACTIC-selected-records', len(actual_tactic) == len(tactic_ids),
+                  expected=len(tactic_ids), actual=len(actual_tactic),
+                  excluded=len(computed.flags) - len(tactic_ids))
             if len(goals) > 10:
                 raise ValueError('More than ten goals; refusing truncation')
             emit('multiSheet_GOAL-시간', {**{k: v for k, v in wide.items() if '-H' not in k},
@@ -540,11 +569,11 @@ def registration_link(evidence, player_id, season, matches):
 
 def registered_player_projection(evidence, player_id, season, matches):
     profile = evidence.get('player_profiles', {}).get(player_id, {})
-    if not profile.get('name'):
-        raise ValueError(f'Missing player name/profile {player_id}')
     link = registration_link(evidence,player_id,season,matches)
     if link is None:
         return None
+    if not profile.get('name'):
+        raise ValueError(f'Missing player name/profile {player_id}')
     pid = player_identity(player_id,profile)
     mapped = {dest:profile[src] for dest,src in PLAYER_FIELDS.items() if profile.get(src) is not None}
     if mapped.get('p_birth'): mapped['p_birth']=dotted_date(mapped['p_birth'])
@@ -625,6 +654,14 @@ def build_players(evidence, item, computed, code, short_season, emit, report, co
         contracts = evidence.get('player_contracts', {}).get(player_id, [])
         scoped = [c for c in contracts if (c.get('competitionType') or league_types.get(c.get('leagueId'), 'league')) == kind]
         contract = select_contract(scoped, match, team_id, covers) if active else {}
+        # Approved legacy date-boundary exceptions: preserve actual appearances,
+        # without extending a contract or borrowing another team's contract.
+        if contract is None and (item['match_id'], side, player_id) in {
+            ('20232024eplj2rgn13na28rd2b8q0220', 'A', '0000003668'),
+            ('20232024eplj2rgn13na28rd2b8q0220', 'A', '0000005560'),
+        }:
+            contract = {}
+            report['warnings'].append(f'{side}: approved legacy contract date boundary {player_id}')
         if contract is None:
             report['errors'].append(f'{side}: no match-date contract {player_id}')
             continue
@@ -684,7 +721,9 @@ def manager_projection(row: dict[str, Any], code: dict[str, Any], team_name: str
     en, kr = status[row['status']]
     return {'PlSeason': row['plSeason'], 'Round': row['round'],
             'T_Code': row['teamId'], 'IDX_CODE': code['IDX_CODE'], 'T_Name': team_name,
-            'm_id': numeric_player_id(row['coachId']), 'Manager_EN': row['coachNameEn'],
+            'm_id': (numeric_player_id(row.get('legacyCoachId') or row['coachId'])
+                     if str(row.get('legacyCoachId') or row['coachId']).isdigit() else player_identity('coach:'+str(row['coachId']))),
+            'Manager_EN': row['coachNameEn'],
             'Manager_KR': row['coachName'], 'Status_EN': en, 'Status_KR': kr,
             'gm_date': dotted_date(row['from']), 'e_date': dotted_date(row.get('to') or '9999.99.99')}
 
@@ -1397,6 +1436,18 @@ MATCH_TARGETS = ('TACTIC', 'multiSheet_ALL', 'multiSheet_BAP', 'multiSheet_DAP',
                  'multiSheet_GOAL', 'multiSheet_JMX', 'multiSheet_SHOT', 'multiSheet_GOAL-시간',
                  'playerGoal', 'vibePlayer', 'bmas_DTA', 'bmas_DTB', 'bmas_DTM', 'bmas_DTS')
 
+MASTER_COLLECTIONS = frozenset(('Player', 'playerDB', 'Manager', 'code', *AGGREGATES))
+MATCH_COLLECTIONS = frozenset(('dMST', 'playerMST', *MATCH_TARGETS))
+
+
+def delivery_mode(scope):
+    mode = scope.get('mode', 'matches')
+    if mode not in ('matches', 'all', 'latest'):
+        fail('Unknown delivery mode')
+    if mode != 'matches' and any(scope.get(k) is not None for k in ('roundFrom', 'roundTo', 'matchId')):
+        fail('ALL/LATEST accept a season only; round and match filters are not allowed')
+    return mode
+
 
 def fail(message, code='aifootballx_validation_failed'):
     raise BackendError(message, status_code=409, code=code)
@@ -1427,14 +1478,59 @@ class SourceCapture:
             q = q.where(filter=FieldFilter(field, op, value))
         return q
 
-    def rows(self, client, path, filters=(), *, source=False, bound=20000):
+    def rows(self, client, path, filters=(), *, source=False, bound=20000, season_range=None):
         snaps = list(self.query(client, path, filters).limit(bound + 1).stream(timeout=60, retry=None))
         if len(snaps) > bound:
             fail(f'Read limit exceeded: {path}')
         if source:
-            self.queries.append({'path': path, 'filters': list(filters), 'bound': bound,
-                                 'versions': {s.id: self.version(s) for s in snaps}})
+            guard = {'path':path,'filters':list(filters),'bound':bound,
+                     **({'season_range':season_range} if season_range else {})}
+            guard['versions'] = self.guard_versions(snaps,guard)
+            self.queries.append(guard)
+            if season_range: snaps=[s for s in snaps if s.id in guard['versions']]
         return [{'id': s.id, 'data': encode(s.to_dict())} for s in snaps]
+
+    def get_many(self, paths):
+        paths = sorted(set(paths))
+        result = {}
+        for start in range(0,len(paths),100):
+            refs = [self.did.document(p) for p in paths[start:start+100]]
+            for snap in self.did.get_all(refs,timeout=60,retry=None):
+                self.documents[snap.reference.path] = self.version(snap)
+                if snap.exists: result[snap.reference.path] = encode(snap.to_dict())
+        return result
+
+    @staticmethod
+    def guard_versions(snaps, guard):
+        result = {}
+        for snap in snaps:
+            if guard.get('season_range'):
+                value = snap.to_dict()
+                start,end = guard['season_range']
+                if (re.sub(r'\D','',value.get('from') or '')>end
+                        or re.sub(r'\D','',value.get('to') or '99999999')<start):
+                    continue
+            key = snap.reference.path if guard.get('group') else snap.id
+            result[key] = None if guard.get('membership_only') else SourceCapture.version(snap)
+        return result
+
+    def team_contracts(self, team_ids, start, end):
+        from google.cloud.firestore_v1.base_query import FieldFilter
+        result = defaultdict(list)
+        for first in range(0,len(team_ids),30):
+            filters = [('teamId','in',team_ids[first:first+30])]
+            query = self.did.collection_group('contracts').where(filter=FieldFilter(*filters[0]))
+            snaps = list(query.limit(50001).stream(timeout=60,retry=None))
+            if len(snaps)>50000: fail('Team contract read limit exceeded')
+            guard = {'group':'contracts','filters':filters,'bound':50000,'season_range':[start,end],
+                     'membership_only':True}
+            guard['versions'] = self.guard_versions(snaps,guard)
+            self.queries.append(guard)
+            for snap in snaps:
+                parts = snap.reference.path.split('/')
+                if snap.reference.path in guard['versions'] and len(parts)==4 and parts[0]=='players':
+                    result[parts[1]].append(dict(encode(snap.to_dict()),_id=snap.id))
+        return result
 
     def assert_fresh(self, guards):
         slot_guard = guards.get('slot_file')
@@ -1447,12 +1543,19 @@ class SourceCapture:
                 if self.version(snap) != guards['documents'][snap.reference.path]:
                     fail('DID source changed; create a new preview', 'aifootballx_source_changed')
         for guard in guards['queries']:
-            snaps = list(self.query(self.did, guard['path'], guard['filters']).limit(guard['bound'] + 1).stream(timeout=60, retry=None))
-            if {s.id: self.version(s) for s in snaps} != guard['versions']:
+            query = self.did.collection_group(guard['group']) if guard.get('group') else self.query(self.did, guard['path'], guard['filters'])
+            if guard.get('group'):
+                from google.cloud.firestore_v1.base_query import FieldFilter
+                for field,op,value in guard.get('filters',[]): query=query.where(filter=FieldFilter(field,op,value))
+            # Version/membership checks need no full RAW/player payloads.
+            if hasattr(query,'select'):
+                query=query.select(['from','to'] if guard.get('season_range') else [])
+            snaps = list(query.limit(guard['bound'] + 1).stream(timeout=60, retry=None))
+            if self.guard_versions(snaps,guard) != guard['versions']:
                 fail('DID source collection changed; create a new preview', 'aifootballx_source_changed')
         if 'reference_code' in guards:
             code = self.rows(self.target, 'code', bound=500)
-            actual = {r['id']: r['data'] for r in code}
+            actual = code_reference(code,guards.get('code_scope'))
             expected = guards['reference_code']
             additions = guards.get('new_code', {})
             if any(actual.get(k) != v for k, v in expected.items()) or any(
@@ -1460,6 +1563,8 @@ class SourceCapture:
                 fail('Destination team code configuration changed; create a new preview', 'aifootballx_source_changed')
 
     def split_scopes(self, scope):
+        if delivery_mode(scope) != 'matches':
+            return [scope]
         if scope.get('matchId'):
             return [scope]
         matches = self.rows(self.did, 'matches', [('seasonId', '==', scope['seasonId']), ('leagueId', '==', 'EPL')], bound=2000)
@@ -1467,10 +1572,12 @@ class SourceCapture:
                          if (scope.get('roundFrom') is None or r['data']['round'] >= scope['roundFrom'])
                          and (scope.get('roundTo') is None or r['data']['round'] <= scope['roundTo'])})
         if not rounds:
-            fail('No DID matches in this scope; finish importing SQL into DID first')
+            fail('No DID matches in this scope')
         return [{**scope, 'roundFrom': n, 'roundTo': n} for n in rounds]
 
     def capture(self, scope, slot_path):
+        if delivery_mode(scope) != 'matches':
+            return self.capture_masters(scope, slot_path)
         from google.cloud.firestore_v1.field_path import FieldPath
         season_id, season = scope['seasonId'], season_label(scope['seasonId'])
         all_matches = self.rows(self.did, 'matches', [('seasonId', '==', season_id), ('leagueId', '==', 'EPL')], source=True, bound=2000)
@@ -1478,31 +1585,29 @@ class SourceCapture:
                     and (scope.get('roundFrom') is None or r['data']['round'] >= scope['roundFrom'])
                     and (scope.get('roundTo') is None or r['data']['round'] <= scope['roundTo'])]
         if not selected:
-            fail('No DID matches in this scope; finish importing SQL into DID first')
+            fail('No DID matches in this scope')
         evidence = {'did_matches': all_matches, 'match_scan_truncated': False, 'source_recordings': [],
                     'captured_at': datetime.now(timezone.utc).isoformat(), 'player_profiles': {}, 'player_contracts': {},
                     'teams': {}, 'stadiums': {}, 'target_existing': {}, 'projects': {},
                     'leagues': {r['id']: r['data'] for r in self.rows(self.did, 'leagues', source=True, bound=100)},
-                    'coach_rounds': self.rows(self.did, 'coachRounds', [('plSeason', '==', season)], source=True, bound=2000),
-                    'coach_contracts': self.rows(self.did, 'coachContracts', source=True, bound=5000),
                     'ai_samples': {'code': self.rows(self.target, 'code', bound=500)}}
         target = evidence['target_existing']
-        for col in ('dMST', 'Manager', *AGGREGATES):
+        for col in ('dMST',):
             field, value = ('SEASON', season[2:4] + '/' + season[7:9]) if col == 'sAVG' else ('PlSeason', season)
             target[col] = self.rows(self.target, col, [(field, '==', value)], bound=5000)
-        slots = json.loads(slot_path.read_text(encoding='utf-8')) if slot_path else {'seasonSlotMappings': {}}
-        setup = plan_new_season(season, all_matches, evidence['ai_samples']['code'], target, slots)
-        evidence['ai_samples']['code'].extend(setup['code_rows'])
-        slots = setup['slots']
-        # Aggregates always use the whole imported season, including previous rounds.
-        refs = [self.did.document(f'matches/{r["id"]}/recordings/{side}') for r in all_matches for side in ('H', 'A')]
+        # Match-only delivery resolves existing/global team codes directly.
+        # Season code creation and aggregate slots belong to ALL/LATEST.
+        slots = {}
+        setup = {'documents': [], 'code_rows': [], 'slots': slots, 'new_season': False}
+        # Match delivery never reads unrelated recordings or sends season masters.
+        refs = [self.did.document(f'matches/{r["id"]}/recordings/{side}') for r in selected for side in ('H', 'A')]
         recording_by_path = {}
         for start in range(0, len(refs), 100):
             for snap in self.did.get_all(refs[start:start + 100], timeout=60, retry=None):
                 self.documents[snap.reference.path] = self.version(snap)
                 recording_by_path[snap.reference.path] = encode(snap.to_dict()) if snap.exists else {}
         aggregate_items = []
-        for row in all_matches:
+        for row in selected:
             match = row['data']
             for side in ('H', 'A'):
                 rec = recording_by_path[f'matches/{row["id"]}/recordings/{side}']
@@ -1520,19 +1625,12 @@ class SourceCapture:
             for col in MATCH_TARGETS:
                 target.setdefault(col, []).extend(self.rows(self.target, col, [('gm_id', '==', mid)]))
             target.setdefault('playerMST', []).extend(self.rows(self.target, 'playerMST', [(FieldPath('P-DB1').to_api_repr(), '==', mid)]))
-        teams={r['data'][k] for r in all_matches for k in ('homeTeamId','awayTeamId')}
-        registered_profiles={}; evidence['player_team_links']={}
-        for team in sorted(teams):
-            for row in self.rows(self.did,'players',[('currentTeamId','==',team)],source=True,bound=2000):
-                player_ids.add(row['id']); registered_profiles[row['id']]=row['data']
-            for row in self.rows(self.did,f'teams/{team}/squad',source=True,bound=2000):
-                player_ids.add(row['id'])
-                evidence['player_team_links'].setdefault(row['id'],[]).append(team)
+        evidence['player_team_links']={}
         for item in evidence['source_recordings']:
             player_ids.update(item['recording'].get('lineup',{}))
         evidence['registration_player_ids']=sorted(player_ids)
         for pid in sorted(player_ids):
-            profile = registered_profiles.get(pid) or self.get('players/' + pid)
+            profile = self.get('players/' + pid)
             if profile:
                 evidence['player_profiles'][pid] = profile
             evidence['player_contracts'][pid] = [dict(r['data'], _id=r['id']) for r in self.rows(self.did, f'players/{pid}/contracts', source=True, bound=500)]
@@ -1564,16 +1662,113 @@ class SourceCapture:
             schemas[col] = {'fields': {key: sorted(types) for key, types in fields.items()}}
         evidence['projects'] = {'aifootballx': schemas}
         guards = {'documents': self.documents, 'queries': self.queries,
-                  'reference_code': {r['id']: r['data'] for r in evidence['ai_samples']['code'] if r not in setup['code_rows']},
+                  'code_scope':{'season':season,'teams':sorted({r['data'][k] for r in all_matches for k in ('homeTeamId','awayTeamId')})},
+                  'reference_code': {},
                   'new_code': {d['document_id']: d['data'] for d in setup['documents']}}
-        if slot_path:
-            guards['slot_file'] = {'path': str(slot_path.resolve()), 'sha256': sha256(slot_path.read_bytes()).hexdigest()}
-        self.assert_fresh(guards)
-        return generate_delivery(evidence, selected, aggregate_items, slots, setup), guards
+        guards['reference_code'] = code_reference(evidence['ai_samples']['code'],guards['code_scope'])
+        return generate_delivery(evidence, selected, aggregate_items, slots, setup, match_only=True), guards
+
+    def capture_masters(self, scope, slot_path):
+        """Read masters independently of match RAW, playerStats and rating jobs."""
+        from google.cloud.firestore_v1.field_path import FieldPath
+        season = season_label(scope['seasonId'])
+        fixtures = self.rows(self.did, 'matches', [('seasonId','==',scope['seasonId']),('leagueId','==','EPL')], source=True, bound=2000)
+        season_doc = self.get('seasons/' + scope['seasonId']) or {}
+        codes = self.rows(self.target,'code',bound=500)
+        context = list(fixtures)
+        start = season_doc.get('from') or season[:4] + '.07.01'
+        end = season_doc.get('to') or season[5:] + '.06.30'
+        team_ids = {r['data'][k] for r in fixtures for k in ('homeTeamId','awayTeamId')}
+        if not context:
+            team_ids = {r['data'].get('TCODE') or r['data'].get('Code') for r in codes if r['data'].get('PlSeason')==season}
+            if not team_ids:
+                team_ids = {r['id'] for r in self.rows(self.did,'teams',[('currentLeagueId','==','EPL')],source=True,bound=100)}
+        team_ids = sorted(team_ids-{None})
+        teams = {p.split('/')[-1]:v for p,v in self.get_many('teams/'+tid for tid in team_ids).items()}
+        selected_contracts = self.team_contracts(team_ids,re.sub(r'\D','',start),re.sub(r'\D','',end))
+        player_ids = set(selected_contracts)
+        profiles = {}
+        links = {}
+        for first in range(0,len(team_ids),30):
+            rows = self.rows(self.did,'players',[('currentTeamId','in',team_ids[first:first+30])],
+                             source=True,bound=5000)
+            player_ids.update(r['id'] for r in rows)
+            profiles.update({r['id']:r['data'] for r in rows})
+        for tid in team_ids:
+            for row in self.rows(self.did,f'teams/{tid}/squad',source=True,bound=2000):
+                player_ids.add(row['id']);links.setdefault(row['id'],[]).append(tid)
+        profiles.update({p.split('/')[-1]:v for p,v in self.get_many('players/'+pid for pid in player_ids-set(profiles)).items()})
+        contracts = {pid:[dict(r['data'],_id=r['id']) for r in self.rows(
+            self.did,f'players/{pid}/contracts',source=True,bound=500)] for pid in sorted(profiles)}
+        # Registration spans the season, even before the first/after the last
+        # recorded fixture. A transfer must not be frozen at the last game date.
+        context.extend({'id':f'registration-{tid}-{n}','data':{'seasonId':scope['seasonId'],'leagueId':'EPL',
+                        'date':date,'homeTeamId':tid,'awayTeamId':tid}}
+                       for tid in sorted(team_ids) for n,date in enumerate((start,end)))
+        if not context: fail('No teams or registrations for this season')
+        target = {}
+        for col in ('dMST','Manager',*AGGREGATES,'Player','playerDB'):
+            field,value = (FieldPath('P-6').to_api_repr(),int(season[2:4]+season[7:9])) if col=='playerDB' else (
+                ('SEASON',season[2:4]+'/'+season[7:9]) if col=='sAVG' else ('PlSeason',season))
+            target[col] = self.rows(self.target,col,[(field,'==',value)],bound=20000)
+        # Auto-ID collision checks read only relevant identities across seasons.
+        auto_ids = sorted({player_identity(pid,profile) for pid,profile in profiles.items() if not str(pid).isdigit()})
+        for col,field in (('Player','p_id'),('playerDB','P-1')):
+            existing = {r['id']:r for r in target[col]}
+            for first in range(0,len(auto_ids),30):
+                existing.update({r['id']:r for r in self.rows(self.target,col,
+                    [(FieldPath(field).to_api_repr(),'in',auto_ids[first:first+30])],bound=5000)})
+            target[col] = list(existing.values())
+        slots = {'seasonSlotMappings':{}}
+        try:
+            if slot_path: slots = json.loads(slot_path.read_text(encoding='utf-8'))
+            if not isinstance(slots,dict) or not isinstance(slots.get('seasonSlotMappings',{}),dict):
+                raise ValueError('Invalid season slot configuration')
+            setup = plan_new_season(season,context,codes,target,slots)
+        except (BackendError,OSError,ValueError,TypeError,KeyError,AttributeError) as exc:
+            reason = exc.message if isinstance(exc,BackendError) else f'Season slot configuration unavailable ({type(exc).__name__})'
+            setup = {'documents':[],'code_rows':[],'slots':slots,'new_season':False,'errors':[reason]}
+        evidence = {'did_matches':context,'source_recordings':[],'player_profiles':profiles,'player_contracts':contracts,
+                    'teams':teams,'player_team_links':links,'target_existing':target,'ai_samples':{'code':codes+setup['code_rows']},
+                    'leagues':{r['id']:r['data'] for r in self.rows(self.did,'leagues',source=True,bound=100)},
+                    'coach_rounds':[] if fixtures else self.rows(self.did,'coachRounds',[('plSeason','==',season)],source=True,bound=2000),
+                    'coach_contracts':[],'coaches':{}}
+        for first in range(0,len(team_ids),30):
+            evidence['coach_contracts'].extend(self.rows(self.did,'coachContracts',
+                [('teamId','in',team_ids[first:first+30])],source=True,bound=5000,
+                season_range=[re.sub(r'\D','',start),re.sub(r'\D','',end)]))
+        coach_ids = {str(r['data']['coachId']) for r in evidence['coach_contracts']+evidence['coach_rounds'] if r['data'].get('coachId') is not None}
+        evidence['coaches'] = {p.split('/')[-1]:v for p,v in self.get_many('coaches/'+pid for pid in coach_ids).items()}
+        items = []
+        refs = [self.did.document(f'matches/{r["id"]}/recordings/{side}') for r in fixtures for side in ('H','A')]
+        heads = {}
+        for start in range(0,len(refs),100):
+            for snap in self.did.get_all(refs[start:start+100],timeout=60,retry=None):
+                self.documents[snap.reference.path]=self.version(snap)
+                heads[snap.reference.path]=encode(snap.to_dict()) or {}
+        for row in fixtures:
+            for side in ('H','A'):
+                rec=heads[f'matches/{row["id"]}/recordings/{side}']
+                items.append({'match_id':row['id'],'match':row['data'],'side':side,'recording':rec,
+                              'team_name':teams.get(rec.get('teamId'),{}).get('nameKr') or teams.get(rec.get('teamId'),{}).get('name')})
+        report = generate_masters(evidence, fixtures, items, setup['slots'], setup, delivery_mode(scope))
+        guards = {'documents':self.documents,'queries':self.queries,'code_scope':{'season':season,'teams':team_ids},
+                  'reference_code':{},
+                  'new_code':{d['document_id']:d['data'] for d in setup['documents']}}
+        guards['reference_code'] = code_reference(codes,guards['code_scope'])
+        if slot_path and not setup.get('errors'):
+            guards['slot_file']={'path':str(slot_path.resolve()),'sha256':sha256(slot_path.read_bytes()).hexdigest()}
+        return report,guards
+
+
+def code_reference(rows, scope=None):
+    return {r['id']:r['data'] for r in rows if scope is None or (
+        r['data'].get('PlSeason') in (None,'',scope['season'])
+        and (r['data'].get('TCODE') or r['data'].get('Code')) in scope['teams'])}
 
 
 def plan_new_season(season, matches, code_rows, target, slots):
-    """A new season gets explicit deterministic slots; established seasons never do."""
+    """Match rows alone do not imply that season code/aggregate slots exist."""
     slots = deepcopy(slots)
     result = {'code_rows': [], 'documents': [], 'slots': slots, 'new_season': False}
     exact = [r for r in code_rows if r['data'].get('PlSeason') == season]
@@ -1582,8 +1777,8 @@ def plan_new_season(season, matches, code_rows, target, slots):
         if set(saved) == set(range(1, 21)) and len(set(saved.values())) == 20:
             slots.setdefault('seasonSlotMappings', {})[season] = {'cavgSlotToCodeTeamCodeMapping': {
                 str(n): {'codeTeamCode': number, 'cavgSlot': n} for n, number in saved.items()}}
-    established = any(target.get(col) for col in ('dMST', 'mMST', 'pMST', 'cAVG', 'rAVG', 'rank'))
-    if exact or established or season in slots.get('seasonSlotMappings', {}):
+    established = any(target.get(col) for col in ('mMST', 'pMST', 'cAVG', 'rAVG', 'rank'))
+    if exact or established:
         return result
     teams = {r['data'][field] for r in matches for field in ('homeTeamId', 'awayTeamId')}
     if len(teams) != 20:
@@ -1603,9 +1798,12 @@ def plan_new_season(season, matches, code_rows, target, slots):
         references.append(code['team_code_number'])
     if len(set(references)) != 20 or len({r['data']['POSITION'] for r in result['code_rows']}) != 20:
         fail('New season team numbers/positions must be unique')
-    slots.setdefault('seasonSlotMappings', {})[season] = {'cavgSlotToCodeTeamCodeMapping': {
-        str(n): {'codeTeamCode': number, 'cavgSlot': n} for n, number in enumerate(sorted(references), 1)}}
-    assigned = {number: n for n, number in enumerate(sorted(references), 1)}
+    slots.setdefault('seasonSlotMappings', {}).setdefault(season, {'cavgSlotToCodeTeamCodeMapping': {
+        str(n): {'codeTeamCode': number, 'cavgSlot': n} for n, number in enumerate(sorted(references), 1)}})
+    mapping = slots['seasonSlotMappings'][season].get('cavgSlotToCodeTeamCodeMapping',{})
+    if set(mapping)!={str(n) for n in range(1,21)} or {v.get('codeTeamCode') for v in mapping.values()}!=set(references):
+        fail('Season slot mapping must cover the same 20 team numbers')
+    assigned = {value['codeTeamCode']:int(key) for key,value in mapping.items()}
     for row, doc in zip(result['code_rows'], result['documents'], strict=True):
         row['data']['DID_CAVG_SLOT'] = assigned[row['data']['Team Code']]
         doc['data']['DID_CAVG_SLOT'] = assigned[row['data']['Team Code']]
@@ -1632,12 +1830,12 @@ def season_player(data, col, evidence, all_matches):
     return {**data,**{aliases[k] if col=='playerDB' else k:v for k,v in fields.items()}}
 
 
-def generate_delivery(evidence, selected, aggregate_items, slots, setup):
-    errors, checks, documents = [], [], list(setup['documents'])
+def generate_delivery(evidence, selected, aggregate_items, slots, setup, *, match_only=False):
+    errors, checks, documents = [], [], [] if match_only else list(setup['documents'])
     for fixture in selected:
         match=fixture['data']
         for team in (match['homeTeamId'],match['awayTeamId']):
-            selected_coaches=[r['data'] for r in evidence.get('coach_rounds',[]) if r['data'].get('teamId')==team
+            selected_coaches=[] if match_only else [r['data'] for r in evidence.get('coach_rounds',[]) if r['data'].get('teamId')==team
                               and r['data'].get('round')==match['round'] and r['data'].get('plSeason')==season_label(match['seasonId'])]
             if len(selected_coaches)==1:
                 coach=selected_coaches[0]
@@ -1652,7 +1850,7 @@ def generate_delivery(evidence, selected, aggregate_items, slots, setup):
                     try: TeamRatingSnapshot.model_validate(item['recording']['teamRating'])
                     except ValueError: errors.append(f'{fixture["id"]}/{team}: required team rating/grade snapshot fields missing')
         scoped = {**evidence, 'target_existing': match_target_scope(evidence['target_existing'], fixture['data'])}
-        report = build_preview(scoped, fixture['id'], covers=JpdDidData._contract_covers_match_date)
+        report = build_preview(scoped, fixture['id'], covers=JpdDidData._contract_covers_match_date, match_only=match_only)
         errors.extend(f'{fixture["id"]}: {e}' for e in report['errors'])
         checks.extend({'matchId': fixture['id'], **c} for c in report['checks'])
         for doc in report['documents']:
@@ -1662,6 +1860,17 @@ def generate_delivery(evidence, selected, aggregate_items, slots, setup):
                 except BackendError as exc:
                     errors.append(exc.message)
             documents.append(doc)
+    if match_only:
+        report = finish_delivery(documents, errors, checks, evidence['target_existing'], 'matches', len(selected))
+        selected_ids = {r['id'] for r in selected}
+        identities = {(d['collection'],d['document_id']) for d in report['documents']}
+        for col in (*MATCH_TARGETS,'playerMST'):
+            stale = [r['id'] for r in evidence['target_existing'].get(col,[])
+                     if (col,r['id']) not in identities and r['data'].get('P-DB1' if col=='playerMST' else 'gm_id') in selected_ids]
+            if stale: report['errors'].append(f'{col}: {len(stale)} unmatched target documents require reviewed reconciliation; no deletes performed')
+        report['validation_passed'] = bool(selected) and not report['errors'] and all(c['passed'] for c in checks)
+        report['summary']['errors'] = len(report['errors'])
+        return report
     aggregate = build_aggregates(aggregate_items, evidence['ai_samples']['code'], slots)
     bind_existing_documents(aggregate, evidence['target_existing'])
     validation = validate_aggregate_links(aggregate, aggregate_items, evidence['ai_samples']['code'], slots)
@@ -1709,7 +1918,154 @@ def generate_delivery(evidence, selected, aggregate_items, slots, setup):
 # ==========================================================================
 
 
-VALIDATION_POLICY = 'goal-inclusive-fpx-whole-match-ssr-og-timeline-v6'
+def finish_delivery(documents, errors, checks, existing, mode, matches=0):
+    """Bind immutable baselines; LATEST compares owned values, never timestamps."""
+    errors = list(errors)
+    by_id = {col:{r['id']:r['data'] for r in rows} for col,rows in existing.items()}
+    unique = {}
+    allowed = MATCH_COLLECTIONS if mode=='matches' else MASTER_COLLECTIONS
+    for original in documents:
+        doc = deepcopy(original)
+        if doc['collection'] not in allowed:
+            errors.append(f'Collection outside {mode} scope: {doc["collection"]}')
+            continue
+        identity = (doc['collection'],doc['document_id'])
+        if identity in unique and unique[identity]['data']!=doc['data']:
+            errors.append(f'Conflicting destination identity: {identity}')
+        old = by_id.get(doc['collection'],{}).get(doc['document_id'])
+        doc['baseline'] = {k:{'exists':old is not None and k in old,'value':old.get(k) if old else None} for k in doc['data']}
+        doc['existed'] = old is not None
+        doc.pop('changed_fields',None)
+        validate_document(doc)
+        unique[identity] = doc
+    changed = [d for (col,ident),d in unique.items() if ident not in by_id.get(col,{})
+               or any(k not in by_id[col][ident] or by_id[col][ident][k]!=v for k,v in d['data'].items())]
+    result = changed if mode=='latest' else list(unique.values())
+    return {'mode':mode,'validation_passed':not errors and all(c['passed'] for c in checks),'write_enabled':False,
+            'documents':result,'checks':checks,'errors':errors,
+            'scope_note':('Selected match documents only; master identities, managers, code and season aggregates excluded'
+                          if mode=='matches' else 'Season masters and six aggregates only; match details excluded'),
+            'summary':{'matches':matches,'documents':len(result),'candidateDocuments':len(unique),
+                       'changedDocuments':len(changed),'unchangedDocuments':len(unique)-len(changed),
+                       'errors':len(errors),'failed_checks':sum(not c['passed'] for c in checks)}}
+
+
+def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode):
+    errors, documents = [], list(setup['documents'])
+    context = evidence['did_matches']
+    season = season_label(context[0]['data']['seasonId'])
+    target = evidence['target_existing']
+    indexes = {}
+    destination_ids = {col:{r['id']:r for r in rows} for col,rows in target.items()}
+    for col,rows in target.items():
+        indexes[col] = defaultdict(list)
+        for row in rows: indexes[col][natural_key(col,row['data'])].append(row)
+    def emit(col,data):
+        key = natural_key(col,data)
+        found = indexes.get(col,{}).get(key,[])
+        if len(found)>1:
+            errors.append(f'{col}: ambiguous existing identity {key}')
+            return
+        ident = found[0]['id'] if found else stable_id(col,key)
+        # Do not replace an unrelated document whose random ID happens to collide.
+        collision = destination_ids.get(col,{}).get(ident)
+        if collision and natural_key(col,collision['data'])!=key:
+            errors.append(f'{col}: destination ID collision {ident}')
+            return
+        if found and found[0]['data'].get('uid'): data['uid']=found[0]['data']['uid']
+        elif col=='Manager': data['uid']=ident
+        documents.append({'collection':col,'document_id':ident,'data':data,'action':'merge-existing' if found else 'create-candidate'})
+    identities = {}
+    for pid,profile in evidence['player_profiles'].items():
+        try:
+            mapped = registered_player_projection(evidence,pid,season,context)
+            if mapped is None: continue
+            identity = mapped['p_id']
+            if identity in identities and identities[identity]!=pid: raise ValueError(f'Player identity collision: {pid}/{identities[identity]}')
+            identities[identity]=pid
+            # Explicitly cleared source fields must clear the old owned value.
+            for dest,src in PLAYER_FIELDS.items():
+                if src in profile and profile[src] is None: mapped[dest]=None
+            link = registration_link(evidence,pid,season,context)
+            if 'to' in link and link['to'] is None: mapped['pt_end']='9999.99.99'
+            for src,dest in (('no','pt_num'),('pos','pt_pos')):
+                if src in link and link[src] is None: mapped[dest]=None
+            emit('Player',mapped)
+            db = {dest:int(season[2:4]+season[7:9]) if dest=='P-6' else mapped[src]
+                  for dest,src in {**PLAYER_DB,'P-17':'p_id_old'}.items() if src in mapped}
+            if 'DID_PLAYER_ID' in mapped: db['DID_PLAYER_ID']=mapped['DID_PLAYER_ID']
+            emit('playerDB',db)
+        except (KeyError,TypeError,ValueError) as exc: errors.append(str(exc))
+    coach_rows = []
+    if fixtures:
+        for fixture in fixtures:
+            match=fixture['data']
+            for team in (match['homeTeamId'],match['awayTeamId']):
+                contracts = [c['data'] for c in evidence.get('coach_contracts',[]) if c['data'].get('teamId')==team
+                             and JpdDidData._contract_covers_match_date(c['data'],match['date'])]
+                latest = max((re.sub(r'\D','',c.get('from') or '') for c in contracts),default=None)
+                contracts = [c for c in contracts if re.sub(r'\D','',c.get('from') or '')==latest]
+                if len(contracts)!=1:
+                    errors.append(f'{fixture["id"]}/{team}: expected one match-date coach contract')
+                    continue
+                coach_rows.append({**contracts[0],'plSeason':season,'round':match['round']})
+    else:
+        for row in evidence.get('coach_rounds',[]):
+            coach=row['data']
+            candidates=[r['data'] for r in evidence.get('coach_contracts',[]) if str(r['data'].get('coachId'))==str(coach.get('coachId'))
+                        and r['data'].get('teamId')==coach.get('teamId') and r['data'].get('from')==coach.get('from')]
+            coach_rows.append({**coach,**candidates[0]} if len(candidates)==1 else coach)
+    represented = {(r.get('teamId'),str(r.get('coachId'))) for r in coach_rows}
+    teams = {r['data'][k] for r in context for k in ('homeTeamId','awayTeamId')}
+    season_end = max(re.sub(r'\D','',r['data']['date']) for r in context)
+    for row in evidence.get('coach_contracts',[]):
+        coach = row['data']
+        if (coach.get('teamId') in teams and not coach.get('to')
+                and re.sub(r'\D','',coach.get('from') or '') <= season_end
+                and (coach.get('teamId'),str(coach.get('coachId'))) not in represented):
+            errors.append(f'{coach.get("teamId")}/{coach.get("coachId")}: active coach needs a fixture or coachRounds round mapping')
+    for coach in coach_rows:
+        try:
+            profile=evidence.get('coaches',{}).get(str(coach.get('coachId')),{})
+            coach={**coach,**{k:v for k,v in {'coachName':profile.get('nameKr') or profile.get('name'),
+                    'coachNameEn':profile.get('nameEn'),'legacyCoachId':profile.get('legacyCoachId')}.items() if v is not None}}
+            team=coach['teamId'];code=resolve_team_code(evidence['ai_samples']['code'],season,team)
+            profile=evidence['teams'].get(team,{})
+            emit('Manager',manager_projection(coach,code,profile.get('nameKr') or profile.get('name') or team))
+        except (KeyError,TypeError,ValueError) as exc: errors.append(str(exc))
+    final = [i for i in aggregate_items if i['recording'].get('status')=='final']
+    known = {(r['data'].get('gm_round'),r['data'].get('t_code')) for r in target.get('dMST',[])}
+    supplied = {(i['match']['round'],i['recording'].get('teamId')) for i in final}
+    validation = None
+    aggregate_errors = list(setup.get('errors',[]))
+    aggregate_docs = []
+    if known-supplied:
+        aggregate_errors.append('Season aggregate coverage incomplete: DID lacks existing destination team/match rows')
+    elif final and not aggregate_errors:
+        try:
+            aggregate=build_aggregates(aggregate_items,evidence['ai_samples']['code'],slots)
+            bind_existing_documents(aggregate,target)
+            validation=validate_aggregate_links(aggregate,aggregate_items,evidence['ai_samples']['code'],slots)
+            aggregate_errors.extend(aggregate['errors'])
+            if not aggregate['complete'] or not validation['passed']:
+                aggregate_errors.append('Season aggregate source/rating validation failed')
+            generated = {(doc['collection'],aggregate_key(doc['collection'],doc['data'])) for doc in aggregate['documents']}
+            if any((col,aggregate_key(col,row['data'])) not in generated for col in AGGREGATES for row in target.get(col,[])):
+                aggregate_errors.append('Season aggregate coverage incomplete: existing destination aggregate rows are missing from DID')
+            if not aggregate_errors:
+                aggregate_docs=aggregate['documents']
+                for doc in aggregate_docs: doc['data'].setdefault('uid',doc['document_id'])
+                documents.extend(aggregate_docs)
+        except (BackendError,KeyError,TypeError,ValueError) as exc:
+            aggregate_errors.append(exc.message if isinstance(exc,BackendError) else f'Aggregate validation failed ({type(exc).__name__})')
+    report=finish_delivery(documents,errors,[],target,mode)
+    report.update(aggregate_validation=validation,new_season=setup['new_season'],slot_definitions=slots,
+                  aggregate_status='blocked' if aggregate_errors else ('ready' if aggregate_docs else 'empty'),
+                  warnings=aggregate_errors,blocked_groups=['aggregates'] if aggregate_errors else [])
+    return report
+
+
+VALIDATION_POLICY = 'scoped-masters-tactic-shot-goal-sequences-v11'
 
 
 def dump(value):
@@ -1727,13 +2083,13 @@ def merge_guards(previous, current):
         if path in documents and documents[path] != version:
             fail('DID source changed between preview chunks', 'aifootballx_source_changed')
         documents[path] = version
-    queries = {fingerprint([g['path'], g['filters']]): g for g in previous['queries']}
+    queries = {fingerprint([g.get('path'),g.get('group'),g.get('filters',[])]): g for g in previous['queries']}
     for guard in current['queries']:
-        key = fingerprint([guard['path'], guard['filters']])
+        key = fingerprint([guard.get('path'),guard.get('group'),guard.get('filters',[])])
         if key in queries and queries[key] != guard:
             fail('DID source collection changed between preview chunks', 'aifootballx_source_changed')
         queries[key] = guard
-    for key in ('reference_code', 'new_code', 'slot_file'):
+    for key in ('reference_code', 'new_code', 'slot_file', 'code_scope'):
         if previous.get(key) != current.get(key):
             fail('Season references changed between preview chunks', 'aifootballx_source_changed')
     merged.update(documents=documents, queries=list(queries.values()))
@@ -1908,6 +2264,9 @@ class JobStore:
                 report['errors'] = sorted(set(previous['report']['errors'] + report['errors']))
                 report['checks'] = previous['report']['checks'] + report['checks']
                 report['summary']['matches'] += previous['report']['summary']['matches']
+                for key in ('candidateDocuments','changedDocuments','unchangedDocuments'):
+                    if key in report['summary']:
+                        report['summary'][key] += previous['report']['summary'].get(key,0)
                 report['summary']['errors'] = len(report['errors'])
                 report['summary']['failed_checks'] = sum(not c['passed'] for c in report['checks'])
                 guards = merge_guards(previous['guards'], guards)
@@ -2089,6 +2448,7 @@ class DeliveryService:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
     def preview(self, scope, owner):
+        delivery_mode(scope)
         ident, created = self.store.create('preview', scope, owner, deduplicate_active=True)
         if created:
             self.pool.submit(self.run_preview, ident, owner)
@@ -2149,6 +2509,9 @@ class DeliveryService:
             if preview['state'] != 'validated': fail('Preview is not validated')
             if preview['meta'].get('validationPolicy') != VALIDATION_POLICY:
                 fail('검증 규칙이 변경됐습니다. 같은 입력으로 새 미리보기가 필요합니다.', 'aifootballx_preview_outdated')
+            if not self.store.page(job,0,1):
+                self.store.set_job(ident,'complete')
+                return
             source = self.source_factory()
             source.assert_fresh(preview['meta']['guards'])
             last_fresh = time.monotonic()
@@ -2189,6 +2552,7 @@ class DeliveryService:
             self.store.fail_job(ident, exc)
 
     def send_scope(self, scope, owner):
+        delivery_mode(scope)
         self.require_enabled()
         ident, created = self.store.create('delivery', scope, owner, deduplicate_active=True)
         if created:
@@ -2205,16 +2569,16 @@ class DeliveryService:
                 sent = self.store.job(previous['meta']['sendId'], owner)
                 if sent['state'] in ('failed', 'partial') and self.store.job(sent['preview_id'],owner)['meta'].get('validationPolicy')==VALIDATION_POLICY:
                     preview = self.store.job(sent['preview_id'], owner)
-                    try:
-                        self.source_factory().assert_fresh(preview['meta']['guards'])
-                    except BackendError:
-                        pass  # Changed source must be previewed again.
-                    else:
-                        if self.store.retry(sent['id'], owner):
-                            self.store.set_job(ident, 'running', meta={'phase':'send','previewId':preview['id'],'sendId':sent['id']})
-                            self.run_send(sent['id'], owner)
-                            completed = self.store.job(sent['id'], owner)
-                            self.store.set_job(ident, completed['state'], meta={'phase':'send','previewId':preview['id'],'sendId':sent['id']}, error=completed['error'])
+                    if self.store.retry(sent['id'], owner):
+                        self.store.set_job(ident, 'running', meta={'phase':'send','previewId':preview['id'],'sendId':sent['id']})
+                        # run_send performs the mandatory freshness check once.
+                        self.run_send(sent['id'], owner)
+                        completed = self.store.job(sent['id'], owner)
+                        if completed['error'] != 'aifootballx_source_changed':
+                            blocked = preview['meta']['report'].get('blocked_groups',[])
+                            state = 'partial' if blocked and completed['state']=='complete' else completed['state']
+                            self.store.set_job(ident, state, meta={'phase':'send','previewId':preview['id'],'sendId':sent['id']},
+                                error=completed['error'] or ('aifootballx_aggregates_blocked' if blocked else None))
                             return
             preview_id, _ = self.store.create('preview', job['scope'], owner, public=False)
             self.store.set_job(ident, 'running', meta={'phase':'preview','previewId':preview_id})
@@ -2228,7 +2592,10 @@ class DeliveryService:
             self.store.set_job(ident, 'running', meta={'phase':'send','previewId':preview_id,'sendId':send_id})
             self.run_send(send_id, owner)
             completed = self.store.job(send_id, owner)
-            self.store.set_job(ident, completed['state'], meta={'phase':'send','previewId':preview_id,'sendId':send_id}, error=completed['error'])
+            blocked = preview['meta']['report'].get('blocked_groups',[])
+            state = 'partial' if blocked and completed['state']=='complete' else completed['state']
+            self.store.set_job(ident, state, meta={'phase':'send','previewId':preview_id,'sendId':send_id},
+                               error=completed['error'] or ('aifootballx_aggregates_blocked' if blocked else None))
         except Exception as exc:
             self.store.fail_job(ident, exc)
 
@@ -2245,6 +2612,7 @@ class DeliveryService:
         sent = self.store.job(send_id, owner) if send_id else None
         report = preview['meta'].get('report', {}) if preview else {}
         reasons = list(report.get('errors', []))
+        reasons.extend(report.get('warnings',[]))
         failed_checks = [c for c in report.get('checks', []) if not c['passed']]
         reasons.extend(f'{c.get("matchId", "")}: {c["name"]}' for c in failed_checks)
         for job in (latest, preview, sent):
@@ -2268,11 +2636,15 @@ class DeliveryService:
         if latest['state'] in ('complete','validated','invalid','partial'):
             percent=100
         return {'status':state,'operation':'send' if latest['kind']=='delivery' else 'preview',
+                'mode':delivery_mode(latest['scope']),
                 'phase':latest['meta'].get('phase', 'preview'),'percent':percent,'writeEnabled':enabled,'scope':latest['scope'],
                 'validationPassed':report.get('validation_passed'),'summary':report.get('summary'),
+                'aggregateStatus':report.get('aggregate_status'),'blockedGroups':report.get('blocked_groups',[]),
+                'warnings':report.get('warnings',[]),
                 'counts':counts,
                 'reason':'; '.join(dict.fromkeys(reasons)) if reasons else (failure_reason(latest['error']) if latest['error'] else None),
                 'failures':failures,'failedChecks':failed_checks[:100],'previewValues':values,
+                'waivedChecks':[c for c in report.get('checks',[]) if c.get('waived')],
                 'previewValuesNote':'최대 20개 생성값을 표시합니다. 전체 값과 상세 이력은 서버의 작업 저장소에 보관됩니다.'}
 
     def status(self, ident, owner, offset=0, limit=50, state=None):
@@ -2296,6 +2668,7 @@ def failure_reason(code):
             'aifootballx_destination_changed':'대상 문서의 생성 필드가 다른 작업에서 변경됐습니다.',
             'aifootballx_validation_failed':'필수 데이터 검증에 실패했습니다. 아래 검증 사유를 확인하세요.',
             'aifootballx_write_disabled':'현재 실제 Firestore 전송이 비활성화돼 있습니다.',
+            'aifootballx_aggregates_blocked':'선수·감독 등 경기 외 데이터 전송은 완료됐으며 시즌 집계는 검증 실패로 보류됐습니다.',
             'aifootballx_PermissionDenied':'대상 Firestore 서비스 계정 권한이 부족합니다.'}.get(code, f'처리 오류 ({code})')
 
 

@@ -17,7 +17,8 @@ def test_draft_snapshot_busy_is_503_and_never_a_missing_draft(monkeypatch):
     assert error.value.code == 'draft_snapshot_busy'
 
 
-def test_live_socket_rejects_unjoined_user_without_crash_or_presence_cleanup(monkeypatch, caplog):
+@pytest.mark.parametrize('code,status,close', [('participant_required', 403, 1008), ('presence_busy', 503, 1013)])
+def test_live_socket_rejects_failed_admission_without_crash_or_presence_cleanup(monkeypatch, caplog, code, status, close):
     import asyncio
     import json
     import logging
@@ -34,7 +35,7 @@ def test_live_socket_rejects_unjoined_user_without_crash_or_presence_cleanup(mon
     presence_calls = []
     def presence(*args):
         presence_calls.append(args[-1])
-        raise BackendError('Join the Draft first', status_code=403, code='participant_required')
+        raise BackendError('admission failed', status_code=status, code=code)
 
     class Socket:
         def __init__(self):
@@ -53,9 +54,9 @@ def test_live_socket_rejects_unjoined_user_without_crash_or_presence_cleanup(mon
     monkeypatch.setattr(api_match_input, 'draft_sockets', DraftSocketHub())
     socket = Socket()
     asyncio.run(api_match_input.live_draft_socket(socket, 'm', 'A'))
-    assert socket.messages[0]['code'] == 'participant_required'
-    assert socket.messages[0]['status'] == 403
-    assert socket.close_code == 1008
+    assert socket.messages[0]['code'] == code
+    assert socket.messages[0]['status'] == status
+    assert socket.close_code == close
     assert presence_calls == [True]
     assert 'crashed' not in caplog.text
     assert 'Presence expires automatically' not in caplog.text
@@ -66,6 +67,63 @@ def test_live_socket_rejects_unjoined_user_without_crash_or_presence_cleanup(mon
     assert rejection['uid'] == 'p'
     assert rejection['stage'] == 'presence_register'
     assert rejection['sessionId'] == authenticated['sessionId']
+
+
+@pytest.mark.parametrize('code', ['presence_busy', 'participant_required', 'session_owner_required'])
+def test_live_socket_heartbeat_busy_keeps_transport_but_authority_errors_close(monkeypatch, code):
+    import asyncio
+    import json
+    from starlette.websockets import WebSocketDisconnect
+    from backend.system.system_firestore import BackendError
+    class Root:
+        def on_snapshot(self, callback):
+            return self
+        def unsubscribe(self):
+            pass
+    class Data:
+        def get_match(self, gm_id):
+            return object()
+        def _input_setup_reference(self, *args):
+            return Root()
+    async def user(socket):
+        return CurrentUser(uid='p', claims={})
+    calls = []
+    def presence(*args):
+        calls.append(args[-1])
+        if len(calls) == 2:
+            raise BackendError('heartbeat failed', status_code=503 if code == 'presence_busy' else 403, code=code)
+    class Socket:
+        def __init__(self):
+            self.messages, self.receives, self.close_code = [], 0, None
+        async def accept(self):
+            pass
+        async def send_json(self, message):
+            self.messages.append(message)
+        async def receive_text(self):
+            self.receives += 1
+            if self.receives == 1:
+                return json.dumps({'type': 'heartbeat'})
+            if self.receives == 2:
+                return json.dumps({'type': 'heartbeat'})
+            raise WebSocketDisconnect()
+        async def close(self, code):
+            self.close_code = code
+    monkeypatch.setattr(api_match_input, 'JpdDidData', Data)
+    monkeypatch.setattr(api_match_input, '_socket_user', user)
+    monkeypatch.setattr(api_match_input, 'update_presence', presence)
+    monkeypatch.setattr(api_match_input, 'draft_sockets', DraftSocketHub())
+    monkeypatch.setattr(api_match_input, 'room_state', lambda *args: {})
+    socket = Socket()
+    asyncio.run(api_match_input.live_draft_socket(socket, 'm', 'H'))
+    assert socket.messages[0]['type'] == 'ready'
+    if code == 'presence_busy':
+        assert [message['type'] for message in socket.messages] == ['ready', 'pong', 'pong']
+        assert socket.close_code is None
+        assert calls == [True, True, True, False]
+    else:
+        assert socket.messages[-1]['code'] == code
+        assert socket.close_code == 1008
+        assert calls == [True, True, False]
 
 
 @pytest.mark.parametrize('fails', [False, True])
