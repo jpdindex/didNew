@@ -2423,7 +2423,8 @@ class JpdDidData:
         Releasing the primary empties the whole team seat (assistant and
         managers included): nobody may stay on a Draft without its primary.
         The emptied seat also drops its setup (formation, lineup and
-        substitutions) so the next primary starts from a blank lineup.
+        substitutions) and the setting-save checkpoint (payload/clientState,
+        which carry the same lineup) so the next primary starts blank.
         """
         reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
 
@@ -2449,10 +2450,11 @@ class JpdDidData:
                 updates["revision"] = int(current.get("revision") or 0) + 1
                 for substitution in substitutions:
                     transaction.delete(substitution.reference)
-            transaction.update(reference, {**updates, **({"setup": firestore.DELETE_FIELD} if clear_setup else {})})
+            cleared = ("setup", "payload", "clientState") if clear_setup else ()
+            transaction.update(reference, {**updates, **{field: firestore.DELETE_FIELD for field in cleared}})
             document = {**current, **updates}
-            if clear_setup:
-                document.pop("setup", None)
+            for field in cleared:
+                document.pop(field, None)
             return document
 
         document = release(self.db.transaction())
