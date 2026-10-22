@@ -9,7 +9,7 @@ const operationMenus = [
   { label: '분석관 운영 대시보드', desc: '경기·팀·주/부 역할·담당 DAP 기준으로 분석관 운영 현황 조회', to: '/manage/analyst-dashboard', ready: true },
   { label: '분석관 계정 관리', desc: '분석관 표시 이름·등급·관리자 권한 변경', to: '/manage/recorders', ready: true },
   { label: 'BASIC 기록 승인', desc: '승인 대기 Draft 검토 후 최종 RAW로 승격', to: '/manage/input-approvals', ready: true },
-  { label: '기록 잠금 관리', desc: '갱신으로 잠긴 반(半) 잠금 해제', to: '/manage/locks', ready: true }
+  { label: '경기 배정 변경', desc: '세팅 저장된 경기 배정을 해제하고 다른 경기로 변경', to: '/manage/locks', ready: true }
 ]
 const dataMenus = [
   { label: 'SQL 데이터 이관', desc: '레거시 SQL 경기 데이터를 Firestore로 이관 (1회성)', to: '/manage/legacy-import', ready: true },

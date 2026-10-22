@@ -1359,3 +1359,15 @@ def get_live_room(gm_id: str, side: Side, user: RequiredUser = None) -> dict:
     if user.uid not in room['participants']:
         raise BackendError('Join the Draft first', status_code=403, code='participant_required')
     return room
+
+
+@router.get('/match-input/assignments', include_in_schema=False)
+def list_input_assignments(_: RequiredUser = None) -> dict:
+    return {'status': 'ok', 'assignments': JpdDidData().list_input_assignments()}
+
+
+@router.delete('/match-input/drafts/{gm_id}/{side}/participants/{uid}', include_in_schema=False)
+def release_input_assignment(gm_id: str, side: Side, uid: str, user: RequiredUser = None) -> dict:
+    document = JpdDidData().release_input_assignment(gm_id, side, user_id=uid, released_by=user.uid)
+    return {'status': 'ok', 'gmId': gm_id, 'side': side,
+            'primaryUid': document.get('primaryUid'), 'participants': document.get('participants', {})}

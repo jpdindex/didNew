@@ -2347,6 +2347,106 @@ class JpdDidData:
             and (status is None or document.get("status") == status)
         ]
 
+    @staticmethod
+    def _draft_lifecycle(document: dict[str, Any]) -> str:
+        shared = document.get("sharedState") if isinstance(document.get("sharedState"), dict) else {}
+        payload = document.get("payload") if isinstance(document.get("payload"), dict) else {}
+        return str(shared.get("halfStatus") or payload.get("status") or document.get("status") or "ready")
+
+    @staticmethod
+    def _draft_has_records(reference: Any, document: dict[str, Any], *, transaction: Any = None) -> bool:
+        payload = document.get("payload") if isinstance(document.get("payload"), dict) else {}
+        if payload.get("records"):
+            return True
+        query = reference.collection("records").limit(1)
+        snapshots = transaction.get(query) if transaction is not None else query.stream(retry=None, timeout=20)
+        return any(True for _ in snapshots)
+
+    def list_input_assignments(self) -> list[dict[str, Any]]:
+        """Seat assignments still held on open Drafts, for the manager screen.
+
+        Only a Draft that has not started (lifecycle ready, no record yet) can
+        be released, so the screen marks every other session as locked.
+        """
+        drafts: list[tuple[Any, dict[str, Any]]] = []
+        for snapshot in self.db.collection("inputDrafts").stream(retry=None, timeout=45):
+            document = snapshot.to_dict() or {}
+            participants = document.get("participants")
+            if document.get("liveClosed") or document.get("side") not in {"H", "A"} or not document.get("gmId"):
+                continue
+            if not isinstance(participants, dict) or not participants:
+                continue
+            drafts.append((snapshot, document))
+
+        matches = self.get_documents_by_ids("matches", {str(document["gmId"]) for _, document in drafts})
+        teams = self.get_documents_by_ids("teams", {
+            str(match.get(key) or "") for match in matches.values() for key in ("homeTeamId", "awayTeamId") if match.get(key)
+        })
+
+        def team_name(team_id: str) -> str:
+            team = teams.get(team_id, {})
+            return str(team.get("nameKr") or team.get("name") or team.get("nameShort") or team_id)
+
+        role_order = {"primary": 0, "assistant": 1, "manager": 2}
+        rows: list[dict[str, Any]] = []
+        for snapshot, document in drafts:
+            gm_id, side = str(document["gmId"]), document["side"]
+            match = matches.get(gm_id, {})
+            status = self._draft_lifecycle(document)
+            home_id, away_id = str(match.get("homeTeamId") or ""), str(match.get("awayTeamId") or "")
+            team_id, opponent_id = (away_id, home_id) if side == "A" else (home_id, away_id)
+            participants = [
+                {"uid": uid, "name": str(values.get("name") or uid), "role": values.get("role")}
+                for uid, values in document["participants"].items() if isinstance(values, dict)
+            ]
+            participants.sort(key=lambda item: role_order.get(item["role"], 9))
+            rows.append({
+                "gmId": gm_id,
+                "side": side,
+                "date": self._normalise_match_date(match.get("date")) if match.get("date") else "",
+                "kickoffTime": match.get("kickoffTime"),
+                "leagueId": match.get("leagueId"),
+                "teamName": team_name(team_id),
+                "opponentName": team_name(opponent_id),
+                "status": status,
+                "releasable": status == "ready" and not self._draft_has_records(snapshot.reference, document),
+                "primaryUid": document.get("primaryUid"),
+                "participants": participants,
+            })
+        rows.sort(key=lambda item: (item["date"], item["kickoffTime"] or "", item["gmId"], item["side"]), reverse=True)
+        return rows
+
+    def release_input_assignment(self, gm_id: str, side: Side, *, user_id: str, released_by: str) -> dict[str, Any]:
+        """Remove an analyst seat from a Draft that has not started.
+
+        Releasing the primary empties the whole team seat (assistant and
+        managers included): nobody may stay on a Draft without its primary.
+        Setup and records are left untouched.
+        """
+        reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
+
+        @firestore.transactional
+        def release(transaction):
+            snapshot = reference.get(transaction=transaction, retry=None, timeout=10)
+            current = snapshot.to_dict() or {}
+            participants = current.get("participants") if isinstance(current.get("participants"), dict) else {}
+            if not snapshot.exists or current.get("liveClosed") or user_id not in participants:
+                raise BackendError("The analyst is not assigned to this team", status_code=404, code="assignment_not_found")
+            if self._draft_lifecycle(current) != "ready" or self._draft_has_records(reference, current, transaction=transaction):
+                raise BackendError("Only an assignment before kickoff can be released", status_code=409, code="assignment_started")
+            primary_uid = current.get("primaryUid")
+            if participants[user_id].get("role") == "primary" or user_id == primary_uid:
+                participants, primary_uid = {}, None
+            else:
+                participants = {uid: values for uid, values in participants.items() if uid != user_id}
+            updates = {"participants": participants, "primaryUid": primary_uid, "updatedAt": utc_now(), "updatedBy": released_by}
+            transaction.update(reference, updates)
+            return {**current, **updates}
+
+        document = release(self.db.transaction())
+        self.sync_input_summary_from_draft(gm_id, side, document)
+        return document
+
     def build_analyst_dashboard(
         self,
         *,

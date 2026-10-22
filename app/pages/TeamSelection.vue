@@ -30,7 +30,8 @@ const match = computed(() => ({
   stadium: String(route.query.stadium ?? '') || 'Fubol de Vallecas',
   home: String(route.query.home ?? '') || 'Vallecano', away: String(route.query.away ?? '') || 'Real Madrid',
 }))
-const kpis = ['TAP', 'DAP', 'DTP', 'Shoot', 'Goal', 'SSR', 'ASR', 'BAP']
+const kpis = ['TAP', 'DAP', 'BAP', 'Shoot', 'DTP', 'Goal', 'SSR', 'ASR']
+const isPercentKpi = (key: string) => key === 'SSR' || key === 'ASR'
 const kpiHalf = ref<'all' | 'H1' | 'H2'>('all')
 type DashboardKpi = Record<(typeof kpis)[number], number>
 const emptyDashboardKpi = (): DashboardKpi => ({ TAP: 0, DAP: 0, DTP: 0, Shoot: 0, Goal: 0, SSR: 0, BAP: 0, ASR: 0 })
@@ -1836,7 +1837,7 @@ function undoSub(index: number) {
             <template v-for="key in kpis" :key="key">
               <div class="kpiRow" :class="{ clickable: isKpiDetailKey(key), open: kpiDetailOpen === key }"
                 @click="toggleKpiDetail(key)">
-                <span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.H[key] : 0 }}</span><b>{{ key }}<i v-if="isKpiDetailKey(key)" class="toggleArrow" :class="{ open: kpiDetailOpen === key }">▾</i></b><span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.A[key] : 0 }}</span>
+                <span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.H[key] : 0 }}{{ isPercentKpi(key) ? '%' : '' }}</span><b>{{ key }}<i v-if="isKpiDetailKey(key)" class="toggleArrow" :class="{ open: kpiDetailOpen === key }">▾</i></b><span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.A[key] : 0 }}{{ isPercentKpi(key) ? '%' : '' }}</span>
               </div>
               <div v-if="kpiDetailOpen === key" class="errDetail shotDetail">
                 <div v-if="kpiDetailTimes.length" class="errDetailGrid">
