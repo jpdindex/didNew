@@ -2450,7 +2450,9 @@ class JpdDidData:
                 updates["revision"] = int(current.get("revision") or 0) + 1
                 for substitution in substitutions:
                     transaction.delete(substitution.reference)
-            cleared = ("setup", "payload", "clientState") if clear_setup else ()
+            # The setup edit stamp goes too: a new device with a slightly earlier
+            # clock must not lose its first setting save to the released lineup.
+            cleared = ("setup", "payload", "clientState", "_editVersions.setup") if clear_setup else ()
             transaction.update(reference, {**updates, **{field: firestore.DELETE_FIELD for field in cleared}})
             document = {**current, **updates}
             for field in cleared:
