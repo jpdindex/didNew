@@ -33,11 +33,8 @@ function keep() {
 
 <template>
   <div v-if="status" class="liveRoomStatus" :class="{ compact }" role="status" aria-live="polite">
+    <!-- 참가자(역할·이름·접속) 목록은 표시하지 않는다. 저장 상태만 보여준다. -->
     <span :title="status.phase === 'error' || status.phase === 'conflict' ? status.error : `서버 버전 ${status.revision}`">{{ label }}<template v-if="status.phase === 'error' || status.phase === 'conflict'"> · {{ errorLabel }}</template></span>
-    <span v-for="(participant, uid) in status.participants" :key="uid" :title="`${participant.name || ''} · ${participant.online === undefined ? '접속 확인 중' : participant.online ? '접속' : '오프라인'}`">
-      {{ participant.role === 'primary' ? '주' : participant.role === 'assistant' ? '부' : '관리' }}
-      {{ participant.name }} · {{ participant.online === undefined ? '접속 확인 중' : participant.online ? '접속' : '오프라인' }}
-    </span>
     <button v-if="status.phase === 'conflict' || status.phase === 'error'" @click="accept">서버 기준 재동기화</button>
     <details v-if="status.phase === 'conflict' && status.conflict" class="conflictDetails">
       <summary>충돌 내용 비교</summary>

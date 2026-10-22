@@ -16,6 +16,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from firebase_admin import auth
 from google.api_core.exceptions import FailedPrecondition
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.websockets import WebSocketState
 
 from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData, NotFoundError, RequiredUser, ensure_firebase_app, get_settings, utc_now
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
@@ -328,34 +329,73 @@ class DraftSocketHub:
             if not clients:
                 self._clients.pop((gm_id, side), None)
 
+    @staticmethod
+    def _json_value(value: Any) -> Any:
+        # Firestore timestamps (DatetimeWithNanoseconds) are datetime/date
+        # subclasses. Send them as ISO strings instead of failing the frame.
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, BaseModel):
+            return value.model_dump(mode='json')
+        if isinstance(value, (set, frozenset, tuple)):
+            return list(value)
+        raise TypeError(f'{type(value).__name__} is not JSON serializable')
+
+    def _encode(self, gm_id: str, side: Side, message: dict[str, Any]) -> str | None:
+        """Serialize before touching the connection.
+
+        A frame that cannot be encoded is a server bug in that one message, not
+        a broken connection. Drop only the frame so later ACK/pong still flow.
+        """
+        try:
+            return json.dumps(message, separators=(',', ':'), ensure_ascii=False, default=self._json_value)
+        except (TypeError, ValueError):
+            logger.exception('Draft live socket frame not serializable: %s/%s type=%s', gm_id, side, message.get('type'))
+            return None
+
+    async def _transmit(self, gm_id: str, side: Side, socket: WebSocket, send_lock: asyncio.Lock, text: str, message_type: Any) -> bool:
+        try:
+            async with send_lock:
+                await socket.send_text(text)
+            return True
+        except Exception as exc:
+            # A transport failure ends this client's fan-out. Stay quiet only
+            # for a connection that is known to be closed; anything else,
+            # including an unexpected RuntimeError, must leave a trace.
+            if not self._closed(socket, exc):
+                logger.exception('Draft live socket send failed: %s/%s type=%s', gm_id, side, message_type)
+            self.disconnect(gm_id, side, socket)
+            return False
+
+    @staticmethod
+    def _closed(socket: WebSocket, exc: Exception) -> bool:
+        if isinstance(exc, WebSocketDisconnect):
+            return True
+        return any(getattr(socket, state, None) == WebSocketState.DISCONNECTED
+                   for state in ('client_state', 'application_state'))
+
     async def send(self, gm_id: str, side: Side, socket: WebSocket, message: dict[str, Any]) -> bool:
         with self._lock:
             client = self._clients.get((gm_id, side), {}).get(id(socket))
         if not client:
             return False
-        _, _, send_lock = client
-        try:
-            async with send_lock:
-                await socket.send_json(message)
-            return True
-        except Exception:
-            self.disconnect(gm_id, side, socket)
+        text = self._encode(gm_id, side, message)
+        if text is None:
             return False
+        return await self._transmit(gm_id, side, socket, client[2], text, message.get('type'))
 
     def publish(self, gm_id: str, side: Side, message: dict[str, Any], *, exclude: WebSocket | None = None) -> None:
         with self._lock:
             clients = list(self._clients.get((gm_id, side), {}).values())
-        for socket, loop, send_lock in clients:
-            if exclude is socket:
-                continue
-            loop.call_soon_threadsafe(asyncio.create_task, self._send(gm_id, side, socket, send_lock, message))
-
-    async def _send(self, gm_id: str, side: Side, socket: WebSocket, send_lock: asyncio.Lock, message: dict[str, Any]) -> None:
-        try:
-            async with send_lock:
-                await socket.send_json(message)
-        except Exception:
-            self.disconnect(gm_id, side, socket)
+        targets = [client for client in clients if client[0] is not exclude]
+        if not targets:
+            return
+        # Encode once for every receiver; an unencodable event keeps all sockets.
+        text = self._encode(gm_id, side, message)
+        if text is None:
+            return
+        for socket, loop, send_lock in targets:
+            loop.call_soon_threadsafe(asyncio.create_task, self._transmit(gm_id, side, socket, send_lock, text, message.get('type')))
 
 
 draft_sockets = DraftSocketHub()

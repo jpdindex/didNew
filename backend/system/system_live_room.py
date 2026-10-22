@@ -683,8 +683,12 @@ def room_state(data, gm_id, side):
     now = utc_now()
     online = {values['uid'] for snapshot in root.collection('presence').stream()
               if (values := snapshot.to_dict() or {}).get('connected') and values.get('expiresAt', now) > now}
+    # The room is sent over the live socket as JSON. Participant entries also
+    # hold Firestore datetimes (joinedAt/lastSeenAt), which made send_json fail
+    # and silently dropped every later ACK/pong. Expose only plain fields.
     return {'revision': int(draft.get('revision') or 0), 'roomEpoch': int(draft.get('roomEpoch') or 0), 'closed': bool(draft.get('liveClosed')), 'primaryUid': draft.get('primaryUid'),
-            'participants': {uid: {**values, 'online': uid in online} for uid, values in (draft.get('participants') or {}).items()}}
+            'participants': {uid: {'role': values.get('role'), 'name': values.get('name'), 'level': values.get('level'), 'online': uid in online}
+                             for uid, values in (draft.get('participants') or {}).items()}}
 
 
 def finalize_command(data, gm_id, side, request, uid, promote):

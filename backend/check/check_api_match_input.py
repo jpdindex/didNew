@@ -43,6 +43,8 @@ def test_live_socket_rejects_failed_admission_without_crash_or_presence_cleanup(
             self.close_code = None
         async def accept(self):
             pass
+        async def send_text(self, text):
+            await self.send_json(json.loads(text))
         async def send_json(self, message):
             self.messages.append(message)
         async def close(self, code):
@@ -97,6 +99,8 @@ def test_live_socket_heartbeat_busy_keeps_transport_but_authority_errors_close(m
             self.messages, self.receives, self.close_code = [], 0, None
         async def accept(self):
             pass
+        async def send_text(self, text):
+            await self.send_json(json.loads(text))
         async def send_json(self, message):
             self.messages.append(message)
         async def receive_text(self):
@@ -221,6 +225,8 @@ def test_live_socket_relays_root_delta_and_requests_resync_for_a_gap(monkeypatch
                 if message is None:
                     raise WebSocketDisconnect()
                 return json.dumps(message)
+            async def send_text(self, text):
+                await self.send_json(json.loads(text))
             async def send_json(self, message):
                 await self.outgoing.put(message)
         socket = Socket()
@@ -775,3 +781,57 @@ def test_dashboard_kpi_refresh_never_reads_or_returns_setup(monkeypatch):
     result = api_match_input.read_match_dashboard_kpis('m', half='all')
     assert result['kpis']['H']['Goal'] == 1
     assert 'inputSetup' not in result
+
+
+def test_socket_hub_serializes_nested_datetimes_and_keeps_client_on_bad_frame():
+    import asyncio
+    import json
+    from datetime import datetime, timezone
+
+    class Socket:
+        def __init__(self):
+            self.messages = []
+        async def send_text(self, text):
+            self.messages.append(json.loads(text))
+
+    async def scenario():
+        hub, socket = DraftSocketHub(), Socket()
+        await hub.connect('m', 'H', socket)
+        joined = datetime(2026, 10, 22, 8, 0, tzinfo=timezone.utc)
+        # Firestore timestamps nested anywhere in a frame are sent as ISO strings.
+        assert await hub.send('m', 'H', socket, {'type': 'room', 'room': {'participants': {'p': {'joinedAt': joined}}}})
+        assert socket.messages[-1]['room']['participants']['p']['joinedAt'] == joined.isoformat()
+        # An unencodable frame is dropped alone; the connection keeps receiving.
+        assert not await hub.send('m', 'H', socket, {'type': 'mutation', 'bad': object()})
+        hub.publish('m', 'H', {'type': 'mutation', 'bad': object()})
+        await asyncio.sleep(0.01)  # publish schedules via call_soon_threadsafe
+        assert await hub.send('m', 'H', socket, {'type': 'pong'})
+        hub.publish('m', 'H', {'type': 'mutation', 'event': {'savedAt': joined}})
+        await asyncio.sleep(0.01)  # publish schedules via call_soon_threadsafe
+        assert [message['type'] for message in socket.messages] == ['room', 'pong', 'mutation']
+
+    asyncio.run(scenario())
+
+
+def test_socket_hub_logs_unexpected_runtime_error_but_not_known_close(caplog):
+    import asyncio
+    from starlette.websockets import WebSocketState
+
+    class Socket:
+        def __init__(self, state):
+            self.client_state = self.application_state = state
+        async def send_text(self, text):
+            raise RuntimeError('unexpected send failure')
+
+    async def send(state):
+        hub, socket = DraftSocketHub(), Socket(state)
+        await hub.connect('m', 'H', socket)
+        assert not await hub.send('m', 'H', socket, {'type': 'pong'})
+        # Either way the failed client leaves fan-out.
+        assert not await hub.send('m', 'H', socket, {'type': 'pong'})
+
+    caplog.clear()
+    asyncio.run(send(WebSocketState.DISCONNECTED))
+    assert 'send failed' not in caplog.text
+    asyncio.run(send(WebSocketState.CONNECTED))
+    assert 'send failed' in caplog.text

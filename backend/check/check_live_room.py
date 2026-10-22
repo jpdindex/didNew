@@ -1,4 +1,5 @@
 from copy import deepcopy
+import json
 
 import pytest
 
@@ -253,6 +254,15 @@ def test_presence_leases_are_per_connection_and_expire(data):
     assert live.room_state(data, 'm', 'H')['participants']['p']['online']
     data.db.documents['inputDrafts/m_H/presence/tab2']['expiresAt'] = live.utc_now()
     assert not live.room_state(data, 'm', 'H')['participants']['p']['online']
+
+
+def test_room_state_is_json_safe_for_the_live_socket(data):
+    # Participant timestamps once made send_json fail, which silently dropped
+    # the socket from fan-out so no later ACK or pong reached the browser.
+    data.db.documents['inputDrafts/m_H']['participants']['p'].update(joinedAt=live.utc_now(), lastSeenAt=live.utc_now())
+    room = live.room_state(data, 'm', 'H')
+    json.dumps(room)
+    assert room['participants']['p']['role'] == 'primary'
 
 
 def test_presence_reads_two_documents_without_locking_or_writing_match(data, monkeypatch):

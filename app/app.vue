@@ -92,6 +92,38 @@ body {
   background: #0b0f17;
 }
 
+/* 기본 흰색 스크롤바 대신 어두운 화면에 맞춘 얇은 스크롤바 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .18);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: rgba(255, 255, 255, .32);
+}
+
+::-webkit-scrollbar-button {
+  display: none;
+}
+
+/* Firefox는 ::-webkit-scrollbar를 모르므로 표준 속성으로 맞춘다 */
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, .18) transparent;
+  }
+}
+
 .canvasHost {
   width: 100vw;
   height: 100dvh;
