@@ -2366,7 +2366,7 @@ class JpdDidData:
         """Seat assignments still held on open Drafts, for the manager screen.
 
         Only a Draft that has not started (lifecycle ready, no record yet) can
-        be released, so the screen marks every other session as locked.
+        be released, so only those sessions are returned.
         """
         drafts: list[tuple[Any, dict[str, Any]]] = []
         for snapshot in self.db.collection("inputDrafts").stream(retry=None, timeout=45):
@@ -2375,6 +2375,9 @@ class JpdDidData:
             if document.get("liveClosed") or document.get("side") not in {"H", "A"} or not document.get("gmId"):
                 continue
             if not isinstance(participants, dict) or not participants:
+                continue
+            # Started or finished sessions cannot be released, so they are not listed.
+            if self._draft_lifecycle(document) != "ready" or self._draft_has_records(snapshot.reference, document):
                 continue
             drafts.append((snapshot, document))
 
@@ -2392,7 +2395,6 @@ class JpdDidData:
         for snapshot, document in drafts:
             gm_id, side = str(document["gmId"]), document["side"]
             match = matches.get(gm_id, {})
-            status = self._draft_lifecycle(document)
             home_id, away_id = str(match.get("homeTeamId") or ""), str(match.get("awayTeamId") or "")
             team_id, opponent_id = (away_id, home_id) if side == "A" else (home_id, away_id)
             participants = [
@@ -2406,10 +2408,9 @@ class JpdDidData:
                 "date": self._normalise_match_date(match.get("date")) if match.get("date") else "",
                 "kickoffTime": match.get("kickoffTime"),
                 "leagueId": match.get("leagueId"),
+                "round": match.get("round"),
                 "teamName": team_name(team_id),
                 "opponentName": team_name(opponent_id),
-                "status": status,
-                "releasable": status == "ready" and not self._draft_has_records(snapshot.reference, document),
                 "primaryUid": document.get("primaryUid"),
                 "participants": participants,
             })

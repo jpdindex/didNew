@@ -113,9 +113,7 @@ const dataMenus = [
 .bg {
   position: absolute;
   inset: 0;
-  background:
-    radial-gradient(1200px 500px at 50% 35%, rgba(255,255,255,0.08), transparent 60%),
-    linear-gradient(180deg, rgba(0,0,0,0.55), rgba(0,0,0,0.75));
+  background: none;
 }
 
 .frame {
@@ -124,9 +122,9 @@ const dataMenus = [
   width: 1280px;
   height: 800px;
   border-radius: 0;
-  background: rgba(10, 14, 22, 0.75);
-  border: 1px solid rgba(255,255,255,0.08);
-  box-shadow: 0 18px 60px rgba(0,0,0,0.55);
+  background: #151a21;
+  border: 1px solid #29313b;
+  box-shadow: none;
   backdrop-filter: blur(8px);
   padding: 24px;
 }
