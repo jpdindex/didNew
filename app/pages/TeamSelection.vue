@@ -1046,6 +1046,26 @@ async function saveEntrySetup({ persist = true } = {}) {
   }
 }
 
+// 재입장 복원 전용: 이미 주 분석관으로 확정된 경기에서 입장 데이터만 받는다.
+// /enter 가 참가 확인과 Draft·라인업 읽기를 한 번에 하므로 /participants·poll 은 생략한다.
+async function prepareRestoredEntry() {
+  preparedInput.value = null
+  try {
+    const inputChunk = preloadRouteComponents('/DidInput').catch(() => undefined)
+    const entry = await enterCollaboration(game.value, requestedRole)
+    if (!isCurrentLobby() || !game.value.lifecycleControl || entry.draft.status !== 'ok') return
+    if (entry.gmId !== game.value.matchId || entry.side !== (game.value.team === 'away' ? 'A' : 'H')) return
+    const selectedSetup = (game.value.team === 'away' ? entry.inputSetup.A : entry.inputSetup.H) || entry.draft.inputSetup
+    if (selectedSetup) applyInputSetup(selectedSetup)
+    await inputChunk
+    if (!isCurrentLobby()) return
+    preparedInput.value = entry
+  } catch {
+    // 입장 버튼의 기존 경로(saveEntrySetup persist:false)가 다시 시도한다.
+    preparedInput.value = null
+  }
+}
+
 function removeFromSlot(slotId: string) {
   if (!matchInfoEditable.value || game.value.assigned[slotId] === undefined) return
   delete game.value.assigned[slotId]
@@ -1299,11 +1319,18 @@ onMounted(async () => {
   bootstrapApplied.value = true
   // 이미 세팅 저장으로 주 분석관이 된 경기라면, 다시 저장하지 않고 저장된 화면으로 연다.
   // 첫 화면을 그리기 전에 판단해 저장 전 화면이 잠깐 보이지 않게 한다.
-  if (requestedRole === 'primary' && (game.value.halfStatus === 'ready' || game.value.halfStatus === 'H1_done') &&
-    canStart.value && bootstrapPrimaryUid && bootstrapPrimaryUid === lobbyAuth.currentUser?.uid) {
-    activeSlot.value = null
-    savedEntryFingerprint.value = entryFingerprint.value
-    restoredSetupSaved.value = true
+  const canRestoreSaved = () => requestedRole === 'primary' && (game.value.halfStatus === 'ready' || game.value.halfStatus === 'H1_done') &&
+    canStart.value && !!bootstrapPrimaryUid && bootstrapPrimaryUid === lobbyAuth.currentUser?.uid
+  if (canRestoreSaved()) {
+    // 로딩 화면에서 입장 데이터까지 받아 둔다. 그래야 "전반전 입장"이 바로 경기장으로 간다.
+    // 실패해도 저장 상태는 그대로 복원하고, 입장 버튼에서 다시 받는다.
+    await prepareRestoredEntry()
+    if (!isCurrentLobby()) return
+    if (canRestoreSaved()) {
+      activeSlot.value = null
+      savedEntryFingerprint.value = entryFingerprint.value
+      restoredSetupSaved.value = true
+    } else preparedInput.value = null
   }
   lobbyReady.value = true
   await nextTick()
