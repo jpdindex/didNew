@@ -25,6 +25,7 @@ const loading = ref(false)
 const error = ref('')
 const keyword = ref('')
 const releasingKey = ref<string | null>(null)
+const releasingLabel = ref('')
 const pendingRelease = ref<{ item: Assignment; participant: Assignment['participants'][number]; others: Assignment['participants'] } | null>(null)
 
 const roleLabels: Record<Role, string> = { primary: '주 분석관', assistant: '부 분석관', manager: '매니저' }
@@ -65,6 +66,7 @@ function confirmRelease() {
 
 async function release(item: Assignment, participant: Assignment['participants'][number]) {
   releasingKey.value = `${item.gmId}_${item.side}_${participant.uid}`
+  releasingLabel.value = `${item.teamName} (${item.side === 'H' ? '홈' : '원정'}) · ${roleLabels[participant.role] ?? participant.role} ${participant.name}`
   error.value = ''
   try {
     await request(
@@ -80,6 +82,7 @@ async function release(item: Assignment, participant: Assignment['participants']
     await load()
   } finally {
     releasingKey.value = null
+    releasingLabel.value = ''
   }
 }
 
@@ -128,10 +131,18 @@ onMounted(load)
                 class="releaseBtn"
                 :disabled="releasingKey !== null"
                 @click="askRelease(item, participant)"
-              >{{ releasingKey === `${item.gmId}_${item.side}_${participant.uid}` ? '해제 중…' : '배정 해제' }}</button>
+              >배정 해제</button>
             </div>
           </div>
         </article>
+      </div>
+    </div>
+
+    <div v-if="releasingKey" class="dialogOverlay" role="status" aria-live="polite">
+      <div class="dialog progressDialog">
+        <span class="spinner" aria-hidden="true" />
+        <p class="progressTitle">배정 해제 중…</p>
+        <p class="progressTarget">{{ releasingLabel }}</p>
       </div>
     </div>
 
@@ -292,4 +303,10 @@ onMounted(load)
 .dialogCancel:active { background: rgba(255,255,255,0.1); }
 .dialogConfirm { border: 1px solid #f05a5a; background: rgba(240,90,90,0.16); color: #ff8a8a; }
 .dialogConfirm:active { background: rgba(240,90,90,0.3); color: #fff; }
+
+.progressDialog { width: 360px; display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 32px 24px; text-align: center; }
+.spinner { width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.14); border-top-color: #f08080; border-radius: 50%; animation: spin 0.8s linear infinite; }
+.progressTitle { margin: 6px 0 0; color: #fff; font-size: 17px; font-weight: 800; }
+.progressTarget { margin: 0; color: rgba(255,255,255,0.6); font-size: 13px; word-break: break-all; }
+@keyframes spin { to { transform: rotate(360deg); } }
 </style>

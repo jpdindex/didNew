@@ -2422,7 +2422,8 @@ class JpdDidData:
 
         Releasing the primary empties the whole team seat (assistant and
         managers included): nobody may stay on a Draft without its primary.
-        Setup and records are left untouched.
+        The emptied seat also drops its setup (formation, lineup and
+        substitutions) so the next primary starts from a blank lineup.
         """
         reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
 
@@ -2436,13 +2437,23 @@ class JpdDidData:
             if self._draft_lifecycle(current) != "ready" or self._draft_has_records(reference, current, transaction=transaction):
                 raise BackendError("Only an assignment before kickoff can be released", status_code=409, code="assignment_started")
             primary_uid = current.get("primaryUid")
-            if participants[user_id].get("role") == "primary" or user_id == primary_uid:
+            clear_setup = participants[user_id].get("role") == "primary" or user_id == primary_uid
+            substitutions = list(transaction.get(reference.collection("substitutions").limit(500))) if clear_setup else []
+            if clear_setup:
                 participants, primary_uid = {}, None
             else:
                 participants = {uid: values for uid, values in participants.items() if uid != user_id}
-            updates = {"participants": participants, "primaryUid": primary_uid, "updatedAt": utc_now(), "updatedBy": released_by}
-            transaction.update(reference, updates)
-            return {**current, **updates}
+            updates: dict[str, Any] = {"participants": participants, "primaryUid": primary_uid, "updatedAt": utc_now(), "updatedBy": released_by}
+            if clear_setup:
+                # A revision bump makes open lobbies resync instead of keeping the old lineup.
+                updates["revision"] = int(current.get("revision") or 0) + 1
+                for substitution in substitutions:
+                    transaction.delete(substitution.reference)
+            transaction.update(reference, {**updates, **({"setup": firestore.DELETE_FIELD} if clear_setup else {})})
+            document = {**current, **updates}
+            if clear_setup:
+                document.pop("setup", None)
+            return document
 
         document = release(self.db.transaction())
         self.sync_input_summary_from_draft(gm_id, side, document)
