@@ -1,12 +1,15 @@
 from __future__ import annotations
-
-from dataclasses import dataclass
 import json
-
+from dataclasses import dataclass
 from backend.system.system_schema import PlayerKpi, RecordingKpi, Side
 from backend.system.system_firestore import JpdDidData, PROJECT_ROOT, round_key_for, utc_now
-from backend.system.system_kpi_rules import KpiRecord, calculate_kpis, calculate_team_kpi_5min
-
+from backend.system.system_kpi_rules import (
+    KpiRecord,
+    calculate_kpis,
+    calculate_team_kpi_5min,
+    reviewed_records,
+    approved_path_difference,
+)
 
 TEAM_FIELDS = tuple(RecordingKpi.model_fields)
 PLAYER_FIELDS = tuple(PlayerKpi.model_fields)
@@ -22,6 +25,8 @@ class KpiValidation:
     team_differences: dict[str, dict[str, int | float]]
     player_differences: dict[str, dict[str, dict[str, int | float]]]
     legacy_drift_accepted: bool = False
+    legacy_own_goal_ssr_accepted: bool = False
+    reviewed_exceptions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +40,16 @@ class BuildMatchKpisResult:
 
 def _same_number(left: int | float, right: int | float) -> bool:
     return abs(float(left) - float(right)) < 0.000001
+
+
+def _legacy_own_goal_ssr(expected: RecordingKpi, actual: RecordingKpi) -> bool:
+    """Recognize imported OG=0 with the current OWN-exclusive SSR formula."""
+    return (
+        expected.OG == 0 and 0 < actual.OG <= actual.GOAL and actual.SHOT > 0
+        and expected.GOAL == actual.GOAL and expected.SHOT == actual.SHOT
+        and _same_number(expected.SSR, (actual.GOAL - actual.OG) / actual.SHOT)
+        and _same_number(actual.SSR, (actual.GOAL - actual.OG) / actual.SHOT)
+    )
 
 
 def _team_differences(expected: RecordingKpi, actual: RecordingKpi) -> dict[str, dict[str, int | float]]:
@@ -155,20 +170,10 @@ class BuildMatchKpis:
             )
             for record_id, record in source.records
         ]
-        # Some historic SQL dumps retain an aggregate-only attack path after
-        # its raw records were removed. It contributes to team TTP/DTP but to
-        # no player KPI. The importer persists those path snapshots, so include
-        # a flag-free virtual record only for legacy recordings.
-        if records and all(record.legacy_flags is not None for record in records):
-            record_path_ids = {record.legacy_path_id for record in records if record.legacy_path_id}
-            for path_id, path in source.paths:
-                if path_id in record_path_ids or path.gtId in record_path_ids:
-                    continue
-                records.append(KpiRecord(
-                    id=f"legacy-path:{path_id}", half="H4", seconds=0, seq=0, act="", res="",
-                    area=18, legacy_path_id=path.gtId, legacy_path_type=path.ptype,
-                    legacy_path_ttp=path.ttp, legacy_flags={},
-                ))
+        # RAW owns path membership. Old path snapshots can refer to events that
+        # now belong to a different path; adding virtual records double counts.
+        before_review = records
+        records = reviewed_records(gm_id, side, records)
         calculation = calculate_kpis(records)
         team_kpi = RecordingKpi(**calculation.team_kpi)
         player_kpis = {
@@ -187,6 +192,16 @@ class BuildMatchKpis:
         if source.recording.kpi is not None and source.recording.kpiSourceFingerprint is None:
             expected_players = self.data.list_player_stats(gm_id, side)
             team_differences = _team_differences(source.recording.kpi, team_kpi)
+            accepted = []
+            unfiltered = calculate_kpis(before_review).team_kpi if len(before_review) != len(records) else {}
+            for field in list(team_differences):
+                stored, calculated = getattr(source.recording.kpi, field), getattr(team_kpi, field)
+                if approved_path_difference(gm_id, side, field, stored, calculated):
+                    accepted.append('obsolete-path:' + field)
+                    del team_differences[field]
+                elif field in unfiltered and _same_number(stored, unfiltered[field]):
+                    accepted.append('reviewed-raw:' + field)
+                    del team_differences[field]
             # Some legacy imports have no trustworthy playerStats baseline.
             # Team KPI remains the acceptance baseline in that case.
             player_differences = _player_differences(expected_players, player_kpis) if expected_players else {}
@@ -196,6 +211,8 @@ class BuildMatchKpis:
                 team_differences=team_differences,
                 player_differences=player_differences,
                 legacy_drift_accepted=legacy_drift_accepted,
+                legacy_own_goal_ssr_accepted=_legacy_own_goal_ssr(source.recording.kpi, team_kpi),
+                reviewed_exceptions=tuple(accepted),
             )
             if not validation.passed and not validation.legacy_drift_accepted:
                 self._save_data_artifact(gm_id, source, team_kpi, player_kpis, validation)
@@ -230,16 +247,21 @@ class BuildMatchKpis:
             "sourceRecordCount": len(source.records),
             "sourceFingerprint": source.fingerprint,
             "teamKpi": team_kpi.model_dump(mode="json") if team_kpi else None,
-            "teamKpi5min": calculate_team_kpi_5min([
+            "teamKpi5min": calculate_team_kpi_5min(reviewed_records(gm_id, source.recording.side, [
                 KpiRecord(record_id, record.half, record.halfSeconds, record.seq, record.act, record.res, record.area,
                           record.playerId, record.shootPosX, record.shootPosY, record.shootDspRange, record.isShot,
-                          record.createdBy, record.createdAt.isoformat())
+                          record.createdBy, record.createdAt.isoformat(),
+                          legacy_path_id=record.legacyPathId, legacy_path_type=record.legacyPathType,
+                          legacy_path_ttp=record.legacyPathTtp, legacy_flags=record.legacyKpiFlags,
+                          bap_reason=record.bapReason)
                 for record_id, record in source.records
-            ]) if team_kpi else [],
+            ])) if team_kpi else [],
             "playerKpis": {key: value.model_dump(mode="json") for key, value in (player_kpis or {}).items()},
             "validation": None if validation is None else {
                 "passed": validation.passed,
                 "legacyDriftAccepted": validation.legacy_drift_accepted,
+                "legacyOwnGoalSsrAccepted": validation.legacy_own_goal_ssr_accepted,
+                "reviewedExceptions": list(validation.reviewed_exceptions),
                 "teamDifferences": validation.team_differences,
                 "playerDifferences": validation.player_differences,
             },

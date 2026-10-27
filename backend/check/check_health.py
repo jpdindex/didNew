@@ -47,6 +47,11 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
         "/api/v1/legacy-import/metadata-status",
         "/api/v1/legacy-import/snapshot-status/{season}",
         "/api/v1/legacy-import/snapshot-backfill",
+        "/api/v1/aifootballx/send/status",
+        "/api/v1/aifootballx/preview",
+        "/api/v1/aifootballx/send/matches",
+        "/api/v1/aifootballx/send/all",
+        "/api/v1/aifootballx/send/latest",
     }
     assert not any(path.startswith("/api/v1/match-input/") for path in schema["paths"])
     assert schema["components"]["securitySchemes"]["SwaggerKey"]["name"] == "X-Swagger-Key"

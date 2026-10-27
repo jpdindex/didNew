@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -3048,6 +3049,7 @@ class JpdDidData:
             "kpiSourceFingerprint": source_fingerprint,
             "teamRating": None,
             "ratingBasedOn": None,
+            "ratingInputFingerprint": None,
             "updatedAt": calculated_at,
         })
         for player_id, player_kpi in player_kpis.items():
@@ -3077,12 +3079,14 @@ class JpdDidData:
         rating_based_on: int,
         player_ratings: list[dict[str, Any]],
         calculated_at: datetime,
+        input_fingerprint: str | None = None,
     ) -> int:
         recording_ref = self.db.collection("matches").document(gm_id).collection("recordings").document(side)
         batch = self.db.batch()
         batch.update(recording_ref, {
             "teamRating": team_rating.model_dump(mode="python"),
             "ratingBasedOn": rating_based_on,
+            "ratingInputFingerprint": input_fingerprint,
             "updatedAt": calculated_at,
         })
         saved = 0
@@ -3113,3 +3117,44 @@ def round_key_for(match: MatchDoc) -> str:
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def resolve_contract_duplicates(contracts):
+    """Resolve one DID team/start identity, preserving distinct transfer histories.
+
+    Explicit end dates beat missing ends; competing explicit dates use the
+    uniquely later createdAt (not a batch repair's updatedAt). Nonzero shirt
+    numbers beat zero. Other conflicting facts still require review.
+    """
+    groups = {}
+    date = lambda value: re.sub(r'\D', '', str(value or ''))
+    for contract in contracts:
+        key = (contract.get('teamId'), contract.get('leagueId') or 'EPL',
+               contract.get('competitionType') or 'league', contract.get('seasonId') or '',
+               date(contract.get('from')))
+        groups.setdefault(key, []).append(contract)
+    resolved = []
+    for key, rows in groups.items():
+        chosen = deepcopy(rows[0])
+        for field in ('no', 'pos', 'to'):
+            values = {str(row.get(field)) for row in rows if row.get(field) not in (None, '')}
+            if field == 'no' and len(values) > 1:
+                values.discard('0')
+            if field == 'to':
+                values = {date(value) for value in values}
+                if len(values) > 1:
+                    dated = [row for row in rows if row.get('to') and row.get('createdAt')]
+                    if len(dated) != sum(bool(row.get('to')) for row in rows):
+                        raise ValueError(f'Conflicting DID contract identity: {key}, end dates lack creation evidence')
+                    latest = max((str(row['createdAt']) for row in dated), default=None)
+                    values = {date(row['to']) for row in dated if str(row['createdAt']) == latest}
+                if len(values) == 1:
+                    value = next(iter(values))
+                    chosen[field] = f'{value[:4]}-{value[4:6]}-{value[6:]}'
+                    continue
+            if len(values) > 1:
+                raise ValueError(f'Conflicting DID contract identity: {key}, field {field}')
+            if values:
+                chosen[field] = next(iter(values))
+        resolved.append(chosen)
+    return resolved

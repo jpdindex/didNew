@@ -59,10 +59,22 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from backend.system import system_aifootballx as delivery
-from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData
+from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData, resolve_contract_duplicates
 from backend.api import api_aifootballx
-from backend.system.system_kpi_rules import calculate_kpis
-
+from backend.system.system_kpi_rules import (
+    calculate_kpis,
+    KpiRecord,
+    calculate_team_kpi_5min,
+    reviewed_records,
+    approved_path_difference,
+    rating_two_decimals,
+    APPROVED_RAW_EXCLUSIONS,
+    approved_apx_difference,
+)
+from datetime import datetime, timezone
+from backend.build.build_match_kpis import _team_differences, BuildMatchKpis
+from backend.system.system_schema import RecordingKpi
+from backend.build.build_match_rating import BuildMatchRating
 
 # ==========================================================================
 # aggregates
@@ -318,7 +330,7 @@ class AggregateTests(unittest.TestCase):
         doc = next(d for d in result['documents'] if d['collection'] == 'sAVG')
         self.assertEqual(doc['document_id'], 'legacy-random-id')
         self.assertEqual(doc['data']['uid'], 'original-uid')
-        self.assertEqual(doc['action'], 'merge-existing')
+        self.assertEqual(doc['action'], 'replace-existing')
 
     def test_sql_is_parsed_as_data_and_rejects_wrong_season(self):
         sql = ("INSERT INTO `ff_game` (`gm_id`) VALUES ('wrong-season');\n"
@@ -431,15 +443,16 @@ def test_keys_and_jobs_are_owner_scoped(service):
     assert error.value.status_code == 404
 
 
-def test_manual_fields_preserved_and_concurrent_owned_field_changes_rejected():
+def test_full_replacement_rejects_concurrent_changes_including_legacy_fields():
     doc = document()
     doc['existed'] = True
     doc['baseline'] = {'m_id': {'exists': True, 'value': 10}, 'uid': {'exists': True, 'value': 'one'}}
     current = {'m_id': 10, 'uid': 'one', 'Coach': 'manual text', 'Captain': 15}
+    doc['baseline'] = delivery.replacement_baseline(doc['data'], current)
     assert decide_merge(doc, current)
     assert current['Coach'] == 'manual text'
-    assert not decide_merge(doc, {**current, 'm_id': 12})
-    with pytest.raises(BackendError, match='owned fields changed'):
+    assert not decide_merge(doc, doc['data'])
+    with pytest.raises(BackendError, match='document changed'):
         decide_merge(doc, {**current, 'm_id': 13})
     bad = deepcopy(doc)
     bad['data']['Coach'] = 'overwrite'
@@ -748,7 +761,7 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(values['SSR'][10], 1)
         self.assertEqual(values['SSR'][11:], [.5] * 9)
 
-    def test_own_goals_excluded(self):
+    def test_team_goal_intervals_include_own_goals(self):
         evidence, _ = preview_fixture()
         item = evidence['source_recordings'][0]
         for row in item['children']['records']:
@@ -757,7 +770,7 @@ class PreviewTests(unittest.TestCase):
         item['children']['records'][1]['data']['playerId'] = 'OWN'
         records = source_records(item)
         values = intervals(records, calculate_kpis(records))
-        self.assertEqual(sum(values['GOAL']), 0)
+        self.assertEqual(sum(values['GOAL']), 1)
 
     def test_complete_preview_and_exclusions(self):
         evidence, match_id = preview_fixture()
@@ -852,9 +865,9 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(player['p_id'], 7)
         self.assertEqual(player['p_birth'], '2000.01.02')
         self.assertEqual(player['pt_begin'], '2023.01.01')
-        self.assertEqual(player['p_id_old'], 'E-H7')
-        mst = next(d['data'] for d in report['documents'] if d['collection'] == 'playerMST')
-        self.assertTrue(all(f'P-KPI{n}' not in mst for n in range(50, 69)))
+        # Shirt number 7 is not a legacy registration identifier.
+        self.assertEqual(player['p_id_old'], '')
+        self.assertFalse(any(d['collection'] == 'playerMST' for d in report['documents']))
         vibe = next(d['data'] for d in report['documents'] if d['collection'] == 'vibePlayer')
         self.assertEqual(vibe['P-BAP'], computed.player_kpis['0000000007']['DTB'])
         self.assertEqual(vibe['gp_type'], 'KY')
@@ -1032,15 +1045,18 @@ def test_sql_detail_rebuilds_totals_instead_of_trusting_sql_summary():
     dmst=next(d['data'] for d in report['documents'] if d['collection']=='dMST' and d['data']['H-A']=='H')
     assert dmst['DTP']==1
     children['H']['ff_game_record'][0]['gr_half']='4'
-    assert build_details(game,infos,children,codes)['errors']
+    excluded = build_details(game,infos,children,codes)
+    assert not excluded['errors']
 
 
-def test_sql_own_goal_does_not_create_player_goal_or_analysis_goal():
+def test_sql_own_goal_contributes_to_team_intervals_but_not_player_goal():
     game, infos, children, codes=sql_fixture()
     children['H']['ff_game_record'][0]['p_id']='OWN'
     report=build_details(game,infos,children,codes)
     assert report['available_source_validation_passed']
     assert not any(d['collection']=='playerGoal' for d in report['documents'])
+    wide=next(d['data'] for d in report['documents'] if d['collection']=='multiSheet_ALL' and d['data']['team_type']=='HOME')
+    assert sum(v for k,v in wide.items() if k.startswith('GOAL-H'))==1
     assert next(d['data'] for d in report['documents'] if d['collection']=='dMST' and d['data']['H-A']=='H')['OG']==1
     timeline=next(d['data'] for d in report['documents'] if d['collection']=='multiSheet_GOAL-시간' and d['data']['team_type']=='HOME')
     assert timeline['GOAL1']=='H1_OG_300'
@@ -1060,7 +1076,7 @@ def test_sql_ssr_carries_first_half_and_timeline_orders_own_goals_with_normal_go
     assert wide['SSR-H2-0-5']==1
     assert wide['SSR-H2-5-10']==1
     assert wide['SSR-H2-10-15']==1
-    assert sum(v for k,v in wide.items() if k.startswith('GOAL-H'))==2
+    assert sum(v for k,v in wide.items() if k.startswith('GOAL-H'))==3
     timeline=next(d['data'] for d in report['documents'] if d['collection']=='multiSheet_GOAL-시간' and d['data']['team_type']=='HOME')
     assert [timeline[f'GOAL{n}'] for n in range(1,5)]==['H1_300','H2_OG_300','H2_600','\\N']
     assert len([d for d in report['documents'] if d['collection']=='playerGoal'])==2
@@ -1128,7 +1144,7 @@ def test_registered_player_without_any_match_stats_is_preserved(player_id):
     player=next(d for d in first['documents'] if d['collection']=='Player')
     assert player['data']['t_code']=='E-H'
     assert player['data']['p_name']=='Registered'
-    assert 'pt_begin' not in player['data'] and 'pt_end' not in player['data']
+    assert player['data']['pt_begin']=='0000.00.00' and player['data']['pt_end']=='9999.99.99'
     assert not any(d['collection'] in ('vibePlayer','playerMST') for d in first['documents'])
     assert first['documents']==second['documents'] and evidence==original
     for doc in first['documents']:
@@ -1145,7 +1161,7 @@ def test_unused_bench_retains_identity_without_match_date_contract_or_rating():
     result=build(evidence,mid)
     assert result['validation_passed'],result['errors']
     assert next(d['data'] for d in result['documents'] if d['collection']=='Player')['pt_end']=='2020.06.30'
-    assert any(d['collection']=='playerMST' for d in result['documents'])
+    assert not any(d['collection']=='playerMST' for d in result['documents'])
     assert not any(d['collection']=='vibePlayer' for d in result['documents'])
 
 
@@ -1158,7 +1174,7 @@ def test_new_player_identity_merge_preserves_destination_id_and_manual_fields():
     second=build(evidence,mid)
     generated=next(d for d in second['documents'] if d['collection']=='Player')
     assert generated['document_id']=='manual-existing' and generated['data']['uid']=='keep-uid'
-    assert 'manualNote' not in generated['data']
+    assert generated['data']['manualNote'] == 'keep'
     evidence['target_existing']['Player'][0]['data'].pop('DID_PLAYER_ID')
     assert not build(evidence,mid)['validation_passed']
 
@@ -1175,7 +1191,7 @@ def test_actual_appearance_still_requires_match_date_contract_even_with_zero_kpi
     assert any('no match-date contract' in e for e in result['errors'])
 
 
-def test_registered_identity_does_not_require_agreement_on_optional_contract_end():
+def test_explicit_end_date_wins_over_null_for_the_same_did_contract_identity():
     evidence,mid=preview_fixture();pid='0000000999'
     evidence['player_profiles'][pid]={'name':'Registered','currentTeamId':'E-H'}
     evidence['player_contracts'][pid]=[
@@ -1183,9 +1199,8 @@ def test_registered_identity_does_not_require_agreement_on_optional_contract_end
         {'teamId':'E-H','leagueId':'EPL','from':'2020-01-01','to':'2026-09-02','no':'11','pos':'FW'}]
     result=build(evidence,mid)
     assert result['validation_passed'], result['errors']
-    player=next(d['data'] for d in result['documents'] if d['collection']=='Player')
-    assert player['t_code']=='E-H' and player['pt_num']==11
-    assert 'pt_end' not in player
+    player = next(d['data'] for d in result['documents'] if d['collection']=='Player' and d['data']['p_id']==999)
+    assert player['pt_end']=='2026.09.02'
 
 
 
@@ -1205,7 +1220,7 @@ def test_new_did_player_links_master_tactic_and_appearance_to_same_identity():
     identity=next(d['data']['p_id'] for d in result['documents'] if d['collection']=='Player')
     assert identity<2**53
     assert next(d['data']['p_id'] for d in result['documents'] if d['collection']=='vibePlayer')==identity
-    assert next(d['data']['P-DB7'] for d in result['documents'] if d['collection']=='playerMST')==identity
+    assert not any(d['collection']=='playerMST' for d in result['documents'])
     for doc in result['documents']:
         if doc['collection']=='TACTIC' and doc['data']['p_id']!='\\N':
             assert doc['data']['p_id']==str(identity)
@@ -1255,7 +1270,7 @@ def test_rating_read_exposes_truncated_strings_beside_original_numbers(monkeypat
     assert response.playerRatingsDisplay[0]['jmx']=='59.7'
 
 
-def test_preview_fpx_includes_own_goal_but_analysis_goal_intervals_do_not():
+def test_preview_fpx_and_goals_include_own_but_ssr_excludes_it():
     evidence,mid=preview_fixture();item=evidence['source_recordings'][0]
     item['children']['records'][-1]['data']['playerId']='OWN'
     computed=calculate_kpis(source_records(item));kpi=computed.team_kpi
@@ -1266,9 +1281,14 @@ def test_preview_fpx_includes_own_goal_but_analysis_goal_intervals_do_not():
     assert result['validation_passed'],result['errors']
     dmst=next(d['data'] for d in result['documents'] if d['collection']=='dMST' and d['data']['H-A']=='H')
     assert dmst['GOAL']==1 and dmst['OG']==1
-    assert dmst['GOALScore']==pytest.approx(100/3)
+    assert dmst['SSR']==0 and dmst['SSRScore']==0
+    assert dmst['FPX']==delivery.rating_two_decimals(item['recording']['teamRating']['fpx'])
+    assert dmst['GOALScore']==33.33
     wide=next(d['data'] for d in result['documents'] if d['collection']=='multiSheet_ALL' and d['data']['team_type']=='HOME')
-    assert sum(v for k,v in wide.items() if k.startswith('GOAL-H'))==0
+    assert sum(v for k,v in wide.items() if k.startswith('GOAL-H'))==1
+    sheet=next(d['data'] for d in result['documents'] if d['collection']=='multiSheet_GOAL' and d['data']['team_type']=='HOME')
+    assert all(v==0 for k,v in sheet.items() if k.startswith('GOAL-H'))
+    assert all(v==0 for k,v in wide.items() if k.startswith('SSR-H'))
     timeline=next(d['data'] for d in result['documents'] if d['collection']=='multiSheet_GOAL-시간' and d['data']['team_type']=='HOME')
     assert timeline['GOAL1']=='H1_OG_300'
     assert all(timeline[f'GOAL{n}']=='\\N' for n in range(2,11))
@@ -1423,7 +1443,7 @@ def test_master_all_includes_registered_nonparticipants_without_raw_or_ratings()
     assert not docs(report,'vibePlayer')
 
 
-def test_latest_compares_owned_values_preserves_ids_and_ignores_manual_changes():
+def test_latest_preserves_destination_only_fields_and_bound_ids():
     evidence,setup=master_fixture()
     original=delivery.generate_masters(evidence,[],[],{},setup,'all')
     for doc in original['documents']:
@@ -1431,7 +1451,7 @@ def test_latest_compares_owned_values_preserves_ids_and_ignores_manual_changes()
             {'id':'existing-'+doc['collection'],'data':{**doc['data'],'uid':'manual-uid','manualNote':'keep'}})
     unchanged=delivery.generate_masters(evidence,[],[],{},setup,'latest')
     assert unchanged['validation_passed'], unchanged['errors']
-    assert not unchanged['documents']
+    assert len(unchanged['documents'])==0
     evidence['player_profiles']['0000000001']['name']='Renamed'
     changed=delivery.generate_masters(evidence,[],[],{},setup,'latest')
     assert changed['validation_passed'], changed['errors']
@@ -1439,7 +1459,7 @@ def test_latest_compares_owned_values_preserves_ids_and_ignores_manual_changes()
     for doc in changed['documents']:
         assert doc['document_id']=='existing-'+doc['collection']
         assert doc['data']['uid']=='manual-uid'
-        assert 'manualNote' not in doc['data']
+        assert doc['data']['manualNote']=='keep'
         merged=delivery.decide_merge(doc,evidence['target_existing'][doc['collection']][0]['data'])
         assert merged
 
@@ -1608,11 +1628,16 @@ def test_master_capture_reads_registration_without_match_children(monkeypatch,tm
     source.get=lambda path:{}
     source.get_many=lambda paths:{p:evidence['teams'][p.split('/')[-1]] for p in paths if p.startswith('teams/')}
     source.assert_fresh=lambda guards:None
+    capture_progress = []
+    source.set_progress_callback(capture_progress.append)
     slot_path=tmp_path/'bad-slots.json' if bad_slot else None
     if slot_path: slot_path.write_text('{',encoding='utf-8')
     report,guards=source.capture({'seasonId':'20232024','mode':'latest'},slot_path)
     assert report['validation_passed'],report['errors']
     assert len(report['documents'])==(4 if with_fixtures else 2)
+    assert capture_progress == sorted(capture_progress)
+    assert capture_progress[0] == 0 and capture_progress[-1] == 100
+    assert any(20 < value <= 65 for value in capture_progress)
     assert guards['queries'][0]['group']=='contracts'
     assert 'coachContracts' in paths and 'coaches' not in paths
     assert ('coachRounds' in paths) is (not with_fixtures)
@@ -1877,6 +1902,942 @@ def test_chelsea_fpx_exception_does_not_disable_other_rating_validation(change):
     report=build_preview(evidence,mid,covers=JpdDidData._contract_covers_match_date,match_only=True)
     assert not report['validation_passed']
     assert not any(c.get('waived') for c in report['checks'])
+
+
+# Delivery policy regressions (offline; no service clients).
+
+
+
+
+@pytest.mark.parametrize('match_side,signature', list(APPROVED_RAW_EXCLUSIONS.items()))
+def test_reviewed_raw_exclusion_is_exact_and_never_deletes_source(match_side, signature):
+    ident, player, half, seconds, act, res = signature
+    event = KpiRecord(ident, half, seconds, 0, act, res, 6, player_id=player, legacy_flags={'tap': True})
+    other = KpiRecord('unreviewed', half, seconds, 1, act, res, 6, player_id=player, legacy_flags={'tap': True})
+    records = [event, other]
+    assert reviewed_records(*match_side, records) == [other]
+    assert records == [event, other]
+    assert reviewed_records('another-match', match_side[1], records) == records
+    from dataclasses import replace
+    with pytest.raises(ValueError, match='exclusion changed'):
+        reviewed_records(*match_side, [replace(event, seconds=seconds + 1)])
+
+
+def test_reviewed_orphan_path_delta_does_not_waive_other_mismatches():
+    match = '20242025eplj2rgn13na28rd2b8q0070'
+    assert approved_path_difference(match, 'H', 'DTP', 21, 16)
+    assert approved_path_difference(match, 'H', 'TTP', 69, 58)
+    assert not approved_path_difference(match, 'H', 'DTP', 22, 16)
+    assert not approved_path_difference(match, 'A', 'DTP', 21, 16)
+    assert not approved_path_difference(match, 'H', 'SHOT', 21, 16)
+
+
+def test_ssr_index_is_uncapped_and_keeps_operating_precision_without_changing_fpx():
+    evidence, mid = preview_fixture()
+    result = build(evidence, mid)
+    home = next(d['data'] for d in result['documents'] if d['collection']=='dMST' and d['data']['H-A']=='H')
+    raw = calculate_kpis(delivery.source_records(evidence['source_recordings'][0])).team_kpi
+    assert home['SSRScore'] == delivery.rounded(raw['SSR'] / .18 * 100, 2)
+    assert home['SSRScore'] > 99.9
+    assert home['FPX'] == rating_two_decimals(evidence['source_recordings'][0]['recording']['teamRating']['fpx'])
+    assert home['SSR(AiSSR)'] == delivery.rounded(raw['SSR'] / .18 * 100, 1)
+
+
+def test_decimal_mean_prevents_one_hundredth_loss_before_truncation():
+    assert delivery.precise_mean([99.9, 95.0, 35.05]) == 76.65
+    assert rating_two_decimals(delivery.precise_mean([99.9,95.0,35.05])) == 76.65
+
+
+def test_existing_registration_alias_is_preserved_verbatim_by_contract_identity():
+    evidence, setup = master_fixture()
+    contract = {'teamId':'E-H','leagueId':'EPL','from':'2023.01.01','no':7}
+    evidence['player_contracts'] = {'0000000001':[contract]}
+    old = {'PlSeason':'2023-2024','p_id':1,'l_code':'EPL','t_code':'E-H',
+           'pt_begin':'2023.01.01','p_id_old':'E-EV07,E-CA34.E-HU60'}
+    evidence['target_existing']['Player']=[{'id':'old','data':old}]
+    assert delivery.registration_alias(evidence,'0000000001','2023-2024',contract) == old['p_id_old']
+    assert delivery.registration_alias(evidence,'0000000001','2023-2024',dict(contract,from_='unused',teamId='E-A')) == ''
+
+
+def test_player_names_remove_whitespace_and_literal_line_endings_only():
+    for value in ('Demarai Gray\r\n',' Demarai Gray ','Demarai Gray\\r\\n'):
+        assert delivery.clean_player_name(value) == 'Demarai Gray'
+    assert delivery.clean_player_name('Name\\nInside') == 'Name\\nInside'
+
+
+def test_club_labels_keep_operating_spelling_except_explicit_user_corrections():
+    old={'t_code':'E-NF','t_Nm':'노팅엄 포레스트'}
+    assert delivery.delivery_payload('dMST',dict(old,t_Nm='노팅엄 포리스트'),old)['t_Nm']==old['t_Nm']
+    for team,name in [('E-EV','에버턴'),('E-LE','레스터')]:
+        old={'t_code':team,'t_Nm':'old-label'}
+        assert delivery.delivery_payload('dMST',dict(old),old)['t_Nm']==name
+    assert delivery.delivery_payload('dMST',{'t_code':'OTHER','t_Nm':'new-label'},old)['t_Nm']=='new-label'
+
+
+def test_rate_precision_preserves_only_equivalent_ieee_values_not_real_changes():
+    original={'SSR':.33299999999999996}
+    assert delivery.delivery_payload('pMST',{'SSR':1/3},original)['SSR']==original['SSR']
+    assert delivery.delivery_payload('pMST',{'SSR':.334},original)['SSR']==.334
+    assert delivery.delivery_payload('mMST',{'H-ASR':1/3})['H-ASR']==.333333
+    assert delivery.delivery_payload('mMST',{'6H-SSR':1/3})['6H-SSR']==.333
+
+
+def test_existing_relegated_club_registration_uses_latest_did_contract_and_real_kit():
+    evidence, setup = master_fixture()
+    evidence['player_profiles']['0000000001']['currentTeamId']='E-OUT'
+    evidence['player_contracts']={'0000000001':[
+        {'teamId':'E-H','leagueId':'EPL','from':'2020.07.23','to':'2020.07.29','no':0},
+        {'teamId':'E-OUT','leagueId':'EPL','from':'2020.09.01','to':'2024.08.31','no':10},
+        {'teamId':'E-OUT','leagueId':'EPL','from':'2024.05.31','to':'2024.08.31','no':0}]}
+    evidence['target_existing']['playerDB']=[{'id':'old','data':{'P-1':1,'P-6':2324,'P-7':'E-OUT'}}]
+    link=delivery.registration_link(evidence,'0000000001','2023-2024',evidence['did_matches'])
+    assert link['teamId']=='E-OUT' and link['from']=='2024.05.31' and link['no']==10
+
+
+def test_reviewed_aggregate_raw_corrections_are_projected_and_unrelated_drift_is_rejected():
+    evidence, mid = preview_fixture()
+    mid='20242025eplj2rgn13na28rd2b8q0070'
+    source=evidence['source_recordings'][0]
+    source['match_id']=mid
+    source['recording']['legacyGiId']='legacy'
+    for row in source['children']['records']:
+        row['data'].update(legacyKpiFlags={'tap': True, 'dap': True},
+                           legacyPathId=row['id'], legacyPathType='UPP', legacyPathTtp=False)
+    # Fixture records carry legacy flags, so the approved stored path delta is auditable.
+    computed=calculate_kpis(delivery.source_records(source)).team_kpi
+    source['recording']['kpi']={**computed,'DTP':computed['DTP']+5,'TTP':computed['TTP']+11}
+    items=[{'match_id':mid,'side':'H','match':source['match'],'recording':source['recording']}]
+    original=deepcopy(items)
+    corrected=delivery.reviewed_aggregate_items(evidence,items)
+    assert corrected[0]['recording']['kpi']['DTP']==computed['DTP']
+    assert corrected[0]['recording']['kpi']['TTP']==computed['TTP']
+    assert items==original
+    source['recording']['kpi']['SHOT']+=1
+    with pytest.raises(ValueError,match='Unreviewed aggregate KPI'):
+        delivery.reviewed_aggregate_items(evidence,items)
+
+
+def test_master_review_capture_reads_only_affected_imported_raw_with_guards():
+    capture=object.__new__(delivery.SourceCapture)
+    capture.did=object()
+    calls=[]
+    def rows(client,path,filters=(),**kwargs):
+        calls.append((path,filters,kwargs))
+        return []
+    capture.rows=rows
+    evidence={'source_recordings':[]}
+    mid='20242025eplj2rgn13na28rd2b8q0070'
+    capture.capture_aggregate_review_sources(evidence,[
+        {'match_id':'new-match','side':'H','recording':{},'match':{}},
+        {'match_id':mid,'side':'H','recording':{'legacyGiId':'legacy'},'match':{}}])
+    assert len(calls)==2 and all(c[2]['source'] for c in calls)
+    assert all(mid in c[0] for c in calls)
+    assert calls[0][1]==[('half','in',['H3','H4'])]
+    assert evidence['source_recordings'][0]['match_id']==mid
+
+
+def test_0087_apx_waiver_requires_exact_fixture_raw_delta_and_saved_rating():
+    args = dict(match_id='20242025eplj2rgn13na28rd2b8q0087', side='H',
+                team_id='E-EV', opponent_id='E-FU', metric='APX', imported=True,
+                excluded_raw=True, stored_dap=271, original_dap=271,
+                calculated_dap=270, stored_rating=67.75, baseline=400)
+    assert approved_apx_difference(**args)
+    for key, value in dict(match_id='another-match', side='A', team_id='E-AR',
+                           opponent_id='E-CH', metric='TPX', imported=False,
+                           excluded_raw=False, stored_dap=272, original_dap=272,
+                           calculated_dap=269, stored_rating=68.0, baseline=450).items():
+        assert not approved_apx_difference(**{**args, key: value}), key
+
+
+def test_contract_resolution_keeps_histories_and_prefers_nonzero_kit_and_explicit_end():
+    base = {'teamId': 'E-H', 'from': '2020-01-01', 'no': '0', 'to': None}
+    records = [base, dict(base, no='42', to='2026-09-02'), {**base, 'from': '2021-01-01'}]
+    before = deepcopy(records)
+    result = resolve_contract_duplicates(records)
+    assert len(result) == 2 and result[0]['no'] == '42' and result[0]['to'] == '2026-09-02'
+    assert result[1]['no'] == '0'
+    assert records == before
+
+
+def test_francis_end_uses_creation_order_not_batch_repair_order():
+    old = {'teamId': 'E-LT', 'from': '2023-05-31', 'to': '2023-09.02',
+           'createdAt': '2026-09-09T07:04:05Z', 'updatedAt': '2026-10-02T07:10:19.114589Z'}
+    new = dict(old, to='2023-08-31', createdAt='2026-10-01T07:02:51Z', updatedAt='2026-10-02T07:10:19.114543Z')
+    assert resolve_contract_duplicates([old, new])[0]['to'] == '2023-08-31'
+    for left, right in [(dict(old, createdAt=None), new), (old, dict(new, createdAt=old['createdAt']))]:
+        with pytest.raises(ValueError, match='Conflicting DID contract identity'):
+            resolve_contract_duplicates([left, right])
+    with pytest.raises(ValueError, match='field no'):
+        resolve_contract_duplicates([dict(old, no='11'), dict(old, no='42')])
+
+
+def test_overlay_preserves_operating_fields_but_replaces_generated_nested_maps():
+    old = {'Coach': 'coach', 'Captain': 'captain', 'PDF': None, 'W-TOT': 8,
+           'W-TOT2': 11, 'calculation': {'removed': 1, 'kept': 2}, 'GOAL': 0}
+    new = {'GOAL': 4, 'calculation': {'kept': 3}}
+    result = delivery.delivery_payload('dMST', new, old)
+    assert result == {**old, **new}
+    assert result['calculation'] == {'kept': 3}
+    assert old['calculation']['removed'] == 1 and new['GOAL'] == 4
+
+
+def test_overlay_removes_absent_generated_fields_but_keeps_operating_notes():
+    result = delivery.delivery_payload('multiSheet_ALL', {'DTP-H1-0-5': 1},
+        {'DTP-H1-0-5': 2, 'DTP-H3-0-5': 9, 'Coach': 'manual'})
+    assert result == {'DTP-H1-0-5': 1, 'Coach': 'manual'}
+    result = delivery.delivery_payload('rank', {'WRK1': 1}, {'WRK21': 21, 'note': 'keep', 'WGR1': 2})
+    assert result == {'WRK1': 1, 'note': 'keep'}
+
+
+def test_kpi_builder_never_synthesizes_raw_from_obsolete_path_metadata(monkeypatch):
+    event = KpiRecord('one', 'H1', 20, 0, 'S', 'X', 2, legacy_path_id='current',
+        legacy_path_type='DTP', legacy_path_ttp=True, legacy_flags={'shot': True})
+    record = SimpleNamespace(half=event.half, halfSeconds=event.seconds, seq=event.seq,
+        act=event.act, res=event.res, area=event.area, playerId=None, shootPosX=None,
+        shootPosY=None, shootDspRange=None, isShot=None, createdBy='legacy-import',
+        createdAt=datetime(2026, 1, 1, tzinfo=timezone.utc), legacyPathId='current',
+        legacyPathType='DTP', legacyPathTtp=True, legacyKpiFlags={'shot': True}, bapReason=None)
+    source = SimpleNamespace(records=[('one', record)], fingerprint='raw-version',
+        recording=SimpleNamespace(kpi=RecordingKpi(**calculate_kpis([event]).team_kpi),
+                                 kpiVersion=1, kpiSourceFingerprint=None, lineup={}),
+        paths=[('obsolete', SimpleNamespace(gtId='obsolete', ptype='DTP', ttp=True))])
+    saved = []
+    data = SimpleNamespace(read_match_kpi_source=lambda *args: source,
+        list_player_stats=lambda *args: {}, save_recording_kpi=lambda *args, **kwargs: saved.append(kwargs))
+    monkeypatch.setattr(BuildMatchKpis, '_save_data_artifact', staticmethod(lambda *args: None))
+    result = BuildMatchKpis(data).rebuild_for_logic_change('match', 'H')
+    assert not result.validation_failed and len(saved) == 1
+    assert saved[0]['kpi'].DTP == 1 and saved[0]['kpi'].TTP == 1
+
+
+def test_preserved_master_fields_are_allowed_only_when_unchanged_in_baseline():
+    old = {'m_id': 1, 'Coach': 'manual', 'Captain': 'manual-captain'}
+    result = delivery.finish_delivery([{'collection': 'Manager', 'document_id': 'one', 'data': {'m_id': 2}}],
+        [], [], {'Manager': [{'id': 'one', 'data': old}]}, 'all')
+    doc = result['documents'][0]
+    assert doc['data'] == dict(old, m_id=2)
+    delivery.validate_document(doc)
+    doc['data']['Coach'] = 'unreviewed-change'
+    with pytest.raises(BackendError, match='Unowned fields'):
+        delivery.validate_document(doc)
+
+
+def test_preserved_metadata_keeps_firestore_timestamp_and_nested_types():
+    stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    current = {'createdAt': stamp, 'manual': {'timestamp': stamp}, 'calculation': {'removed': 1}}
+    reviewed = delivery.delivery_payload('dMST', {'calculation': {'new': 2}}, delivery.encode(current))
+    payload = delivery.firestore_payload({'data': reviewed}, current)
+    assert payload['createdAt'] == stamp and isinstance(payload['createdAt'], datetime)
+    assert payload['manual']['timestamp'] == stamp
+    assert payload['calculation'] == {'new': 2}
+
+
+@pytest.mark.parametrize('value,expected', [(10.685, 10.68), (9.435, 9.43), (10.185, 10.18),
+                                           (99.9999, 99.99), (0, 0), (10.68, 10.68)])
+def test_delivery_ratings_truncate_two_decimals_without_mutating_source(value, expected):
+    assert rating_two_decimals(value) == expected
+    original = {'P-JMX': value, 'P-APX': value, 'P-DTP': 7, 'P-SSR': .123456}
+    result = delivery.delivery_payload('vibePlayer', original)
+    assert result['P-JMX'] == result['P-APX'] == expected
+    assert result['P-DTP'] == 7 and result['P-SSR'] == .123
+    assert original['P-JMX'] == value
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+def test_scientific_path_id_binds_only_the_same_event_in_both_directions(reverse):
+    raw, scientific = '67076605852888.11901468', '6.70766E+13'
+    event = dict(gm_id='match', t_code='TEAM', gr_half='H1', gr_half_seconds=5,
+                 gt_id=raw, p_id='7', gr_act_code='P', gr_res_code='O', gr_pos_x=20, gr_pos_y=30)
+    old = dict(event, gt_id=scientific)
+    if reverse:
+        event, old = old, event
+    rows = [{'id': 'existing', 'data': old}]
+    assert delivery.path_ids_equivalent(raw, scientific)
+    assert delivery.path_ids_equivalent(scientific, raw)
+    assert delivery.matching_rows('TACTIC', event, rows) == rows
+    assert not delivery.matching_rows('TACTIC', dict(event, gr_half_seconds=6), rows)
+    assert not delivery.path_ids_equivalent('67079999999999', scientific)
+    assert not delivery.path_ids_equivalent('hex-path', scientific)
+
+
+def test_scientific_path_mapping_keeps_ambiguity_visible():
+    event = dict(gm_id='match', t_code='TEAM', gr_half='H1', gr_half_seconds=5,
+                 gt_id='6.70766E+13', p_id='7', gr_act_code='P', gr_res_code='O')
+    rows = [{'id': str(n), 'data': dict(event, gt_id=value)} for n, value in enumerate([
+        '67076605852888.11901468', '67076605852889.11901468'])]
+    assert len(delivery.matching_rows('TACTIC', event, rows)) == 2
+
+
+def test_player_history_uses_did_team_start_identity_and_preserves_sentinels():
+    evidence, setup = master_fixture()
+    evidence['player_contracts'] = {'0000000001': [
+        {'teamId': 'E-H', 'leagueId': 'EPL', 'from': '0000.00.00', 'to': '2024.01.01', 'no': 7},
+        {'teamId': 'E-A', 'leagueId': 'EPL', 'from': '2024.01.02', 'to': '2024.02.01', 'no': 8},
+        {'teamId': 'E-H', 'leagueId': 'EPL', 'from': '2024.02.02', 'to': None, 'no': 9},
+    ]}
+    original = deepcopy(evidence)
+    report = delivery.generate_masters(evidence, [], [], {}, setup, 'all')
+    assert report['validation_passed'], report['errors']
+    players = docs(report, 'Player')
+    assert len(players) == 3
+    assert {(p['t_code'], p['pt_begin'], p['pt_end']) for p in players} == {
+        ('E-H', '0000.00.00', '2024.01.01'), ('E-A', '2024.01.02', '2024.02.01'),
+        ('E-H', '2024.02.02', '9999.99.99')}
+    assert len({delivery.natural_key('Player', p) for p in players}) == 3
+    assert len(docs(report, 'playerDB')) == 1
+    assert docs(report, 'playerDB')[0]['P-7'] == 'E-H'
+    assert evidence == original
+    for doc in report['documents']:
+        evidence['target_existing'].setdefault(doc['collection'], []).append(
+            {'id': doc['document_id'], 'data': deepcopy(doc['data'])})
+    before = {delivery.natural_key('Player', d['data']): d['document_id']
+              for d in report['documents'] if d['collection'] == 'Player'}
+    evidence['target_existing']['Player'][0]['data']['p_id_old'] = 'FOREIGN-999'
+    evidence['player_contracts']['0000000001'][-1]['to'] = '2024.06.30'
+    closed = delivery.generate_masters(evidence, [], [], {}, setup, 'all')
+    assert closed['validation_passed'], closed['errors']
+    assert any(p['p_id_old'] == 'FOREIGN-999' for p in docs(closed, 'Player'))
+    assert {delivery.natural_key('Player', d['data']): d['document_id']
+            for d in closed['documents'] if d['collection'] == 'Player'} == before
+
+
+def test_player_dtp_is_maker_plus_assister_not_paths_buildup_or_shots():
+    assert delivery.player_tactical_participation(dict(DTM=2, DTA=3, DTB=9, DTS=7, DTP=11)) == 5
+    assert delivery.player_tactical_participation(dict(DTM=0, DTA=0, DTB=2, DTS=1, DTP=3)) == 0
+
+
+@pytest.mark.parametrize('half', ['H3', 'H4'])
+def test_extra_half_events_do_not_block_delivery_or_change_source(half):
+    evidence, mid = preview_fixture()
+    item = evidence['source_recordings'][0]
+    extra = deepcopy(item['children']['records'][0])
+    extra['id'] = 'test-extra-half'
+    extra['data'].update(half=half, halfSeconds=0)
+    item['children']['records'].append(extra)
+    before = deepcopy(evidence)
+    result = build(evidence, mid)
+    assert result['validation_passed'], result['errors']
+    assert any('excluded from delivery eligibility' in warning for warning in result['warnings'])
+    assert all(d['data'].get('gr_half') not in ('H3', 'H4') for d in result['documents'])
+    assert evidence == before
+
+
+def test_extra_half_rating_baseline_waiver_requires_the_full_raw_explanation():
+    evidence, mid = preview_fixture()
+    item = evidence['source_recordings'][0]
+    for row in item['children']['records']:
+        row['data'].update(legacyPathId='main', legacyPathType='DTP', legacyPathTtp=True,
+            legacyKpiFlags={'tap': True, 'dap': True,
+                            'shot': row['id']=='shot', 'goal': row['id']=='shot'})
+    extra = deepcopy(item['children']['records'][0])
+    extra['id'] = 'extra-dap'
+    extra['data'].update(half='H4', halfSeconds=0, legacyPathId='extra',
+                         legacyPathType='UPP', legacyPathTtp=False)
+    item['children']['records'].append(extra)
+    full = calculate_kpis(delivery.source_records(item, include_extra_halves=True)).team_kpi
+    item['recording']['kpi'] = full
+    item['recording']['teamRating']['apx'] = full['DAP'] / 4
+    result = build(evidence, mid)
+    assert result['validation_passed'], [c for c in result['checks'] if not c['passed']]
+    assert any(c['name']=='H:APX-baseline' and c.get('excluded_extra_halves') for c in result['checks'])
+    item['recording']['teamRating']['apx'] += 2
+    assert not build(evidence, mid)['validation_passed']
+
+
+def test_reviewed_path_correction_does_not_certify_a_rating_from_old_kpi():
+    evidence, old_mid = preview_fixture()
+    mid = '20242025eplj2rgn13na28rd2b8q0070'
+    evidence['did_matches'][0]['id'] = mid
+    for item in evidence['source_recordings']:
+        item['match_id'] = mid
+    item = evidence['source_recordings'][0]
+    item['recording']['kpi']['DTP'] += 5
+    item['recording']['kpi']['TTP'] += 11
+    result = build(evidence, mid)
+    checks = {c['name']: c for c in result['checks']}
+    assert checks['H:source-KPI-DTP']['passed']
+    assert checks['H:source-KPI-TTP']['passed']
+    assert not checks['H:reviewed-KPI-rebuild']['passed']
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_ssr_excludes_own_in_team_cumulative_and_rating_inputs_without_changing_goals(legacy):
+    def record(ident, half, seconds, result, player, goal):
+        return KpiRecord(ident, half, seconds, 0, 'S', result, 4, player_id=player,
+            legacy_path_id=ident if legacy else None, legacy_path_type='STP' if legacy else None,
+            legacy_path_ttp=False if legacy else None,
+            legacy_flags={'shot': player!='OWN', 'goal': goal} if legacy else None)
+    records = [record('normal', 'H1', 10, 'GOAL', 'scorer', True),
+               record('own', 'H2', 300, 'GOAL', 'OWN', True),
+               record('miss', 'H2', 600, 'X', 'shooter', False)]
+    result = calculate_kpis(records)
+    assert result.team_kpi['GOAL']==2 and result.team_kpi['OG']==1 and result.team_kpi['SHOT']==2
+    assert result.team_kpi['SSR']==.5
+    assert 'OWN' not in result.player_kpis
+    values = delivery.intervals(records, result)
+    assert sum(values['GOAL'])==2 and sum(values['SHOT'])==2
+    assert values['SSR'][10:13]==[1, 1, .5]
+    rating = calculate_team_kpi_5min(records, {'H1': 2700, 'H2': 3000})
+    assert rating[11]['GOAL']==2 and rating[11]['SSR']==1
+    assert rating[-1]['GOAL']==2 and rating[-1]['SSR']==.5
+    zero = calculate_kpis([records[1]])
+    assert zero.team_kpi['GOAL']==1 and zero.team_kpi['SHOT']==0 and zero.team_kpi['SSR']==0
+
+
+def test_imported_og_placeholder_is_audited_without_requiring_new_input_kpi_post():
+    evidence, mid = preview_fixture()
+    item = evidence['source_recordings'][0]
+    for row in item['children']['records']:
+        row['data'].update(legacyPathId='main', legacyPathType='DTP', legacyPathTtp=True,
+            legacyKpiFlags={'tap': True, 'dap': True,
+                            'shot': row['id']=='shot', 'goal': row['id']=='shot'})
+    own = deepcopy(item['children']['records'][-1])
+    own['id']='own'
+    own['data'].update(half='H2', halfSeconds=100, playerId='OWN', legacyPathId='own',
+        legacyPathType='STP', legacyPathTtp=False, legacyKpiFlags={'goal': True})
+    item['children']['records'].append(own)
+    raw = calculate_kpis(delivery.source_records(item)).team_kpi
+    item['recording'].update(legacyGiId='imported', kpi={**raw, 'OG': 0})
+    item['recording']['teamRating'].update(apx=raw['DAP']/4, tpx=raw['DTP']/12*100,
+        fpx=(min(raw['SHOT']/15*100, 99.9)+min(raw['GOAL']/3*100, 99.9))/2)
+    result = build(evidence, mid)
+    assert result['validation_passed'], [c for c in result['checks'] if not c['passed']]
+    goal_sheet = next(d['data'] for d in result['documents']
+                      if d['collection']=='multiSheet_GOAL' and d['data']['team_type']=='HOME')
+    assert sum(v for k,v in goal_sheet.items() if k.startswith('GOAL-H')) == raw['GOAL'] - raw['OG']
+    assert goal_sheet['GOAL-H2-0-5'] == 0
+    check = next(c for c in result['checks'] if c['name']=='H:source-KPI-OG')
+    assert check['legacy_og_placeholder'] and not check['actual_passed']
+    assert item['recording']['kpi']['OG']==0
+    evidence['target_existing']['playerGoal']=[{'id':'old-own', 'data':{
+        'gm_id':mid,'IDX_CODE':'HX','gr_half':'H2','gr_half_seconds':100,'p_id':'OWN'}}]
+    for current in evidence['source_recordings']:
+        rating=current['recording']['teamRating']
+        rating.update({metric+'Grade':delivery.grade(rating[metric]) for metric in ('apx','tpx','fpx')})
+    full=delivery.generate_delivery(evidence,evidence['did_matches'],[],{}, {'documents':[]},match_only=True)
+    assert full['validation_passed'], full['errors']
+    assert full['excluded_existing_documents'][0]['document_id']=='old-own'
+    assert not any(d['collection']=='playerGoal' and d['data'].get('p_id')=='OWN' for d in full['documents'])
+    evidence['target_existing']['playerGoal'][0]['data']['gr_half_seconds']=101
+    mismatch=delivery.generate_delivery(evidence,evidence['did_matches'],[],{}, {'documents':[]},match_only=True)
+    assert not mismatch['validation_passed']
+    item['recording'].pop('legacyGiId')
+    assert not build(evidence, mid)['validation_passed']
+
+
+def test_imported_reviewed_path_delta_does_not_require_a_kpi_post_but_still_checks_ratings():
+    evidence, _ = preview_fixture()
+    mid='20242025eplj2rgn13na28rd2b8q0070'
+    evidence['did_matches'][0]['id']=mid
+    for item in evidence['source_recordings']: item['match_id']=mid
+    item=evidence['source_recordings'][0]
+    for row in item['children']['records']:
+        row['data'].update(legacyPathId='main', legacyPathType='DTP', legacyPathTtp=True,
+            legacyKpiFlags={'tap': True, 'dap': True,
+                            'shot': row['id']=='shot', 'goal': row['id']=='shot'})
+    raw=calculate_kpis(delivery.source_records(item)).team_kpi
+    item['recording'].update(legacyGiId='imported', kpi={**raw, 'DTP':raw['DTP']+5, 'TTP':raw['TTP']+11})
+    item['recording']['teamRating'].update(apx=raw['DAP']/4, tpx=raw['DTP']/12*100)
+    result=build(evidence, mid)
+    assert result['validation_passed'], [c for c in result['checks'] if not c['passed']]
+    assert next(c for c in result['checks'] if c['name']=='H:reviewed-import-KPI-difference')['passed']
+    item['recording']['teamRating']['apx']+=2
+    assert not build(evidence, mid)['validation_passed']
+
+
+def test_dtp_uses_final_shot_result_even_when_later_touch_is_in_same_path():
+    def record(ident, seconds, act, result, flags):
+        return KpiRecord(ident, 'H1', seconds, 0, act, result, 2,
+                         legacy_path_id='path', legacy_path_type='DTP', legacy_path_ttp=True,
+                         legacy_flags=flags)
+    records = [record('pass', 290, 'P', 'O', {'dap': True}),
+               record('shot', 299, 'S', 'O', {'shot': True}),
+               record('result', 300, '', 'X', {}),
+               record('unrelated-later-touch', 601, 'P', 'X', {})]
+    bins = delivery.intervals(records, calculate_kpis(records))
+    assert bins['DTP'][1] == 1 and bins['DTP'][2] == 0
+    with pytest.raises(ValueError, match='result is missing'):
+        delivery.intervals(records[:2], calculate_kpis(records[:2]))
+
+
+@pytest.mark.parametrize('collection', sorted(delivery.EXCLUDED_COLLECTIONS))
+def test_excluded_collections_cannot_reach_the_writer(collection):
+    with pytest.raises(BackendError, match='Invalid delivery collection'):
+        delivery.validate_document({'collection': collection, 'document_id': 'id', 'data': {'value': 1}})
+    assert collection not in delivery.MATCH_COLLECTIONS
+    assert collection not in delivery.MASTER_COLLECTIONS
+
+
+def test_full_replacement_removes_old_fields_and_guards_the_entire_baseline(monkeypatch):
+    from firebase_admin import firestore
+    monkeypatch.setattr(firestore, 'transactional', lambda fn: fn)
+    old = {'m_id': 10, 'uid': 'one', 'obsolete': 99, 'updatedAt': datetime(2026, 1, 1, tzinfo=timezone.utc)}
+    current = {'Manager/one': old}
+    writes = []
+    class Ref:
+        def __init__(self, path): self.path = path
+        def document(self, ident): return Ref(self.path + '/' + ident)
+        def get(self, transaction):
+            return SimpleNamespace(exists=self.path in current, to_dict=lambda: current.get(self.path))
+    class Transaction:
+        def set(self, ref, value, merge=False):
+            writes.append((ref.path, merge))
+            current[ref.path] = deepcopy(value)
+    client = SimpleNamespace(project='aifootballx', collection=lambda name: Ref(name), transaction=Transaction)
+    doc = document()
+    doc.update(existed=True, baseline=delivery.replacement_baseline(doc['data'], delivery.encode(old)))
+    assert delivery.FirestoreWriter(client).send(doc, 'preview') == 'success'
+    assert current['Manager/one'] == doc['data']
+    assert ('Manager/one', False) in writes
+    with pytest.raises(BackendError, match='document changed'):
+        delivery.decide_merge(doc, dict(old, obsolete=100))
+
+
+def test_rating_request_preserves_legacy_flags_and_own_goal_team_inputs(monkeypatch):
+    flags = {'shot': False, 'goal': True}
+    record = SimpleNamespace(half='H1', halfSeconds=20, seq=0, act='S', res='GOAL', area=2,
+        playerId='OWN', shootPosX=0, shootPosY=0, shootDspRange=None, isShot=None,
+        createdBy='legacy-import', createdAt=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        legacyPathId='path', legacyPathType='STP', legacyPathTtp=False, legacyKpiFlags=flags, bapReason=None)
+    kpi = {'GOAL': 2, 'OG': 1, 'SHOT': 1, 'SSR': 1}
+    scorer = SimpleNamespace(**{**vars(record), 'playerId': '0000000001', 'halfSeconds': 19,
+        'legacyPathId': 'scorer-path', 'legacyKpiFlags': {'shot': True, 'goal': True}})
+    source = SimpleNamespace(records=[('record', record), ('scorer', scorer)],
+        recording=SimpleNamespace(kpi=SimpleNamespace(model_dump=lambda **kwargs: kpi), kpiVersion=1,
+            teamRating=None, ratingBasedOn=None, teamId='T1', opponentTeamId='T2', halves={}),
+        match=SimpleNamespace(leagueId='EPL', seasonId='20262027', matchType='league', round=1))
+    captured = {}
+    def intervals(records, ends):
+        captured['records'] = records
+        return [calculate_kpis(records).team_kpi] * 20
+    def request(body):
+        captured['body'] = body
+        raise RuntimeError('offline request captured')
+    monkeypatch.setattr('backend.build.build_match_rating.calculate_team_kpi_5min', intervals)
+    monkeypatch.setattr(BuildMatchRating, '_request_rating', staticmethod(request))
+    data = SimpleNamespace(read_match_kpi_source=lambda *args: source, list_player_stats=lambda *args: {})
+    with pytest.raises(RuntimeError, match='offline request captured'):
+        BuildMatchRating(data).build('match', 'H', force=True)
+    assert captured['records'][0].legacy_flags == flags
+    assert captured['body']['teamKpi'] == kpi
+    # Approved import OG=0 needs no KPI POST or source rewrite. Its request
+    # must still carry RAW OG and the same OWN-exclusive success ratio.
+    source.recording.legacyGiId='legacy'
+    kpi['OG']=0
+    with pytest.raises(RuntimeError, match='offline request captured'):
+        BuildMatchRating(data).build('match', 'H', force=True)
+    assert kpi['OG']==0 and captured['body']['teamKpi']['OG']==1
+    assert captured['body']['teamKpi']['SSR']==1
+
+
+def test_rating_cache_requires_exact_current_input_fingerprint(monkeypatch):
+    event=SimpleNamespace(half='H1',halfSeconds=20,seq=0,act='S',res='GOAL',area=2,
+        playerId='p',shootPosX=0,shootPosY=0,shootDspRange=None,isShot=None,
+        createdBy='legacy-import',createdAt=datetime(2026,1,1,tzinfo=timezone.utc),
+        legacyPathId='path',legacyPathType='STP',legacyPathTtp=False,
+        legacyKpiFlags={'shot':True,'goal':True,'dap':True},bapReason=None)
+    raw=KpiRecord('event','H1',20,0,'S','GOAL',2,'p',legacy_path_id='path',
+                  legacy_path_type='STP',legacy_flags=event.legacyKpiFlags)
+    kpi=calculate_kpis([raw]).team_kpi
+    source=SimpleNamespace(records=[('event',event)],fingerprint='source-v1',
+        recording=SimpleNamespace(kpi=SimpleNamespace(model_dump=lambda **kw:kpi),kpiVersion=1,
+            ratingBasedOn=1,teamRating={'jmx':50},ratingInputFingerprint=None,
+            teamId='T1',opponentTeamId='T2',halves={}),
+        match=SimpleNamespace(leagueId='EPL',seasonId='20262027',matchType='league',round=1))
+    requests=[]
+    def request(body):
+        requests.append(deepcopy(body))
+        return {'teamRating':{'jmx':50,'jmxSeries':[50]*20,'apx':.25,'apxGrade':'F',
+                'tpx':0,'tpxGrade':'F','fpx':20,'fpxGrade':'F'},'playerRatings':[]}
+    def save(*args,**kwargs):
+        source.recording.ratingInputFingerprint=kwargs['input_fingerprint']
+        source.recording.teamRating=kwargs['team_rating']
+        return 0
+    monkeypatch.setattr(BuildMatchRating,'_request_rating',staticmethod(request))
+    data=SimpleNamespace(read_match_kpi_source=lambda *a:source,
+                         list_player_stats=lambda *a:{},save_recording_rating=save)
+    builder=BuildMatchRating(data)
+    assert not builder.build('match','H').unchanged
+    assert len(requests)==1 and source.recording.ratingInputFingerprint
+    assert builder.build('match','H').unchanged and len(requests)==1
+    source.recording.ratingInputFingerprint='obsolete-policy'
+    assert not builder.build('match','H').unchanged and len(requests)==2
+
+
+def test_rating_rejects_inconsistent_final_interval_before_request(monkeypatch):
+    event=SimpleNamespace(half='H1',halfSeconds=20,seq=0,act='S',res='GOAL',area=2,
+        playerId='p',shootPosX=0,shootPosY=0,shootDspRange=None,isShot=None,
+        createdBy='legacy-import',createdAt=datetime(2026,1,1,tzinfo=timezone.utc),
+        legacyPathId='path',legacyPathType='STP',legacyPathTtp=False,
+        legacyKpiFlags={'shot':True,'goal':True,'dap':True},bapReason=None)
+    raw=KpiRecord('event','H1',20,0,'S','GOAL',2,'p',legacy_path_id='path',
+                  legacy_path_type='STP',legacy_flags=event.legacyKpiFlags)
+    kpi=calculate_kpis([raw]).team_kpi
+    source=SimpleNamespace(records=[('event',event)],recording=SimpleNamespace(
+        kpi=SimpleNamespace(model_dump=lambda **kw:kpi),kpiVersion=1,teamId='T1',opponentTeamId='T2',halves={}),
+        match=SimpleNamespace(leagueId='EPL',seasonId='20262027',matchType='league',round=1))
+    monkeypatch.setattr('backend.build.build_match_rating.calculate_team_kpi_5min',
+                        lambda *a:[{**kpi,'DAP':kpi['DAP']+5}]*20)
+    monkeypatch.setattr(BuildMatchRating,'_request_rating',staticmethod(lambda b:pytest.fail('Request must be blocked')))
+    with pytest.raises(BackendError) as rejected:
+        BuildMatchRating(SimpleNamespace(read_match_kpi_source=lambda *a:source,list_player_stats=lambda *a:{})).build('match','H')
+    assert rejected.value.code=='rating_interval_kpi_mismatch'
+
+
+def test_legacy_dtp_is_not_counted_until_its_shot_result_and_uses_half_open_buckets():
+    def record(ident, seconds, act, result, flags):
+        return KpiRecord(ident, 'H1', seconds, 0, act, result, 2,
+                         legacy_path_id='path', legacy_path_type='DTP', legacy_path_ttp=True,
+                         legacy_flags=flags)
+    records = [record('pass', 10, 'P', 'O', {'dap': True}),
+               record('shot', 299, 'S', 'O', {'shot': True}),
+               record('result', 300, '', 'X', {})]
+    snapshots = calculate_team_kpi_5min(records)
+    bins = delivery.intervals(records, calculate_kpis(records))
+    assert snapshots[0]['DTP'] == bins['DTP'][0] == 0
+    assert snapshots[1]['DTP'] == bins['DTP'][1] == 1
+    assert snapshots[-1]['DTP'] == 1
+    with pytest.raises(ValueError, match='result is missing'):
+        calculate_team_kpi_5min(records[:2])
+
+
+def test_modern_rating_input_uses_same_finalized_dap_flags_as_delivery_intervals():
+    records=[KpiRecord('first','H1',299,0,'P','O',2,'p'),
+             KpiRecord('second','H1',301,1,'P','X',2,'p')]
+    computed=calculate_kpis(records)
+    bins=delivery.intervals(records,computed)
+    snapshots=calculate_team_kpi_5min(records)
+    assert snapshots[0]['DAP']==bins['DAP'][0]==1
+    assert snapshots[1]['DAP']==sum(bins['DAP'][:2])==2
+    assert calculate_kpis(records[:1]).team_kpi['DAP']==0
+    for index, snapshot in enumerate(snapshots):
+        for field in ('DAP','DTP','SHOT','GOAL'):
+            assert snapshot[field]==sum(bins[field][:index+1])
+        assert snapshot['SSR']==bins['SSR'][index]
+
+
+def test_last_rating_bucket_keeps_stoppage_records_even_with_a_short_stored_half_duration():
+    records = [KpiRecord('late-shot', 'H2', 3301, 0, 'S', 'GOAL', 2, 'p')]
+    assert calculate_team_kpi_5min(records, {'H2': 2900})[-1]['GOAL'] == 1
+
+
+def test_h4_player_eligibility_waives_only_differences_explained_by_the_excluded_records():
+    evidence, mid = preview_fixture()
+    item = evidence['source_recordings'][0]
+    pid = '0000000007'
+    for row in item['children']['records']:
+        row['data']['playerId'] = pid
+    extra = deepcopy(item['children']['records'][0])
+    extra['id'] = 'extra-h4'
+    extra['data'].update(half='H4', halfSeconds=0)
+    item['children']['records'].append(extra)
+    full = calculate_kpis(delivery.source_records(item, include_extra_halves=True))
+    item['recording']['kpi'] = full.team_kpi
+    item['recording']['lineup'][pid] = {'type': 'START', 'pos': 'MF'}
+    item['children']['playerStats'] = [{'id': pid, 'data': {
+        **full.player_kpis[pid], 'ratingBasedOn': 1, 'apx': 70, 'tpx': 60, 'fpx': 50, 'jmx': 5}}]
+    evidence['player_profiles'][pid] = {'name': 'Player'}
+    evidence['player_contracts'][pid] = [{'teamId': 'E-H', 'leagueId': 'EPL', 'from': '2023-01-01'}]
+    before = deepcopy(evidence)
+    result = build(evidence, mid)
+    assert result['validation_passed'], (result['errors'], [c for c in result['checks'] if not c['passed']])
+    assert any(c.get('excluded_extra_halves') for c in result['checks'])
+    assert evidence == before
+    item['children']['playerStats'][0]['data']['TAP'] += 1
+    rejected = build(evidence, mid)
+    assert not rejected['validation_passed']
+    assert any(c['name'].endswith('player-7-TAP') and not c['passed'] for c in rejected['checks'])
+
+
+def test_historical_contract_uses_a_verified_cross_season_index_without_relaxing_match_codes():
+    evidence, setup = master_fixture()
+    evidence['player_profiles'] = {'0000000001': {'name': 'Retired'}}
+    evidence['player_contracts'] = {'0000000001': [
+        {'teamId': 'E-OLD', 'leagueId': 'EPL', 'from': '2000-01-01', 'to': '2001-01-01'}]}
+    evidence['ai_samples']['code'].append({'data': {'TCODE': 'E-OLD', 'PlSeason': '2020-2021', 'IDX_NAME': 'OLDX'}})
+    before = deepcopy(evidence)
+    report = delivery.generate_masters(evidence, [], [], {}, setup, 'all')
+    assert report['validation_passed'], report['errors']
+    assert docs(report, 'Player')[0]['IDX_CODE'] == 'OLDX'
+    assert not docs(report, 'playerDB')
+    assert evidence == before
+    with pytest.raises(ValueError, match='season-specific'):
+        delivery.resolve_team_code(evidence['ai_samples']['code'], '2023-2024', 'E-OLD')
+    evidence['ai_samples']['code'].append({'data': {'TCODE': 'E-OLD', 'PlSeason': '2021-2022', 'IDX_NAME': 'OTHER'}})
+    assert not delivery.generate_masters(evidence, [], [], {}, setup, 'all')['validation_passed']
+
+
+def test_existing_contract_alias_is_bound_by_team_and_start_instead_of_shirt_number():
+    evidence, setup = master_fixture()
+    pid = '0000000001'
+    evidence['player_contracts'] = {pid: [{'teamId': 'E-H', 'leagueId': 'EPL', 'from': '2023-01-01', 'no': 38}]}
+    evidence['target_existing']['Player'] = [{'id': 'old', 'data': {
+        'PlSeason': '2023-2024', 'p_id': 1, 'l_code': 'EPL', 't_code': 'E-H',
+        'pt_begin': '2023.01.01', 'IDX_CODE': 'HX', 'p_id_old': 'E-H111'}}]
+    report = delivery.generate_masters(evidence, [], [], {}, setup, 'all')
+    assert report['validation_passed'], report['errors']
+    assert docs(report, 'Player')[0]['p_id_old'] == 'E-H111'
+    assert docs(report, 'Player')[0]['pt_num'] == 38
+    assert docs(report, 'playerDB')[0]['P-17'] == 'E-H111'
+    evidence['player_contracts'][pid][0]['from'] = '2023-01-02'
+    assert docs(delivery.generate_masters(evidence, [], [], {}, setup, 'all'), 'Player')[0]['p_id_old'] == ''
+
+
+@pytest.mark.parametrize('bundle', ['F-PS04,E-H111,USA121', 'E-H', 'E-OLD11,ENG117'])
+def test_verified_registration_alias_preserves_the_existing_multi_club_national_bundle(bundle):
+    evidence, setup = master_fixture()
+    evidence['player_contracts'] = {'0000000001': [
+        {'teamId': 'E-H', 'leagueId': 'EPL', 'from': '2023-01-01', 'no': 38}]}
+    evidence['target_existing']['Player'] = [{'id': 'old', 'data': {
+        'PlSeason': '2023-2024', 'p_id': 1, 'l_code': 'EPL', 't_code': 'E-H',
+        'pt_begin': '2023.01.01', 'IDX_CODE': 'HX', 'p_id_old': bundle}}]
+    report = delivery.generate_masters(evidence, [], [], {}, setup, 'all')
+    assert report['validation_passed'], report['errors']
+    assert docs(report, 'Player')[0]['p_id_old'] == bundle
+    assert docs(report, 'playerDB')[0]['P-17'] == bundle
+
+
+def test_player_db_abbreviation_is_not_the_player_index_and_open_dates_are_explicit():
+    evidence, setup = master_fixture()
+    evidence['ai_samples']['code'][0]['data']['구단(약자)'] = 'HOM'
+    report = delivery.generate_masters(evidence, [], [], {}, setup, 'all')
+    assert docs(report, 'Player')[0]['IDX_CODE'] == 'HX'
+    assert docs(report, 'playerDB')[0]['P-8'] == 'HOM'
+    assert docs(report, 'playerDB')[0]['P-14'] == '0000.00.00'
+    assert docs(report, 'playerDB')[0]['P-15'] == '9999.99.99'
+
+
+def test_registration_namespaces_can_differ_from_chart_team_codes():
+    evidence, setup = master_fixture()
+    evidence['target_existing']['Player'] = [{'id': 'old', 'data': {
+        'PlSeason': '2023-2024', 'p_id': 1, 'l_code': 'EPL', 't_code': 'E-H',
+        'pt_begin': '0000.00.00', 'IDX_CODE': 'LEGACYX'}}]
+    evidence['target_existing']['playerDB'] = [{'id': 'old-db', 'data': {
+        'P-6': 2324, 'P-1': 1, 'P-7': 'E-H', 'P-8': 'LEG'}}]
+    evidence['ai_samples']['code'][0]['data']['구단(약자)'] = 'HOM'
+    report = delivery.generate_masters(evidence, [], [], {}, setup, 'all')
+    assert report['validation_passed'], report['errors']
+    assert docs(report, 'Player')[0]['IDX_CODE'] == 'LEGACYX'
+    assert docs(report, 'playerDB')[0]['P-8'] == 'LEG'
+    assert delivery.resolve_team_code(evidence['ai_samples']['code'], '2023-2024', 'E-H')['IDX_CODE'] == 'HX'
+
+
+def test_a_future_transfer_does_not_create_a_season_registration():
+    evidence, setup = master_fixture()
+    evidence['player_contracts'] = {'0000000001': [
+        {'teamId': 'E-H', 'leagueId': 'EPL', 'from': '2026-01-01'}]}
+    report = delivery.generate_masters(evidence, [], [], {}, setup, 'all')
+    assert report['validation_passed'], report['errors']
+    assert not docs(report, 'playerDB')
+
+
+def test_retired_history_is_preserved_without_creating_an_active_registration():
+    evidence, setup = master_fixture()
+    evidence['player_profiles']['0000000001'].pop('currentTeamId')
+    evidence['player_contracts'] = {'0000000001': [
+        {'teamId': 'E-H', 'leagueId': 'EPL', 'from': '2000-01-01', 'to': '2001-01-01'}]}
+    report = delivery.generate_masters(evidence, [], [], {}, setup, 'all')
+    assert report['validation_passed'], report['errors']
+    assert len(docs(report, 'Player')) == 1
+    assert not docs(report, 'playerDB')
+
+
+def test_explicit_rating_build_rejects_incorrect_og_metadata_before_any_request(monkeypatch):
+    record = SimpleNamespace(half='H1', halfSeconds=20, seq=0, act='S', res='GOAL', area=2,
+        playerId='OWN', shootPosX=0, shootPosY=0, shootDspRange=None, isShot=None,
+        createdBy='legacy-import', createdAt=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        legacyPathId='own', legacyPathType='STP', legacyPathTtp=False,
+        legacyKpiFlags={'goal': True}, bapReason=None)
+    source = SimpleNamespace(records=[('own', record)], recording=SimpleNamespace(
+        kpi=SimpleNamespace(model_dump=lambda **kwargs: {'GOAL': 1, 'OG': 0, 'SHOT': 0, 'SSR': 0}),
+        kpiVersion=1, ratingBasedOn=1, teamRating={'jmx': 80}))
+    data = SimpleNamespace(read_match_kpi_source=lambda *args: source)
+    monkeypatch.setattr(BuildMatchRating, '_request_rating', staticmethod(lambda body: pytest.fail('Unexpected rating request')))
+    with pytest.raises(BackendError) as rejected:
+        BuildMatchRating(data).build('match', 'H')
+    assert rejected.value.code == 'rating_kpi_definition_mismatch'
+
+
+def test_legacy_own_goal_baseline_is_recognized_but_arbitrary_ssr_drift_is_rejected():
+    raw = RecordingKpi(**{k: 0 for k in RecordingKpi.model_fields}).model_copy(
+        update={'GOAL': 2, 'OG': 1, 'SHOT': 10, 'SSR': .1})
+    imported = raw.model_copy(update={'OG': 0, 'SSR': .1})
+    assert _team_differences(imported, raw) == {}
+    assert 'SSR' in _team_differences(imported.model_copy(update={'SSR': .12}), raw)
+    assert 'GOAL' in _team_differences(imported.model_copy(update={'GOAL': 3}), raw)
+    assert 'SSR' in _team_differences(imported, raw.model_copy(update={'SSR': .15}))
+
+
+def test_registration_reference_guard_rejects_changed_aliases_before_send():
+    source = object.__new__(delivery.SourceCapture)
+    source.target = object()
+    row = {'id': 'old', 'data': {'PlSeason': '2024-2025', 'p_id': 1, 'p_id_old': 'E-H10'}}
+    baseline = delivery.registration_reference_values([row], '2024-2025')
+    source.rows = lambda *args, **kwargs: [dict(row, data=dict(row['data'], p_id_old='E-H11'))]
+    with pytest.raises(BackendError, match='Registration identity references changed'):
+        source.assert_fresh({'documents': {}, 'queries': [],
+                             'registration_references': {'season': '2024-2025', 'values': baseline}})
+
+
+def test_historical_membership_has_a_bounded_version_guarded_fallback_without_a_group_index():
+    from google.api_core.exceptions import FailedPrecondition
+    def missing(**kwargs):
+        raise FailedPrecondition('query requires an index')
+    snaps = [SimpleNamespace(reference=SimpleNamespace(path='players/' + pid + '/contracts/one'),
+                             update_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                             to_dict=lambda league=league: {'leagueId': league}, exists=True)
+             for pid, league in [('one', 'EPL'), ('two', 'K1')]]
+    limits = []
+    fallback = SimpleNamespace(limit=lambda n: (limits.append(n) or SimpleNamespace(stream=lambda **kwargs: snaps)))
+    group = SimpleNamespace(where=lambda **kwargs: SimpleNamespace(limit=lambda n: SimpleNamespace(stream=missing)),
+                            select=lambda fields: fallback)
+    source = object.__new__(delivery.SourceCapture)
+    source.did = SimpleNamespace(collection_group=lambda name: group)
+    source.queries = []
+    assert source.historical_league_players('EPL') == {'one'}
+    assert limits == [50001]
+    guard = source.queries[0]
+    assert guard['filters'] == [] and not guard['membership_only']
+    assert len(guard['versions']) == 2 and all(guard['versions'].values())
+
+
+def test_source_version_is_identical_for_protobuf_and_datetime_sdk_results():
+    from google.protobuf.timestamp_pb2 import Timestamp
+    from google.api_core.datetime_helpers import DatetimeWithNanoseconds
+    stamp = Timestamp(seconds=1770000000, nanos=123456789)
+    dt = DatetimeWithNanoseconds.from_timestamp_pb(stamp)
+    a = SimpleNamespace(exists=True, update_time=stamp)
+    b = SimpleNamespace(exists=True, update_time=dt)
+    assert delivery.SourceCapture.version(a) == delivery.SourceCapture.version(b)
+    stamp.nanos += 1
+    assert delivery.SourceCapture.version(a) != delivery.SourceCapture.version(b)
+
+
+@pytest.mark.parametrize('team,index', [
+    ('E-HU', 'HUDX'), ('E-CA', 'CARX'), ('S-BA', 'S-BA'),
+    ('S-GI', 'S-GI'), ('S-VI', 'S-VI'), ('S-BE', 'S-BE'), ('S-OV', 'S-OV'),
+])
+def test_historical_player_indexes_are_reference_only_and_do_not_expand_write_scope(team, index):
+    evidence, setup = master_fixture()
+    evidence['player_profiles'] = {'0000000001': {'name': 'Retired'}}
+    evidence['player_contracts'] = {'0000000001': [
+        {'teamId': team, 'leagueId': 'EPL', 'from': '2000-01-01', 'to': '2001-01-01'}]}
+    evidence['historical_team_indexes'] = {team: [index]}
+    before = deepcopy(evidence)
+    report = delivery.generate_masters(evidence, [], [], {}, setup, 'all')
+    assert report['validation_passed'], report['errors']
+    assert docs(report, 'Player')[0]['IDX_CODE'] == index
+    assert docs(report, 'Player')[0]['PlSeason'] == '2023-2024'
+    assert not docs(report, 'playerDB')
+    assert evidence == before
+    with pytest.raises(ValueError, match='season-specific'):
+        delivery.resolve_team_code(evidence['ai_samples']['code'], '2023-2024', team)
+    evidence['historical_team_indexes'][team].append('CONFLICT')
+    assert not delivery.generate_masters(evidence, [], [], {}, setup, 'all')['validation_passed']
+
+
+def test_historical_team_index_capture_uses_bounded_team_queries_only():
+    source = object.__new__(delivery.SourceCapture)
+    source.target = object()
+    calls = []
+    def rows(client, path, filters, **kwargs):
+        calls.append((path, filters, kwargs))
+        assert client is source.target and path == 'Player'
+        return [{'id': str(n), 'data': {'t_code': team, 'IDX_CODE': team+'X',
+                                      'PlSeason': '2026-2027'}}
+                for n, team in enumerate(filters[0][2])]
+    source.rows = rows
+    teams = [f'T{n}' for n in range(31)]
+    result = source.historical_team_indexes(teams)
+    assert result == {team: [team+'X'] for team in teams}
+    assert len(calls) == 2
+    assert all(call[1][0][:2] == ('t_code', 'in') and call[2]['bound'] == 20000 for call in calls)
+    source.rows = lambda *args, **kwargs: pytest.fail('Empty team list must not query Player')
+    assert source.historical_team_indexes([]) == {}
+
+
+def test_historical_team_index_guard_rejects_mapping_changes_before_send():
+    source = object.__new__(delivery.SourceCapture)
+    source.historical_team_indexes = lambda teams: {'E-HU': ['HUDX']}
+    guards = {'documents': {}, 'queries': [], 'historical_team_indexes': {
+        'team_ids': ['E-HU'], 'values': {'E-HU': ['HUDX']}}}
+    source.assert_fresh(guards)
+    source.historical_team_indexes = lambda teams: {'E-HU': ['CHANGED']}
+    with pytest.raises(BackendError, match='Historical team index references changed'):
+        source.assert_fresh(guards)
+
+
+@pytest.mark.parametrize('mode,chunks', [('matches', 1), ('matches', 3), ('all', 1), ('latest', 1)])
+def test_public_progress_covers_capture_validation_and_send_without_reset(service, mode, chunks):
+    svc, source, writer, _ = service
+    writer.fail_two = False
+    timeline = []
+    source.set_progress_callback = lambda callback: setattr(source, 'progress_callback', callback)
+    original_capture = source.capture
+    original_send = writer.send
+    def capture(scope, slot):
+        for value in (0, 20, 50, 100):
+            source.progress_callback(value)
+            timeline.append(svc.public_status('operator')['percent'])
+        return original_capture(scope, slot)
+    def fresh(guards):
+        for value in (0, 50, 100):
+            source.progress_callback(value)
+            timeline.append(svc.public_status('operator')['percent'])
+    def send(doc, preview):
+        timeline.append(svc.public_status('operator')['percent'])
+        return original_send(doc, preview)
+    source.capture = capture
+    source.assert_fresh = fresh
+    source.split_scopes = lambda scope: [scope] * chunks
+    writer.send = send
+    svc.send_scope({'seasonId': '20232024', 'mode': mode}, 'operator')
+    status = svc.public_status('operator')
+    timeline.append(status['percent'])
+    assert status['status'] == 'complete', status
+    assert timeline == sorted(timeline), timeline
+    assert timeline[0] == 0 and timeline[-1] == 100
+    assert any(0 < value < 40 for value in timeline)
+    assert any(40 <= value < 50 for value in timeline)
+    assert any(50 <= value < 99 for value in timeline)
+    assert all(value < 100 for value in timeline[:-1])
+
+
+def test_progress_preserves_manifest_and_only_success_reaches_100(service):
+    svc, source, _, _ = service
+    preview = svc.preview({'seasonId': '20232024'}, 'operator')
+    assert svc.public_status('operator')['percent'] == 100
+    report_before = deepcopy(svc.store.job(preview, 'operator')['meta']['report'])
+    svc.store.record_progress(preview, 90)
+    svc.store.record_progress(preview, 10)
+    meta = svc.store.job(preview, 'operator')['meta']
+    assert meta['progress']['percent'] == 90
+    assert meta['report'] == report_before
+    svc.send_scope({'seasonId': '20232024'}, 'operator')
+    partial = svc.public_status('operator')
+    assert partial['status'] == 'fail' and partial['percent'] == 99
+    source.passed = False
+    svc.send_scope({'seasonId': '20242025'}, 'operator')
+    invalid = svc.public_status('operator')
+    assert invalid['status'] == 'fail' and invalid['percent'] < 100
+
+
+def test_progress_does_not_regress_when_send_must_revalidate(service):
+    svc, _, _, _ = service
+    scope = {'seasonId': '20232024', 'mode': 'all'}
+    preview = svc.preview(scope, 'operator')
+    operation, _ = svc.store.create('delivery', scope, 'operator')
+    send, _ = svc.store.create('send', scope, 'operator', preview_id=preview, public=False)
+    svc.store.set_job(operation, 'running', meta={'phase': 'send', 'previewId': preview, 'sendId': send})
+    svc.store.record_progress(send, 10)
+    assert svc.public_status('operator')['percent'] == 55
+    meta = svc.store.job(preview, 'operator')['meta']
+    meta['progress'] = {'percent': 20}
+    svc.store.set_job(preview, 'running', meta=meta)
+    svc.store.set_job(operation, 'running', meta={'phase': 'preview', 'previewId': preview})
+    assert svc.public_status('operator')['percent'] == 55
+    svc.store.set_job(operation, 'failed')
+    assert svc.public_status('operator')['percent'] == 55
 
 
 if __name__ == '__main__':

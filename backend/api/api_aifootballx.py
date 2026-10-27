@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Form
 from backend.system.system_firestore import RequiredUser, BackendError
 from backend.system.system_aifootballx import delivery_service
 from backend.system.system_aifootballx import season_label
-from backend.temporary.build_legacy_import import normalize_season_id
+from backend.build.build_legacy_import import normalize_season_id
 
 
 def delivery_operator(user: RequiredUser):

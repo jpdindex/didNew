@@ -130,6 +130,7 @@ class RecordingDoc(SchemaModel):
     kpiSourceFingerprint: str | None = None
     teamRating: TeamRatingSnapshot | None = None
     ratingBasedOn: int | None = None
+    ratingInputFingerprint: str | None = None
     # Legacy imports use either the old numeric game ID or a Firestore-style ID.
     legacyGiId: int | str | None = None
     legacyRecorderId: str | None = None

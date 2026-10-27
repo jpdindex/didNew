@@ -10,8 +10,7 @@ from typing import Literal
 from fastapi import APIRouter, File, Form, UploadFile
 from pydantic import BaseModel, Field
 
-from backend.check.audit_legacy_firestore_import import LegacyFirestoreImportAudit
-from backend.temporary.build_legacy_import import BuildLegacyImport, LegacyMetadataRepair
+from backend.build.build_legacy_import import BuildLegacyImport, LegacyMetadataRepair, LegacyFirestoreImportAudit
 from backend.system.system_firestore import BackendError, JpdDidData, RequiredUser
 from backend.system.system_pipeline_jobs import PipelineJob, pipeline_jobs
 

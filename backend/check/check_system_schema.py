@@ -91,7 +91,7 @@ def test_match_tree_contract_separates_common_raw_from_legacy_evidence() -> None
 
 
 def test_importer_contract_diagnostic_identifies_path_field_and_expected_type() -> None:
-    from backend.temporary.build_legacy_import import BuildLegacyImport
+    from backend.build.build_legacy_import import BuildLegacyImport
 
     with pytest.raises(BackendError, match=r"matches/gm-1/recordings/H field formationKey: expected common-required"):
         BuildLegacyImport._validate_storage_contract("matches/gm-1/recordings/H", {
@@ -101,7 +101,7 @@ def test_importer_contract_diagnostic_identifies_path_field_and_expected_type() 
 
 
 def test_audit_schema_diagnostic_includes_contract_scope_and_expectation() -> None:
-    from backend.check.audit_legacy_firestore_import import AuditCollector, _validate_schema
+    from backend.build.build_legacy_import import AuditCollector, _validate_schema
 
     collector = AuditCollector()
     _validate_schema(

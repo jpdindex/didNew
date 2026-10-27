@@ -1,14 +1,18 @@
 from __future__ import annotations
-
+import json
+import httpx
 from dataclasses import dataclass
 from typing import Any
-
-import httpx
-
+from hashlib import sha256
 from backend.system.system_schema import PlayerKpi, TeamRatingSnapshot
 from backend.system.system_firestore import BackendError, JpdDidData, get_settings, utc_now
-from backend.system.system_kpi_rules import KpiRecord, calculate_team_kpi_5min
-
+from backend.system.system_kpi_rules import (
+    KpiRecord,
+    calculate_kpis,
+    calculate_team_kpi_5min,
+    reviewed_records,
+    approved_path_difference,
+)
 
 PLAYER_KPI_FIELDS = tuple(PlayerKpi.model_fields)
 @dataclass(frozen=True, slots=True)
@@ -40,13 +44,43 @@ class BuildMatchRating:
                 status_code=409,
                 code="rating_kpi_missing",
             )
-        if (
-            not force
-            and source.recording.ratingBasedOn == source.recording.kpiVersion
-            and source.recording.teamRating is not None
-        ):
-            return BuildMatchRatingResult(gm_id, side, source.recording.kpiVersion, 0, unchanged=True)
-
+        records = [
+            KpiRecord(
+                record_id, record.half, record.halfSeconds, record.seq,
+                record.act, record.res, record.area, record.playerId,
+                record.shootPosX, record.shootPosY, record.shootDspRange,
+                record.isShot, record.createdBy, record.createdAt.isoformat(),
+                legacy_path_id=record.legacyPathId, legacy_path_type=record.legacyPathType,
+                legacy_path_ttp=record.legacyPathTtp, legacy_flags=record.legacyKpiFlags,
+                bap_reason=record.bapReason,
+            ) for record_id, record in source.records
+        ]
+        all_records = records
+        normal_records = [r for r in all_records if r.half in ('H1','H2')]
+        records = reviewed_records(gm_id, side, normal_records)
+        team_kpi = source.recording.kpi.model_dump(mode="json")
+        raw_kpi = calculate_kpis(records).team_kpi
+        imported = bool(getattr(source.recording, 'legacyGiId', None)) and all(r.legacy_flags is not None for r in records)
+        before = calculate_kpis(normal_records).team_kpi if len(records) != len(normal_records) else raw_kpi
+        full = calculate_kpis(all_records).team_kpi if len(all_records) != len(normal_records) else before
+        def reviewed_import_difference(field, value):
+            return imported and (
+                (len(records) != len(normal_records) and abs(value-before[field]) < 1e-6)
+                or (len(all_records) != len(normal_records) and abs(value-full[field]) < 1e-6)
+                or approved_path_difference(gm_id, side, field, value, raw_kpi[field])
+                or (field == 'OG' and value == 0 and raw_kpi['OG'] > 0
+                    and all(abs(team_kpi[k]-raw_kpi[k]) < 1e-6 for k in ('GOAL','SHOT','SSR'))))
+        if (any(field not in team_kpi for field in ("GOAL", "OG", "SHOT", "SSR"))
+                or any(abs(value - raw_kpi[field]) >= 1e-6 and not reviewed_import_difference(field, value)
+                       for field, value in team_kpi.items() if field in raw_kpi)):
+            raise BackendError(
+                message=f"Stored KPI differs from reviewed RAW; rebuild KPI before rating: {gm_id}/{side}",
+                status_code=409, code="rating_kpi_definition_mismatch",
+            )
+        if imported:
+            # Import deliberately skips KPI POST. Correct only the request,
+            # preserving stored KPI/version and validating every other delta.
+            team_kpi = raw_kpi
         player_stats = self.data.list_player_stats(gm_id, side)
         request_body = {
             "gm_id": gm_id,
@@ -58,25 +92,30 @@ class BuildMatchRating:
             "teamId": source.recording.teamId,
             "opponentTeamId": source.recording.opponentTeamId,
             "kpiVersion": source.recording.kpiVersion,
-            "teamKpi": source.recording.kpi.model_dump(mode="json"),
-            "teamKpi5min": calculate_team_kpi_5min([
-                KpiRecord(
-                    record_id, record.half, record.halfSeconds, record.seq,
-                    record.act, record.res, record.area, record.playerId,
-                    record.shootPosX, record.shootPosY, record.shootDspRange,
-                    record.isShot, record.createdBy, record.createdAt.isoformat(),
-                )
-                for record_id, record in source.records
-            ], {
+            "teamKpi": team_kpi,
+            "teamKpi5min": calculate_team_kpi_5min(records, {
                 half: timing.seconds
                 for half, timing in source.recording.halves.items()
             }),
             "playerKpis": [
                 {field: stat.get(field, 0) for field in PLAYER_KPI_FIELDS}
-                for stat in player_stats.values()
+                for _, stat in sorted(player_stats.items())
             ],
         }
         self._remove_null_match_fields(request_body)
+        snapshots = request_body['teamKpi5min']
+        if len(snapshots) != 20 or any(
+                abs(snapshots[-1][field] - raw_kpi[field]) >= 1e-6
+                for field in ('DAP','DTP','SHOT','SSR','GOAL')):
+            raise BackendError('Final five-minute rating input differs from RAW KPI',
+                               status_code=409, code='rating_interval_kpi_mismatch')
+        input_fingerprint = sha256(json.dumps(
+            {'policy': 'finalized-raw-flags-own-exclusive-ssr-confirmed-dtp-v3', 'request': request_body},
+            sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+        if (not force and source.recording.ratingBasedOn == source.recording.kpiVersion
+                and source.recording.teamRating is not None
+                and getattr(source.recording, 'ratingInputFingerprint', None) == input_fingerprint):
+            return BuildMatchRatingResult(gm_id, side, source.recording.kpiVersion, 0, unchanged=True)
         response_body = self._request_rating(request_body)
         team_rating = self._parse_team_rating(response_body)
         rating_based_on = response_body.get("ratingBasedOn", source.recording.kpiVersion)
@@ -107,6 +146,7 @@ class BuildMatchRating:
             rating_based_on=rating_based_on,
             player_ratings=player_ratings,
             calculated_at=utc_now(),
+            input_fingerprint=input_fingerprint,
         )
         return BuildMatchRatingResult(gm_id, side, source.recording.kpiVersion, saved)
 

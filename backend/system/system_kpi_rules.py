@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from decimal import Decimal, ROUND_DOWN
 from dataclasses import dataclass
 from typing import Literal
 
@@ -372,6 +373,8 @@ def calculate_kpis(records: list[KpiRecord], *, close_trailing_bap: bool = True)
     team["DTP"] = sum(int(path.path_type == "DTP") for path in paths)
     team["BAP"] = len(bap_events)
     team["ASR"] = _ratio(dap_success, team["DAP"])
+    # GOAL/FPX include OWN, but shot success excludes OWN. Both counts come
+    # from RAW here; never subtract an imported OG=0 placeholder.
     team["SSR"] = _ratio(team["GOAL"] - team["OG"], team["SHOT"])
     for player_id, player in players.items():
         # Legacy ff_game_player uses distinct gt_id rows for each player, not
@@ -431,19 +434,109 @@ def _calculate_legacy_kpis(records: list[KpiRecord]) -> KpiCalculation:
     return KpiCalculation(team, dict(players), tuple(paths.values()), flags, ())
 
 
+def confirmed_dtp_results(records: list[KpiRecord], calculation: KpiCalculation) -> dict[str, KpiRecord]:
+    """Locate the final shot result shared by delivery buckets and rating inputs."""
+    groups: defaultdict[str, list[KpiRecord]] = defaultdict(list)
+    for record in sorted(records, key=lambda r: (r.half, r.seconds, r.created_at, r.seq, r.id)):
+        if record.half in ('H1', 'H2'):
+            groups[calculation.flags[record.id].path_id].append(record)
+    results = {}
+    for path in calculation.paths:
+        if path.path_type != 'DTP' or path.id not in groups:
+            continue
+        members = groups[path.id]
+        shots = [r for r in members if calculation.flags[r.id].is_shot]
+        if not shots:
+            raise ValueError('DTP path has no shot; cannot assign a confirmed interval')
+        shot = shots[-1]
+        terminal = shot
+        for following in members[members.index(shot) + 1:]:
+            if following.act:
+                break
+            terminal = following
+        if terminal.res in ('', 'O'):
+            raise ValueError('DTP final shot result is missing; sequence is not confirmed')
+        results[path.id] = terminal
+    return results
+
+
 def calculate_team_kpi_5min(
     records: list[KpiRecord],
     half_end_seconds: dict[str, int] | None = None,
 ) -> list[dict[str, int]]:
     """Return 20 cumulative five-minute team snapshots for the rating API."""
     snapshots: list[dict[str, int]] = []
+    # A persisted legacy DTP path label is visible on its first pass. It must
+    # not count in a rating interval before the final shot result is recorded.
+    calculation = calculate_kpis(records, close_trailing_bap=False)
+    results = confirmed_dtp_results(records, calculation)
     for half, offset in (("H1", 0), ("H2", 10)):
         completed_halves = [record for record in records if record.half in ({"H1"} if half == "H1" else {"H1", "H2"})]
         for interval in range(1, 11):
             cutoff = interval * 300
             if interval == 10 and half_end_seconds:
                 cutoff = max(cutoff, half_end_seconds.get(half, cutoff))
-            scoped = [record for record in completed_halves if record.half != half or record.seconds <= cutoff]
-            kpi = calculate_kpis(scoped, close_trailing_bap=False).team_kpi
-            snapshots.append({field: kpi[field] for field in ("DAP", "DTP", "SHOT", "SSR", "GOAL")})
+            scoped = [record for record in completed_halves
+                      if record.half != half or interval == 10 or record.seconds < cutoff]
+            # Use the finalized path decisions shared by the delivery bins.
+            # Reclassifying an unfinished prefix can count a different DAP
+            # path from the same finalized RAW in multiSheet_ALL.
+            dap = sum(calculation.flags[r.id].is_dap for r in scoped)
+            shots = sum(calculation.flags[r.id].is_shot for r in scoped)
+            goals = sum(calculation.flags[r.id].is_goal for r in scoped)
+            own = sum(calculation.flags[r.id].is_goal and r.player_id == 'OWN' for r in scoped)
+            dtp = sum(result.half < half or (result.half == half and
+                             (interval == 10 or result.seconds < cutoff)) for result in results.values())
+            snapshots.append({'DAP': dap, 'DTP': dtp, 'SHOT': shots,
+                              'SSR': _ratio(goals-own, shots), 'GOAL': goals})
     return snapshots
+
+
+# Reviewed import RAW exceptions and delivery score precision.
+APPROVED_RAW_EXCLUSIONS = {
+    ('20242025eplj2rgn13na28rd2b8q0087', 'H'):
+        ('023145453dec4d7aa36f3c733ad77ae2', '0000000833', 'H2', 7, 'P', 'X'),
+    ('20242025eplj2rgn13na28rd2b8q0326', 'H'):
+        ('46e47d4b2bb44e7284736502f16d0387', '0000003732', 'H1', 1, 'C', 'B'),
+}
+APPROVED_PATH_DELTAS = {
+    ('20242025eplj2rgn13na28rd2b8q0070', 'H'): {'DTP': 5, 'TTP': 11},
+    ('20242025eplj2rgn13na28rd2b8q0275', 'H'): {'TTP': 1},
+}
+
+
+def reviewed_records(match_id, side, records):
+    """Exclude only the two exact reviewed events, refusing changed contents."""
+    exception = APPROVED_RAW_EXCLUSIONS.get((match_id, side))
+    result = []
+    for record in records:
+        if exception and record.id == exception[0]:
+            signature = (record.id, record.player_id, record.half, record.seconds, record.act, record.res)
+            if signature != exception or record.legacy_flags is None:
+                raise ValueError('Reviewed RAW exclusion changed; a new review is required')
+            continue
+        result.append(record)
+    return result
+
+
+def approved_path_difference(match_id, side, field, stored, calculated):
+    delta = APPROVED_PATH_DELTAS.get((match_id, side), {}).get(field)
+    return delta is not None and abs(stored - calculated - delta) < 1e-6
+
+
+def approved_apx_difference(match_id, side, team_id, opponent_id, metric,
+                            imported, excluded_raw, stored_dap, original_dap,
+                            calculated_dap, stored_rating, baseline):
+    """Only the approved 0087H rating delta caused by its exact RAW exclusion."""
+    return (match_id == '20242025eplj2rgn13na28rd2b8q0087'
+            and side == 'H' and team_id == 'E-EV' and opponent_id == 'E-FU'
+            and metric == 'APX' and imported and excluded_raw
+            and stored_dap == original_dap == 271 and calculated_dap == 270
+            and stored_rating == 67.75 and baseline == 400)
+
+
+def rating_two_decimals(value):
+    number = Decimal(str(value))
+    if not number.is_finite():
+        raise ValueError('Rating must be finite')
+    return float(number.quantize(Decimal('.01'), rounding=ROUND_DOWN))

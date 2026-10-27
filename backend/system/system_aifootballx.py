@@ -2,8 +2,8 @@
 
 Clients and workers are created only when the delivery service is requested.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import math
 import re
 import json
@@ -13,16 +13,32 @@ from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from hashlib import sha256
 from typing import Any
-from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
+from backend.system.system_kpi_rules import (
+    KpiRecord,
+    calculate_kpis,
+    confirmed_dtp_results,
+    reviewed_records,
+    approved_path_difference,
+    approved_apx_difference,
+    rating_two_decimals,
+    APPROVED_RAW_EXCLUSIONS,
+    APPROVED_PATH_DELTAS,
+)
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 from statistics import mean
 from copy import deepcopy
 from pathlib import Path
-from backend.system.system_firestore import BackendError, JpdDidData, PROJECT_ROOT, get_settings, get_firestore_client
+from backend.system.system_firestore import (
+    BackendError,
+    JpdDidData,
+    PROJECT_ROOT,
+    get_settings,
+    get_firestore_client,
+    resolve_contract_duplicates,
+)
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
 from uuid import uuid4
-
 
 # ==========================================================================
 # Conversion
@@ -41,6 +57,10 @@ PLAYER_DB = {'P-1': 'p_id', 'P-2': 'p_name', 'P-3': 'p_name_en', 'P-4': 'p_name_
 PLAYER_MST_KPI = {8: 'TAP', 12: 'DAP', 16: 'UTP', 17: 'DTP', 18: 'TTP', 23: 'SHOT',
                   26: 'AST', 27: 'GOAL', 29: 'DTB', 30: 'DTM', 31: 'DTA', 32: 'DTS',
                   33: 'GTB', 34: 'GTM', 35: 'ASR', 36: 'SSR', 37: 'scoreRel', 38: 'scoreAbs', 39: 'score'}
+
+# User-approved exclusions, shared by generation, comparison and transmission.
+EXCLUDED_COLLECTIONS = frozenset(('playerMST', 'aiPHR', 'yPHR', 'prediction', 'pushMatches',
+                                  'bmas_DTA', 'bmas_DTB', 'bmas_DTM', 'bmas_DTS'))
 
 def season_label(value: str) -> str:
     value = str(value)
@@ -70,6 +90,116 @@ def resolve_team_code(rows: list[dict[str, Any]], season: str, team_id: str) -> 
             'No': no, 'basis': 'exact-season' if exact else 'global-fallback'}
 
 
+def registration_team_index(evidence, season, team_id):
+    """Resolve a historical contract's identity without allocating a match slot.
+
+    Historical clubs need no current-season No/POSITION. Player has its own
+    index namespace (e.g. LTNX vs code.LUTX); never weaken match lookup.
+    """
+    codes = evidence['ai_samples']['code']
+    references = {r['data']['IDX_CODE'] for r in evidence.get('target_existing', {}).get('Player', [])
+                  if r['data'].get('PlSeason') == season and r['data'].get('t_code') == team_id
+                  and r['data'].get('IDX_CODE')}
+    if len(references) > 1:
+        raise ValueError(f'Ambiguous Player team index: {team_id}')
+    if references:
+        return references.pop()
+    try:
+        return resolve_team_code(codes, season, team_id)['IDX_CODE']
+    except ValueError:
+        values = {r['data']['IDX_NAME'] for r in codes
+                  if (r['data'].get('TCODE') or r['data'].get('Code')) == team_id
+                  and r['data'].get('IDX_NAME')}
+        values.update(r['data']['IDX_CODE'] for r in evidence.get('target_existing', {}).get('Player', [])
+                      if r['data'].get('t_code') == team_id and r['data'].get('IDX_CODE'))
+        # Cross-season Player rows are reference-only, never destination candidates.
+        values.update(evidence.get('historical_team_indexes', {}).get(team_id, []))
+        if len(values) != 1:
+            raise ValueError(f'Missing or ambiguous historical team index: {team_id}')
+        return values.pop()
+
+
+def registration_alias(evidence, player_id, season, contract):
+    """Bind an old registration identifier by DID team/start, never by shirt no.
+
+    The old suffix is an operating registration number, not the player's kit
+    number. New DID registrations have no legacy alias until one is supplied.
+    """
+    team = contract['teamId']
+    identity = (season, player_identity(player_id, evidence.get('player_profiles', {}).get(player_id)),
+                'EPL', team, dotted_date(contract.get('from') or '0000.00.00'))
+    rows = evidence.get('_registration_reference_index', {}).get(identity)
+    if rows is None:
+        rows = [r for r in evidence.get('target_existing', {}).get('Player', [])
+                if natural_key('Player', r['data']) == identity]
+    # A verified legacy value may contain the whole career, including foreign
+    # clubs or national teams. Do not erase that bundle or rebuild it from kits.
+    aliases = {r['data']['p_id_old'] for r in rows
+               if isinstance(r['data'].get('p_id_old'), str) and r['data']['p_id_old']}
+    if len(aliases) > 1:
+        raise ValueError(f'Ambiguous registration alias: {identity}')
+    return next(iter(aliases), '')
+
+
+def registration_history(evidence, player_id, season):
+    contracts = evidence.get('player_contracts', {}).get(player_id, [])
+    aliases = [registration_alias(evidence, player_id, season, c)
+               for c in sorted(contracts, key=lambda c: (c.get('from') or '', c.get('teamId') or ''))
+               if c.get('leagueId') in (None, '', 'EPL') and c.get('teamId')
+               and c.get('competitionType', 'league') == 'league']
+    return ','.join(dict.fromkeys(token.strip() for alias in aliases
+                                  for token in alias.split(',') if token.strip()))
+
+
+def with_registration_references(evidence):
+    references = defaultdict(list)
+    for row in evidence.get('target_existing', {}).get('Player', []):
+        references[natural_key('Player', row['data'])].append(row)
+    return {**evidence, '_registration_reference_index': references}
+
+
+def player_db_projection(evidence, mapped, season):
+    """playerDB P-8 uses the club abbreviation; Player uses IDX_CODE."""
+    db = {dest: int(season[2:4]+season[7:9]) if dest == 'P-6' else mapped[src]
+          for dest, src in {**PLAYER_DB, 'P-17': 'p_id_old'}.items() if src in mapped}
+    team = mapped['t_code']
+    rows = [r['data'] for r in evidence['ai_samples']['code']
+            if (r['data'].get('TCODE') or r['data'].get('Code')) == team]
+    exact = [r for r in rows if r.get('PlSeason') == season]
+    names = {r['구단(약자)'] for r in exact or rows if r.get('구단(약자)')}
+    if len(names) > 1:
+        raise ValueError(f'Ambiguous playerDB team abbreviation: {team}')
+    existing_names = {r['data']['P-8'] for r in evidence.get('target_existing', {}).get('playerDB', [])
+                      if r['data'].get('P-6') == int(season[2:4]+season[7:9])
+                      and r['data'].get('P-7') == team and r['data'].get('P-8')}
+    if len(existing_names) > 1:
+        raise ValueError(f'Ambiguous playerDB team abbreviation reference: {team}')
+    if existing_names:
+        db['P-8'] = existing_names.pop()
+    elif names:
+        db['P-8'] = names.pop()
+    elif evidence.get('teams', {}).get(team, {}).get('nameShort'):
+        db['P-8'] = evidence['teams'][team]['nameShort']
+    db.setdefault('P-14', '0000.00.00')
+    db.setdefault('P-15', '9999.99.99')
+    if 'DID_PLAYER_ID' in mapped:
+        db['DID_PLAYER_ID'] = mapped['DID_PLAYER_ID']
+    return db
+
+
+def team_delivery_name(code_rows, season, team_id, profile):
+    """Use the operating season's configured label, rather than another namespace."""
+    overrides = {'E-EV': '에버턴', 'E-LE': '레스터'}
+    if team_id in overrides:
+        return overrides[team_id]
+    names = {r['data']['FC Name(한글)'] for r in code_rows
+             if (r['data'].get('TCODE') or r['data'].get('Code')) == team_id
+             and r['data'].get('PlSeason') == season and r['data'].get('FC Name(한글)')}
+    if len(names) > 1:
+        raise ValueError(f'Ambiguous season team label: {team_id}')
+    return next(iter(names), None) or profile.get('nameKr') or profile.get('name') or team_id
+
+
 def tactic_projection(item: dict[str, Any], row: dict[str, Any], path_id: str | None) -> dict[str, Any]:
     value, match, recording = row['data'], item['match'], item['recording']
     halves = ['H1', 'H2', 'H3', 'H4']
@@ -95,7 +225,7 @@ def tactic_projection(item: dict[str, Any], row: dict[str, Any], path_id: str | 
 
 
 def pitch_coordinate(value: Any, extent: int) -> float | str:
-    # Reverse backend/temporary/build_legacy_import.py's 971x634 -> percent conversion.
+    # Reverse backend/build/build_legacy_import.py's 971x634 -> percent conversion.
     if value is None:
         return NULL
     number = float(value)
@@ -118,6 +248,20 @@ def truncate_rating(value, digits=1):
     if not number.is_finite():
         raise ValueError('Rating must be finite')
     return float(number.quantize(Decimal(10) ** -digits,rounding=ROUND_DOWN))
+
+
+def precise_mean(values):
+    """Average decimal source values before applying presentation precision."""
+    values = list(values)
+    if not values:
+        raise ValueError('Cannot average empty values')
+    return float(sum(Decimal(str(v)) for v in values) / len(values))
+
+
+def clean_player_name(value):
+    if not isinstance(value, str):
+        return value
+    return re.sub(r'(?:\\r|\\n|\s)+$', '', value).strip()
 
 
 def rating_display(values):
@@ -144,8 +288,8 @@ def interval_name(index: int) -> str:
     return f"H{index // 10 + 1}-" + (f'{slot * 5}-{(slot + 1) * 5}' if slot < 9 else '45-Plus')
 
 
-def source_records(item: dict[str, Any]) -> list[KpiRecord]:
-    return [KpiRecord(id=row['id'], half=v['half'], seconds=v['halfSeconds'], seq=v['seq'],
+def source_records(item: dict[str, Any], *, include_extra_halves=False, include_reviewed_exclusions=False) -> list[KpiRecord]:
+    records = [KpiRecord(id=row['id'], half=v['half'], seconds=v['halfSeconds'], seq=v['seq'],
                      act=v['act'], res=v['res'], area=v['area'], player_id=v.get('playerId'),
                      shoot_pos_x=v.get('shootPosX'), shoot_pos_y=v.get('shootPosY'),
                      shoot_dsp_range=v.get('shootDspRange'), is_shot=v.get('isShot'),
@@ -154,7 +298,8 @@ def source_records(item: dict[str, Any]) -> list[KpiRecord]:
                      legacy_path_ttp=v.get('legacyPathTtp'), legacy_flags=v.get('legacyKpiFlags'),
                      bap_reason=v.get('bapReason'))
             for row in item['children']['records'] for v in [row['data']]
-            if v.get('half') not in ('', None)]
+            if v.get('half') in (('H1', 'H2', 'H3', 'H4') if include_extra_halves else ('H1', 'H2'))]
+    return records if include_reviewed_exclusions else reviewed_records(item['match_id'], item['side'], records)
 
 
 def tactic_record_ids(records: list[KpiRecord], computed: Any) -> set[str]:
@@ -172,30 +317,27 @@ def intervals(records: list[KpiRecord], computed: Any) -> dict[str, list[float]]
     values = {key: [0] * 20 for key in ('BAP', 'DAP', 'DTP', 'SHOT', 'GOAL', 'SSR')}
     ordered = sorted(records, key=lambda r: (r.half, r.seconds, r.created_at, r.seq, r.id))
     paths = defaultdict(list)
+    ordinary_goals = [0] * 20
     for record in ordered:
         slot = bucket(record.half, record.seconds)
         flag = computed.flags[record.id]
+        ordinary_goals[slot] += int(flag.is_goal and record.player_id != 'OWN')
         paths[flag.path_id].append(record)
         for metric, enabled in (('DAP', flag.is_dap), ('SHOT', flag.is_shot),
-                                ('GOAL', flag.is_goal and record.player_id != 'OWN')):
+                                ('GOAL', flag.is_goal)):
             values[metric][slot] += int(enabled)
         if record.legacy_flags is not None and record.bap_reason:
             values['BAP'][slot] += 1
     for event in computed.bap_events:
         record = next(r for r in ordered if r.id == event.record_id)
         values['BAP'][bucket(record.half, record.seconds)] += 1
-    for path in computed.paths:
-        if path.path_type != 'DTP':
-            continue
-        members = paths.get(path.id, [])
-        if not members:
-            raise ValueError('DTP path has no timestamped record; cannot assign an interval')
-        # Count a path once at its terminal record, never once per member or by prefix recalculation.
-        terminal = members[-1]
+    if any(path.path_type == 'DTP' and path.id not in paths for path in computed.paths):
+        raise ValueError('DTP path has no timestamped record; cannot assign an interval')
+    for terminal in confirmed_dtp_results(records, computed).values():
         values['DTP'][bucket(terminal.half, terminal.seconds)] += 1
     goals = shots = 0
     for index in range(20):
-        goals += values['GOAL'][index]
+        goals += ordinary_goals[index]
         shots += values['SHOT'][index]
         values['SSR'][index] = goals / shots if shots else 0
     return values
@@ -227,9 +369,13 @@ def natural_key(collection: str, data: dict[str, Any]) -> tuple[Any, ...]:
         return data.get('PlSeason'), data.get('T_Code'), data.get('Round')
     if collection == 'dMST':
         return data.get('PlSeason'), data.get('gm_round'), data.get('t_code')
-    if collection in ('Player', 'playerDB'):
-        return ((data.get('PlSeason'), data.get('p_id')) if collection == 'Player'
-                else (data.get('P-6'), data.get('P-1')))
+    if collection == 'Player':
+        # DID contract documents are keyed by team + start; closing an open
+        # contract must update its document rather than create a second one.
+        return (data.get('PlSeason'), data.get('p_id'), data.get('l_code') or 'EPL',
+                data.get('t_code'), dotted_date(data.get('pt_begin') or '0000.00.00'))
+    if collection == 'playerDB':
+        return data.get('P-6'), data.get('P-1')
     if collection == 'playerMST':
         return data.get('P-DB1'), data.get('P-DB3'), data.get('P-DB7')
     if collection == 'vibePlayer':
@@ -245,10 +391,43 @@ def natural_key(collection: str, data: dict[str, Any]) -> tuple[Any, ...]:
     return data.get('gm_id'), data.get('t_code'), data.get('team_type')
 
 
+def path_ids_equivalent(left, right):
+    """Match a legacy scientific display to its original ID, in either direction.
+
+    Precision is taken from the actual display. Callers must also match the
+    event identity and reject multiple matches; rounded IDs are not unique.
+    """
+    if str(left) == str(right):
+        return True
+    scientific = re.compile(r'^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$')
+    left_sci, right_sci = bool(scientific.fullmatch(str(left))), bool(scientific.fullmatch(str(right)))
+    if left_sci == right_sci:
+        return False
+    display, original = (str(left), str(right)) if left_sci else (str(right), str(left))
+    if not re.fullmatch(r'\d+(?:\.\d+)?', original):
+        return False
+    try:
+        number, rounded_id = Decimal(original), Decimal(display)
+        return number.quantize(Decimal(1).scaleb(rounded_id.as_tuple().exponent), rounding=ROUND_HALF_UP) == rounded_id
+    except ArithmeticError:
+        return False
+
+
+def matching_rows(collection, data, rows):
+    key = natural_key(collection, data)
+    exact = [row for row in rows if natural_key(collection, row['data']) == key]
+    if exact or collection != 'TACTIC':
+        return exact
+    # Only gt_id may differ. Coordinates, player, clock and action still bind.
+    return [row for row in rows if
+            all(a == b for n, (a, b) in enumerate(zip(key, natural_key(collection, row['data']))) if n != 4)
+            and path_ids_equivalent(data.get('gt_id'), row['data'].get('gt_id'))]
+
+
 def select_contract(contracts: list[dict[str, Any]], match: dict[str, Any], team_id: str,
                     covers: Any) -> dict[str, Any] | None:
     # covers is the existing DID date policy, injected to keep conversion free of database access.
-    selected = [c for c in contracts if c.get('teamId') == team_id
+    selected = [c for c in resolve_contract_duplicates(contracts) if c.get('teamId') == team_id
                 and c.get('leagueId') in (None, '', match['leagueId'])
                 and c.get('seasonId') in (None, '', match['seasonId'])
                 and covers(c, match['date'])]
@@ -273,23 +452,26 @@ def history(existing: str, contracts: list[dict[str, Any]], league_types: dict[s
 
 def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match_only=False) -> dict[str, Any]:
     """Return reviewable merge candidates and checks; never writes a destination."""
+    evidence = with_registration_references(evidence)
     report: dict[str, Any] = {'mode': 'preview-only', 'match_id': match_id, 'documents': [],
                               'source_captured_at': evidence.get('captured_at'),
                               'checks': [], 'errors': [], 'warnings': [],
-                              'scope': ['dMST', 'TACTIC', 'multiSheet_*', 'bmas_*', 'playerGoal',
-                                        'Player', 'playerDB', 'playerMST', 'vibePlayer'],
+                              'scope': ['dMST', 'TACTIC', 'multiSheet_*', 'playerGoal',
+                                        'Player', 'playerDB', 'vibePlayer'],
                               'not_generated': ['Manager', 'code (existing lookup only)',
                                                 'mMST/pMST/cAVG/rAVG/sAVG/rank (aggregate stage)']}
     report['limitations'] = [
         'No same-match SQL/AIfootballX value-equivalence claim; checks use DID source and observed target types.',
-        'DTP paths are assigned once at their terminal record; historical per-bin SQL placement is not proven.',
+        'DTP paths are assigned once at their final shot result; SSR is cumulative and excludes OWN; GOAL/FPX include OWN.',
         'New candidate IDs are stable, but deletion reconciliation and a write manifest belong to the transmission stage.',
         'Some target fields have no confirmed definition; these are omitted, not zero-filled.',
-        'Manual-upload fields (Manager.Coach/Captain and residual player scores) are preserved; missing values are not zero-filled.',
+        'Destination-only fields are preserved; generated fields and nested calculation maps are replaced from the reviewed payload.',
     ]
     report['excluded'] = {'unused': ['pMST.I-*/PH-*/PA-*/PI-*', 'prediction', 'aiPHR', 'yPHR',
                                     'rank.WGR*/Season/S_Avg/R_Rate'],
                           'manual_upload': ['Manager.Coach/Captain', 'playerMST residual score fields']}
+    report['excluded']['collections'] = sorted(EXCLUDED_COLLECTIONS)
+    report['excluded']['halves'] = ['H3', 'H4']
     report['type_checks'] = {'checked': 0, 'unobserved_fields': [], 'null_only_fields': []}
     target = evidence.get('target_existing', {})
     index: dict[str, dict[tuple[Any, ...], list[dict[str, Any]]]] = {}
@@ -305,8 +487,10 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
         report['checks'].append({'name': name, 'passed': bool(passed), **details})
 
     def emit(collection, data, source_key=None):
+        if collection in EXCLUDED_COLLECTIONS:
+            return
         key = natural_key(collection, data)
-        rows = index.get(collection, {}).get(key, [])
+        rows = matching_rows(collection, data, target.get(collection, []))
         if len(rows) > 1:
             report['errors'].append(f'{collection}: ambiguous existing identity {key}')
             return
@@ -345,8 +529,8 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
             if types and set(types) != {'NoneType'} and type(value).__name__ not in types and not (type(value) in (int, float) and set(types) & {'int', 'float'}):
                 report['errors'].append(f'{collection}.{field}: {type(value).__name__} incompatible with {types}')
         report['documents'].append({'collection': collection, 'document_id': document_id,
-                                    'action': 'merge-existing' if old else 'create-candidate',
-                                    'data': data, 'changed_fields': sorted(k for k, v in data.items()
+                                    'action': 'replace-existing' if old else 'create-candidate',
+                                    'data': delivery_payload(collection, data, old['data'] if old else None), 'changed_fields': sorted(k for k, v in data.items()
                                                                           if not old or old['data'].get(k) != v)})
 
     items = sorted((i for i in evidence['source_recordings'] if i['match_id'] == match_id), key=lambda i: i['side'])
@@ -390,6 +574,11 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
                 raise ValueError('No records')
             computed = calculate_kpis(records)
             kpi, rating = recording['kpi'], recording['teamRating']
+            unfiltered = source_records(item, include_reviewed_exclusions=True)
+            has_reviewed_exclusions = len(unfiltered) != len(records)
+            before_exclusions = calculate_kpis(unfiltered) if has_reviewed_exclusions else computed
+            if has_reviewed_exclusions:
+                report['warnings'].append(prefix + f'{len(unfiltered) - len(records)} reviewed SQL RAW event excluded; source unchanged')
             for metric in ('apx','tpx','fpx'):
                 if metric+'Grade' in rating:
                     consistent = rating[metric+'Grade']==grade(rating[metric])
@@ -402,13 +591,41 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
                           score=rating[metric], stored=rating[metric+'Grade'], expected=grade(rating[metric]),
                           **({'waived':True,'actual_passed':False,
                               'waiver_reason':'User-approved legacy Chelsea home FPX 50.0/F; delivery only'} if waived else {}))
+            excluded_records = len(source_records(item, include_extra_halves=True)) - len(records)
+            all_computed = calculate_kpis(source_records(item, include_extra_halves=True)) if excluded_records else computed
+            if excluded_records:
+                report['warnings'].append(prefix + f'{excluded_records} H3/H4 records excluded from delivery eligibility')
+            imported = bool(recording.get('legacyGiId')) and all(r.legacy_flags is not None for r in records)
             for key, value in kpi.items():
                 if key in computed.team_kpi:
-                    check(prefix + 'source-KPI-' + key, abs(value - computed.team_kpi[key]) < 1e-6,
-                          stored=value, calculated=computed.team_kpi[key])
+                    legacy_og = (imported and key == 'OG' and value == 0 and computed.team_kpi['OG'] > 0
+                        and all(abs(kpi[field] - computed.team_kpi[field]) < 1e-6
+                                for field in ('GOAL', 'SHOT', 'SSR')))
+                    check(prefix + 'source-KPI-' + key, abs(value - computed.team_kpi[key]) < 1e-6
+                          or (excluded_records and abs(value - all_computed.team_kpi[key]) < 1e-6)
+                          or (has_reviewed_exclusions and abs(value - before_exclusions.team_kpi[key]) < 1e-6)
+                          or approved_path_difference(match_id, side, key, value, computed.team_kpi[key])
+                          or legacy_og,
+                          stored=value, calculated=computed.team_kpi[key],
+                          **({'legacy_og_placeholder': True, 'actual_passed': False,
+                              'reason': 'Imported OG placeholder; GOAL/SHOT/OWN-exclusive SSR verified against RAW'} if legacy_og else {}))
+            # Use the reviewed RAW result, never reintroduce obsolete stored totals.
+            kpi = computed.team_kpi
+            reviewed_change = has_reviewed_exclusions or any(
+                approved_path_difference(match_id, side, key, value, computed.team_kpi[key])
+                for key, value in recording['kpi'].items() if key in computed.team_kpi)
+            if reviewed_change:
+                # Imported data does not run the new-input KPI POST. Exact
+                # reviewed deltas are audited above; rating value checks below
+                # remain independent and are never silently waived.
+                check(prefix + ('reviewed-import-KPI-difference' if imported else 'reviewed-KPI-rebuild'), imported or all(
+                    abs(value - computed.team_kpi[key]) < 1e-6
+                    for key, value in recording['kpi'].items() if key in computed.team_kpi),
+                    reason=('Reviewed import difference; no new-input KPI POST required; saved ratings checked separately'
+                            if imported else 'New-input stored KPI differs from reviewed RAW'))
             bins = intervals(records, computed)
             for metric in ('BAP', 'DAP', 'DTP', 'SHOT', 'GOAL'):
-                expected = kpi[metric] - (kpi.get('OG', 0) if metric == 'GOAL' else 0)
+                expected = computed.team_kpi[metric]
                 check(prefix + 'interval-total-' + metric, sum(bins[metric]) == expected,
                       intervals=sum(bins[metric]), total=expected)
             common = {'gm_id': match_id, 'gm_round': match['round'], 'PlSeason': season}
@@ -418,26 +635,36 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
                 raise ValueError('Expected 20 stored JMX intervals')
             check(prefix + 'JMX-final', abs(series[-1] - rating['jmx']) < 1e-6)
             bins['JMX'] = series
+            # Only the standalone GOAL sheet excludes OWN; ALL and team totals retain it.
+            sheet_goals = list(bins['GOAL'])
+            for record in records:
+                if computed.flags[record.id].is_goal and record.player_id == 'OWN':
+                    sheet_goals[bucket(record.half, record.seconds)] -= 1
+            expected_sheet_goals = computed.team_kpi['GOAL'] - computed.team_kpi['OG']
+            check(prefix + 'multiSheet_GOAL-total', sum(sheet_goals) == expected_sheet_goals,
+                  intervals=sum(sheet_goals), total=expected_sheet_goals)
             for metric, values in bins.items():
                 fields = {f'{metric}-{interval_name(i)}': v for i, v in enumerate(values)}
                 wide.update(fields)
                 if metric != 'SSR':
-                    emit('multiSheet_' + metric, {**{k: v for k, v in wide.items() if '-H' not in k}, **fields})
+                    sheet_fields = ({f'GOAL-{interval_name(i)}': v for i, v in enumerate(sheet_goals)}
+                                    if metric == 'GOAL' else fields)
+                    emit('multiSheet_' + metric, {**{k: v for k, v in wide.items() if '-H' not in k}, **sheet_fields})
             emit('multiSheet_ALL', wide)
             shotscore = min(kpi['SHOT'] / SCORE_BASELINES['SHOT'] * 100, 99.9)
             goalscore = min(kpi['GOAL'] / SCORE_BASELINES['GOAL'] * 100, 99.9)
-            ssrscore = min(kpi['SSR'] / SCORE_BASELINES['SSR'] * 100, 99.9)
+            ssrscore = float(Decimal(str(kpi['SSR'])) / Decimal(str(SCORE_BASELINES['SSR'])) * 100)
             dmst = {**common, 'gm_date': dotted_date(match['date']), 't_code': team_id, 'IDX_CODE': idx,
                     'H-A': side, 'Season': short_season, 'Match': position,
                     **{key: kpi[key] for key in ('BAP', 'DAP', 'DTP', 'TTP', 'SHOT', 'ASR', 'SSR', 'GOAL', 'OG')},
                     **{dest: kpi[src] for dest, src in {'gi_tmp': 'TAP', 'B': 'DTB', 'M': 'DTM', 'A': 'DTA', 'S': 'DTS'}.items()},
-                    'DAP(AiAttack)': kpi['DAP'] / SCORE_BASELINES['DAP'] * 100,
-                    'DTP(AiTactic)': kpi['DTP'] / SCORE_BASELINES['DTP'] * 100,
+                    'DAP(AiAttack)': float(Decimal(str(kpi['DAP'])) / SCORE_BASELINES['DAP'] * 100),
+                    'DTP(AiTactic)': float(Decimal(str(kpi['DTP'])) / SCORE_BASELINES['DTP'] * 100),
                     'SHOTScore': shotscore, 'SHOT(AiShot)': shotscore, 'GOALScore': goalscore,
                     'GOAL(AiGoal)': goalscore, 'SSRScore': ssrscore, 'SSR(AiSSR)': ssrscore,
                     'JMX': rating['jmx'], 'JMX2': rating['jmx'], 'gi_score2': rating['jmx'],
                     'APX': rating['apx'], 'TPX': rating['tpx'], 'FPX': rating['fpx'], 'FPX(AiFPX)': rating['fpx'],
-                    'Power3X(AVG)': sum(rating[k] for k in ('apx', 'tpx', 'fpx')) / 3,
+                    'Power3X(AVG)': precise_mean(rating[k] for k in ('apx', 'tpx', 'fpx')),
                     'T-code': code['No'], 'T-code2': code['No'] + match['round'], 'T-code3': 0}
             for metric in ('APX', 'TPX', 'FPX', 'JMX'):
                 dmst['G-' + metric] = grade(dmst[metric])
@@ -445,7 +672,20 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
                 dmst['G-' + metric] = grade(value)
             check(prefix + 'FPX-components', abs((shotscore + goalscore) / 2 - rating['fpx']) < .11)
             for metric, source, baseline in (('APX', 'DAP', 'DAP'), ('TPX', 'DTP', 'DTP')):
-                check(prefix + metric + '-baseline', abs(min(kpi[source] / SCORE_BASELINES[baseline] * 100, 99.9) - dmst[metric]) < .11)
+                equal = abs(min(kpi[source] / SCORE_BASELINES[baseline] * 100, 99.9) - dmst[metric]) < .11
+                excluded_only = (excluded_records
+                    and abs(recording['kpi'][source] - all_computed.team_kpi[source]) < 1e-6
+                    and abs(min(recording['kpi'][source] / SCORE_BASELINES[baseline] * 100, 99.9) - dmst[metric]) < .11)
+                waived = approved_apx_difference(
+                    match_id, side, team_id, match.get('awayTeamId'), metric,
+                    imported, has_reviewed_exclusions, recording['kpi'].get('DAP'),
+                    before_exclusions.team_kpi['DAP'], kpi['DAP'], dmst[metric], SCORE_BASELINES[baseline])
+                check(prefix + metric + '-baseline', equal or excluded_only or waived,
+                      **({'excluded_extra_halves': True} if excluded_only and not equal else {}),
+                      **({'waived': True, 'actual_passed': False,
+                          'stored': dmst[metric], 'calculated': 67.50,
+                          'waiver_reason': 'User-approved 0087H APX 67.75/67.50 after exact reviewed RAW exclusion; saved rating preserved'}
+                         if waived else {}))
             dmst.update({'M_No2': match['round'] * 100 + position,
                          'S-Round': short_season * 10000 + match['round'] * 100 + position,
                          'M_No1': short_season * 10000 + (match['round'] - 1) * 20 + position,
@@ -457,8 +697,7 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
             own, other = ('home', 'away') if side == 'H' else ('away', 'home')
             dmst['Point'] = 3 if match['score'][own] > match['score'][other] else 1 if match['score'][own] == match['score'][other] else 0
             team = evidence.get('teams', {}).get(team_id, {})
-            if team.get('nameKr') or team.get('name'):
-                dmst['t_Nm'] = team.get('nameKr') or team['name']
+            dmst['t_Nm'] = team_delivery_name(evidence['ai_samples']['code'], season, team_id, team)
             emit('dMST', dmst)
             if 'coach_rounds' in evidence and not match_only:
                 managers = [r['data'] for r in evidence['coach_rounds'] if r['data'].get('plSeason') == season
@@ -476,11 +715,6 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
                 projection = tactic_projection(item, row, flag.path_id)
                 if row['id'] in tactic_ids:
                     emit('TACTIC', dict(projection, t_code=idx), (match_id, side, row['id']))
-                for role in ('DTA', 'DTB', 'DTM', 'DTS'):
-                    if getattr(flag, 'is_' + role.lower()):
-                        emit('bmas_' + role, {**common, 'team_type': wide['team_type'], 't_code': idx, 'Type': role,
-                             **{k: projection[k] for k in ('gr_half', 'gr_seconds', 'gr_area_code', 'gr_pos_x', 'gr_pos_y')}},
-                             (match_id, side, row['id'], role))
                 if not flag.is_goal:
                     continue
                 own_goal = value.get('playerId') == 'OWN'
@@ -542,14 +776,34 @@ def registration_link(evidence, player_id, season, matches):
     """Identity membership is independent of a particular match's appearance/date."""
     teams = {r['data'][k] for r in matches for k in ('homeTeamId','awayTeamId')}
     profile = evidence.get('player_profiles', {}).get(player_id, {})
-    contracts = [c for c in evidence.get('player_contracts', {}).get(player_id, [])
+    all_contracts = resolve_contract_duplicates(evidence.get('player_contracts', {}).get(player_id, []))
+    dates = sorted(re.sub(r'\D','',r['data']['date']) for r in matches)
+    dated_contracts = [c for c in all_contracts if c.get('leagueId') in (None, '', 'EPL')
+                       and c.get('competitionType', 'league') == 'league'
+                       and re.sub(r'\D', '', c.get('from') or '') <= dates[-1]]
+    contracts = [c for c in dated_contracts
                  if c.get('teamId') in teams and c.get('leagueId') in (None,'EPL')
                  and c.get('competitionType','league')=='league']
-    dates = sorted(re.sub(r'\D','',r['data']['date']) for r in matches)
+    identity = player_identity(player_id, profile)
+    has_destination_registration = any(
+        r['data'].get('P-1') == identity and r['data'].get('P-6') == int(season[2:4]+season[7:9])
+        for r in evidence.get('target_existing', {}).get('playerDB', []))
+    # Existing registrations for a relegated club still need an identity. The
+    # destination supplies membership only; contract values always come from DID.
+    if has_destination_registration:
+        # An existing registration can belong to a relegated/foreign club.
+        # Its newer DID contract must not lose to an older current-season club.
+        contracts = dated_contracts
+    if not dated_contracts and any(c.get('leagueId') == 'EPL' for c in all_contracts):
+        return None  # A later transfer is not a registration in an earlier season.
     overlapping = [c for c in contracts if re.sub(r'\D','',c.get('from') or '')<=dates[-1]
                    and re.sub(r'\D','',c.get('to') or '99999999')>=dates[0]]
     if overlapping:
         contracts = overlapping
+    elif dated_contracts and not has_destination_registration:
+        # Historical Player coverage must not register every retired player in
+        # the active playerDB merely because his old club is still in the EPL.
+        return None
     elif profile.get('currentTeamId') in teams:
         return {'teamId':profile['currentTeamId'], 'no':profile.get('currentNo'), 'pos':profile.get('currentPos')}
     if not contracts:
@@ -563,22 +817,32 @@ def registration_link(evidence, player_id, season, matches):
     if len({c['teamId'] for c in chosen})!=1:
         raise ValueError(f'Ambiguous latest season contract for player {player_id}')
     # Identity needs the team, not a fabricated choice between conflicting optional dates/attributes.
-    return {key:chosen[0][key] for key in ('teamId','from','to','no','pos')
-            if key in chosen[0] and all(c.get(key)==chosen[0][key] for c in chosen)}
+    result = {key:chosen[0][key] for key in ('teamId','from','to','no','pos')
+              if key in chosen[0] and all(c.get(key)==chosen[0][key] for c in chosen)}
+    if str(result.get('no') or '0') == '0':
+        known = [c for c in dated_contracts if c.get('teamId') == result['teamId']
+                 and str(c.get('no') or '').isdigit() and int(c['no']) > 0]
+        if known:
+            latest_known = max(re.sub(r'\D', '', c.get('from') or '') for c in known)
+            numbers = {int(c['no']) for c in known if re.sub(r'\D', '', c.get('from') or '') == latest_known}
+            if len(numbers) == 1:
+                result['no'] = numbers.pop()
+    return result
 
 
-def registered_player_projection(evidence, player_id, season, matches):
+def registered_player_projection(evidence, player_id, season, matches, *, contract=None):
     profile = evidence.get('player_profiles', {}).get(player_id, {})
-    link = registration_link(evidence,player_id,season,matches)
+    link = contract if contract is not None else registration_link(evidence,player_id,season,matches)
     if link is None:
         return None
     if not profile.get('name'):
         raise ValueError(f'Missing player name/profile {player_id}')
     pid = player_identity(player_id,profile)
-    mapped = {dest:profile[src] for dest,src in PLAYER_FIELDS.items() if profile.get(src) is not None}
+    mapped = {dest:clean_player_name(profile[src]) if dest in ('p_name','p_name_en','p_name_full') else profile[src]
+              for dest,src in PLAYER_FIELDS.items() if profile.get(src) is not None}
     if mapped.get('p_birth'): mapped['p_birth']=dotted_date(mapped['p_birth'])
     mapped.update(p_id=pid,PlSeason=season,l_code='EPL',t_code=link['teamId'],
-                  IDX_CODE=resolve_team_code(evidence['ai_samples']['code'],season,link['teamId'])['IDX_CODE'])
+                  IDX_CODE=registration_team_index(evidence,season,link['teamId']))
     if not str(player_id).isdigit():
         mapped['DID_PLAYER_ID']=player_id
         for col,field in (('Player','p_id'),('playerDB','P-1')):
@@ -589,16 +853,44 @@ def registered_player_projection(evidence, player_id, season, matches):
         if link.get(source): mapped[dest]=dotted_date(link[source])
     if link.get('pos'): mapped['pt_pos']=link['pos']
     if str(link.get('no') or '').isdigit(): mapped['pt_num']=int(link['no'])
-    contracts=evidence.get('player_contracts',{}).get(player_id,[])
-    prior=[]
-    short=int(season[2:4]+season[7:9])
-    for col,field in (('Player','p_id'),('playerDB','P-1')):
-        for old in evidence.get('target_existing',{}).get(col,[]):
-            if old['data'].get(field)==pid and (old['data'].get('PlSeason')==season if col=='Player' else old['data'].get('P-6')==short):
-                prior.append(old['data'].get('p_id_old' if col=='Player' else 'P-17',''))
-    league_types={key:value.get('competitionType','league') for key,value in evidence.get('leagues',{}).items()}
-    mapped['p_id_old']=history(','.join(prior),contracts,league_types,'league')
+    mapped['p_id_old'] = registration_history(evidence, player_id, season)
     return mapped
+
+
+def registered_player_projections(evidence, player_id, season, matches):
+    """Preserve DID team/start contract identities, including unknown/open dates.
+
+    playerDB remains the latest season registration; Player stores the history.
+    Contract ends are values, not identity: an eventual transfer closes the same
+    team/start document. No historical source document is changed here.
+    """
+    contracts = [c for c in resolve_contract_duplicates(evidence.get('player_contracts', {}).get(player_id, []))
+                 if c.get('leagueId') in (None, '', 'EPL')
+                 and c.get('competitionType', 'league') == 'league' and c.get('teamId')]
+    if not contracts:
+        mapped = registered_player_projection(evidence, player_id, season, matches)
+        if mapped is None:
+            return []
+        mapped.setdefault('pt_begin', '0000.00.00')
+        mapped.setdefault('pt_end', '9999.99.99')
+        return [mapped]
+    projections = {}
+    for contract in sorted(contracts, key=lambda c: (c['teamId'], c.get('from') or '', c.get('_id') or '')):
+        mapped = registered_player_projection(evidence, player_id, season, matches, contract=contract)
+        for dest, src in PLAYER_FIELDS.items():
+            if src in evidence['player_profiles'][player_id] and evidence['player_profiles'][player_id][src] is None:
+                mapped[dest] = None
+        mapped['pt_begin'] = dotted_date(contract.get('from') or '0000.00.00')
+        mapped['pt_end'] = dotted_date(contract.get('to') or '9999.99.99')
+        mapped['p_id_old'] = registration_alias(evidence, player_id, season, contract)
+        for src, dest in (('no', 'pt_num'), ('pos', 'pt_pos')):
+            if src in contract and contract[src] is None:
+                mapped[dest] = None
+        identity = natural_key('Player', mapped)
+        if identity in projections and projections[identity] != mapped:
+            raise ValueError(f'Conflicting DID contract identity for player {player_id}: {identity}')
+        projections[identity] = mapped
+    return list(projections.values())
 
 
 def registered_players(evidence, match, emit, report):
@@ -613,18 +905,27 @@ def registered_players(evidence, match, emit, report):
     for pid in sorted(selected):
         try:
             mapped=registered_player_projection(evidence,pid,season,matches)
-            if mapped is None: continue
-            identity=mapped['p_id']
+            registrations = registered_player_projections(evidence, pid, season, matches)
+            if mapped is None and not registrations: continue
+            identity=player_identity(pid, evidence.get('player_profiles', {}).get(pid))
             if identity in identities and identities[identity]!=pid:
                 raise ValueError(f'Player identity collision: {pid}/{identities[identity]}')
             identities[identity]=pid
-            emit('Player',mapped)
-            db={dest:int(season[2:4]+season[7:9]) if dest=='P-6' else mapped[src]
-                for dest,src in {**PLAYER_DB,'P-17':'p_id_old'}.items() if src in mapped}
-            if 'DID_PLAYER_ID' in mapped: db['DID_PLAYER_ID']=mapped['DID_PLAYER_ID']
-            emit('playerDB',db)
+            for registration in registrations:
+                emit('Player', registration)
+            if mapped is not None:
+                emit('playerDB',player_db_projection(evidence,mapped,season))
         except (KeyError,ValueError,TypeError) as exc:
             report['errors'].append(str(exc))
+
+def player_tactical_participation(kpi):
+    """vibePlayer P-DTP is maker + assister contribution (DTM + DTA).
+
+    It is not the distinct DTP path participation count used by playerStats.DTP.
+    Build-up and shooting contributions are separate metrics, not P-DTP.
+    """
+    return kpi['DTM'] + kpi['DTA']
+
 
 def build_players(evidence, item, computed, code, short_season, emit, report, covers, check):
     match, rec, side = item['match'], item['recording'], item['side']
@@ -635,6 +936,9 @@ def build_players(evidence, item, computed, code, short_season, emit, report, co
     missing = set(computed.player_kpis) - stats_ids
     if missing:
         report['errors'].append(f'{side}: playerStats missing active record players {sorted(missing)}')
+    records_with_extra_halves = source_records(item, include_extra_halves=True)
+    has_extra_halves = len(records_with_extra_halves) != len(source_records(item))
+    full_computed = calculate_kpis(records_with_extra_halves) if has_extra_halves else computed
     for row in item['children']['playerStats']:
         value, player_id = row['data'], row['id']
         profile = evidence.get('player_profiles', {}).get(player_id)
@@ -644,16 +948,24 @@ def build_players(evidence, item, computed, code, short_season, emit, report, co
         pid = player_identity(player_id,profile)
         lineup = rec.get('lineup', {}).get(player_id, {})
         gp_type = player_game_type(lineup, lineup.get('pos') or '') if lineup.get('type') else None
-        active = gp_type is not None or any(computed.player_kpis.get(player_id, {}).values()) or any(value.get(k) for k in PLAYER_MST_KPI.values())
-        if not active and not any(k in value for k in PLAYER_MST_KPI.values()):
+        active = gp_type is not None or any(computed.player_kpis.get(player_id, {}).values())
+        if not active:
             continue
         for field, actual in computed.player_kpis.get(player_id, {}).items():
             stored = value.get(field)
-            check(f'{side}:player-{pid}-{field}', stored is not None and abs(stored - actual) < 1e-6,
-                  stored=stored, calculated=actual)
+            equal = stored is not None and abs(stored - actual) < 1e-6
+            # Only waive a discrepancy explained by the excluded H3/H4 records.
+            # An unrelated mismatch in H1/H2 must still fail validation.
+            with_extras = full_computed.player_kpis.get(player_id, {}).get(field)
+            excluded_only = (has_extra_halves and with_extras is not None and stored is not None
+                             and abs(stored - with_extras) < 1e-6)
+            check(f'{side}:player-{pid}-{field}', equal or excluded_only,
+                  stored=stored, calculated=actual,
+                  **({'excluded_extra_halves': True, 'calculated_with_extra_halves': with_extras}
+                     if excluded_only and not equal else {}))
         contracts = evidence.get('player_contracts', {}).get(player_id, [])
         scoped = [c for c in contracts if (c.get('competitionType') or league_types.get(c.get('leagueId'), 'league')) == kind]
-        contract = select_contract(scoped, match, team_id, covers) if active else {}
+        contract = select_contract(scoped, match, team_id, covers)
         # Approved legacy date-boundary exceptions: preserve actual appearances,
         # without extending a contract or borrowing another team's contract.
         if contract is None and (item['match_id'], side, player_id) in {
@@ -665,29 +977,12 @@ def build_players(evidence, item, computed, code, short_season, emit, report, co
         if contract is None:
             report['errors'].append(f'{side}: no match-date contract {player_id}')
             continue
-        mapped = registered_player_projection(evidence, player_id, season, evidence.get('did_matches') or [{'data':match}]) or {}
+        # Match appearances need the profile name, not a season registration or
+        # every historical alias. Match-date contract validation is above.
+        mapped = {'p_name': profile.get('name', '')}
         lineup = rec.get('lineup', {}).get(player_id, {})
-        mst = {'P-DB1': item['match_id'], 'P-DB2': match['round'], 'P-DB3': side, 'P-DB4': team_id,
-               'P-DB5': mapped.get('p_name', ''), 'P-DB6': lineup.get('pos') or contract.get('pos') or '', 'P-DB7': pid}
-        mst.update({f'P-DB{number}': value[field] for number, field in PLAYER_MST_KPI.items()
-                    if field in value and value[field] is not None})
-        flags = [computed.flags[r['id']] for r in item['children']['records']
-                 if r['id'] in computed.flags and r['data'].get('playerId') == player_id]
-        ratio = lambda a, b: round(a / b, 6) if b else 0
-        tap_success = sum(f.is_tap_success for f in flags)
-        dap_success = sum(f.is_dap_success for f in flags)
-        shot_success = sum(f.is_shot_success for f in flags)
-        additions = {9: tap_success, 10: ratio(tap_success, value['TAP']), 11: ratio(value['TAP'], rec['kpi']['TAP']),
-                     13: dap_success, 14: ratio(dap_success, value['DAP']), 15: ratio(value['DAP'], rec['kpi']['DAP']),
-                     19: value['DTP'], 20: ratio(value['DTP'], value['TTP']), 21: ratio(value['TTP'], rec['kpi']['TTP']),
-                     22: ratio(value['TTP'], value['DAP']), 24: shot_success, 25: ratio(shot_success, rec['kpi']['SHOT']),
-                     28: ratio(value['GTB'] * .5 + value['GTM'] + value['AST'] + value['GOAL'], rec['kpi']['GOAL'])}
-        mst.update({f'P-DB{n}': v for n, v in additions.items()})
-        aliases = {42: pid, 43: value['TAP'], 44: value['DAP'], 45: value['DTB'], 46: value['DTP'],
-                   47: value['SHOT'], 48: value['SSR'], 49: value['GOAL']}
-        mst.update({f'P-KPI{n}': v for n, v in aliases.items()})
-        emit('playerMST', mst)
-        gp_type = player_game_type(lineup, mst['P-DB6']) if lineup.get('type') else None
+        position = lineup.get('pos') or contract.get('pos') or ''
+        gp_type = player_game_type(lineup, position) if lineup.get('type') else None
         if gp_type is None:
             if any(computed.player_kpis.get(player_id, {}).get(k, 0) for k in ('TAP', 'SHOT', 'GOAL')):
                 report['errors'].append(f'{side}: active player lacks substitute entry time {player_id}')
@@ -696,13 +991,14 @@ def build_players(evidence, item, computed, code, short_season, emit, report, co
             report['errors'].append(f'{side}: stale player rating {player_id}')
         vibe = {'gm_id': item['match_id'], 'gm_round': match['round'], 'PlSeason': season, 'p_id': pid,
                 'gi_write_code': side, 'l_code': match['leagueId'], 'IDX_CODE': idx,
-                'p_name': mapped.get('p_name', ''), 'pt_pos': mst['P-DB6'],
+                'p_name': mapped.get('p_name', ''), 'pt_pos': position,
                 'P-BAP': value['DTB'], 'gp_type': gp_type}
-        for metric in ('apx', 'tpx', 'fpx', 'jmx', 'DAP', 'DTP', 'SHOT', 'SSR', 'GOAL'):
+        for metric in ('apx', 'tpx', 'fpx', 'jmx', 'DAP', 'SHOT', 'SSR', 'GOAL'):
             if value.get(metric) is None:
                 report['errors'].append(f'{side}: missing player rating/KPI {player_id}.{metric}')
             else:
-                vibe['P-' + metric.upper()] = value[metric]
+                vibe['P-' + metric.upper()] = rating_two_decimals(value[metric]) if metric in ('apx', 'tpx', 'fpx', 'jmx') else value[metric]
+        vibe['P-DTP'] = player_tactical_participation(value)
         for metric in ('apx', 'tpx', 'fpx'):
             if value.get(metric + 'Grade'):
                 check(f'{side}:player-{pid}-{metric}-grade', value[metric+'Grade']==grade(value[metric]),
@@ -815,12 +1111,12 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
             return
         keys.add((collection, key))
         result['documents'].append({'collection': collection, 'document_id': stable_id(collection, key),
-                                    'data': data})
+                                    'data': data if legacy else delivery_payload(collection, data)})
 
     def avg_known(values, collection, field, scope):
         # Never average a partial subset and present it as the complete league.
         if values and all(v is not None for v in values):
-            return mean(values)
+            return precise_mean(values)
         blocked[collection].add(f'{field}: missing stored JMX ({scope})')
         return None
 
@@ -861,7 +1157,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                'kpi': rec['kpi'], 'jmx': rating.get('jmx'), 'goals': score, 'against': against,
                'point': 3 if score > against else 1 if score == against else 0,
                'wdl': 'W' if score > against else 'D' if score == against else 'L',
-               'name': item.get('team_name') or team}
+               'name': team_delivery_name(code_rows, season, team, {'name': item.get('team_name')})}
         matching_codes = [r['data'] for r in code_rows
                           if (r['data'].get('TCODE') or r['data'].get('Code')) == team
                           and r['data'].get('PlSeason') == season]
@@ -1025,7 +1321,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
             ravg['M-AVG'] = rating_precision(round_avg)
         round_means.append(round_avg)
         if history_available and all(v is not None for v in round_means):
-            ravg['S_AVG'] = rating_precision(mean(round_means))
+            ravg['S_AVG'] = rating_precision(precise_mean(round_means))
         else:
             blocked['rAVG'].add('S_AVG: missing prior round ratings')
         emit('rAVG', ravg)
@@ -1133,11 +1429,12 @@ def bind_existing_documents(generated: dict, existing: dict) -> None:
             generated['errors'].append(f'{col}: ambiguous existing identity {key}')
             generated['complete'] = False
             continue
-        doc['action'] = 'merge-existing' if rows else 'create-candidate'
+        doc['action'] = 'replace-existing' if rows else 'create-candidate'
         if rows:
             doc['document_id'] = rows[0]['id']
             if rows[0]['data'].get('uid'):
                 doc['data']['uid'] = rows[0]['data']['uid']
+        doc['data'] = delivery_payload(col, doc['data'], rows[0]['data'] if rows else None)
     generated['summary']['errors'] = len(generated['errors'])
 
 
@@ -1373,7 +1670,7 @@ def validate_aggregate_links(generated, items, codes, slots):
             team = item['recording']['teamId']
             match = item['match']
             check('mMST', (season, number, match['homeTeamId'], match['awayTeamId']), item['side'] + '-FX', truncate_rating(jmx, 2))
-            check('pMST', (season, number, team), 'gi_score', jmx)
+            check('pMST', (season, number, team), 'gi_score', rating_two_decimals(jmx))
             check('rAVG', (season, number), f'M{item["side"]}{n}-IDX', truncate_rating(jmx))
             try:
                 code = resolve_team_code(codes, season, team)
@@ -1413,15 +1710,15 @@ def validate_aggregate_links(generated, items, codes, slots):
         for mid, pair in pairs.items():
             if len(pair) == 2:
                 match = next(i['match'] for i in values if i['match_id'] == mid)
-                check('mMST', (season, number, match['homeTeamId'], match['awayTeamId']), 'HA-avg', truncate_rating(mean(pair), 2))
+                check('mMST', (season, number, match['homeTeamId'], match['awayTeamId']), 'HA-avg', truncate_rating(precise_mean(pair), 2))
         if len(current) == len(values):
-            cumulative.append(mean(current))
-            check('cAVG', (season, number), 'R-AVG', truncate_rating(mean(current)))
-            check('rAVG', (season, number), 'M-AVG', truncate_rating(mean(current)))
-            check('rAVG', (season, number), 'S_AVG', truncate_rating(mean(cumulative)))
+            cumulative.append(precise_mean(current))
+            check('cAVG', (season, number), 'R-AVG', truncate_rating(precise_mean(current)))
+            check('rAVG', (season, number), 'M-AVG', truncate_rating(precise_mean(current)))
+            check('rAVG', (season, number), 'S_AVG', truncate_rating(precise_mean(cumulative)))
     if len(ratings) == len(final):
         for field in ('AI Rating', 'AVG'):
-            check('sAVG', (season[2:4] + '/' + season[7:9],), field, truncate_rating(mean(ratings)))
+            check('sAVG', (season[2:4] + '/' + season[7:9],), field, truncate_rating(precise_mean(ratings)))
     return {'passed': facts['passed'] and all(c['passed'] for c in checks), 'source_facts': facts,
             'rating_checks': checks, 'rating_checks_count': len(checks),
             'rating_checks_failed': sum(not c['passed'] for c in checks)}
@@ -1434,10 +1731,10 @@ def validate_aggregate_links(generated, items, codes, slots):
 
 MATCH_TARGETS = ('TACTIC', 'multiSheet_ALL', 'multiSheet_BAP', 'multiSheet_DAP', 'multiSheet_DTP',
                  'multiSheet_GOAL', 'multiSheet_JMX', 'multiSheet_SHOT', 'multiSheet_GOAL-시간',
-                 'playerGoal', 'vibePlayer', 'bmas_DTA', 'bmas_DTB', 'bmas_DTM', 'bmas_DTS')
+                 'playerGoal', 'vibePlayer')
 
 MASTER_COLLECTIONS = frozenset(('Player', 'playerDB', 'Manager', 'code', *AGGREGATES))
-MATCH_COLLECTIONS = frozenset(('dMST', 'playerMST', *MATCH_TARGETS))
+MATCH_COLLECTIONS = frozenset(('dMST', *MATCH_TARGETS))
 
 
 def delivery_mode(scope):
@@ -1461,9 +1758,31 @@ class SourceCapture:
         self.documents = {}
         self.queries = []
 
+    def set_progress_callback(self, callback):
+        self._progress_callback = callback
+
+    def report_progress(self, percent):
+        callback = getattr(self, '_progress_callback', None)
+        if callback:
+            callback(max(0, min(100, percent)))
+
     @staticmethod
     def version(snap):
-        return snap.update_time.isoformat() if snap.exists else None
+        if not snap.exists:
+            return None
+        value = snap.update_time
+        # Collection-group SDK results can carry protobuf Timestamp whereas
+        # document reads carry DatetimeWithNanoseconds. Keep one exact format.
+        if hasattr(value, 'ToJsonString'):
+            return value.ToJsonString()
+        if hasattr(value, 'timestamp_pb'):
+            return value.timestamp_pb().ToJsonString()
+        if isinstance(value, datetime):
+            from google.protobuf.timestamp_pb2 import Timestamp
+            stamp = Timestamp()
+            stamp.FromDatetime(value)
+            return stamp.ToJsonString()
+        return value.isoformat()
 
     def get(self, path):
         snap = self.did.document(path).get(timeout=30, retry=None)
@@ -1532,7 +1851,50 @@ class SourceCapture:
                     result[parts[1]].append(dict(encode(snap.to_dict()),_id=snap.id))
         return result
 
+    def historical_league_players(self, league_id):
+        """Read historical registration membership, separately from season squads."""
+        from google.cloud.firestore_v1.base_query import FieldFilter
+        from google.api_core.exceptions import FailedPrecondition
+        filters = [('leagueId', '==', league_id)]
+        membership_only = True
+        try:
+            query = self.did.collection_group('contracts').where(filter=FieldFilter(*filters[0]))
+            snaps = list(query.limit(50001).stream(timeout=60, retry=None))
+        except FailedPrecondition as exc:
+            if 'index' not in str(exc).lower():
+                raise
+            # Existing installations may not have the leagueId group index yet.
+            # Read only league membership, with an explicit bound. Guard every
+            # document version so league changes cannot evade the unfiltered query.
+            query = self.did.collection_group('contracts').select(['leagueId'])
+            snaps = list(query.limit(50001).stream(timeout=60, retry=None))
+            filters, membership_only = [], False
+        if len(snaps) > 50000:
+            fail('Historical contract read limit exceeded')
+        guard = {'group': 'contracts', 'filters': filters, 'bound': 50000, 'membership_only': membership_only}
+        guard['versions'] = self.guard_versions(snaps, guard)
+        self.queries.append(guard)
+        return {s.reference.path.split('/')[1] for s in snaps
+                if len(s.reference.path.split('/')) == 4 and s.reference.path.startswith('players/')
+                and (membership_only or s.to_dict().get('leagueId') == league_id)}
+
+    def historical_team_indexes(self, team_ids):
+        """Read only team/index pairs across seasons, without expanding write scope."""
+        team_ids = sorted(set(team_ids))
+        values = {team_id: set() for team_id in team_ids}
+        for start in range(0, len(team_ids), 30):
+            rows = self.rows(self.target, 'Player', [('t_code', 'in', team_ids[start:start + 30])], bound=20000)
+            for row in rows:
+                team, index = row['data'].get('t_code'), row['data'].get('IDX_CODE')
+                if team in values and index:
+                    values[team].add(index)
+        return {team: sorted(indexes) for team, indexes in values.items()}
+
     def assert_fresh(self, guards):
+        self.report_progress(0)
+        document_batches = (len(guards['documents']) + 99) // 100
+        work_total = max(1, document_batches + len(guards['queries']))
+        work_done = 0
         slot_guard = guards.get('slot_file')
         if slot_guard and (not Path(slot_guard['path']).is_file() or
                            sha256(Path(slot_guard['path']).read_bytes()).hexdigest() != slot_guard['sha256']):
@@ -1542,6 +1904,8 @@ class SourceCapture:
             for snap in self.did.get_all([self.did.document(p) for p in paths], timeout=60, retry=None):
                 if self.version(snap) != guards['documents'][snap.reference.path]:
                     fail('DID source changed; create a new preview', 'aifootballx_source_changed')
+            work_done += 1
+            self.report_progress(95 * work_done / work_total)
         for guard in guards['queries']:
             query = self.did.collection_group(guard['group']) if guard.get('group') else self.query(self.did, guard['path'], guard['filters'])
             if guard.get('group'):
@@ -1553,6 +1917,8 @@ class SourceCapture:
             snaps = list(query.limit(guard['bound'] + 1).stream(timeout=60, retry=None))
             if self.guard_versions(snaps,guard) != guard['versions']:
                 fail('DID source collection changed; create a new preview', 'aifootballx_source_changed')
+            work_done += 1
+            self.report_progress(95 * work_done / work_total)
         if 'reference_code' in guards:
             code = self.rows(self.target, 'code', bound=500)
             actual = code_reference(code,guards.get('code_scope'))
@@ -1561,6 +1927,23 @@ class SourceCapture:
             if any(actual.get(k) != v for k, v in expected.items()) or any(
                     k not in expected and (k not in additions or v != additions[k]) for k, v in actual.items()):
                 fail('Destination team code configuration changed; create a new preview', 'aifootballx_source_changed')
+        if 'registration_references' in guards:
+            reference = guards['registration_references']
+            rows = self.rows(self.target, 'Player', [('PlSeason', '==', reference['season'])], bound=20000)
+            if registration_reference_values(rows, reference['season']) != reference['values']:
+                fail('Registration identity references changed; create a new preview', 'aifootballx_source_changed')
+            if 'player_db_values' in reference:
+                from google.cloud.firestore_v1.field_path import FieldPath
+                season = reference['season']
+                rows = self.rows(self.target, 'playerDB', [(FieldPath('P-6').to_api_repr(), '==',
+                    int(season[2:4]+season[7:9]))], bound=20000)
+                if player_db_reference_values(rows, season) != reference['player_db_values']:
+                    fail('playerDB code references changed; create a new preview', 'aifootballx_source_changed')
+        if 'historical_team_indexes' in guards:
+            reference = guards['historical_team_indexes']
+            if self.historical_team_indexes(reference['team_ids']) != reference['values']:
+                fail('Historical team index references changed; create a new preview', 'aifootballx_source_changed')
+        self.report_progress(100)
 
     def split_scopes(self, scope):
         if delivery_mode(scope) != 'matches':
@@ -1579,6 +1962,7 @@ class SourceCapture:
         if delivery_mode(scope) != 'matches':
             return self.capture_masters(scope, slot_path)
         from google.cloud.firestore_v1.field_path import FieldPath
+        self.report_progress(0)
         season_id, season = scope['seasonId'], season_label(scope['seasonId'])
         all_matches = self.rows(self.did, 'matches', [('seasonId', '==', season_id), ('leagueId', '==', 'EPL')], source=True, bound=2000)
         selected = [r for r in all_matches if (not scope.get('matchId') or r['id'] == scope['matchId'])
@@ -1586,6 +1970,7 @@ class SourceCapture:
                     and (scope.get('roundTo') is None or r['data']['round'] <= scope['roundTo'])]
         if not selected:
             fail('No DID matches in this scope')
+        self.report_progress(5)
         evidence = {'did_matches': all_matches, 'match_scan_truncated': False, 'source_recordings': [],
                     'captured_at': datetime.now(timezone.utc).isoformat(), 'player_profiles': {}, 'player_contracts': {},
                     'teams': {}, 'stadiums': {}, 'target_existing': {}, 'projects': {},
@@ -1613,7 +1998,7 @@ class SourceCapture:
                 rec = recording_by_path[f'matches/{row["id"]}/recordings/{side}']
                 aggregate_items.append({'match_id': row['id'], 'match': match, 'side': side, 'recording': rec})
         player_ids = set()
-        for row in selected:
+        for match_number, row in enumerate(selected, 1):
             match, mid = row['data'], row['id']
             for side in ('H', 'A'):
                 path = f'matches/{mid}/recordings/{side}'
@@ -1624,12 +2009,12 @@ class SourceCapture:
                     'recording': recording_by_path[path], 'children': children})
             for col in MATCH_TARGETS:
                 target.setdefault(col, []).extend(self.rows(self.target, col, [('gm_id', '==', mid)]))
-            target.setdefault('playerMST', []).extend(self.rows(self.target, 'playerMST', [(FieldPath('P-DB1').to_api_repr(), '==', mid)]))
+            self.report_progress(10 + 45 * match_number / len(selected))
         evidence['player_team_links']={}
         for item in evidence['source_recordings']:
             player_ids.update(item['recording'].get('lineup',{}))
         evidence['registration_player_ids']=sorted(player_ids)
-        for pid in sorted(player_ids):
+        for player_number, pid in enumerate(sorted(player_ids), 1):
             profile = self.get('players/' + pid)
             if profile:
                 evidence['player_profiles'][pid] = profile
@@ -1637,6 +2022,7 @@ class SourceCapture:
             for col, field in [('Player', 'p_id'), ('playerDB', 'P-1')]:
                 identity=player_identity(pid,profile)
                 target.setdefault(col, []).extend(self.rows(self.target, col, [(FieldPath(field).to_api_repr(), '==', identity)], bound=200))
+            self.report_progress(55 + 35 * player_number / len(player_ids))
         for row in all_matches:
             for tid in (row['data']['homeTeamId'], row['data']['awayTeamId']):
                 if tid not in evidence['teams']:
@@ -1661,16 +2047,20 @@ class SourceCapture:
                         fields[key].add(type(value).__name__)
             schemas[col] = {'fields': {key: sorted(types) for key, types in fields.items()}}
         evidence['projects'] = {'aifootballx': schemas}
+        self.report_progress(95)
         guards = {'documents': self.documents, 'queries': self.queries,
                   'code_scope':{'season':season,'teams':sorted({r['data'][k] for r in all_matches for k in ('homeTeamId','awayTeamId')})},
                   'reference_code': {},
                   'new_code': {d['document_id']: d['data'] for d in setup['documents']}}
         guards['reference_code'] = code_reference(evidence['ai_samples']['code'],guards['code_scope'])
-        return generate_delivery(evidence, selected, aggregate_items, slots, setup, match_only=True), guards
+        report = generate_delivery(evidence, selected, aggregate_items, slots, setup, match_only=True)
+        self.report_progress(100)
+        return report, guards
 
     def capture_masters(self, scope, slot_path):
         """Read masters independently of match RAW, playerStats and rating jobs."""
         from google.cloud.firestore_v1.field_path import FieldPath
+        self.report_progress(0)
         season = season_label(scope['seasonId'])
         fixtures = self.rows(self.did, 'matches', [('seasonId','==',scope['seasonId']),('leagueId','==','EPL')], source=True, bound=2000)
         season_doc = self.get('seasons/' + scope['seasonId']) or {}
@@ -1686,7 +2076,8 @@ class SourceCapture:
         team_ids = sorted(team_ids-{None})
         teams = {p.split('/')[-1]:v for p,v in self.get_many('teams/'+tid for tid in team_ids).items()}
         selected_contracts = self.team_contracts(team_ids,re.sub(r'\D','',start),re.sub(r'\D','',end))
-        player_ids = set(selected_contracts)
+        player_ids = set(selected_contracts) | self.historical_league_players('EPL')
+        self.report_progress(10)
         profiles = {}
         links = {}
         for first in range(0,len(team_ids),30):
@@ -1698,8 +2089,16 @@ class SourceCapture:
             for row in self.rows(self.did,f'teams/{tid}/squad',source=True,bound=2000):
                 player_ids.add(row['id']);links.setdefault(row['id'],[]).append(tid)
         profiles.update({p.split('/')[-1]:v for p,v in self.get_many('players/'+pid for pid in player_ids-set(profiles)).items()})
-        contracts = {pid:[dict(r['data'],_id=r['id']) for r in self.rows(
-            self.did,f'players/{pid}/contracts',source=True,bound=500)] for pid in sorted(profiles)}
+        self.report_progress(20)
+        contracts = {}
+        for number, pid in enumerate(sorted(profiles), 1):
+            contracts[pid] = [dict(r['data'], _id=r['id']) for r in self.rows(
+                self.did, f'players/{pid}/contracts', source=True, bound=500)]
+            self.report_progress(20 + 45 * number / len(profiles))
+        historical_teams = {c['teamId'] for values in contracts.values() for c in values
+                            if c.get('leagueId') == 'EPL' and c.get('teamId')}
+        teams.update({path.split('/')[-1]: value for path, value in
+                      self.get_many('teams/' + tid for tid in sorted(historical_teams - set(teams))).items()})
         # Registration spans the season, even before the first/after the last
         # recorded fixture. A transfer must not be frozen at the last game date.
         context.extend({'id':f'registration-{tid}-{n}','data':{'seasonId':scope['seasonId'],'leagueId':'EPL',
@@ -1728,8 +2127,18 @@ class SourceCapture:
         except (BackendError,OSError,ValueError,TypeError,KeyError,AttributeError) as exc:
             reason = exc.message if isinstance(exc,BackendError) else f'Season slot configuration unavailable ({type(exc).__name__})'
             setup = {'documents':[],'code_rows':[],'slots':slots,'new_season':False,'errors':[reason]}
+        reference_context = {'target_existing': target, 'ai_samples': {'code': codes + setup['code_rows']}}
+        missing_team_ids = []
+        for team_id in sorted(historical_teams):
+            try:
+                registration_team_index(reference_context, season, team_id)
+            except ValueError:
+                missing_team_ids.append(team_id)
+        historical_indexes = self.historical_team_indexes(missing_team_ids)
+        self.report_progress(75)
         evidence = {'did_matches':context,'source_recordings':[],'player_profiles':profiles,'player_contracts':contracts,
                     'teams':teams,'player_team_links':links,'target_existing':target,'ai_samples':{'code':codes+setup['code_rows']},
+                    'historical_team_indexes': historical_indexes,
                     'leagues':{r['id']:r['data'] for r in self.rows(self.did,'leagues',source=True,bound=100)},
                     'coach_rounds':[] if fixtures else self.rows(self.did,'coachRounds',[('plSeason','==',season)],source=True,bound=2000),
                     'coach_contracts':[],'coaches':{}}
@@ -1751,20 +2160,56 @@ class SourceCapture:
                 rec=heads[f'matches/{row["id"]}/recordings/{side}']
                 items.append({'match_id':row['id'],'match':row['data'],'side':side,'recording':rec,
                               'team_name':teams.get(rec.get('teamId'),{}).get('nameKr') or teams.get(rec.get('teamId'),{}).get('name')})
+        self.capture_aggregate_review_sources(evidence, items)
+        self.report_progress(95)
         report = generate_masters(evidence, fixtures, items, setup['slots'], setup, delivery_mode(scope))
-        guards = {'documents':self.documents,'queries':self.queries,'code_scope':{'season':season,'teams':team_ids},
+        self.report_progress(100)
+        guards = {'documents':self.documents,'queries':self.queries,'code_scope':None,
                   'reference_code':{},
                   'new_code':{d['document_id']:d['data'] for d in setup['documents']}}
         guards['reference_code'] = code_reference(codes,guards['code_scope'])
+        guards['registration_references'] = {
+            'season': season, 'values': registration_reference_values(target.get('Player', []), season),
+            'player_db_values': player_db_reference_values(target.get('playerDB', []), season)}
+        guards['historical_team_indexes'] = {'team_ids': missing_team_ids, 'values': historical_indexes}
         if slot_path and not setup.get('errors'):
             guards['slot_file']={'path':str(slot_path.resolve()),'sha256':sha256(slot_path.read_bytes()).hexdigest()}
         return report,guards
+
+    def capture_aggregate_review_sources(self, evidence, items):
+        """Read RAW only for imported records affected by approved exclusions.
+
+        New input uses its built KPI. An empty guarded H3/H4 query also detects
+        an excluded-half insertion after preview. No source values are written.
+        """
+        for item_number, item in enumerate(items, 1):
+            self.report_progress(80 + 14 * item_number / len(items))
+            if not item['recording'].get('legacyGiId'):
+                continue
+            mid, side = item['match_id'], item['side']
+            path = f'matches/{mid}/recordings/{side}/records'
+            extras = self.rows(self.did, path, [('half', 'in', ['H3','H4'])], source=True, bound=1000)
+            if extras or (mid, side) in APPROVED_RAW_EXCLUSIONS or (mid, side) in APPROVED_PATH_DELTAS:
+                records = self.rows(self.did, path, source=True, bound=20000)
+                evidence['source_recordings'].append({**item,
+                    'children': {'records': records, 'paths': [], 'playerStats': [], 'cards': []}})
 
 
 def code_reference(rows, scope=None):
     return {r['id']:r['data'] for r in rows if scope is None or (
         r['data'].get('PlSeason') in (None,'',scope['season'])
         and (r['data'].get('TCODE') or r['data'].get('Code')) in scope['teams'])}
+
+
+def registration_reference_values(rows, season):
+    return {r['id']: {field: r['data'].get(field) for field in
+                     ('PlSeason', 'p_id', 'l_code', 't_code', 'pt_begin', 'IDX_CODE', 'p_id_old')}
+            for r in rows if r['data'].get('PlSeason') == season}
+
+
+def player_db_reference_values(rows, season):
+    return {r['id']: {field: r['data'].get(field) for field in ('P-6', 'P-7', 'P-8')}
+            for r in rows if r['data'].get('P-6') == int(season[2:4]+season[7:9])}
 
 
 def plan_new_season(season, matches, code_rows, target, slots):
@@ -1830,6 +2275,61 @@ def season_player(data, col, evidence, all_matches):
     return {**data,**{aliases[k] if col=='playerDB' else k:v for k,v in fields.items()}}
 
 
+def excluded_existing_own_goals(evidence, selected_ids):
+    """Identify only imported OWN goal documents backed by the same RAW event.
+
+    OWN is intentionally absent from playerGoal output. Existing historical
+    OWN documents are an approved comparison exclusion, never a delete plan.
+    """
+    keys = set()
+    for item in evidence['source_recordings']:
+        if item['match_id'] not in selected_ids or not item['recording'].get('legacyGiId'):
+            continue
+        season = season_label(item['match']['seasonId'])
+        idx = resolve_team_code(evidence['ai_samples']['code'], season, item['recording']['teamId'])['IDX_CODE']
+        for row in item['children']['records']:
+            value = row['data']
+            if (value.get('playerId') == 'OWN' and value.get('half') in ('H1', 'H2')
+                    and (value.get('legacyKpiFlags') or {}).get('goal')):
+                keys.add((item['match_id'], idx, value['half'], value['halfSeconds'], 'OWN'))
+    return {row['id'] for row in evidence['target_existing'].get('playerGoal', [])
+            if natural_key('playerGoal', row['data']) in keys}
+
+
+def reviewed_aggregate_items(evidence, items):
+    """Project approved RAW corrections into aggregates without editing source KPI."""
+    sources = {(r['match_id'], r['side']): r for r in evidence.get('source_recordings', [])}
+    result = []
+    for item in items:
+        source = sources.get((item['match_id'], item['side']))
+        if source is None:
+            result.append(item)
+            continue
+        records = source_records(source)
+        if not records:
+            raise ValueError('Reviewed aggregate RAW is empty')
+        calculated = calculate_kpis(records).team_kpi
+        unfiltered = source_records(source, include_reviewed_exclusions=True)
+        full = source_records(source, include_reviewed_exclusions=True, include_extra_halves=True)
+        before = calculate_kpis(unfiltered).team_kpi if len(unfiltered) != len(records) else calculated
+        with_extras = calculate_kpis(full).team_kpi if len(full) != len(unfiltered) else before
+        stored = item['recording'].get('kpi') or {}
+        imported = bool(item['recording'].get('legacyGiId')) and all(r.legacy_flags is not None for r in records)
+        for field, value in stored.items():
+            if field not in calculated or abs(value - calculated[field]) < 1e-6:
+                continue
+            approved = imported and (
+                (len(unfiltered) != len(records) and abs(value-before[field]) < 1e-6)
+                or (len(full) != len(unfiltered) and abs(value-with_extras[field]) < 1e-6)
+                or approved_path_difference(item['match_id'], item['side'], field, value, calculated[field])
+                or (field == 'OG' and value == 0 and calculated['OG'] > 0
+                    and all(abs(stored[k]-calculated[k]) < 1e-6 for k in ('GOAL','SHOT','SSR'))))
+            if not approved:
+                raise ValueError(f'Unreviewed aggregate KPI difference: {item["match_id"]}/{item["side"]}/{field}')
+        result.append({**item, 'recording': {**item['recording'], 'kpi': calculated}})
+    return result
+
+
 def generate_delivery(evidence, selected, aggregate_items, slots, setup, *, match_only=False):
     errors, checks, documents = [], [], [] if match_only else list(setup['documents'])
     for fixture in selected:
@@ -1854,7 +2354,7 @@ def generate_delivery(evidence, selected, aggregate_items, slots, setup, *, matc
         errors.extend(f'{fixture["id"]}: {e}' for e in report['errors'])
         checks.extend({'matchId': fixture['id'], **c} for c in report['checks'])
         for doc in report['documents']:
-            if doc['collection'] in ('Player', 'playerDB'):
+            if doc['collection'] == 'playerDB':
                 try:
                     doc['data'] = season_player(doc['data'], doc['collection'], evidence, evidence['did_matches'])
                 except BackendError as exc:
@@ -1863,14 +2363,20 @@ def generate_delivery(evidence, selected, aggregate_items, slots, setup, *, matc
     if match_only:
         report = finish_delivery(documents, errors, checks, evidence['target_existing'], 'matches', len(selected))
         selected_ids = {r['id'] for r in selected}
+        excluded_own = excluded_existing_own_goals(evidence, selected_ids) if not report['errors'] else set()
+        report['excluded_existing_documents'] = [
+            {'collection': 'playerGoal', 'document_id': ident, 'reason': 'Approved imported OWN goal exclusion; no deletion'}
+            for ident in sorted(excluded_own)]
         identities = {(d['collection'],d['document_id']) for d in report['documents']}
-        for col in (*MATCH_TARGETS,'playerMST'):
+        for col in MATCH_TARGETS:
             stale = [r['id'] for r in evidence['target_existing'].get(col,[])
-                     if (col,r['id']) not in identities and r['data'].get('P-DB1' if col=='playerMST' else 'gm_id') in selected_ids]
+                     if (col,r['id']) not in identities and r['data'].get('P-DB1' if col=='playerMST' else 'gm_id') in selected_ids
+                     and not (col=='playerGoal' and r['id'] in excluded_own)]
             if stale: report['errors'].append(f'{col}: {len(stale)} unmatched target documents require reviewed reconciliation; no deletes performed')
         report['validation_passed'] = bool(selected) and not report['errors'] and all(c['passed'] for c in checks)
         report['summary']['errors'] = len(report['errors'])
         return report
+    aggregate_items = reviewed_aggregate_items(evidence, aggregate_items)
     aggregate = build_aggregates(aggregate_items, evidence['ai_samples']['code'], slots)
     bind_existing_documents(aggregate, evidence['target_existing'])
     validation = validate_aggregate_links(aggregate, aggregate_items, evidence['ai_samples']['code'], slots)
@@ -1891,21 +2397,26 @@ def generate_delivery(evidence, selected, aggregate_items, slots, setup, *, matc
     # A merge cannot reconcile a removed source event by itself. Detect obsolete
     # target rows and require a reviewed cleanup instead of leaving silent extras.
     selected_ids = {r['id'] for r in selected}
-    for col in (*MATCH_TARGETS, 'playerMST'):
+    excluded_own = excluded_existing_own_goals(evidence, selected_ids) if not errors else set()
+    for col in MATCH_TARGETS:
         stale = [r['id'] for r in evidence['target_existing'].get(col, [])
                  if (col, r['id']) not in unique
-                 and r['data'].get('P-DB1' if col == 'playerMST' else 'gm_id') in selected_ids]
+                 and r['data'].get('P-DB1' if col == 'playerMST' else 'gm_id') in selected_ids
+                 and not (col=='playerGoal' and r['id'] in excluded_own)]
         if stale:
             errors.append(f'{col}: {len(stale)} unmatched target documents require reviewed reconciliation; no deletes performed')
     existing = {col: {r['id']: r['data'] for r in rows} for col, rows in evidence['target_existing'].items()}
     for doc in unique.values():
         old = existing.get(doc['collection'], {}).get(doc['document_id'])
-        doc['baseline'] = {k: {'exists': k in old, 'value': old.get(k)} if old is not None
-                           else {'exists': False, 'value': None} for k in doc['data']}
+        doc['data'] = delivery_payload(doc['collection'], doc['data'], old)
+        doc['baseline'] = replacement_baseline(doc['data'], old)
         doc['existed'] = old is not None
         doc.pop('changed_fields', None)
     passed = bool(selected) and not errors and all(c['passed'] for c in checks)
     return {'validation_passed': passed, 'write_enabled': False, 'documents': list(unique.values()),
+            'excluded_existing_documents': [
+                {'collection': 'playerGoal', 'document_id': ident, 'reason': 'Approved imported OWN goal exclusion; no deletion'}
+                for ident in sorted(excluded_own)],
             'checks': checks, 'errors': errors, 'aggregate_validation': validation,
             'new_season': setup['new_season'], 'slot_definitions': slots,
             'scope_note': 'Selected match details plus whole-season aggregates and registered player identities independent of appearances',
@@ -1918,8 +2429,88 @@ def generate_delivery(evidence, selected, aggregate_items, slots, setup, *, matc
 # ==========================================================================
 
 
+def delivery_payload(collection, generated, old=None):
+    """Preserve destination-only fields, replace each generated value atomically.
+
+    This is deliberately a shallow overlay: a newly generated nested map owns
+    that entire map, so removed calculated entries cannot survive a deep merge.
+    The writer commits this reviewed full document under a complete baseline.
+    """
+    data = deepcopy(generated)
+    if collection == 'vibePlayer':
+        fields = ('P-APX', 'P-TPX', 'P-FPX', 'P-JMX')
+    elif collection == 'dMST':
+        fields = ('APX', 'TPX', 'FPX', 'FPX(AiFPX)', 'JMX', 'JMX2', 'gi_score2', 'Power3X(AVG)')
+    elif collection in ('multiSheet_JMX', 'multiSheet_ALL'):
+        fields = tuple(k for k in data if k.startswith('JMX-H'))
+    elif collection == 'pMST':
+        fields = ('gi_score',)
+    else:
+        fields = ()
+    for field in fields:
+        if data.get(field) is not None:
+            data[field] = rating_two_decimals(data[field])
+    precision = ({'ASR': 3, 'SSR': 3, 'SHOTScore': 2, 'GOALScore': 2, 'SSRScore': 2,
+                  'DAP(AiAttack)': 1, 'DTP(AiTactic)': 1, 'SHOT(AiShot)': 1,
+                  'GOAL(AiGoal)': 1, 'SSR(AiSSR)': 1} if collection == 'dMST' else
+                 {'P-SSR': 3} if collection == 'vibePlayer' else
+                 {'ASR':3,'SSR':3,'SSR2':3} if collection == 'pMST' else
+                 {'ASR':3,'SSR':3} if collection == 'sAVG' else
+                 {**{side+'-'+m:6 for side in ('H','A') for m in ('ASR','SSR')},
+                  **{'6'+side+'-SSR':3 for side in ('H','A')}} if collection == 'mMST' else {})
+    for field, digits in precision.items():
+        if data.get(field) is not None:
+            data[field] = rounded(data[field], digits)
+            previous = (old or {}).get(field)
+            if (type(previous) in (int,float) and abs(previous-data[field]) < 1e-12
+                    and rounded(previous,digits) == data[field]):
+                # Retain an equivalent historical IEEE representation instead
+                # of rewriting 0.33299999999999996 as 0.333 on every upload.
+                data[field] = previous
+    for field in ('p_name', 'p_name_en', 'p_name_full') if collection == 'Player' else (
+            ('P-2', 'P-3', 'P-4') if collection == 'playerDB' else ()):
+        if field in data:
+            data[field] = clean_player_name(data[field])
+    # Keep each collection's established club label. The user explicitly
+    # corrected Everton/Leicester; other labels need no spelling migration.
+    team_names = {'Manager': (('T_Code','T_Name'),), 'dMST': (('t_code','t_Nm'),),
+                  'pMST': (('t_code','t_Nm'),),
+                  'mMST': (('H-Code','H-Name'),('A-Code','A-Name'))}
+    for team_field, name_field in team_names.get(collection, ()):
+        team = data.get(team_field)
+        if team in ('E-EV', 'E-LE'):
+            data[name_field] = {'E-EV':'에버턴', 'E-LE':'레스터'}[team]
+        elif (old or {}).get(team_field) == team and (old or {}).get(name_field):
+            data[name_field] = old[name_field]
+    preserved = {k: deepcopy(v) for k, v in (old or {}).items()
+                 if not retired_calculation_field(collection, k)
+                 and not generated_calculation_field(collection, k)}
+    return {**preserved, **data}
+
+
+def retired_calculation_field(collection, field):
+    return ((collection == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-')))
+            or (collection == 'rank' and (field.startswith('WGR') or field in ('Season', 'S_Avg', 'R_Rate'))))
+
+
+def generated_calculation_field(collection, field):
+    """Dynamic calculation families belong to the generator, including removals."""
+    if collection.startswith('multiSheet_'):
+        return bool(re.fullmatch(r'(?:BAP|DAP|DTP|SHOT|GOAL|SSR|JMX)-H[1-4]-.+', field))
+    if collection == 'rank':
+        return bool(re.fullmatch(r'(?:WRK|RRK|RAV)\d+', field))
+    if collection == 'rAVG':
+        return bool(re.fullmatch(r'M[HA]\d+-IDX', field))
+    return False
+
+
+def replacement_baseline(data, old):
+    return {k: {'exists': old is not None and k in old, 'value': old.get(k) if old else None}
+            for k in set(data) | set(old or {})}
+
+
 def finish_delivery(documents, errors, checks, existing, mode, matches=0):
-    """Bind immutable baselines; LATEST compares owned values, never timestamps."""
+    """Bind the reviewed overlay and complete destination concurrency baseline."""
     errors = list(errors)
     by_id = {col:{r['id']:r['data'] for r in rows} for col,rows in existing.items()}
     unique = {}
@@ -1933,13 +2524,13 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0):
         if identity in unique and unique[identity]['data']!=doc['data']:
             errors.append(f'Conflicting destination identity: {identity}')
         old = by_id.get(doc['collection'],{}).get(doc['document_id'])
-        doc['baseline'] = {k:{'exists':old is not None and k in old,'value':old.get(k) if old else None} for k in doc['data']}
+        doc['data'] = delivery_payload(doc['collection'], doc['data'], old)
+        doc['baseline'] = replacement_baseline(doc['data'], old)
         doc['existed'] = old is not None
         doc.pop('changed_fields',None)
         validate_document(doc)
         unique[identity] = doc
-    changed = [d for (col,ident),d in unique.items() if ident not in by_id.get(col,{})
-               or any(k not in by_id[col][ident] or by_id[col][ident][k]!=v for k,v in d['data'].items())]
+    changed = [d for (col,ident),d in unique.items() if by_id.get(col,{}).get(ident) != d['data']]
     result = changed if mode=='latest' else list(unique.values())
     return {'mode':mode,'validation_passed':not errors and all(c['passed'] for c in checks),'write_enabled':False,
             'documents':result,'checks':checks,'errors':errors,
@@ -1951,6 +2542,7 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0):
 
 
 def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode):
+    evidence = with_registration_references(evidence)
     errors, documents = [], list(setup['documents'])
     context = evidence['did_matches']
     season = season_label(context[0]['data']['seasonId'])
@@ -1974,15 +2566,20 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode):
             return
         if found and found[0]['data'].get('uid'): data['uid']=found[0]['data']['uid']
         elif col=='Manager': data['uid']=ident
-        documents.append({'collection':col,'document_id':ident,'data':data,'action':'merge-existing' if found else 'create-candidate'})
+        documents.append({'collection':col,'document_id':ident,'data':data,'action':'replace-existing' if found else 'create-candidate'})
     identities = {}
     for pid,profile in evidence['player_profiles'].items():
         try:
             mapped = registered_player_projection(evidence,pid,season,context)
-            if mapped is None: continue
-            identity = mapped['p_id']
+            registrations = registered_player_projections(evidence, pid, season, context)
+            if mapped is None and not registrations: continue
+            identity = player_identity(pid, profile)
             if identity in identities and identities[identity]!=pid: raise ValueError(f'Player identity collision: {pid}/{identities[identity]}')
             identities[identity]=pid
+            for registration in registrations:
+                emit('Player', registration)
+            if mapped is None:
+                continue
             # Explicitly cleared source fields must clear the old owned value.
             for dest,src in PLAYER_FIELDS.items():
                 if src in profile and profile[src] is None: mapped[dest]=None
@@ -1990,11 +2587,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode):
             if 'to' in link and link['to'] is None: mapped['pt_end']='9999.99.99'
             for src,dest in (('no','pt_num'),('pos','pt_pos')):
                 if src in link and link[src] is None: mapped[dest]=None
-            emit('Player',mapped)
-            db = {dest:int(season[2:4]+season[7:9]) if dest=='P-6' else mapped[src]
-                  for dest,src in {**PLAYER_DB,'P-17':'p_id_old'}.items() if src in mapped}
-            if 'DID_PLAYER_ID' in mapped: db['DID_PLAYER_ID']=mapped['DID_PLAYER_ID']
-            emit('playerDB',db)
+            emit('playerDB',player_db_projection(evidence,mapped,season))
         except (KeyError,TypeError,ValueError) as exc: errors.append(str(exc))
     coach_rows = []
     if fixtures:
@@ -2031,8 +2624,13 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode):
                     'coachNameEn':profile.get('nameEn'),'legacyCoachId':profile.get('legacyCoachId')}.items() if v is not None}}
             team=coach['teamId'];code=resolve_team_code(evidence['ai_samples']['code'],season,team)
             profile=evidence['teams'].get(team,{})
-            emit('Manager',manager_projection(coach,code,profile.get('nameKr') or profile.get('name') or team))
+            emit('Manager',manager_projection(coach,code,team_delivery_name(evidence['ai_samples']['code'],season,team,profile)))
         except (KeyError,TypeError,ValueError) as exc: errors.append(str(exc))
+    try:
+        aggregate_items = reviewed_aggregate_items(evidence, aggregate_items)
+    except (KeyError, TypeError, ValueError) as exc:
+        errors.append(str(exc))
+        aggregate_items = []
     final = [i for i in aggregate_items if i['recording'].get('status')=='final']
     known = {(r['data'].get('gm_round'),r['data'].get('t_code')) for r in target.get('dMST',[])}
     supplied = {(i['match']['round'],i['recording'].get('teamId')) for i in final}
@@ -2065,7 +2663,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode):
     return report
 
 
-VALIDATION_POLICY = 'scoped-masters-tactic-shot-goal-sequences-v11'
+VALIDATION_POLICY = 'reviewed-raw-cross-season-team-references-v21'
 
 
 def dump(value):
@@ -2100,6 +2698,7 @@ ALLOWED_COLLECTIONS = {'code', 'Manager', 'Player', 'playerDB', 'playerMST', 'vi
     'playerGoal', 'mMST', 'pMST', 'cAVG', 'rAVG', 'sAVG', 'rank', 'bmas_DTA', 'bmas_DTB', 'bmas_DTM', 'bmas_DTS',
     'multiSheet_ALL', 'multiSheet_BAP', 'multiSheet_DAP', 'multiSheet_DTP', 'multiSheet_GOAL',
     'multiSheet_JMX', 'multiSheet_SHOT', 'multiSheet_GOAL-시간'}
+ALLOWED_COLLECTIONS -= EXCLUDED_COLLECTIONS
 MASTER_FIELDS = {
     'Manager': {'PlSeason', 'Round', 'T_Code', 'IDX_CODE', 'T_Name', 'm_id', 'Manager_EN', 'Manager_KR',
                 'Status_EN', 'Status_KR', 'gm_date', 'e_date', 'uid'},
@@ -2115,10 +2714,12 @@ def validate_document(doc):
     col, ident, data = doc['collection'], doc['document_id'], doc['data']
     if col not in ALLOWED_COLLECTIONS or not ident or '/' in ident or not data:
         fail('Invalid delivery collection/document')
-    if col in MASTER_FIELDS and set(data) - MASTER_FIELDS[col]:
+    preserved = {field for field, expected in doc.get('baseline', {}).items()
+                 if expected['exists'] and field in data and data[field] == expected['value']}
+    if col in MASTER_FIELDS and set(data) - MASTER_FIELDS[col] - preserved:
         fail(f'Unowned fields in {col}')
     for field in data:
-        if '.' in field or field.startswith('`'):
+        if ('.' in field or field.startswith('`')) and field not in preserved:
             fail('Payload fields must be literal top-level names')
         if col == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-')):
             fail('Unused prediction field in delivery')
@@ -2239,7 +2840,25 @@ class JobStore:
             if meta is None:
                 db.execute('UPDATE jobs SET state=?,updated=?,error=? WHERE id=?', (state, time.time(), error, ident))
             else:
+                db.execute('BEGIN IMMEDIATE')
+                previous = json.loads(db.execute('SELECT meta FROM jobs WHERE id=?', (ident,)).fetchone()[0])
+                if 'progress' in previous:
+                    progress = meta.get('progress', {})
+                    meta = {**meta, 'progress': {**previous['progress'], **progress,
+                        'percent': max(previous['progress'].get('percent', 0), progress.get('percent', 0))}}
                 db.execute('UPDATE jobs SET state=?,updated=?,error=?,meta=? WHERE id=?', (state, time.time(), error, dump(meta), ident))
+
+    def record_progress(self, ident, percent, **details):
+        """Persist completed work without discarding a manifest or moving backwards."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            meta = json.loads(db.execute('SELECT meta FROM jobs WHERE id=?', (ident,)).fetchone()[0])
+            previous = meta.get('progress', {})
+            percent = max(previous.get('percent', 0), min(99, int(percent)))
+            progress = {**previous, **details, 'percent': percent}
+            if progress != previous:
+                meta['progress'] = progress
+                db.execute('UPDATE jobs SET meta=?,updated=? WHERE id=?', (dump(meta), time.time(), ident))
 
     def save_preview(self, ident, report, guards, *, complete=True):
         docs = report.pop('documents')
@@ -2259,7 +2878,7 @@ class JobStore:
                     db.execute('INSERT INTO documents (preview_id,ordinal,payload,identity) VALUES (?,?,?,?)', (ident, ordinal, payload, identity))
                     ordinal += 1
             previous = json.loads(db.execute('SELECT meta FROM jobs WHERE id=?', (ident,)).fetchone()[0])
-            if previous:
+            if previous.get('report'):
                 report['validation_passed'] &= previous['report']['validation_passed']
                 report['errors'] = sorted(set(previous['report']['errors'] + report['errors']))
                 report['checks'] = previous['report']['checks'] + report['checks']
@@ -2271,7 +2890,7 @@ class JobStore:
                 report['summary']['failed_checks'] = sum(not c['passed'] for c in report['checks'])
                 guards = merge_guards(previous['guards'], guards)
             report['summary']['documents'] = ordinal
-            meta = {'report': report, 'guards': guards, 'validationPolicy': VALIDATION_POLICY}
+            meta = {**previous, 'report': report, 'guards': guards, 'validationPolicy': VALIDATION_POLICY}
             db.execute('UPDATE jobs SET state=?,meta=?,updated=? WHERE id=?',
                        (('validated' if report['validation_passed'] else 'invalid') if complete else 'running', dump(meta), time.time(), ident))
 
@@ -2331,19 +2950,28 @@ class JobStore:
 
 
 def decide_merge(doc, current):
-    """Optimistic concurrency on owned fields; unrelated/manual changes survive."""
+    """Commit the reviewed overlay only against the complete captured baseline."""
+    current = encode(current) if current is not None else None
     data = doc['data']
-    if current is not None and all(k in current and current[k] == v for k, v in data.items()):
+    if current == data:
         return False
     if doc['existed'] != (current is not None):
         fail('Destination existence changed; create a new preview', 'aifootballx_destination_changed')
-    current = current or {}
-    for field, expected in doc['baseline'].items():
-        if field in current and current[field] == data[field]:
-            continue
-        if (field in current) != expected['exists'] or (field in current and current[field] != expected['value']):
-            fail('Destination owned fields changed; create a new preview', 'aifootballx_destination_changed')
+    baseline = {field: expected['value'] for field, expected in doc['baseline'].items() if expected['exists']}
+    if (current or {}) != baseline:
+        fail('Destination document changed; create a new preview', 'aifootballx_destination_changed')
     return True
+
+
+def firestore_payload(doc, current):
+    """Keep unchanged destination values in their original Firestore types.
+
+    Preview JSON encodes timestamps as strings. Reuse the transaction's raw
+    value when unchanged, so preserving metadata never converts its type.
+    """
+    return {field: deepcopy(current[field])
+            if current is not None and field in current and encode(current[field]) == value else deepcopy(value)
+            for field, value in doc['data'].items()}
 
 
 class FirestoreWriter:
@@ -2365,9 +2993,10 @@ class FirestoreWriter:
             if seen.exists:
                 return 'skipped'
             snap = ref.get(transaction=tx)
-            write = decide_merge(doc, snap.to_dict() if snap.exists else None)
+            current = snap.to_dict() if snap.exists else None
+            write = decide_merge(doc, current)
             if write:
-                tx.set(ref, doc['data'], merge=True)
+                tx.set(ref, firestore_payload(doc, current), merge=False)
             tx.set(receipt, {'previewId': preview_id, 'collection': doc['collection'], 'documentId': doc['document_id'],
                              'payloadHash': digest, 'completedAt': firestore.SERVER_TIMESTAMP})
             return 'success' if write else 'skipped'
@@ -2400,7 +3029,8 @@ class FirestoreWriter:
                 plan.append((doc, dest, receipt, 'success' if write else 'skipped', True))
             for doc, dest, receipt, state, record in plan:
                 if state == 'success':
-                    tx.set(dest, doc['data'], merge=True)
+                    snap = snapshots[dest.path]
+                    tx.set(dest, firestore_payload(doc, snap.to_dict() if snap.exists else None), merge=False)
                 if record:
                     tx.set(receipt, {'previewId': preview_id, 'collection': doc['collection'],
                                     'documentId': doc['document_id'], 'completedAt': firestore.SERVER_TIMESTAMP})
@@ -2468,12 +3098,16 @@ class DeliveryService:
             for number,scope in enumerate(scopes,1):
                 self.ensure_running()
                 source = self.source_factory()
+                if hasattr(source, 'set_progress_callback'):
+                    source.set_progress_callback(lambda value, chunk=number:
+                        self.store.record_progress(ident, 80 * (chunk - 1 + value / 100) / len(scopes)))
                 report, guards = source.capture(scope, slot_path)
                 self.ensure_running()
                 self.store.save_preview(ident, report, guards, complete=False)
-                progress=self.store.job(ident,owner)['meta']
-                progress['progress']={'roundsTotal':len(scopes),'roundsProcessed':number,'percent':min(99,int(number/len(scopes)*100))}
-                self.store.set_job(ident,'running',meta=progress)
+                self.store.record_progress(ident, 80 * number / len(scopes),
+                                           roundsTotal=len(scopes), roundsProcessed=number)
+            if hasattr(source, 'set_progress_callback'):
+                source.set_progress_callback(lambda value: self.store.record_progress(ident, 80 + 19 * value / 100))
             self.store.finalize_preview(ident, owner, source)
         except Exception as exc:
             self.store.fail_job(ident, exc)
@@ -2513,7 +3147,10 @@ class DeliveryService:
                 self.store.set_job(ident,'complete')
                 return
             source = self.source_factory()
+            if hasattr(source, 'set_progress_callback'):
+                source.set_progress_callback(lambda value: self.store.record_progress(ident, value / 10))
             source.assert_fresh(preview['meta']['guards'])
+            self.store.record_progress(ident, 10)
             last_fresh = time.monotonic()
             writer = self.writer_factory()
             # Read a fixed ordinal window. Success rows are never retried.
@@ -2632,9 +3269,25 @@ class DeliveryService:
                       for d in self.store.page(preview,0,20)]
         counts=self.store.counts(send_id) if send_id else {}
         total=sum(counts.values())
-        percent=int((total-counts.get('pending',0))/total*100) if total else (preview['meta'].get('progress',{}).get('percent',0) if preview else 0)
-        if latest['state'] in ('complete','validated','invalid','partial'):
-            percent=100
+        preview_percent = (100 if preview and preview['state'] == 'validated' else
+                           preview['meta'].get('progress', {}).get('percent', 0) if preview else 0)
+        percent = preview_percent
+        if latest['kind'] == 'delivery':
+            percent = int(preview_percent / 2)
+            if sent:
+                send_percent = sent['meta'].get('progress', {}).get('percent', 0)
+                processed = total - counts.get('pending', 0)
+                if total and (send_percent >= 10 or processed):
+                    send_percent = max(send_percent, 10 + 90 * processed / total)
+                percent = min(99, 50 + int(send_percent / 2))
+        percent = min(99, percent)
+        if latest['kind'] == 'delivery':
+            percent = max(percent, latest['meta'].get('progress', {}).get('percent', 0))
+            if latest['state'] in ('queued', 'running'):
+                # A retry may need a new preview; retain this operation's high-water mark.
+                self.store.record_progress(latest['id'], percent)
+        if latest['state'] in ('complete', 'validated'):
+            percent = 100
         return {'status':state,'operation':'send' if latest['kind']=='delivery' else 'preview',
                 'mode':delivery_mode(latest['scope']),
                 'phase':latest['meta'].get('phase', 'preview'),'percent':percent,'writeEnabled':enabled,'scope':latest['scope'],

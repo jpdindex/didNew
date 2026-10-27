@@ -34,6 +34,7 @@ from backend.system.system_aifootballx import (
     build_preview,
     stable_id,
     natural_key,
+    EXCLUDED_COLLECTIONS,
     bucket,
     dotted_date,
     LEGACY_2025_PREDICTION_BASELINES,
@@ -49,7 +50,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from statistics import mean
-from backend.temporary.build_legacy_import import _tuple_values
+from backend.build.build_legacy_import import _tuple_values
 from backend.build.build_match_rating import BuildMatchRating
 from backend.system.system_firestore import get_firestore_client, JpdDidData, BackendError
 from backend.system.system_schema import PlayerKpi, RecordingKpi, TeamRatingSnapshot
@@ -267,7 +268,7 @@ def field_rule(collection: str, field: str, label: str = '') -> tuple[str, str, 
             return 'derived', 'matches.score + recording.side → 승3/무1/패0', '기존 footballindex 결과 처리와 일치; 미경기 값과 구분'
         if field == 't_Nm':
             return 'join', 'teams.nameKr / 기존 code 한국어 명칭', '목적지 기존 표시명 유지 우선'
-        if field in {'PDF', 'T-code2__bak'}:
+        if field in {'PDF', 'W-TOT', 'W-TOT2', 'T-code2__bak'}:
             return 'preserve', '기존 대상 자료/백업 필드', 'DID 기록으로 재생성하지 않음'
         if field in {'DAP(AiAttack)', 'DTP(AiTactic)'}:
             metric = 'DAP' if field == 'DAP(AiAttack)' else 'DTP'
@@ -277,8 +278,8 @@ def field_rule(collection: str, field: str, label: str = '') -> tuple[str, str, 
             if field.startswith('JMX-'):
                 return 'candidate', 'recordings.teamRating.jmxSeries[0..19]', 'H1 10개→H2 10개; 누적 평점 직접 사용, 재계산 금지'
             if field.startswith('SSR-'):
-                return 'derived', '자책골 제외 누적 GOAL / 누적 SHOT', 'NEW 엑셀 SSR-5 기준: 경기 시작부터 해당 구간까지 누적, 후반에도 전반 누적 유지; 분모 0은 0'
-            return 'derived', 'records → KPI flags/구간 집계', '5:00은 5–10 구간; 분석 골은 자책골 제외. DTP 경기 총계는 구간 합과 일치'
+                return 'derived', '(누적 GOAL − RAW의 누적 OWN 득점 수) / 누적 SHOT', 'SSR만 OWN 제외; GOAL·FPX는 OWN 포함. 후반에도 전반 누적 유지; 분모 0은 0'
+            return 'derived', 'records → KPI flags/구간 집계', '5:00은 5–10 구간; GOAL은 자책골 포함. DTP는 마지막 슛 결과 시점에 배치'
         if re.fullmatch(r'GOAL\d+', field):
             return 'derived', '골 records.half/halfSeconds/seq → H1_초 또는 H2_초; 자책골은 H1_OG_초 또는 H2_OG_초', '시간순으로 자책골도 보존; 미지정은 문자열 \\N; 10골 초과 목적지 처리 확인 필요'
     if collection.startswith('bmas_') and field in {'gr_area_code', 'gr_half', 'gr_pos_x', 'gr_pos_y', 'gr_seconds', 'Type'}:
@@ -323,6 +324,8 @@ def field_rule(collection: str, field: str, label: str = '') -> tuple[str, str, 
         if match and int(match[1]) in aliases:
             return 'candidate', aliases[int(match[1])], '화면 레거시 제목 + 동일 문서 원자값 대조 후보; 가중점수 필드는 별도'
     if collection == 'vibePlayer':
+        if field == 'P-DTP':
+            return 'derived', 'playerStats.DTM + playerStats.DTA', '선수 메이커·어시스터 전술 기여; 고유 DTP 경로 참여 횟수와 구분'
         if field == 'P-BAP':
             return 'candidate', 'playerStats.DTB', '같은 AIfootballX 경기 선수 32명에서 P-BAP=P-DB29(gp_ctb) 32/32 일치; DID gp_ctb→DTB 가져오기 코드 확인'
         if field == 'gp_type':
@@ -736,7 +739,8 @@ def from_target_dmst(rows: list[dict], sql_items: list[dict], precise_ratings: l
 
 
 def compare(generated: dict, existing: dict, *, replay: bool = False) -> dict:
-    report = {'collections': {}, 'limitations': ['Target replay reuses target dMST as its input and is not independent SQL/DID validation.',
+    report = {'collections': {}, 'excluded_collections': sorted(EXCLUDED_COLLECTIONS),
+              'limitations': ['Target replay reuses target dMST as its input and is not independent SQL/DID validation.',
                                                'Unmapped fields and missing ratings are reported separately, never counted as passes.']}
     for col in AGGREGATES:
         targets = defaultdict(list)
@@ -942,7 +946,7 @@ def rating_input(game,info,players,detail):
     cumulative=[]; totals=Counter()
     for n in range(20):
         for metric in ('DAP','DTP','SHOT','GOAL'): totals[metric]+=wide[metric+'-'+interval_name(n)]
-        cumulative.append({**dict(totals),'SSR':totals['GOAL']/totals['SHOT'] if totals['SHOT'] else 0})
+        cumulative.append({**dict(totals),'SSR':wide['SSR-'+interval_name(n)]})
     aliases={field:source for n,source in PLAYER_COLUMNS.items() for field in [{8:'TAP',12:'DAP',16:'UTP',17:'DTP',18:'TTP',23:'SHOT',26:'AST',27:'GOAL',29:'DTB',30:'DTM',31:'DTA',32:'DTS',33:'GTB',34:'GTM',35:'ASR',36:'SSR'}[n]]}
     body={'gm_id':game['gm_id'],'side':side,'leagueId':'EPL','seasonId':game['gm_id'][:8],'matchType':'league','round':game['gm_round'],
           'teamId':game['gm_h_t_code' if side=='H' else 'gm_a_t_code'],
@@ -1621,7 +1625,7 @@ def normalized_sql_source(info, source):
     from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
 
     source = {**source, 'ff_game_record': [r for r in source.get('ff_game_record', [])
-                                         if r.get('gr_half') not in ('', None)]}
+                                         if str(r.get('gr_half')) in ('1', '2', 'H1', 'H2')]}
     records = source['ff_game_record']
     linked = {r.get('gt_id') for r in records if r.get('gt_id')}
     paths = [p for p in source.get('ff_game_path', []) if p['gt_id'] in linked]
@@ -1690,6 +1694,7 @@ def build_details(game, infos, children, codes):
                       or (not r.get('gt_id') and (r.get('gr_is_sht') or r.get('gr_is_gol')))}
         members = defaultdict(list)
         bins = {m: [0] * 20 for m in ('DAP','DTP','BAP','SHOT','GOAL','SSR')}
+        ordinary_goals = [0] * 20
         own_goals, goal_times = 0, []
         for seq, row in enumerate(records):
             half = {'1':'H1','2':'H2','H1':'H1','H2':'H2'}.get(str(row['gr_half']))
@@ -1699,15 +1704,18 @@ def build_details(game, infos, children, codes):
             if half and type(seconds) is int and seconds >= 0:
                 slot = bucket(half, seconds)
                 if row.get('gt_id'):
-                    members[str(row['gt_id'])].append((slot, seconds, seq))
+                    members[str(row['gt_id'])].append((slot, seconds, seq, bool(row.get('gr_is_sht')),
+                                                       row.get('gr_act_code'), row.get('gr_res_code')))
             elif active:
                 errors.append(f'{side}: KPI event outside supported H1/H2 clock: {row["gr_id"]}')
             else:
                 diagnostics.append({'type': 'clockless-non-KPI-record', 'record_id': row['gr_id']})
             for metric, field in [('DAP','gr_is_tap'),('SHOT','gr_is_sht'),('GOAL','gr_is_gol')]:
-                if slot is not None and row.get(field) and (metric != 'GOAL' or row.get('p_id') != 'OWN'):
+                if slot is not None and row.get(field):
                     bins[metric][slot] += 1
             if row.get('gr_is_gol') and row.get('p_id') == 'OWN': own_goals += 1
+            if slot is not None and row.get('gr_is_gol') and row.get('p_id') != 'OWN':
+                ordinary_goals[slot] += 1
             projected = {**common, 't_code': idx, 'gr_half': half or 'H' + str(row['gr_half']), 'gr_half_seconds': seconds,
                          'gr_seconds': seconds + (info['gi_h1_seconds'] if half == 'H2' else 0),
                          'gr_act_code': row.get('gr_act_code') or None, 'gr_res_code': 'G' if row.get('gr_res_code') == 'GOAL' else row.get('gr_res_code'),
@@ -1736,7 +1744,19 @@ def build_details(game, infos, children, codes):
             if not times:
                 errors.append(f'{side}: DTP path has no supported timestamp: {path["gt_id"]}')
             else:
-                terminal = max(times, key=lambda t: (t[0] // 10, t[1], t[2]))
+                times.sort(key=lambda t: (t[0] // 10, t[1], t[2]))
+                shots = [t for t in times if t[3]]
+                if not shots:
+                    errors.append(f'{side}: DTP path has no shot result: {path["gt_id"]}')
+                    continue
+                terminal = shots[-1]
+                for following in times[times.index(terminal) + 1:]:
+                    if following[4]:
+                        break
+                    terminal = following
+                if terminal[5] in ('', None, 'O'):
+                    errors.append(f'{side}: DTP final shot result is missing: {path["gt_id"]}')
+                    continue
                 bins['DTP'][terminal[0]] += 1
         for row in source.get('ff_game_bap', []):
             half = {'1':'H1','2':'H2','H1':'H1','H2':'H2'}.get(str(row['gr_half']))
@@ -1745,10 +1765,10 @@ def build_details(game, infos, children, codes):
             else: errors.append(f'{side}: BAP outside supported clock')
         goals = shots = 0
         for n in range(20):
-            goals += bins['GOAL'][n]; shots += bins['SHOT'][n]
+            goals += ordinary_goals[n]; shots += bins['SHOT'][n]
             bins['SSR'][n] = goals/shots if shots else 0
         for metric in ('DAP','DTP','BAP','SHOT','GOAL'):
-            expected = info[TEAM_COLUMNS[metric]] - (own_goals if metric == 'GOAL' else 0)
+            expected = info[TEAM_COLUMNS[metric]]
             check(side + ':interval-total-' + metric, sum(bins[metric]), expected)
         for metric, values in bins.items():
             fields = {metric+'-'+interval_name(n):v for n,v in enumerate(values)}
