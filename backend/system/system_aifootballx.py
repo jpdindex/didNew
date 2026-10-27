@@ -1733,16 +1733,18 @@ MATCH_TARGETS = ('TACTIC', 'multiSheet_ALL', 'multiSheet_BAP', 'multiSheet_DAP',
                  'multiSheet_GOAL', 'multiSheet_JMX', 'multiSheet_SHOT', 'multiSheet_GOAL-시간',
                  'playerGoal', 'vibePlayer')
 
-MASTER_COLLECTIONS = frozenset(('Player', 'playerDB', 'Manager', 'code', *AGGREGATES))
+IDENTITY_COLLECTIONS = frozenset(('Player', 'playerDB', 'Manager', 'code'))
+MASTER_COLLECTIONS = IDENTITY_COLLECTIONS | frozenset(AGGREGATES)
 MATCH_COLLECTIONS = frozenset(('dMST', *MATCH_TARGETS))
 
 
 def delivery_mode(scope):
     mode = scope.get('mode', 'matches')
-    if mode not in ('matches', 'all', 'latest'):
+    # Keep old stored job scopes readable; only the three new modes have HTTP routes.
+    if mode not in ('matches', 'masters', 'aggregates', 'all', 'latest'):
         fail('Unknown delivery mode')
-    if mode != 'matches' and any(scope.get(k) is not None for k in ('roundFrom', 'roundTo', 'matchId')):
-        fail('ALL/LATEST accept a season only; round and match filters are not allowed')
+    if (mode in ('masters', 'latest') or (mode == 'all' and not scope.get('unified'))) and any(scope.get(k) is not None for k in ('roundFrom', 'roundTo', 'matchId')):
+        fail('Masters accept a season only; round and match filters are not allowed')
     return mode
 
 
@@ -1943,9 +1945,24 @@ class SourceCapture:
             reference = guards['historical_team_indexes']
             if self.historical_team_indexes(reference['team_ids']) != reference['values']:
                 fail('Historical team index references changed; create a new preview', 'aifootballx_source_changed')
+        groups = guards.get('delivery_groups', [])
+        if groups:
+            callback = getattr(self, '_progress_callback', None)
+            try:
+                for number, group in enumerate(groups):
+                    if callback:
+                        self.set_progress_callback(lambda value, index=number:
+                            callback(95 + 5 * (index + value / 100) / len(groups)))
+                    self.assert_fresh({'documents': {}, 'queries': [], **group})
+            finally:
+                self.set_progress_callback(callback)
         self.report_progress(100)
 
     def split_scopes(self, scope):
+        if delivery_mode(scope) == 'all' and scope.get('unified'):
+            masters = {**scope, 'mode': 'masters', 'roundFrom': None, 'roundTo': None, 'matchId': None}
+            matches = self.split_scopes({**scope, 'mode': 'matches'})
+            return [masters, *matches, {**scope, 'mode': 'aggregates'}]
         if delivery_mode(scope) != 'matches':
             return [scope]
         if scope.get('matchId'):
@@ -1959,6 +1976,8 @@ class SourceCapture:
         return [{**scope, 'roundFrom': n, 'roundTo': n} for n in rounds]
 
     def capture(self, scope, slot_path):
+        if delivery_mode(scope) == 'aggregates':
+            return self.capture_aggregates(scope, slot_path)
         if delivery_mode(scope) != 'matches':
             return self.capture_masters(scope, slot_path)
         from google.cloud.firestore_v1.field_path import FieldPath
@@ -2054,6 +2073,68 @@ class SourceCapture:
                   'new_code': {d['document_id']: d['data'] for d in setup['documents']}}
         guards['reference_code'] = code_reference(evidence['ai_samples']['code'],guards['code_scope'])
         report = generate_delivery(evidence, selected, aggregate_items, slots, setup, match_only=True)
+        if scope.get('latest'):
+            retain_changed_documents(report, target)
+        self.report_progress(100)
+        return report, guards
+
+    def capture_aggregates(self, scope, slot_path):
+        """Capture team KPI/rating context without reading player or coach masters."""
+        self.report_progress(0)
+        season = season_label(scope['seasonId'])
+        fixtures = self.rows(self.did, 'matches', [('seasonId', '==', scope['seasonId']),
+                             ('leagueId', '==', 'EPL')], source=True, bound=2000)
+        selected = [r for r in fixtures if (not scope.get('matchId') or r['id'] == scope['matchId'])
+                    and (scope.get('roundFrom') is None or r['data']['round'] >= scope['roundFrom'])
+                    and (scope.get('roundTo') is None or r['data']['round'] <= scope['roundTo'])]
+        if not selected:
+            fail('No DID matches in this scope')
+        codes = self.rows(self.target, 'code', bound=500)
+        target = {}
+        for col in ('dMST', *AGGREGATES):
+            field, value = ('SEASON', season[2:4] + '/' + season[7:9]) if col == 'sAVG' else ('PlSeason', season)
+            target[col] = self.rows(self.target, col, [(field, '==', value)], bound=20000)
+        # Earlier edits must propagate through already published cumulative rounds.
+        existing_end = max((r['data'].get('gm_round' if col == 'pMST' else 'Round', 0) or 0
+                            for col in AGGREGATES if col != 'sAVG' for r in target[col]), default=0)
+        cutoff = max(existing_end, max(r['data']['round'] for r in selected))
+        context = [r for r in fixtures if r['data']['round'] <= cutoff]
+        target['dMST'] = [r for r in target['dMST'] if (r['data'].get('gm_round') or 0) <= cutoff]
+        slots = {'seasonSlotMappings': {}}
+        try:
+            if slot_path:
+                slots = json.loads(slot_path.read_text(encoding='utf-8'))
+            if not isinstance(slots, dict) or not isinstance(slots.get('seasonSlotMappings', {}), dict):
+                raise ValueError('Invalid season slot configuration')
+            setup = plan_new_season(season, fixtures, codes, target, slots)
+        except (BackendError, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            reason = exc.message if isinstance(exc, BackendError) else f'Season slot configuration unavailable ({type(exc).__name__})'
+            setup = {'documents': [], 'code_rows': [], 'slots': slots, 'new_season': False, 'errors': [reason]}
+        teams = self.get_many('teams/' + team for team in sorted({r['data'][key]
+                             for r in context for key in ('homeTeamId', 'awayTeamId')}))
+        self.report_progress(20)
+        refs = [self.did.document(f'matches/{r["id"]}/recordings/{side}') for r in context for side in ('H', 'A')]
+        heads = {}
+        for start in range(0, len(refs), 100):
+            for snap in self.did.get_all(refs[start:start + 100], timeout=60, retry=None):
+                self.documents[snap.reference.path] = self.version(snap)
+                heads[snap.reference.path] = encode(snap.to_dict()) or {}
+            self.report_progress(20 + 55 * min(start + 100, len(refs)) / len(refs))
+        items = [{'match_id': r['id'], 'match': r['data'], 'side': side,
+                  'recording': heads[f'matches/{r["id"]}/recordings/{side}'],
+                  'team_name': (teams.get('teams/' + r['data']['homeTeamId' if side == 'H' else 'awayTeamId'], {}).get('nameKr'))}
+                 for r in context for side in ('H', 'A')]
+        evidence = {'did_matches': context, 'source_recordings': [], 'player_profiles': {},
+                    'target_existing': target, 'ai_samples': {'code': codes + setup['code_rows']}}
+        self.capture_aggregate_review_sources(evidence, items)
+        self.report_progress(95)
+        report = generate_masters(evidence, context, items, setup['slots'], setup, 'aggregates')
+        report = scoped_aggregate_delivery(report, selected, target, latest=scope.get('latest', False))
+        guards = {'documents': self.documents, 'queries': self.queries, 'code_scope': None,
+                  'reference_code': code_reference(codes),
+                  'new_code': {d['document_id']: d['data'] for d in setup['documents']}}
+        if slot_path and not setup.get('errors'):
+            guards['slot_file'] = {'path': str(slot_path.resolve()), 'sha256': sha256(slot_path.read_bytes()).hexdigest()}
         self.report_progress(100)
         return report, guards
 
@@ -2106,7 +2187,8 @@ class SourceCapture:
                        for tid in sorted(team_ids) for n,date in enumerate((start,end)))
         if not context: fail('No teams or registrations for this season')
         target = {}
-        for col in ('dMST','Manager',*AGGREGATES,'Player','playerDB'):
+        target_collections = ('Manager', 'Player', 'playerDB') if delivery_mode(scope) == 'masters' else ('dMST','Manager',*AGGREGATES,'Player','playerDB')
+        for col in target_collections:
             field,value = (FieldPath('P-6').to_api_repr(),int(season[2:4]+season[7:9])) if col=='playerDB' else (
                 ('SEASON',season[2:4]+'/'+season[7:9]) if col=='sAVG' else ('PlSeason',season))
             target[col] = self.rows(self.target,col,[(field,'==',value)],bound=20000)
@@ -2149,20 +2231,22 @@ class SourceCapture:
         coach_ids = {str(r['data']['coachId']) for r in evidence['coach_contracts']+evidence['coach_rounds'] if r['data'].get('coachId') is not None}
         evidence['coaches'] = {p.split('/')[-1]:v for p,v in self.get_many('coaches/'+pid for pid in coach_ids).items()}
         items = []
-        refs = [self.did.document(f'matches/{r["id"]}/recordings/{side}') for r in fixtures for side in ('H','A')]
-        heads = {}
-        for start in range(0,len(refs),100):
-            for snap in self.did.get_all(refs[start:start+100],timeout=60,retry=None):
-                self.documents[snap.reference.path]=self.version(snap)
-                heads[snap.reference.path]=encode(snap.to_dict()) or {}
-        for row in fixtures:
-            for side in ('H','A'):
-                rec=heads[f'matches/{row["id"]}/recordings/{side}']
-                items.append({'match_id':row['id'],'match':row['data'],'side':side,'recording':rec,
-                              'team_name':teams.get(rec.get('teamId'),{}).get('nameKr') or teams.get(rec.get('teamId'),{}).get('name')})
-        self.capture_aggregate_review_sources(evidence, items)
+        if delivery_mode(scope) != 'masters':
+            items = []
+            refs = [self.did.document(f'matches/{r["id"]}/recordings/{side}') for r in fixtures for side in ('H','A')]
+            heads = {}
+            for start in range(0,len(refs),100):
+                for snap in self.did.get_all(refs[start:start+100],timeout=60,retry=None):
+                    self.documents[snap.reference.path]=self.version(snap)
+                    heads[snap.reference.path]=encode(snap.to_dict()) or {}
+            for row in fixtures:
+                for side in ('H','A'):
+                    rec=heads[f'matches/{row["id"]}/recordings/{side}']
+                    items.append({'match_id':row['id'],'match':row['data'],'side':side,'recording':rec,
+                                  'team_name':teams.get(rec.get('teamId'),{}).get('nameKr') or teams.get(rec.get('teamId'),{}).get('name')})
+            self.capture_aggregate_review_sources(evidence, items)
         self.report_progress(95)
-        report = generate_masters(evidence, fixtures, items, setup['slots'], setup, delivery_mode(scope))
+        report = generate_masters(evidence, fixtures, items, setup['slots'], setup, delivery_mode(scope), latest=scope.get('latest', False))
         self.report_progress(100)
         guards = {'documents':self.documents,'queries':self.queries,'code_scope':None,
                   'reference_code':{},
@@ -2509,12 +2593,39 @@ def replacement_baseline(data, old):
             for k in set(data) | set(old or {})}
 
 
-def finish_delivery(documents, errors, checks, existing, mode, matches=0):
+def retain_changed_documents(report, existing):
+    by_id = {col: {r['id']: r['data'] for r in rows} for col, rows in existing.items()}
+    report['documents'] = [d for d in report['documents']
+                           if by_id.get(d['collection'], {}).get(d['document_id']) != d['data']]
+    report['summary']['documents'] = len(report['documents'])
+
+
+def scoped_aggregate_delivery(report, selected, target, *, latest=False):
+    """Limit fixture rows; retain affected later round totals and season averages."""
+    season = season_label(selected[0]['data']['seasonId'])
+    first_round = min(r['data']['round'] for r in selected)
+    fixture_keys = {(season, r['data']['round'], r['data']['homeTeamId'], r['data']['awayTeamId']) for r in selected}
+    team_keys = {(season, r['data']['round'], r['data'][side])
+                 for r in selected for side in ('homeTeamId', 'awayTeamId')}
+    def selected_document(doc):
+        col, data = doc['collection'], doc['data']
+        if col == 'pMST':
+            return aggregate_key(col, data) in team_keys
+        if col == 'mMST':
+            return aggregate_key(col, data) in fixture_keys
+        return col == 'sAVG' or data.get('Round', 0) >= first_round
+    result = finish_delivery([d for d in report['documents'] if selected_document(d)],
+                             report['errors'], report['checks'], target, 'aggregates', len(selected), latest=latest)
+    return {**report, **result}
+
+
+def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, latest=False):
     """Bind the reviewed overlay and complete destination concurrency baseline."""
     errors = list(errors)
     by_id = {col:{r['id']:r['data'] for r in rows} for col,rows in existing.items()}
     unique = {}
-    allowed = MATCH_COLLECTIONS if mode=='matches' else MASTER_COLLECTIONS
+    allowed = (MATCH_COLLECTIONS if mode == 'matches' else IDENTITY_COLLECTIONS if mode == 'masters'
+               else frozenset(AGGREGATES) if mode == 'aggregates' else MASTER_COLLECTIONS)
     for original in documents:
         doc = deepcopy(original)
         if doc['collection'] not in allowed:
@@ -2531,19 +2642,21 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0):
         validate_document(doc)
         unique[identity] = doc
     changed = [d for (col,ident),d in unique.items() if by_id.get(col,{}).get(ident) != d['data']]
-    result = changed if mode=='latest' else list(unique.values())
+    result = changed if latest or mode=='latest' else list(unique.values())
     return {'mode':mode,'validation_passed':not errors and all(c['passed'] for c in checks),'write_enabled':False,
             'documents':result,'checks':checks,'errors':errors,
-            'scope_note':('Selected match documents only; master identities, managers, code and season aggregates excluded'
-                          if mode=='matches' else 'Season masters and six aggregates only; match details excluded'),
+            'scope_note':('Selected match documents only' if mode == 'matches' else
+                          'Player, playerDB, Manager, code only' if mode == 'masters' else
+                          'pMST, mMST, cAVG, rAVG, rank, sAVG only' if mode == 'aggregates' else
+                          'Legacy combined master/aggregate scope'),
             'summary':{'matches':matches,'documents':len(result),'candidateDocuments':len(unique),
                        'changedDocuments':len(changed),'unchangedDocuments':len(unique)-len(changed),
                        'errors':len(errors),'failed_checks':sum(not c['passed'] for c in checks)}}
 
 
-def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode):
+def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *, latest=False):
     evidence = with_registration_references(evidence)
-    errors, documents = [], list(setup['documents'])
+    errors, documents = [], ([] if mode == 'aggregates' else list(setup['documents']))
     context = evidence['did_matches']
     season = season_label(context[0]['data']['seasonId'])
     target = evidence['target_existing']
@@ -2567,103 +2680,110 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode):
         if found and found[0]['data'].get('uid'): data['uid']=found[0]['data']['uid']
         elif col=='Manager': data['uid']=ident
         documents.append({'collection':col,'document_id':ident,'data':data,'action':'replace-existing' if found else 'create-candidate'})
-    identities = {}
-    for pid,profile in evidence['player_profiles'].items():
-        try:
-            mapped = registered_player_projection(evidence,pid,season,context)
-            registrations = registered_player_projections(evidence, pid, season, context)
-            if mapped is None and not registrations: continue
-            identity = player_identity(pid, profile)
-            if identity in identities and identities[identity]!=pid: raise ValueError(f'Player identity collision: {pid}/{identities[identity]}')
-            identities[identity]=pid
-            for registration in registrations:
-                emit('Player', registration)
-            if mapped is None:
-                continue
-            # Explicitly cleared source fields must clear the old owned value.
-            for dest,src in PLAYER_FIELDS.items():
-                if src in profile and profile[src] is None: mapped[dest]=None
-            link = registration_link(evidence,pid,season,context)
-            if 'to' in link and link['to'] is None: mapped['pt_end']='9999.99.99'
-            for src,dest in (('no','pt_num'),('pos','pt_pos')):
-                if src in link and link[src] is None: mapped[dest]=None
-            emit('playerDB',player_db_projection(evidence,mapped,season))
-        except (KeyError,TypeError,ValueError) as exc: errors.append(str(exc))
-    coach_rows = []
-    if fixtures:
-        for fixture in fixtures:
-            match=fixture['data']
-            for team in (match['homeTeamId'],match['awayTeamId']):
-                contracts = [c['data'] for c in evidence.get('coach_contracts',[]) if c['data'].get('teamId')==team
-                             and JpdDidData._contract_covers_match_date(c['data'],match['date'])]
-                latest = max((re.sub(r'\D','',c.get('from') or '') for c in contracts),default=None)
-                contracts = [c for c in contracts if re.sub(r'\D','',c.get('from') or '')==latest]
-                if len(contracts)!=1:
-                    errors.append(f'{fixture["id"]}/{team}: expected one match-date coach contract')
+    if mode != 'aggregates':
+        identities = {}
+        for pid,profile in evidence['player_profiles'].items():
+            try:
+                mapped = registered_player_projection(evidence,pid,season,context)
+                registrations = registered_player_projections(evidence, pid, season, context)
+                if mapped is None and not registrations: continue
+                identity = player_identity(pid, profile)
+                if identity in identities and identities[identity]!=pid: raise ValueError(f'Player identity collision: {pid}/{identities[identity]}')
+                identities[identity]=pid
+                for registration in registrations:
+                    emit('Player', registration)
+                if mapped is None:
                     continue
-                coach_rows.append({**contracts[0],'plSeason':season,'round':match['round']})
-    else:
-        for row in evidence.get('coach_rounds',[]):
-            coach=row['data']
-            candidates=[r['data'] for r in evidence.get('coach_contracts',[]) if str(r['data'].get('coachId'))==str(coach.get('coachId'))
-                        and r['data'].get('teamId')==coach.get('teamId') and r['data'].get('from')==coach.get('from')]
-            coach_rows.append({**coach,**candidates[0]} if len(candidates)==1 else coach)
-    represented = {(r.get('teamId'),str(r.get('coachId'))) for r in coach_rows}
-    teams = {r['data'][k] for r in context for k in ('homeTeamId','awayTeamId')}
-    season_end = max(re.sub(r'\D','',r['data']['date']) for r in context)
-    for row in evidence.get('coach_contracts',[]):
-        coach = row['data']
-        if (coach.get('teamId') in teams and not coach.get('to')
-                and re.sub(r'\D','',coach.get('from') or '') <= season_end
-                and (coach.get('teamId'),str(coach.get('coachId'))) not in represented):
-            errors.append(f'{coach.get("teamId")}/{coach.get("coachId")}: active coach needs a fixture or coachRounds round mapping')
-    for coach in coach_rows:
+                # Explicitly cleared source fields must clear the old owned value.
+                for dest,src in PLAYER_FIELDS.items():
+                    if src in profile and profile[src] is None: mapped[dest]=None
+                link = registration_link(evidence,pid,season,context)
+                if 'to' in link and link['to'] is None: mapped['pt_end']='9999.99.99'
+                for src,dest in (('no','pt_num'),('pos','pt_pos')):
+                    if src in link and link[src] is None: mapped[dest]=None
+                emit('playerDB',player_db_projection(evidence,mapped,season))
+            except (KeyError,TypeError,ValueError) as exc: errors.append(str(exc))
+        coach_rows = []
+        if fixtures:
+            for fixture in fixtures:
+                match=fixture['data']
+                for team in (match['homeTeamId'],match['awayTeamId']):
+                    contracts = [c['data'] for c in evidence.get('coach_contracts',[]) if c['data'].get('teamId')==team
+                                 and JpdDidData._contract_covers_match_date(c['data'],match['date'])]
+                    latest_contract_start = max((re.sub(r'\D','',c.get('from') or '') for c in contracts),default=None)
+                    contracts = [c for c in contracts if re.sub(r'\D','',c.get('from') or '')==latest_contract_start]
+                    if len(contracts)!=1:
+                        errors.append(f'{fixture["id"]}/{team}: expected one match-date coach contract')
+                        continue
+                    coach_rows.append({**contracts[0],'plSeason':season,'round':match['round']})
+        else:
+            for row in evidence.get('coach_rounds',[]):
+                coach=row['data']
+                candidates=[r['data'] for r in evidence.get('coach_contracts',[]) if str(r['data'].get('coachId'))==str(coach.get('coachId'))
+                            and r['data'].get('teamId')==coach.get('teamId') and r['data'].get('from')==coach.get('from')]
+                coach_rows.append({**coach,**candidates[0]} if len(candidates)==1 else coach)
+        represented = {(r.get('teamId'),str(r.get('coachId'))) for r in coach_rows}
+        teams = {r['data'][k] for r in context for k in ('homeTeamId','awayTeamId')}
+        season_end = max(re.sub(r'\D','',r['data']['date']) for r in context)
+        for row in evidence.get('coach_contracts',[]):
+            coach = row['data']
+            if (coach.get('teamId') in teams and not coach.get('to')
+                    and re.sub(r'\D','',coach.get('from') or '') <= season_end
+                    and (coach.get('teamId'),str(coach.get('coachId'))) not in represented):
+                errors.append(f'{coach.get("teamId")}/{coach.get("coachId")}: active coach needs a fixture or coachRounds round mapping')
+        for coach in coach_rows:
+            try:
+                profile=evidence.get('coaches',{}).get(str(coach.get('coachId')),{})
+                coach={**coach,**{k:v for k,v in {'coachName':profile.get('nameKr') or profile.get('name'),
+                        'coachNameEn':profile.get('nameEn'),'legacyCoachId':profile.get('legacyCoachId')}.items() if v is not None}}
+                team=coach['teamId'];code=resolve_team_code(evidence['ai_samples']['code'],season,team)
+                profile=evidence['teams'].get(team,{})
+                emit('Manager',manager_projection(coach,code,team_delivery_name(evidence['ai_samples']['code'],season,team,profile)))
+            except (KeyError,TypeError,ValueError) as exc: errors.append(str(exc))
+    validation, aggregate_errors, aggregate_docs = None, [], []
+    if mode != 'masters':
         try:
-            profile=evidence.get('coaches',{}).get(str(coach.get('coachId')),{})
-            coach={**coach,**{k:v for k,v in {'coachName':profile.get('nameKr') or profile.get('name'),
-                    'coachNameEn':profile.get('nameEn'),'legacyCoachId':profile.get('legacyCoachId')}.items() if v is not None}}
-            team=coach['teamId'];code=resolve_team_code(evidence['ai_samples']['code'],season,team)
-            profile=evidence['teams'].get(team,{})
-            emit('Manager',manager_projection(coach,code,team_delivery_name(evidence['ai_samples']['code'],season,team,profile)))
-        except (KeyError,TypeError,ValueError) as exc: errors.append(str(exc))
-    try:
-        aggregate_items = reviewed_aggregate_items(evidence, aggregate_items)
-    except (KeyError, TypeError, ValueError) as exc:
-        errors.append(str(exc))
-        aggregate_items = []
-    final = [i for i in aggregate_items if i['recording'].get('status')=='final']
-    known = {(r['data'].get('gm_round'),r['data'].get('t_code')) for r in target.get('dMST',[])}
-    supplied = {(i['match']['round'],i['recording'].get('teamId')) for i in final}
-    validation = None
-    aggregate_errors = list(setup.get('errors',[]))
-    aggregate_docs = []
-    if known-supplied:
-        aggregate_errors.append('Season aggregate coverage incomplete: DID lacks existing destination team/match rows')
-    elif final and not aggregate_errors:
-        try:
-            aggregate=build_aggregates(aggregate_items,evidence['ai_samples']['code'],slots)
-            bind_existing_documents(aggregate,target)
-            validation=validate_aggregate_links(aggregate,aggregate_items,evidence['ai_samples']['code'],slots)
-            aggregate_errors.extend(aggregate['errors'])
-            if not aggregate['complete'] or not validation['passed']:
-                aggregate_errors.append('Season aggregate source/rating validation failed')
-            generated = {(doc['collection'],aggregate_key(doc['collection'],doc['data'])) for doc in aggregate['documents']}
-            if any((col,aggregate_key(col,row['data'])) not in generated for col in AGGREGATES for row in target.get(col,[])):
-                aggregate_errors.append('Season aggregate coverage incomplete: existing destination aggregate rows are missing from DID')
-            if not aggregate_errors:
-                aggregate_docs=aggregate['documents']
-                for doc in aggregate_docs: doc['data'].setdefault('uid',doc['document_id'])
-                documents.extend(aggregate_docs)
-        except (BackendError,KeyError,TypeError,ValueError) as exc:
-            aggregate_errors.append(exc.message if isinstance(exc,BackendError) else f'Aggregate validation failed ({type(exc).__name__})')
-    report=finish_delivery(documents,errors,[],target,mode)
+            aggregate_items = reviewed_aggregate_items(evidence, aggregate_items)
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(str(exc))
+            aggregate_items = []
+        final = [i for i in aggregate_items if i['recording'].get('status')=='final']
+        known = {(r['data'].get('gm_round'),r['data'].get('t_code')) for r in target.get('dMST',[])}
+        supplied = {(i['match']['round'],i['recording'].get('teamId')) for i in final}
+        validation = None
+        aggregate_errors = list(setup.get('errors',[]))
+        aggregate_docs = []
+        if known-supplied:
+            aggregate_errors.append('Season aggregate coverage incomplete: DID lacks existing destination team/match rows')
+        elif final and not aggregate_errors:
+            try:
+                aggregate=build_aggregates(aggregate_items,evidence['ai_samples']['code'],slots)
+                bind_existing_documents(aggregate,target)
+                validation=validate_aggregate_links(aggregate,aggregate_items,evidence['ai_samples']['code'],slots)
+                aggregate_errors.extend(aggregate['errors'])
+                if not aggregate['complete'] or not validation['passed']:
+                    aggregate_errors.append('Season aggregate source/rating validation failed')
+                generated = {(doc['collection'],aggregate_key(doc['collection'],doc['data'])) for doc in aggregate['documents']}
+                if any((col,aggregate_key(col,row['data'])) not in generated for col in AGGREGATES for row in target.get(col,[])):
+                    aggregate_errors.append('Season aggregate coverage incomplete: existing destination aggregate rows are missing from DID')
+                if not aggregate_errors:
+                    aggregate_docs=aggregate['documents']
+                    for doc in aggregate_docs: doc['data'].setdefault('uid',doc['document_id'])
+                    documents.extend(aggregate_docs)
+            except (BackendError,KeyError,TypeError,ValueError) as exc:
+                aggregate_errors.append(exc.message if isinstance(exc,BackendError) else f'Aggregate validation failed ({type(exc).__name__})')
+    if mode == 'aggregates':
+        errors.extend(aggregate_errors)
+        if not aggregate_docs and not aggregate_errors:
+            errors.append('No final DID recordings available for aggregates')
+    report=finish_delivery(documents,errors,[],target,mode,latest=latest)
     report.update(aggregate_validation=validation,new_season=setup['new_season'],slot_definitions=slots,
-                  aggregate_status='blocked' if aggregate_errors else ('ready' if aggregate_docs else 'empty'),
+                  aggregate_status=None if mode == 'masters' else ('blocked' if aggregate_errors else ('ready' if aggregate_docs else 'empty')),
                   warnings=aggregate_errors,blocked_groups=['aggregates'] if aggregate_errors else [])
     return report
 
 
-VALIDATION_POLICY = 'reviewed-raw-cross-season-team-references-v21'
+VALIDATION_POLICY = 'unified-all-matches-masters-aggregates-v23'
 
 
 def dump(value):
@@ -2691,6 +2811,15 @@ def merge_guards(previous, current):
         if previous.get(key) != current.get(key):
             fail('Season references changed between preview chunks', 'aifootballx_source_changed')
     merged.update(documents=documents, queries=list(queries.values()))
+    if previous.get('delivery_groups') or current.get('delivery_groups'):
+        groups = previous.get('delivery_groups', []) + current.get('delivery_groups', [])
+        additions = {}
+        for group in groups:
+            for ident, data in group.get('new_code', {}).items():
+                if ident in additions and additions[ident] != data:
+                    fail('Season code candidates changed between delivery groups', 'aifootballx_source_changed')
+                additions[ident] = data
+        merged['delivery_groups'] = [{**group, 'new_code': additions} for group in groups]
     return merged
 
 
@@ -3102,6 +3231,12 @@ class DeliveryService:
                     source.set_progress_callback(lambda value, chunk=number:
                         self.store.record_progress(ident, 80 * (chunk - 1 + value / 100) / len(scopes)))
                 report, guards = source.capture(scope, slot_path)
+                if job['scope'].get('unified'):
+                    # Verify the shared source once, plus each group's destination references.
+                    guards = {'documents': guards['documents'], 'queries': guards['queries'],
+                              'delivery_groups': [{k: v for k, v in guards.items() if k not in ('documents', 'queries')}]}
+                    if scope['mode'] != 'matches':
+                        report['summary']['matches'] = 0
                 self.ensure_running()
                 self.store.save_preview(ident, report, guards, complete=False)
                 self.store.record_progress(ident, 80 * number / len(scopes),

@@ -150,7 +150,7 @@ def build_match_rating(
     return _status_response(job)
 
 
-@router.post("/match-ratings/read", response_model=MatchRatingReadResponse, summary="Read team and player rating")
+@router.post("/match-ratings/read", response_model=MatchRatingReadResponse, summary="Read team and player rating", include_in_schema=False)
 def read_match_rating(
     gm_id: str = Form(...),
     side: Side = Form(...),

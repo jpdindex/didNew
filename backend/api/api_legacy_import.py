@@ -416,7 +416,7 @@ def read_legacy_verify_status(_: RequiredUser = None) -> LegacyVerifyStatusRespo
     return _verify_response(job)
 
 
-@router.get("/legacy-import/metadata-status", response_model=LegacyMetadataRepairStatusResponse, summary="Read legacy metadata repair status")
+@router.get("/legacy-import/metadata-status", response_model=LegacyMetadataRepairStatusResponse, summary="Read legacy metadata repair status", include_in_schema=False)
 def read_legacy_metadata_repair_status(_: RequiredUser = None) -> LegacyMetadataRepairStatusResponse:
     return _metadata_repair_response(pipeline_jobs.get("legacy-metadata-repair"))
 
@@ -490,7 +490,7 @@ async def verify_legacy_sql(
     return _verify_response(job)
 
 
-@router.post("/legacy-import/metadata-repair", response_model=LegacyMetadataRepairStatusResponse, status_code=202, summary="Start legacy league, team, and contract metadata repair")
+@router.post("/legacy-import/metadata-repair", response_model=LegacyMetadataRepairStatusResponse, status_code=202, summary="Start legacy league, team, and contract metadata repair", include_in_schema=False)
 def repair_legacy_metadata(_: RequiredUser = None) -> LegacyMetadataRepairStatusResponse:
     job = pipeline_jobs.start("legacy-metadata-repair", {}, _run_metadata_repair)
     if job is None:

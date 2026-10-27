@@ -422,3 +422,42 @@ FPX 검증과 dMST의 GOAL 점수 성분은 자책골을 포함한 GOAL 전체�
 `/send/status`의 percent는 전송 요청 전체를 기준으로 계산한다. 조회·후보 생성·검증은 0~50%, 실제 쓰기 전 원본 재확인 및 문서 전송은 50~99%, 정상 완료는 100%로 표시한다. 단독 preview 요청은 검증 완료 시 100%/ready다. 실패·부분 실패는 100%로 올리지 않는다.
 
 선수 계약 조회, 경기 RAW 조회, 이관 H3/H4 검사, 원본 변경 재확인 등 실제 처리 단위에 따라 진행 상황을 기록한다. 단계 가중치 기반이며 경과 시간 또는 남은 시간 비율은 아니다. 진행률은 로컬 작업 저장소에 보존하여 단계 전환 및 같은 요청의 재검증에서 감소하지 않게 한다. 처리 중 스냅샷과 원본 보호 규칙은 유지한다. 전체 로컬 테스트 376개 통과. 실제 전송·Firestore 쓰기·백엔드 재시작은 수행하지 않았다.
+
+
+## Swagger 전송 역할 분리 - 2026-10-27
+
+공개 API는 GET `/aifootballx/send/status`와 개별 3개·통합 ALL의 총 4개 POST로 구성한다. `/preview`, `/send/latest` 공개 경로는 제거했으며 `/send/all`은 경기 상세까지 포함하는 통합 요청으로 교체했다. 전송 전 원본 캡처·후보 생성·검증은 비동기 작업 내부에서 유지한다.
+
+| POST | 컬렉션 |
+|---|---|
+| `/send/matches` | dMST, TACTIC, vibePlayer, playerGoal, multiSheet_BAP, multiSheet_DAP, multiSheet_DTP, multiSheet_SHOT, multiSheet_GOAL, multiSheet_GOAL-시간, multiSheet_JMX, multiSheet_ALL |
+| `/send/masters` | Player, playerDB, Manager, code |
+| `/send/aggregates` | pMST, mMST, cAVG, rAVG, rank, sAVG |
+| `/send/all` | 위 세 그룹 전체 22개 컬렉션 |
+
+세 POST는 season만 필수이며 latest(boolean, 기본 false)를 선택할 수 있다. latest=true는 최근 라운드 선택이 아니라 신규·변경 문서만 전송하는 옵션이다. matches와 aggregates는 round_from, round_to, gm_id를 선택 입력으로 받는다. masters는 시즌 전체 식별·소속·계약·감독·코드만 처리하며 경기 RAW·Rating을 조회하지 않는다. aggregates는 선수·감독 계약을 조회하거나 생성하지 않는다.
+
+세 POST는 같은 비동기 작업 흐름과 공통 status를 사용한다. status는 최근 요청을 표시하며 0~100% 전체 진행률을 유지한다. Swagger 각 POST 설명에는 대상 컬렉션 이름만 표시한다. 이전 작업 이력 조회를 위해 내부의 구 all/latest 범위 해석은 남겨 두되 공개 전송 경로로 제공하지 않는다.
+
+집계 라운드 필터는 해당 경기의 pMST/mMST를 선택하며, 라운드 집계는 계산에 필요한 이전 라운드 원본을 함께 참조한다. 과거 라운드 변경 시 이미 발행된 이후 라운드 누적 집계와 sAVG도 갱신한다. 새 시즌에서 1라운드만 지정하고 이후 집계가 없다면 이후 라운드 집계를 새로 생성하지 않는다. 집계 자체의 검증 실패는 해당 aggregates 전송을 차단하며 masters 결과와 섞지 않는다.
+
+전체 로컬 테스트 389개 통과. 저장된 23-24 캡처를 재사용한 대조에서 기존 후보 8,600개가 masters 7,345개·aggregates 1,255개로 분리되며 문서 ID와 payload는 전부 동일하다. 새 파일 추가, 실제 Firestore 쓰기·전송·평점 호출·백엔드 재시작·커밋·push는 수행하지 않았다.
+
+
+## 통합 ALL - 2026-10-27
+
+`POST /send/all`은 masters, 선택 경기 상세(matches), aggregates를 하나의 비동기 요청으로 실행한다. season만 필수이며 latest·round_from·round_to·gm_id는 선택이다. 경기·라운드 필터는 matches와 aggregates에 적용하고 masters는 지정 시즌 전체를 유지한다. 공통 GET `/send/status`에서 mode=all인 하나의 진행률·검증·전송 결과를 확인한다.
+
+각 그룹의 후보를 내부에서 생성하고 전체 검증을 마친 후에만 실제 전송을 시작한다. 어느 그룹이든 검증이 실패하면 해당 ALL 요청의 쓰기를 시작하지 않는다. 공통 원본 버전·쿼리 멤버십은 합쳐 검사하며, 그룹별 코드·슬롯·계약 참조 보호는 각각 유지한다. ALL 후보에 포함된 신규 시즌 코드만 정상적인 추가로 허용한다. latest=true는 세 그룹 모두에 적용하며, 경기 수는 matches에서만 집계하여 집계 그룹과 중복 계산하지 않는다.
+
+구 all(마스터+집계) 작업 이력과 새 통합 ALL은 내부 scope의 unified 값으로 구분한다. 새 HTTP ALL은 항상 unified=true이며, 이전 작업 이력을 새 통합 전송으로 오인해 재사용하지 않는다. 전체 로컬 테스트 396개 통과. 실제 Firestore 쓰기·전송·평점 호출·재시작·커밋·push는 수행하지 않았다.
+
+
+## 유지보수 API 표시 정리 - 2026-10-27
+
+`/match-ratings/read`, `/legacy-import/metadata-repair`, `/legacy-import/metadata-status`는 Swagger/OpenAPI에서만 숨긴다(`include_in_schema=False`). 내부 함수·실제 경로·인증 및 기존 동작은 유지한다. KPI·Rating 생성, 이관·검증·backfill 및 전송 경로는 변경하지 않는다. 관련 기존 테스트 4개 통과. 실제 데이터 쓰기나 유지보수 실행은 수행하지 않았다.
+
+
+## latest 옵션 변수 충돌 수정 - 2026-10-27
+
+감독 계약 선택에 사용하던 지역 변수 latest를 latest_contract_start로 변경하여 전송의 latest boolean을 덮어쓰지 않도록 수정했다. 감독 계약이 있는 경우에도 latest=false는 전체 후보, latest=true는 신규·변경 후보를 선택한다. 해당 회귀 테스트를 추가했으며 전체 로컬 테스트 398개 통과. 실제 Firestore 쓰기·전송·재시작·커밋·push는 수행하지 않았다.

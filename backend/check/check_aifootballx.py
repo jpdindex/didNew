@@ -610,7 +610,8 @@ def test_old_validation_policy_cannot_publish_cached_preview(service):
 
 
 def test_swagger_routes_validate_scope_and_require_operator(service, monkeypatch):
-    svc, _, _, _ = service
+    svc, _, writer, _ = service
+    writer.fail_two = False
     monkeypatch.setattr(api_aifootballx, 'delivery_service', lambda: svc)
     app = FastAPI()
     app.include_router(api_aifootballx.router, prefix='/api/v1')
@@ -620,19 +621,19 @@ def test_swagger_routes_validate_scope_and_require_operator(service, monkeypatch
         return JSONResponse({'error': exc.code}, status_code=exc.status_code)
     app.dependency_overrides[api_aifootballx.delivery_operator] = lambda: CurrentUser(uid='operator', claims={})
     client = TestClient(app)
-    assert client.post('/api/v1/aifootballx/preview', data={'season':'2024-2025','round_from':5,'round_to':1}).status_code == 422
-    assert client.post('/api/v1/aifootballx/preview', data={'season':'2024-2025','gm_id':'20252026x'}).status_code == 422
-    result = client.post('/api/v1/aifootballx/preview', data={'season':'2024-2025','round_from':1,'round_to':1})
+    assert client.post('/api/v1/aifootballx/send/matches', data={'season':'2024-2025','round_from':5,'round_to':1}).status_code == 422
+    assert client.post('/api/v1/aifootballx/send/matches', data={'season':'2024-2025','gm_id':'20252026x'}).status_code == 422
+    result = client.post('/api/v1/aifootballx/send/matches', data={'season':'2024-2025','round_from':1,'round_to':1})
     assert result.status_code == 202
     assert 'jobId' not in result.json()
     assert result.json()['scope']['seasonId'] == '20242025'
     response=client.get('/api/v1/aifootballx/send/status').json()
-    assert response['validationPassed'] and response['status']=='ready'
+    assert response['validationPassed'] and response['status']=='complete'
     paths=app.openapi()['paths']
-    assert list(paths)==['/api/v1/aifootballx/send/status','/api/v1/aifootballx/preview',
-                         '/api/v1/aifootballx/send/matches','/api/v1/aifootballx/send/all','/api/v1/aifootballx/send/latest']
+    assert list(paths)==['/api/v1/aifootballx/send/status', '/api/v1/aifootballx/send/matches',
+                         '/api/v1/aifootballx/send/masters', '/api/v1/aifootballx/send/aggregates', '/api/v1/aifootballx/send/all']
     assert not paths['/api/v1/aifootballx/send/status']['get'].get('parameters')
-    for path in ('matches','all','latest'):
+    for path in ('matches','masters','aggregates','all'):
         endpoint=paths['/api/v1/aifootballx/send/'+path]['post']
         assert 'application/x-www-form-urlencoded' in endpoint['requestBody']['content']
         assert not endpoint.get('parameters')
@@ -1550,16 +1551,22 @@ def test_all_posts_queue_work_before_source_or_writer_is_created(service,monkeyp
     app.include_router(api_aifootballx.router,prefix='/api/v1')
     app.dependency_overrides[api_aifootballx.delivery_operator]=lambda:CurrentUser(uid='operator',claims={})
     client=TestClient(app)
-    for path in ('preview','send/matches','send/all','send/latest'):
-        response=client.post('/api/v1/aifootballx/'+path,data={'season':'2023-2024'})
+    for path in ('send/matches','send/masters','send/aggregates','send/all'):
+        response=client.post('/api/v1/aifootballx/'+path,data={'season':'2023-2024','latest':'true'})
         assert response.status_code==202
         assert response.json()['status']=='queued'
+        assert response.json()['scope']['latest'] is True
     assert len(submitted)==4 and not calls
+    for removed in ('preview', 'send/latest'):
+        assert client.post('/api/v1/aifootballx/'+removed,data={'season':'2023-2024'}).status_code == 404
     schema=app.openapi()
-    for mode in ('all','latest'):
+    for mode in ('matches','masters','aggregates','all'):
         body=schema['paths']['/api/v1/aifootballx/send/'+mode]['post']['requestBody']['content']['application/x-www-form-urlencoded']['schema']
         form=schema['components']['schemas'][body['$ref'].split('/')[-1]]
-        assert set(form['properties'])=={'season'}
+        assert form['required']==['season']
+        assert form['properties']['latest']['type']=='boolean'
+        assert form['properties']['latest']['default'] is False
+        if mode=='masters': assert set(form['properties'])=={'season','latest'}
 
 
 def test_latest_no_changes_completes_without_writer(service):
@@ -1597,7 +1604,8 @@ def test_send_enabled_by_default():
 
 @pytest.mark.parametrize('bad_slot',[False,True])
 @pytest.mark.parametrize('with_fixtures',[False,True])
-def test_master_capture_reads_registration_without_match_children(monkeypatch,tmp_path,bad_slot,with_fixtures):
+@pytest.mark.parametrize('mode', ['latest', 'masters'])
+def test_master_capture_reads_registration_without_match_children(monkeypatch,tmp_path,bad_slot,with_fixtures,mode):
     evidence,_=master_fixture()
     source=object.__new__(delivery.SourceCapture)
     source.documents={};source.queries=[]
@@ -1632,7 +1640,9 @@ def test_master_capture_reads_registration_without_match_children(monkeypatch,tm
     source.set_progress_callback(capture_progress.append)
     slot_path=tmp_path/'bad-slots.json' if bad_slot else None
     if slot_path: slot_path.write_text('{',encoding='utf-8')
-    report,guards=source.capture({'seasonId':'20232024','mode':'latest'},slot_path)
+    if mode == 'masters':
+        source.did.get_all = lambda *args, **kwargs: pytest.fail('Masters must not read recording heads')
+    report,guards=source.capture({'seasonId':'20232024','mode':mode},slot_path)
     assert report['validation_passed'],report['errors']
     assert len(report['documents'])==(4 if with_fixtures else 2)
     assert capture_progress == sorted(capture_progress)
@@ -1641,7 +1651,9 @@ def test_master_capture_reads_registration_without_match_children(monkeypatch,tm
     assert guards['queries'][0]['group']=='contracts'
     assert 'coachContracts' in paths and 'coaches' not in paths
     assert ('coachRounds' in paths) is (not with_fixtures)
-    if bad_slot:
+    if mode == 'masters':
+        assert report['aggregate_status'] is None and not report['warnings']
+    elif bad_slot:
         assert report['aggregate_status']=='blocked' and report['warnings']
         assert 'slot_file' not in guards
 
@@ -1677,6 +1689,7 @@ def test_match_new_season_can_send_without_nonmatch_setup():
 
 def test_match_capture_does_not_require_season_code_or_slot_setup(monkeypatch,tmp_path):
     evidence,_=preview_fixture()
+    existing_targets = {}
     source=object.__new__(delivery.SourceCapture)
     source.did=object();source.target=SimpleNamespace(collection=lambda col:SimpleNamespace(
         limit=lambda n:SimpleNamespace(stream=lambda **kwargs:[])))
@@ -1696,6 +1709,8 @@ def test_match_capture_does_not_require_season_code_or_slot_setup(monkeypatch,tm
             if parent in recordings: return recordings[parent]['children'].get(child,[])
         if client is source.target and path=='code':
             return [{'id':str(n),**row} for n,row in enumerate(evidence['ai_samples']['code'])]
+        if client is source.target:
+            return existing_targets.get(path, [])
         return []
     source.rows=rows;source.get=lambda path:{};source.assert_fresh=lambda guards:None
     monkeypatch.setattr(delivery,'plan_new_season',lambda *a,**k:pytest.fail('Match delivery attempted season setup'))
@@ -1705,6 +1720,19 @@ def test_match_capture_does_not_require_season_code_or_slot_setup(monkeypatch,tm
                                 tmp_path/'missing-aggregate-slots.json')
     assert report['validation_passed'],report['errors']
     assert 'slot_file' not in guards and guards['new_code']=={}
+    for doc in report['documents']:
+        existing_targets.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': doc['data']})
+    scope = {'seasonId':'20232024','mode':'matches','roundFrom':1,'roundTo':1,'latest':True}
+    unchanged, _ = source.capture(scope, None)
+    assert unchanged['validation_passed'], unchanged['errors']
+    assert not unchanged['documents'] and unchanged['summary']['unchangedDocuments'] > 0
+    extra = deepcopy(existing_targets['TACTIC'][0])
+    extra['id'] = 'obsolete-event'
+    extra['data']['gr_half_seconds'] += 1
+    existing_targets['TACTIC'].append(extra)
+    rejected, _ = source.capture(scope, None)
+    assert not rejected['validation_passed']
+    assert any('unmatched target documents' in e for e in rejected['errors'])
 
 
 def test_match_first_then_all_can_create_missing_season_code_and_slots():
@@ -2767,7 +2795,7 @@ def test_historical_team_index_guard_rejects_mapping_changes_before_send():
         source.assert_fresh(guards)
 
 
-@pytest.mark.parametrize('mode,chunks', [('matches', 1), ('matches', 3), ('all', 1), ('latest', 1)])
+@pytest.mark.parametrize('mode,chunks', [('matches', 1), ('matches', 3), ('masters', 1), ('aggregates', 1), ('all', 1), ('latest', 1)])
 def test_public_progress_covers_capture_validation_and_send_without_reset(service, mode, chunks):
     svc, source, writer, _ = service
     writer.fail_two = False
@@ -2838,6 +2866,188 @@ def test_progress_does_not_regress_when_send_must_revalidate(service):
     assert svc.public_status('operator')['percent'] == 55
     svc.store.set_job(operation, 'failed')
     assert svc.public_status('operator')['percent'] == 55
+
+
+def test_masters_never_generate_or_require_aggregate_ratings(monkeypatch):
+    evidence, setup = master_fixture()
+    items, _, _ = aggregate_fixture()
+    items[0]['recording']['teamRating'] = None
+    monkeypatch.setattr(delivery, 'build_aggregates', lambda *args, **kwargs: pytest.fail('Masters called aggregate builder'))
+    report = delivery.generate_masters(evidence, [], items, {}, setup, 'masters')
+    assert report['validation_passed'], report['errors']
+    assert {d['collection'] for d in report['documents']} == {'Player', 'playerDB'}
+    assert report['aggregate_status'] is None and not report['blocked_groups']
+
+
+def test_aggregates_ignore_unrelated_player_and_coach_errors_and_support_latest():
+    items, codes, slots = aggregate_fixture()
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    evidence = {'did_matches': fixtures, 'ai_samples': {'code': codes}, 'target_existing': {},
+                'player_profiles': {'bad-player': {'name': None}}, 'teams': {}, 'coach_contracts': []}
+    setup = {'documents': [{'collection': 'code', 'document_id': 'must-not-send', 'data': {}}], 'new_season': False}
+    report = delivery.generate_masters(evidence, fixtures, items, slots, setup, 'aggregates')
+    assert report['validation_passed'], report['errors']
+    assert {d['collection'] for d in report['documents']} == set(delivery.AGGREGATES)
+    for d in report['documents']:
+        evidence['target_existing'].setdefault(d['collection'], []).append({'id': d['document_id'], 'data': d['data']})
+    unchanged = delivery.generate_masters(evidence, fixtures, items, slots, setup, 'aggregates', latest=True)
+    assert unchanged['validation_passed'] and not unchanged['documents']
+
+
+@pytest.mark.parametrize('mode,collection', [('matches', 'TACTIC'), ('masters', 'Player'), ('aggregates', 'rAVG')])
+def test_latest_option_is_independent_of_the_three_delivery_groups(mode, collection):
+    data = {'PlSeason': '2023-2024', 'p_id': 1, 't_code': 'E-H', 'IDX_CODE': 'HX', 'Round': 1}
+    doc = {'collection': collection, 'document_id': 'existing', 'data': data}
+    existing = {collection: [{'id': 'existing', 'data': data}]}
+    full = delivery.finish_delivery([doc], [], [], existing, mode)
+    changed = delivery.finish_delivery([doc], [], [], existing, mode, latest=True)
+    assert full['validation_passed'] and len(full['documents']) == 1
+    assert changed['validation_passed'] and not changed['documents']
+    delivery.retain_changed_documents(full, existing)
+    assert not full['documents']
+
+
+@pytest.mark.parametrize('published_later', [False, True])
+def test_aggregate_capture_scopes_rounds_and_carries_existing_later_totals(tmp_path, published_later):
+    items, codes, slots = aggregate_fixture()
+    second = deepcopy(items)
+    for item in second:
+        item['match_id'] += '-r2'
+        item['match'].update(round=2, date='2024.08.19')
+        item['recording']['teamRating']['jmx'] += 10
+    all_items = items + second
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in all_items if i['side'] == 'H']
+    prior = delivery.build_aggregates(all_items, codes, slots)
+    assert prior['complete'], prior['errors']
+    existing = {}
+    if published_later:
+        for d in prior['documents']:
+            existing.setdefault(d['collection'], []).append({'id': d['document_id'], 'data': d['data']})
+    source = object.__new__(delivery.SourceCapture)
+    source.documents = {}; source.queries = []
+    heads = {f'matches/{i["match_id"]}/recordings/{i["side"]}': i['recording'] for i in all_items}
+    def get_all(refs, **kwargs):
+        return [SimpleNamespace(reference=ref, exists=True,
+                                update_time=SimpleNamespace(isoformat=lambda: 'v1'),
+                                to_dict=lambda path=ref.path: heads[path]) for ref in refs]
+    source.did = SimpleNamespace(document=lambda path: SimpleNamespace(path=path), get_all=get_all)
+    source.target = object()
+    def rows(client, path, filters=(), **kwargs):
+        assert path not in ('Player', 'playerDB', 'Manager', 'players', 'coachContracts', 'coaches')
+        if client is source.did:
+            assert path == 'matches'
+            return fixtures
+        if path == 'code':
+            return [{'id': str(n), **r} for n, r in enumerate(codes)]
+        return existing.get(path, [])
+    source.rows = rows
+    source.get_many = lambda paths: {p: {'nameKr': p.split('/')[-1]} for p in paths}
+    slot_path = tmp_path / 'slots.json'
+    slot_path.write_text(json.dumps(slots), encoding='utf-8')
+    scope = {'seasonId': '20242025', 'mode': 'aggregates', 'roundFrom': 1, 'roundTo': 1}
+    assert source.split_scopes(scope) == [scope]
+    report, guards = source.capture(scope, slot_path)
+    assert report['validation_passed'], report['errors']
+    assert {d['collection'] for d in report['documents']} == set(delivery.AGGREGATES)
+    assert {d['Round'] for d in docs(report, 'rAVG')} == ({1, 2} if published_later else {1})
+    assert {d['gm_round'] for d in docs(report, 'pMST')} == {1}
+    assert {d['Round'] for d in docs(report, 'mMST')} == {1}
+    assert len(source.documents) == (40 if published_later else 20)
+    assert 'registration_references' not in guards
+
+
+def test_unified_all_expands_to_all_three_scopes_with_shared_latest_and_filters():
+    source = object.__new__(delivery.SourceCapture)
+    source.did = object()
+    source.rows = lambda *args, **kwargs: [{'id': str(n), 'data': {'round': n}} for n in (1, 2, 3)]
+    scope = {'seasonId': '20232024', 'mode': 'all', 'unified': True, 'latest': True,
+             'roundFrom': 2, 'roundTo': 3, 'matchId': None}
+    assert delivery.delivery_mode(scope) == 'all'
+    scopes = source.split_scopes(scope)
+    assert [s['mode'] for s in scopes] == ['masters', 'matches', 'matches', 'aggregates']
+    assert scopes[0]['roundFrom'] is None and scopes[0]['roundTo'] is None
+    assert [s['roundFrom'] for s in scopes[1:3]] == [2, 3]
+    assert scopes[-1]['roundFrom'] == 2 and scopes[-1]['roundTo'] == 3
+    assert all(s['latest'] for s in scopes)
+
+
+@pytest.mark.parametrize('invalid_group', [None, 'masters', 'matches', 'aggregates', 'source-change'])
+def test_unified_all_validates_every_group_before_any_writes(service, invalid_group):
+    svc, source, writer, calls = service
+    writer.fail_two = False
+    scope = {'seasonId': '20232024', 'mode': 'all', 'unified': True, 'latest': False}
+    source.split_scopes = lambda _: [{**scope, 'mode': mode} for mode in ('masters', 'matches', 'aggregates')]
+    captured = []
+    def capture(group, slot):
+        assert not calls
+        mode = group['mode']
+        captured.append(mode)
+        passed = invalid_group != mode
+        report = {'documents': [document(mode)], 'validation_passed': passed,
+                  'summary': {'documents': 1, 'matches': 1, 'errors': int(not passed), 'failed_checks': 0},
+                  'errors': [] if passed else [mode+' invalid'], 'checks': []}
+        guard = {'documents': {'shared': 'v2' if invalid_group == 'source-change' and mode == 'aggregates' else 'v1'},
+                 'queries': [], 'reference_code': {}, 'code_scope': {'teams': [mode]}, 'new_code': {}}
+        return report, guard
+    source.capture = capture
+    svc.send_scope(scope, 'operator')
+    status = svc.public_status('operator')
+    assert status['mode'] == 'all'
+    assert captured == ['masters', 'matches', 'aggregates']
+    if invalid_group:
+        assert status['status'] in ('fail', 'error') and not calls
+    else:
+        assert status['status'] == 'complete' and status['percent'] == 100
+        assert status['counts'] == {'success': 3}
+        assert status['summary']['matches'] == 1
+        assert calls == ['masters', 'matches', 'aggregates']
+
+
+def test_unified_guards_allow_only_planned_code_additions_across_groups():
+    code = {'Code': 'E-H', 'PlSeason': '2023-2024', 'IDX_NAME': 'HX'}
+    first = {'documents': {}, 'queries': [], 'delivery_groups': [
+        {'reference_code': {}, 'code_scope': None, 'new_code': {'planned': code}}]}
+    second = {'documents': {}, 'queries': [], 'delivery_groups': [
+        {'reference_code': {}, 'code_scope': {'season': '2023-2024', 'teams': ['E-H']}, 'new_code': {}}]}
+    combined = delivery.merge_guards(first, second)
+    assert all(g['new_code'] == {'planned': code} for g in combined['delivery_groups'])
+    source = object.__new__(delivery.SourceCapture)
+    source.target = object()
+    source.rows = lambda *args, **kwargs: [{'id': 'planned', 'data': code}]
+    source.assert_fresh(combined)
+    source.rows = lambda *args, **kwargs: [{'id': 'unexpected', 'data': code}]
+    with pytest.raises(BackendError, match='Destination team code configuration changed'):
+        source.assert_fresh(combined)
+    conflicting = deepcopy(second)
+    conflicting['delivery_groups'][0]['new_code'] = {'planned': {**code, 'IDX_NAME': 'OTHER'}}
+    with pytest.raises(BackendError, match='Season code candidates changed'):
+        delivery.merge_guards(first, conflicting)
+
+
+@pytest.mark.parametrize('mode', ['masters', 'all'])
+def test_coach_contract_selection_does_not_override_latest_option(mode):
+    evidence, setup = master_fixture()
+    fixtures = evidence['did_matches'][:1]
+    evidence['coach_contracts'] = [{'data': {
+        'teamId': team, 'coachId': str(number), 'coachName': 'Coach '+team,
+        'coachNameEn': 'Coach '+team, 'from': '2023-07-01', 'to': None, 'status': 'MANAGER'}}
+        for number, team in enumerate(('E-H', 'E-A'), 1)]
+    first = delivery.generate_masters(evidence, fixtures, [], {}, setup, mode, latest=False)
+    assert first['validation_passed'], first['errors']
+    assert len(docs(first, 'Manager')) == 2
+    for doc in first['documents']:
+        evidence['target_existing'].setdefault(doc['collection'], []).append({
+            'id': doc['document_id'], 'data': doc['data']})
+    full = delivery.generate_masters(evidence, fixtures, [], {}, setup, mode, latest=False)
+    changed = delivery.generate_masters(evidence, fixtures, [], {}, setup, mode, latest=True)
+    assert full['validation_passed'] and changed['validation_passed']
+    assert len(full['documents']) == len(first['documents'])
+    assert full['summary']['unchangedDocuments'] == len(first['documents'])
+    assert not changed['documents']
+    evidence['player_profiles']['0000000001']['name'] = 'Changed'
+    updated = delivery.generate_masters(evidence, fixtures, [], {}, setup, mode, latest=True)
+    assert updated['validation_passed'], updated['errors']
+    assert {d['collection'] for d in updated['documents']} == {'Player', 'playerDB'}
 
 
 if __name__ == '__main__':

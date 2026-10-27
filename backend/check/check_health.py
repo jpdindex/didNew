@@ -38,22 +38,25 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
         "/api/v1/match-kpis/status",
         "/api/v1/match-ratings/build",
         "/api/v1/match-ratings/status",
-        "/api/v1/match-ratings/read",
         "/api/v1/legacy-import",
         "/api/v1/legacy-import/status",
         "/api/v1/legacy-import/verify",
         "/api/v1/legacy-import/verify-status",
-        "/api/v1/legacy-import/metadata-repair",
-        "/api/v1/legacy-import/metadata-status",
         "/api/v1/legacy-import/snapshot-status/{season}",
         "/api/v1/legacy-import/snapshot-backfill",
         "/api/v1/aifootballx/send/status",
-        "/api/v1/aifootballx/preview",
         "/api/v1/aifootballx/send/matches",
+        "/api/v1/aifootballx/send/masters",
+        "/api/v1/aifootballx/send/aggregates",
         "/api/v1/aifootballx/send/all",
-        "/api/v1/aifootballx/send/latest",
     }
     assert not any(path.startswith("/api/v1/match-input/") for path in schema["paths"])
+    from backend.api import api_match_ratings, api_legacy_import
+    maintenance_routes = [*api_match_ratings.router.routes, *api_legacy_import.router.routes]
+    for hidden in ("/api/v1/match-ratings/read", "/api/v1/legacy-import/metadata-repair", "/api/v1/legacy-import/metadata-status"):
+        route = next(route for route in maintenance_routes if getattr(route, 'path', None) == hidden.removeprefix('/api/v1'))
+        assert not route.include_in_schema
+        assert hidden not in schema["paths"]
     assert schema["components"]["securitySchemes"]["SwaggerKey"]["name"] == "X-Swagger-Key"
     assert schema["paths"]["/api/v1/match-kpis/build"]["post"]["security"] == [{"SwaggerKey": []}]
     assert schema["paths"]["/api/v1/match-ratings/build"]["post"]["security"] == [{"SwaggerKey": []}]
