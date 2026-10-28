@@ -2804,7 +2804,9 @@ def merge_guards(previous, current):
     queries = {fingerprint([g.get('path'),g.get('group'),g.get('filters',[])]): g for g in previous['queries']}
     for guard in current['queries']:
         key = fingerprint([guard.get('path'),guard.get('group'),guard.get('filters',[])])
-        if key in queries and queries[key] != guard:
+        # Persisted JSON turns filter tuples into lists; compare their canonical
+        # representation while still checking every version and query option.
+        if key in queries and dump(queries[key]) != dump(guard):
             fail('DID source collection changed between preview chunks', 'aifootballx_source_changed')
         queries[key] = guard
     for key in ('reference_code', 'new_code', 'slot_file', 'code_scope'):

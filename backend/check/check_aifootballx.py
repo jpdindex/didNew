@@ -575,6 +575,35 @@ def test_preview_chunk_merge_rejects_source_version_change():
         merge_guards(first,{'documents':{'players/one':'v2'},'queries':[]})
 
 
+def test_preview_chunks_accept_unchanged_queries_after_json_storage(service):
+    svc, source, _, _ = service
+    source.split_scopes = lambda scope: [scope, scope]
+    original_capture = source.capture
+    def capture(scope, slot_path):
+        report, guards = original_capture(scope, slot_path)
+        guards['queries'] = [{'path': 'matches', 'filters': [('seasonId', '==', '20232024')],
+                              'bound': 2000, 'versions': {'match-one': 'v1'}}]
+        return report, guards
+    source.capture = capture
+    ident = svc.preview({'seasonId': '20232024'}, 'operator')
+    assert svc.status(ident, 'operator')['state'] == 'validated'
+
+
+@pytest.mark.parametrize('change', ['update', 'add', 'remove'])
+def test_preview_chunk_merge_still_rejects_query_changes_after_json_storage(change):
+    query = {'path': 'matches', 'filters': [('seasonId', '==', '20232024')],
+             'bound': 2000, 'versions': {'match-one': 'v1'}}
+    previous = json.loads(json.dumps({'documents': {}, 'queries': [query]}))
+    if change == 'update':
+        query['versions']['match-one'] = 'v2'
+    elif change == 'add':
+        query['versions']['match-two'] = 'v1'
+    else:
+        query['versions'].clear()
+    with pytest.raises(BackendError, match='source collection changed'):
+        delivery.merge_guards(previous, {'documents': {}, 'queries': [query]})
+
+
 def test_send_by_inputs_runs_async_validation_and_retries_only_failures(service):
     svc, source, writer, calls=service
     scope={'seasonId':'20242025','roundFrom':1,'roundTo':1,'matchId':None}

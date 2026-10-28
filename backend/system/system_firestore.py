@@ -250,7 +250,7 @@ def get_current_user(
     swagger_api_key: Annotated[str | None, Security(swagger_key_auth)] = None,
     settings: Settings = Depends(get_settings),
 ) -> CurrentUser:
-    if settings.app_env == "local" and settings.swagger_api_key and swagger_api_key:
+    if settings.swagger_api_key and swagger_api_key:
         if compare_digest(swagger_api_key, settings.swagger_api_key):
             return CurrentUser(uid="local-swagger", claims={"auth": "swagger_api_key"})
 
@@ -277,8 +277,8 @@ def get_current_user(
         if isinstance(uid, str) and uid:
             return CurrentUser(uid=uid, claims=dict(decoded))
 
-    if settings.app_env == "local" and settings.swagger_api_key:
-        raise AuthenticationError("Enter the local Swagger key or sign in through DID INPUT")
+    if settings.swagger_api_key:
+        raise AuthenticationError("Enter the Swagger key or sign in through DID INPUT")
     raise AuthenticationError("Authentication is not configured")
 
 
