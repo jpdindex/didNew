@@ -1,4 +1,14 @@
 <script setup lang="ts">
+import { onAuthStateChanged } from 'firebase/auth'
+import { canAccessManagement, isRestrictedManagementPath } from '~/utils/managementAccess'
+
+const { $auth } = useNuxtApp()
+const managementAllowed = ref(canAccessManagement($auth.currentUser?.email))
+const unsubscribe = onAuthStateChanged($auth, user => {
+  managementAllowed.value = canAccessManagement(user?.email)
+})
+onScopeDispose(unsubscribe)
+
 const inputMenus = [
   { label: '팀 관리', desc: '팀 정보와 엠블럼을 빠르게 등록·수정', to: '/manage/teams', ready: true },
   { label: '선수 관리', desc: '선수·등번호·포지션을 한 번에 등록·수정', to: '/manage/players', ready: true },
@@ -16,6 +26,8 @@ const dataMenus = [
   { label: 'Firestore 데이터 뷰어', desc: '컬렉션 조회 + 값 수정 (삭제는 없음)', to: '/manage/data-viewer', ready: true },
   { label: '입력 데이터 (경기 기록)', desc: '경기 → 팀 → 레코드/KPI/카드 순으로 클릭만으로 조회', to: '/manage/input-data', ready: true }
 ]
+const visibleOperationMenus = computed(() => operationMenus.filter(menu =>
+  managementAllowed.value || !isRestrictedManagementPath(menu.to)))
 </script>
 
 <template>
@@ -28,10 +40,10 @@ const dataMenus = [
         <NuxtLink class="backBtn" to="/schedule">← 경기 선택으로</NuxtLink>
       </div>
 
-      <div class="sectionTitle firstSection">
+      <div v-if="managementAllowed" class="sectionTitle firstSection">
         <span>경기 입력 준비</span>
       </div>
-      <div class="grid twoColumnGrid">
+      <div v-if="managementAllowed" class="grid twoColumnGrid">
         <template v-for="menu in inputMenus" :key="menu.label">
           <NuxtLink v-if="menu.ready" :to="menu.to" class="card">
             <div class="label">{{ menu.label }}</div>
@@ -50,7 +62,7 @@ const dataMenus = [
       </div>
       <div class="grid twoColumnGrid">
         <NuxtLink
-          v-for="menu in operationMenus.filter(menu => menu.ready)"
+          v-for="menu in visibleOperationMenus.filter(menu => menu.ready)"
           :key="menu.label"
           :to="menu.to"
           class="card"
@@ -60,7 +72,7 @@ const dataMenus = [
         </NuxtLink>
 
         <div
-          v-for="menu in operationMenus.filter(menu => !menu.ready)"
+          v-for="menu in visibleOperationMenus.filter(menu => !menu.ready)"
           :key="menu.label"
           class="card disabled"
         >
@@ -70,10 +82,10 @@ const dataMenus = [
         </div>
       </div>
 
-      <div class="sectionTitle">
+      <div v-if="managementAllowed" class="sectionTitle">
         <span>데이터 점검·이관</span>
       </div>
-      <div class="grid threeColumnGrid">
+      <div v-if="managementAllowed" class="grid threeColumnGrid">
         <NuxtLink
           v-for="menu in dataMenus.filter(menu => menu.ready)"
           :key="menu.label"

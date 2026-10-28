@@ -1901,14 +1901,12 @@ class SourceCapture:
         if slot_guard and (not Path(slot_guard['path']).is_file() or
                            sha256(Path(slot_guard['path']).read_bytes()).hexdigest() != slot_guard['sha256']):
             fail('Season slot configuration changed; create a new preview', 'aifootballx_source_changed')
-        for start in range(0, len(guards['documents']), 100):
-            paths = list(guards['documents'])[start:start + 100]
+        def check_documents(paths):
             for snap in self.did.get_all([self.did.document(p) for p in paths], timeout=60, retry=None):
                 if self.version(snap) != guards['documents'][snap.reference.path]:
                     fail('DID source changed; create a new preview', 'aifootballx_source_changed')
-            work_done += 1
-            self.report_progress(95 * work_done / work_total)
-        for guard in guards['queries']:
+
+        def check_query(guard):
             query = self.did.collection_group(guard['group']) if guard.get('group') else self.query(self.did, guard['path'], guard['filters'])
             if guard.get('group'):
                 from google.cloud.firestore_v1.base_query import FieldFilter
@@ -1919,8 +1917,25 @@ class SourceCapture:
             snaps = list(query.limit(guard['bound'] + 1).stream(timeout=60, retry=None))
             if self.guard_versions(snaps,guard) != guard['versions']:
                 fail('DID source collection changed; create a new preview', 'aifootballx_source_changed')
-            work_done += 1
-            self.report_progress(95 * work_done / work_total)
+
+        paths = list(guards['documents'])
+        checks = [(check_documents, paths[start:start + 100]) for start in range(0, len(paths), 100)]
+        checks.extend((check_query, guard) for guard in guards['queries'])
+        # Only independent reads run concurrently. Keep at most four in flight,
+        # wait for every check before proceeding, and report progress on the
+        # caller thread so callbacks and the job store are never shared workers.
+        if len(checks) > 1:
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix='did-freshness') as pool:
+                for start in range(0, len(checks), 4):
+                    futures = [pool.submit(check, value) for check, value in checks[start:start + 4]]
+                    for future in futures:
+                        future.result()
+                        work_done += 1
+                        self.report_progress(95 * work_done / work_total)
+        elif checks:
+            check, value = checks[0]
+            check(value)
+            self.report_progress(95)
         if 'reference_code' in guards:
             code = self.rows(self.target, 'code', bound=500)
             actual = code_reference(code,guards.get('code_scope'))

@@ -17,6 +17,8 @@ logs
 __pycache__
 *.py[cod]
 .pytest_cache/
+# Temporary fixtures and databases from local test runs
+/tmp/pytest-*/
 *.db
 *.sqlite3
 *.sqlite3-*

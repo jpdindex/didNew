@@ -3079,5 +3079,119 @@ def test_coach_contract_selection_does_not_override_latest_option(mode):
     assert {d['collection'] for d in updated['documents']} == {'Player', 'playerDB'}
 
 
+@pytest.fixture
+def freshness_reads():
+    from threading import Lock
+    source = object.__new__(delivery.SourceCapture)
+    state = SimpleNamespace(documents={}, queries={}, reads=[], hook=lambda: None)
+    lock = Lock()
+
+    def snapshot(path, version):
+        return SimpleNamespace(id=path.rsplit('/', 1)[-1], reference=SimpleNamespace(path=path),
+                               exists=version is not None,
+                               update_time=SimpleNamespace(isoformat=lambda: version))
+
+    def record(kind, paths):
+        with lock:
+            state.reads.append((kind, paths))
+        state.hook()
+
+    def get_all(refs, **kwargs):
+        assert kwargs == {'timeout': 60, 'retry': None}
+        record('documents', list(refs))
+        return [snapshot(path, state.documents[path]) for path in reversed(refs)]
+
+    class Query:
+        def __init__(self, path): self.path = path
+        def select(self, fields):
+            assert fields == []
+            return self
+        def limit(self, bound):
+            assert bound == 11
+            return self
+        def stream(self, **kwargs):
+            assert kwargs == {'timeout': 60, 'retry': None}
+            record('query', self.path)
+            return [snapshot(self.path+'/'+ident, version)
+                    for ident, version in state.queries[self.path].items()]
+
+    source.did = SimpleNamespace(document=lambda path: path, get_all=get_all)
+    source.query = lambda client, path, filters: Query(path)
+    source.split_scopes = lambda scope: [scope]
+    state.documents = {f'players/{n}': 'v1' for n in range(250)}
+    state.queries = {f'records{n}': {'one': 'v1'} for n in range(5)}
+    guards = {'documents': dict(state.documents), 'queries': [
+        {'path': path, 'filters': [], 'bound': 10, 'versions': dict(versions)}
+        for path, versions in state.queries.items()]}
+    return source, guards, state
+
+
+def test_freshness_reads_overlap_without_skipping_checks_or_threading_callbacks(freshness_reads):
+    from threading import Barrier, get_ident
+    source, guards, state = freshness_reads
+    barrier = Barrier(4)
+    state.hook = lambda: barrier.wait(timeout=5)
+    caller = get_ident()
+    progress = []
+    def report(value):
+        assert get_ident() == caller
+        progress.append(value)
+    source.set_progress_callback(report)
+    source.assert_fresh(guards)
+    assert len(state.reads) == 8
+    read_documents = [path for kind, paths in state.reads if kind == 'documents' for path in paths]
+    assert sorted(read_documents) == sorted(guards['documents'])
+    assert sorted(paths for kind, paths in state.reads if kind == 'query') == sorted(state.queries)
+    assert progress == sorted(progress) and progress[0] == 0 and progress[-1] == 100
+
+
+@pytest.mark.parametrize('change', ['document-version', 'document-deleted', 'query-version',
+                                   'query-added', 'query-deleted', 'read-error'])
+@pytest.mark.parametrize('phase', ['preview', 'send'])
+def test_parallel_freshness_failures_prevent_any_writes(service, freshness_reads, change, phase):
+    svc, _, _, calls = service
+    source, guards, state = freshness_reads
+    source.capture = lambda *args: ({'documents': [document()], 'validation_passed': True,
+        'summary': {'documents': 1}, 'checks': [], 'errors': []}, guards)
+    svc.source_factory = lambda: source
+    svc.writer_factory = lambda: pytest.fail('Failed verification must not construct a writer')
+    if phase == 'send':
+        preview = svc.preview({'seasonId': '20232024'}, 'operator')
+        assert svc.store.job(preview, 'operator')['state'] == 'validated'
+    if change == 'document-version': state.documents['players/249'] = 'v2'
+    if change == 'document-deleted': state.documents['players/249'] = None
+    if change == 'query-version': state.queries['records4']['one'] = 'v2'
+    if change == 'query-added': state.queries['records4']['new'] = 'v1'
+    if change == 'query-deleted': state.queries['records4'].clear()
+    if change == 'read-error':
+        def unavailable(): raise RuntimeError('simulated read failure')
+        state.hook = unavailable
+    if phase == 'preview':
+        job = svc.preview({'seasonId': '20232024'}, 'operator')
+    else:
+        job = svc.send(preview, 'operator', 'key')
+    result = svc.store.job(job, 'operator')
+    assert result['state'] == 'failed'
+    assert result['error'] == ('aifootballx_RuntimeError' if change == 'read-error'
+                               else 'aifootballx_source_changed')
+    assert not calls
+
+
+def test_parallel_freshness_finishes_all_checks_before_constructing_writer(service, freshness_reads):
+    svc, _, writer, calls = service
+    source, guards, state = freshness_reads
+    source.capture = lambda *args: ({'documents': [document()], 'validation_passed': True,
+        'summary': {'documents': 1}, 'checks': [], 'errors': []}, guards)
+    svc.source_factory = lambda: source
+    def make_writer():
+        assert len(state.reads) == 16  # Eight checks at preview, eight before writing.
+        return writer
+    svc.writer_factory = make_writer
+    svc.send_scope({'seasonId': '20232024', 'mode': 'matches'}, 'operator')
+    status = svc.public_status('operator')
+    assert status['status'] == 'complete' and status['counts'] == {'success': 1}
+    assert calls == ['one']
+
+
 if __name__ == '__main__':
     raise SystemExit(pytest.main([__file__]))
