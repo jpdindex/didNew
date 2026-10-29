@@ -1903,6 +1903,7 @@ function undoSub(index: number) {
           <div class="analystInfo analystRole" :class="{ assistant: game.participantRole !== 'primary' }">
             분석 역할: {{ roleLabel(game.participantRole) }}
           </div>
+          <NuxtLink class="playerRegistrationLink" :to="{ path: '/manage/player-requests', query: { matchId: matchId, team: game.team } }">선수 등록 요청하기</NuxtLink>
           <div v-if="roomStatus" class="sidebarRoomStatus">
             <LiveRoomStatus compact :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
           </div>
@@ -3351,6 +3352,21 @@ button {
   right: 0
 }
 
+.playerRegistrationLink {
+  display: block;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border: 1px solid #41516a;
+  border-radius: 5px;
+  color: #91dbea;
+  font-size: 13px;
+  text-align: center;
+  text-decoration: none;
+}
+.playerRegistrationLink:hover {
+  background: rgba(145, 219, 234, .08);
+  border-color: #91dbea;
+}
 .playerPanel {}
 
 .tabs {

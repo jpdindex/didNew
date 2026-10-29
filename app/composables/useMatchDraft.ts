@@ -376,8 +376,14 @@ export function useMatchDraft() {
 
   async function restoreFinalRaw(game: MatchState) {
     const side = inputSide(game)
-    if (!await liveRoom.submit(game.matchId, side, 'restore', {})) throw new Error('RAW 복원 확인을 기다리고 있습니다. 연결 복구 후 같은 명령으로 재시도합니다.')
-    const response = await request<{ payload: InputPayload; clientState: MatchState }>(
+    let restored: { payload: InputPayload; clientState: MatchState } | undefined
+    if (!await liveRoom.submit(game.matchId, side, 'restore', {}, {
+      throwOnFailure: true,
+      onConfirmed: response => { if (response.payload) restored = response },
+    })) throw new Error('RAW 복원 완료를 아직 확인하지 못했습니다. 요청은 보관되어 있으며, 수정 버튼을 다시 누르면 같은 요청으로 확인합니다.')
+    // The confirmed restore response already contains the complete Draft.
+    // A recovery that completed before this subscription still uses GET.
+    const response = restored || await request<{ payload: InputPayload; clientState: MatchState }>(
       `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${side}`,
     )
     hydrateFromPayload(game, response.payload, response.clientState)

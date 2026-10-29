@@ -16,6 +16,7 @@ const inputMenus = [
   { label: '감독 관리', desc: '감독 정보와 소속 팀을 빠르게 등록·수정', to: '/manage/coaches', ready: true }
 ]
 const operationMenus = [
+  { label: '선수 등록 요청하기', desc: '누락 선수 정보를 제출하고 관리자 승인 후 DB 등록', to: '/manage/player-requests', ready: true },
   { label: '분석관 운영 대시보드', desc: '경기·팀·주/부 역할·담당 DAP 기준으로 분석관 운영 현황 조회', to: '/manage/analyst-dashboard', ready: true },
   { label: '분석관 계정 관리', desc: '분석관 표시 이름·등급·관리자 권한 변경', to: '/manage/recorders', ready: true },
   { label: 'BASIC 기록 승인', desc: '승인 대기 Draft 검토 후 최종 RAW로 승격', to: '/manage/input-approvals', ready: true },

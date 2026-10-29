@@ -19,6 +19,26 @@ class MemoryDB:
     def transaction(self, **kwargs):
         return MemoryTransaction(self)
 
+    def batch(self):
+        return MemoryBatch(self)
+
+
+class MemoryBatch:
+    def __init__(self, db):
+        self.db, self.writes, self.deletes = db, [], []
+
+    def set(self, reference, values, merge=False):
+        self.writes.append((reference, values, merge))
+
+    def delete(self, reference):
+        self.deletes.append(reference.path)
+
+    def commit(self, **kwargs):
+        for path in self.deletes:
+            self.db.documents.pop(path, None)
+        for reference, values, merge in self.writes:
+            reference.set(values, merge=merge)
+
 
 class MemoryTransaction:
     def __init__(self, db):
@@ -439,6 +459,21 @@ def test_raw_restore_is_frozen_and_deduplicated(data):
     assert len(calls) == 1
     assert first['savedRevision'] == 2
     assert data.db.documents['inputDrafts/m_H']['liveRestoring'] is None
+
+
+def test_full_raw_restore_creates_editable_draft_with_all_records(data):
+    from backend.api.api_match_input import _draft_response
+    root = data.db.documents['inputDrafts/m_H']
+    root.update(liveClosed=True, payload=None)
+    raw = payload([record(f'r{i}') for i in range(955)])
+    raw['status'] = 'final'
+    data.read_input_state_from_raw = lambda *args: {'payload': raw, 'clientState': {'restoredFromRaw': True}}
+    request = FinalizeCommandRequest(commandId='restore-full', baseRevision=0, roomEpoch=0)
+    receipt = live.restore_command(data, 'm', 'H', request, 'p')
+    response = _draft_response(data.get_input_draft('m', 'H'))
+    assert len(response.payload.records) == 955
+    assert response.revision == receipt['savedRevision']
+    assert not data.db.documents['inputDrafts/m_H']['liveClosed']
 
 
 def test_basic_participant_cannot_claim_advanced_final_authority(data):

@@ -106,6 +106,131 @@ function environment(transport, indexedDB = fakeIndexedDB(), nativeBatch = false
 
 async function settle() { for (let i = 0; i < 40; i++) await Promise.resolve() }
 
+test('RAW restore accepts the root receipt when the response also contains lineup setup', async () => {
+  let confirmed
+  const env = environment(async (url, options = {}) => {
+    if (!options.method) return { status: 'missing', revision: 0, roomEpoch: 0 }
+    const body = JSON.parse(options.body)
+    return { status: 'ok', commandId: body.commandId, savedRevision: 2, revision: 2,
+      payload: { records: [] }, inputSetup: { formationKey: '4-3-3', lineup: [], revision: 1 } }
+  })
+  assert.equal(await env.room.submit('m', 'H', 'restore', {}, { throwOnFailure: true, onConfirmed: response => { confirmed = response } }), true)
+  assert.equal(confirmed.savedRevision, 2)
+  assert.equal(confirmed.inputSetup.formationKey, '4-3-3')
+  assert.equal(env.indexedDB.rows.size, 0)
+  assert.equal(env.timers.length, 0)
+})
+
+test('restoring RAW hydrates the confirmed response without fetching the complete Draft again', async () => {
+  const payload = { gmId: 'm', side: 'A', formationKey: '4-3-3', lineup: [], cards: [], inputMode: '분석', fieldSide: 'left',
+    homeScore: 1, awayScore: 2, status: 'final', halves: { H1: { seconds: 2700 }, H2: { seconds: 2700 } },
+    records: [{ id: 'raw-1', half: 'H2', halfSeconds: 12, seq: 1, act: 'P', res: 'O', area: 2 }] }
+  const { useMatchDraft } = load('composables/useMatchDraft.ts', {
+    useBackendApi: () => ({ request: async () => { throw new Error('Unexpected duplicate Draft GET') } }),
+    useNuxtApp: () => ({ $auth: { currentUser: { uid: 'p' } } }),
+    useLiveRoom: () => ({ submit: async (gmId, side, kind, body, options) => {
+      assert.equal(side, 'A')
+      options.onConfirmed({ payload, clientState: { restoredFromRaw: true } })
+      return true
+    } }),
+  }, { '~/utils/formationLayout': { assignmentsFromLineup: () => ({}), lineupOrderForSlot: () => 0 } })
+  const game = { matchId: 'm', team: 'away', participantRole: 'manager', lifecycleControl: true, recorderLevel: 'advanced' }
+  await useMatchDraft().restoreFinalRaw(game)
+  assert.equal(game.records.length, 1)
+  assert.equal(game.records[0].id, 'raw-1')
+  assert.equal(game.records[0].seconds, 12)
+})
+
+test('setup writes continue to accept their nested receipt', async () => {
+  const env = environment(async (url, options = {}) => {
+    if (!options.method) return { status: 'missing', revision: 0, roomEpoch: 0 }
+    const body = JSON.parse(options.body)
+    return { inputSetup: { commandId: body.commandId, savedRevision: 1 } }
+  })
+  assert.equal(await env.room.submit('m', 'H', 'setup', { syncScope: 'setup', payload: { lineup: [] } }), true)
+  assert.equal(env.indexedDB.rows.size, 0)
+})
+
+test('Edit retries the original RAW restoration after an uncertain response', async () => {
+  const sent = []
+  const env = environment(async (url, options = {}) => {
+    if (!options.method) return { status: 'missing', revision: 3, roomEpoch: 1 }
+    const body = JSON.parse(options.body)
+    sent.push(body)
+    if (sent.length === 1) throw new Error('response lost')
+    return { commandId: body.commandId, savedRevision: 4 }
+  })
+  assert.equal(await env.room.submit('m', 'H', 'restore', {}), false)
+  assert.equal(env.indexedDB.rows.size, 1)
+  assert.equal(await env.room.submit('m', 'H', 'restore', {}), true)
+  assert.equal(sent.length, 2)
+  assert.deepEqual(sent[1], sent[0])
+  assert.equal(env.indexedDB.rows.size, 0)
+})
+
+test('RAW restoration exposes permanent rejection and keeps one queued request', async () => {
+  let writes = 0
+  const env = environment(async (url, options = {}) => {
+    if (!options.method) return { status: 'missing', revision: 3, roomEpoch: 1 }
+    writes++
+    throw Object.assign(new Error('Only an authorized advanced analyst can restore RAW'), { status: 403, code: 'primary_required' })
+  })
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await assert.rejects(env.room.submit('m', 'H', 'restore', {}, { throwOnFailure: true }), /primary_required/)
+  }
+  assert.equal(writes, 1)
+  assert.equal(env.indexedDB.rows.size, 1)
+  assert.equal(env.timers.length, 0)
+})
+
+test('RAW restoration exposes server failure while retaining automatic retry', async () => {
+  const env = environment(async (url, options = {}) => {
+    if (!options.method) return { status: 'missing', revision: 0, roomEpoch: 0 }
+    throw Object.assign(new Error('RAW conversion failed'), { status: 500, code: 'raw_conversion_failed' })
+  })
+  await assert.rejects(env.room.submit('m', 'H', 'restore', {}, { throwOnFailure: true }), /raw_conversion_failed.*RAW conversion failed/)
+  assert.equal(env.indexedDB.rows.size, 1)
+  assert.equal(env.timers.length, 1)
+})
+
+test('RAW restore refreshes a rejected stale version without replacing the command ID', async () => {
+  const sent = []
+  const env = environment(async (url, options = {}) => {
+    if (!options.method) return { status: 'missing', revision: 5, roomEpoch: 2, closed: true }
+    const body = JSON.parse(options.body)
+    sent.push(body)
+    if (body.baseRevision !== 5 || body.roomEpoch !== 2) {
+      throw Object.assign(new Error('Reload the server state before restoring RAW'), { status: 409, code: 'draft_conflict' })
+    }
+    return { commandId: body.commandId, savedRevision: 7 }
+  })
+  await env.room.observe('m', 'H', 0, 0)
+  assert.equal(await env.room.submit('m', 'H', 'restore', {}, { throwOnFailure: true }), true)
+  assert.equal(sent.length, 2)
+  assert.equal(sent[0].commandId, sent[1].commandId)
+  assert.equal(sent[1].baseRevision, 5)
+  assert.equal(sent[1].roomEpoch, 2)
+  assert.equal(env.indexedDB.rows.size, 0)
+})
+
+test('previously blocked RAW restore is recovered instead of permanently blocking Edit', async () => {
+  const sent = []
+  const env = environment(async (url, options = {}) => {
+    if (!options.method) return { status: 'missing', revision: 5, roomEpoch: 2, closed: true }
+    const body = JSON.parse(options.body)
+    sent.push(body)
+    if (body.baseRevision !== 5) throw Object.assign(new Error('stale restore'), { status: 409, code: 'draft_conflict' })
+    return { commandId: body.commandId, savedRevision: 7 }
+  })
+  const storage = new env.storage.LiveCommandStore()
+  await storage.add({ commandId: 'old-restore', key: 'p:m:H', uid: 'p', gmId: 'm', side: 'H', kind: 'restore',
+    attempted: true, blocked: 'draft_conflict', request: { commandId: 'old-restore', baseRevision: 0, roomEpoch: 0 } })
+  assert.equal(await env.room.submit('m', 'H', 'restore', {}, { throwOnFailure: true }), true)
+  assert.equal(sent.length, 2)
+  assert.ok(sent.every(body => body.commandId === 'old-restore'))
+  assert.equal(env.indexedDB.rows.size, 0)
+})
+
 function inputPageEnvironment() {
   const vue = require('vue')
   const text = fs.readFileSync(path.resolve(__dirname, '../pages/DidInput.vue'), 'utf8')

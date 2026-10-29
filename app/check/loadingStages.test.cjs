@@ -29,7 +29,7 @@ test('saved setup paints without waiting for profile, then only the current half
     loadBootstrap: async () => ({}),
     applyBootstrap: () => { events.push('setup'); return true },
     isCurrentLobby: () => true,
-    bootstrapApplied: ref(false), nextTick: async () => {},
+    bootstrapApplied: ref(false), lobbyReady: ref(false), nextTick: async () => {},
     lobbyTeam: 'home', lobbyMatchId: 'm', initialKpisLoading: true,
     dashboardKpis: ref({ H: {}, A: {} }), dashboardKpiLoaded: {}, kpiHalf: ref('H2'),
     request: url => { events.push(url); return half.promise },

@@ -3,6 +3,9 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
+    function manager() {
+      return signedIn() && request.auth.token.email == 'jpdindex@gmail.com';
+    }
     function draft(draftId) { return get(/databases/$(database)/documents/inputDrafts/$(draftId)); }
     function participant(draftId) {
       return signedIn() && request.auth.uid in draft(draftId).data.participants;
@@ -30,8 +33,12 @@ service cloud.firestore {
     // promotes a finalized Draft into matches/.../recordings.
     match /matches/{matchId} { allow read, write: if signedIn(); }
     match /matches/{matchId}/inputSnapshots/{document=**} { allow read: if signedIn(); }
-    match /players/{document=**} { allow read, write: if signedIn(); }
-    match /teams/{document=**} { allow read, write: if signedIn(); }
+    match /players/{document=**} { allow read: if signedIn(); allow write: if manager(); }
+    match /teams/{document=**} { allow read: if signedIn(); allow write: if manager(); }
+    // Registration requests and revision markers are served by the authenticated
+    // API. Clients cannot bypass review by writing approval or roster data.
+    match /playerRegistrationRequests/{document=**} { allow read, write: if false; }
+    match /playerRegistrationRosterVersions/{document=**} { allow read, write: if false; }
     match /stadiums/{document=**} { allow read, write: if signedIn(); }
     match /coachContracts/{document=**} { allow read, write: if signedIn(); }
     match /coaches/{document=**} { allow read, write: if signedIn(); }

@@ -7,7 +7,8 @@ export function canAccessManagement(email?: string | null): boolean {
 export function isRestrictedManagementPath(path: string): boolean {
   const normalizedPath = path.toLowerCase().replace(/\/+$/, '')
   // New management pages are restricted by default; only the menu and the
-  // analyst dashboard remain available to every signed-in user.
+  // analyst dashboard and player requests remain available to signed-in users.
   return normalizedPath.startsWith('/manage/')
     && normalizedPath !== '/manage/analyst-dashboard'
+    && normalizedPath !== '/manage/player-requests'
 }

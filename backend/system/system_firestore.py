@@ -935,6 +935,14 @@ class JpdDidData:
     def _input_squads_reference(self, gm_id: str):
         return self.db.collection("matches").document(gm_id).collection("inputSnapshots").document("squads")
 
+    def _player_registration_roster_versions(self, match: MatchDoc) -> dict[str, int]:
+        """Small revision markers let normal re-entry see newly approved players."""
+        return {
+            team_id: (self.db.collection('playerRegistrationRosterVersions').document(team_id)
+                      .get(retry=None, timeout=10).to_dict() or {}).get('version', 0)
+            for team_id in {match.homeTeamId, match.awayTeamId}
+        }
+
     def _input_setup_reference(self, gm_id: str, side: Side):
         """Return the temporary, team-specific Draft document holding setup.
 
@@ -1369,12 +1377,14 @@ class JpdDidData:
         existing = reference.get(retry=None, timeout=10)
         document = existing.to_dict() or {}
         source = self._input_squad_source(match)
+        roster_versions = self._player_registration_roster_versions(match)
         home, away = document.get("H"), document.get("A")
         if (
             document.get("schemaVersion") == 3
             and document.get("source") == source
             and isinstance(home, list)
             and isinstance(away, list)
+            and document.get('registrationRosterVersions', {key: 0 for key in roster_versions}) == roster_versions
         ):
             return {"H": home, "A": away}, True, document
         seed_squads = {"H": home, "A": away} if (
@@ -1509,6 +1519,7 @@ class JpdDidData:
         write_batch: Any = None,
     ) -> dict[str, list[dict[str, str]]]:
         """Rebuild squad + imported-lineup snapshot after source data is corrected."""
+        roster_versions = self._player_registration_roster_versions(match)
         reference = self._input_squads_reference(gm_id)
         existing = reference.get(retry=None, timeout=10)
         existing_document = existing.to_dict() or {}
@@ -1536,6 +1547,7 @@ class JpdDidData:
         values = {
             "schemaVersion": 3,
             "source": self._input_squad_source(match),
+            "registrationRosterVersions": roster_versions,
             "H": squads["H"],
             "A": squads["A"],
             "legacyLineup": legacy_lineups,
@@ -2969,6 +2981,7 @@ class JpdDidData:
             client_state=raw_state["clientState"],
             user_id=user_id,
             allow_closed=True,
+            include_events=False,
         )
         # Final RAW already owns formation, field side and lineup. Seed the
         # temporary setup when the explicit edit action recreates its Draft.

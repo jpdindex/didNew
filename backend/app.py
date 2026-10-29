@@ -11,6 +11,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response
 
 from backend.api.api_health import router as health_router
+from backend.api.api_player_requests import router as player_requests_router
 from backend.api.api_aifootballx import router as aifootballx_router
 from backend.api.api_legacy_import import router as legacy_import_router
 from backend.api.api_match_kpis import router as match_kpis_router
@@ -75,7 +76,9 @@ async def request_validation_error_handler(request: Request, exc: RequestValidat
     # Live Draft writes used to surface only an HTTP 422 access-log line. Keep
     # the API response compact, but log the exact invalid field so a malformed
     # browser snapshot cannot silently stall both analysts' collaboration.
-    errors = exc.errors()
+    # Pydantic validators put ValueError instances in ctx, which cannot be
+    # serialized by JSONResponse. Retain field locations and messages only.
+    errors = [{key: value for key, value in error.items() if key != 'ctx'} for error in exc.errors()]
     logger.warning("Request validation failed: %s %s errors=%s", request.method, request.url.path, errors)
     return JSONResponse(
         status_code=422,
@@ -93,6 +96,7 @@ async def unhandled_error_handler(_: Request, exc: Exception) -> JSONResponse:
 
 
 app.include_router(health_router)
+app.include_router(player_requests_router, prefix=settings.api_prefix)
 app.include_router(aifootballx_router, prefix=settings.api_prefix)
 app.include_router(legacy_import_router, prefix=settings.api_prefix)
 app.include_router(match_kpis_router, prefix=settings.api_prefix)

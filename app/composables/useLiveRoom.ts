@@ -193,7 +193,9 @@ export function useLiveRoom() {
         },
         send: command => request<any>(`/api/v1/match-input/drafts/${encodeURIComponent(gmId)}/${side}${command.kind === 'setup' ? '/setup' : command.kind === 'finalize' ? '/finalize' : command.kind === 'restore' ? '/restore-raw' : ''}`, {
           expectedUid: uid, method: command.kind === 'finalize' || command.kind === 'restore' ? 'POST' : 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(command.request),
-          signal: AbortSignal.timeout(15_000),
+          // RAW restoration reads and writes the complete match in chunks;
+          // it cannot share the short timeout of a single live input event.
+          signal: AbortSignal.timeout(command.kind === 'restore' ? 120_000 : 15_000),
         }),
       }
       rooms.set(key, room)
@@ -208,7 +210,10 @@ export function useLiveRoom() {
     room.timer = undefined
     let activeCommand: LiveCommand | undefined
     const confirmCommand = async (command: LiveCommand, response: any) => {
-      const ack = response.inputSetup || response
+      // Only the setup endpoint nests its command receipt in inputSetup.
+      // Restore/Draft responses include display setup too, but their receipt
+      // is on the response root; treating the lineup as an ACK rejects success.
+      const ack = command.kind === 'setup' ? response.inputSetup || response : response
       if (ack?.commandId !== command.commandId || typeof ack.savedRevision !== 'number') throw new Error('서버 저장 확인이 누락되었습니다.')
       if (typeof response.serverTimeMs === 'number') room.clockOffset = response.serverTimeMs - Date.now()
       for (const target of commandTargets(command)) {
@@ -238,7 +243,7 @@ export function useLiveRoom() {
     try {
       let commands = await store.list(key)
       for (const item of commands) {
-        if (item.blocked === 'draft_conflict' && (item.kind === 'draft' || item.kind === 'setup')) {
+        if (item.blocked === 'draft_conflict' && (item.kind === 'draft' || item.kind === 'setup' || item.kind === 'restore')) {
           item.blocked = undefined
           await store.update(item)
         }
@@ -352,12 +357,24 @@ export function useLiveRoom() {
           }
         } else response = await room.send(command)
         } catch (error: any) {
-          // Only a server-rejected, event-free state command is independent
-          // of later ACTs. Event conflicts and all other failures stay blocked.
-          if (error?.code === 'primary_required' && error?.status === 403 && await skipForbidden()) {
-            continue
+          if (command.kind === 'restore' && error?.status === 409 && error?.code === 'draft_conflict') {
+            // The server rejected this restore before claiming its lease or
+            // writing any records. Refresh only this lifecycle request's base;
+            // ordinary record edits must keep their original conflict checks.
+            const baseline = await room.read()
+            seedRoom(room, baseline)
+            command.request.baseRevision = Number(baseline.revision || 0)
+            command.request.roomEpoch = Number(baseline.roomEpoch || 0)
+            await store.update(command)
+            response = await room.send(command)
+          } else {
+            // Only a server-rejected, event-free state command is independent
+            // of later ACTs. Event conflicts and all other failures stay blocked.
+            if (error?.code === 'primary_required' && error?.status === 403 && await skipForbidden()) {
+              continue
+            }
+            throw error
           }
-          throw error
         }
         await confirmCommand(command, response)
       }
@@ -394,15 +411,15 @@ export function useLiveRoom() {
   }
 
   async function submit(gmId: string, side: 'H' | 'A', kind: LiveCommand['kind'], body: Record<string, unknown>,
-    options: { scoreOnly?: boolean } = {}) {
+    options: { scoreOnly?: boolean; throwOnFailure?: boolean; onConfirmed?: (response: any) => void } = {}) {
     const localEditedAt = Date.now()
     const { room, key, uid } = await roomFor(gmId, side)
     // 점수만 바꾸는 상태 전송(수정 화면): 서버는 scoreOnly 명령에서 시계·반 상태를 무시하고
     // homeScore/awayScore 만 합친다. 이 경우엔 보조 분석관·매니저도 보낼 수 있다.
     if (options.scoreOnly) body = { ...body, scoreOnly: true }
-    const commandId = crypto.randomUUID()
+    let commandId = crypto.randomUUID()
     const changedAtMs = room.lastEditAt = Math.max(room.lastEditAt, localEditedAt + room.clockOffset)
-    const command: LiveCommand = { commandId, key, uid, gmId, side, kind,
+    let command: LiveCommand = { commandId, key, uid, gmId, side, kind,
       request: JSON.parse(JSON.stringify({ ...body, commandId, baseRevision: room.status.phase === 'loading' ? null : room.status.revision,
         roomEpoch: room.status.phase === 'loading' ? null : room.status.roomEpoch })) }
     const targets = commandTargets(command)
@@ -413,6 +430,16 @@ export function useLiveRoom() {
       for (const [target, value] of commandInputs(command)) room.pendingInputs.set(target, { commandId, value: JSON.parse(JSON.stringify(value)) })
     }
     const added = room.enqueue.then(async () => {
+      // A timed-out restoration may still own the server lease. Keep its ID
+      // when the user presses Edit again instead of queuing a competing restore.
+      if (kind === 'restore') {
+        const existing = (await store.list(key)).find(item => item.kind === 'restore')
+        if (existing) {
+          command = existing
+          commandId = existing.commandId
+          return
+        }
+      }
       if (kind === 'draft' || kind === 'setup') {
         for (const earlier of await store.list(key)) {
           if (earlier.request.roomEpoch !== command.request.roomEpoch) continue
@@ -432,12 +459,28 @@ export function useLiveRoom() {
       for (const target of targets) if (room.pendingInputs.get(target)?.commandId === commandId) room.pendingInputs.delete(target)
       throw error
     }
-    if (room.running) await new Promise<void>(resolve => room.idle.add(resolve))
-    if (room.cancelled.delete(commandId)) return false
-    if (room.completed.delete(commandId)) return true
-    const result = new Promise<boolean>(resolve => room.waiters.set(commandId, resolve))
-    void pump(key, room)
-    return await result
+    const confirmed = (response: any) => {
+      if (response.ackCommand?.commandId === commandId) options.onConfirmed?.(response)
+    }
+    if (options.onConfirmed) room.listeners.add(confirmed)
+    try {
+      if (room.running) await new Promise<void>(resolve => room.idle.add(resolve))
+      if (room.cancelled.delete(commandId)) return false
+      if (room.completed.delete(commandId)) return true
+      const result = new Promise<boolean>(resolve => room.waiters.set(commandId, resolve))
+      void pump(key, room)
+      const saved = await result
+      if (!saved && options.throwOnFailure) {
+        const stopped = ['error', 'conflict'].includes(room.status.phase)
+        const summary = stopped
+          ? '요청이 중단되었습니다.'
+          : '완료를 확인하지 못했습니다. 요청은 보관되어 있으며 같은 요청으로 재시도합니다.'
+        throw new Error(`${summary}${room.status.error ? ` ${room.status.error}` : ''}`)
+      }
+      return saved
+    } finally {
+      room.listeners.delete(confirmed)
+    }
   }
 
   async function attach(gmId: string, side: 'H' | 'A', listener: (response: any) => void) {
