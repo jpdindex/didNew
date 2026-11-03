@@ -45,8 +45,7 @@ async function startNew() {
       const match = (await getDoc(doc($db, 'matches', matchId))).data()
       if (!match) throw new Error('해당 경기를 찾을 수 없습니다.')
       form.value = { ...form.value, matchId, leagueId: match.leagueId, seasonId: match.seasonId,
-        teamId: route.query.team === 'away' ? match.awayTeamId : match.homeTeamId,
-        fromDate: String(match.date).replaceAll('.', '-') }
+        teamId: route.query.team === 'away' ? match.awayTeamId : match.homeTeamId }
     } catch (e) { error.value = e instanceof Error ? e.message : '경기 정보를 불러오지 못했습니다.'; return }
   }
   editing.value = true
@@ -124,7 +123,7 @@ onMounted(async () => {
     <section class="list">
       <div class="sectionHead"><h2>{{ manager ? '전체 등록 요청' : '내 등록 요청' }}</h2><div class="filters"><select v-model="filter"><option value="">전체 상태</option><option v-for="(label, value) in statuses" :key="value" :value="value">{{ label }}</option></select><button :disabled="busy || loading" @click="load">목록 새로고침</button></div></div>
       <p v-if="loading">요청을 불러오는 중...</p><p v-else-if="!visible.length" class="empty">해당 상태의 요청이 없습니다.</p>
-      <button v-for="item in visible" :key="item.id" class="requestRow" :disabled="busy" @click="open(item)"><span><strong>{{ item.payload.name }}</strong> · {{ item.payload.nameFull }}<small>{{ item.leagueName }} · {{ item.payload.seasonId.slice(0, 4) }}/{{ item.payload.seasonId.slice(6) }} · {{ item.teamName }} · {{ item.payload.no }}번 / {{ item.payload.pos }}</small><small>{{ item.requestedName }} · 생년월일 {{ item.payload.birth }} · 적용 {{ item.payload.fromDate }}</small></span><span class="badge" :class="item.status">{{ statuses[item.status] }}</span></button>
+      <button v-for="item in visible" :key="item.id" class="requestRow" :disabled="busy" @click="open(item)"><span><strong>{{ item.payload.name }}</strong> · {{ item.payload.nameFull }}<small>{{ item.leagueName }} · {{ item.payload.seasonId.slice(0, 4) }}/{{ item.payload.seasonId.slice(6) }} · {{ item.teamName }} · {{ item.payload.no }}번 / {{ item.payload.pos }}</small><small>{{ item.requestedName }} · 생년월일 {{ item.payload.birth }} · 적용 {{ item.payload.fromDate || '미입력' }}</small></span><span class="badge" :class="item.status">{{ statuses[item.status] }}</span></button>
     </section>
   </main>
 </template>

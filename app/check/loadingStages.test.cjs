@@ -83,6 +83,77 @@ test('confirmed final editing navigates only after RAW restore succeeds', async 
 test('completed match no longer renders the temporary half-edit button', () => {
   assert.ok(!source('TeamSelection.vue').includes('전반/후반 수정'))
 })
+
+function substitutionSaveEnvironment(save) {
+  const original = { id: 'old', half: 'H1', seconds: 20, outPlayer: 'one', inPlayer: 'two' }
+  const incoming = { id: 'new', half: 'H2', seconds: 0, outPlayer: 'three', inPlayer: 'four' }
+  const game = ref({ halfStatus: 'H1_done', subs: [original], assigned: { gk: 'four', b1: 'three' } })
+  const open = ref(true), requests = []
+  const context = functions('TeamSelection.vue', ['saveSub'], {
+    game, subSaving: ref(false), lifecycleBusy: ref(false), matchInfoEditable: ref(true), subSaveError: ref(''),
+    pendingSubs: ref([incoming]), HALF_ORDER: { H1: 1, H2: 2 }, formationSaveTimer: undefined,
+    addSub: () => {}, closeSub: () => { open.value = false },
+    persistCurrentSetup: async () => { requests.push(JSON.parse(JSON.stringify(game.value))); return save() },
+  })
+  return { context, requests, game, open }
+}
+
+test('halftime substitution Submit waits for lineup and history save before closing', async () => {
+  const gate = deferred()
+  const env = substitutionSaveEnvironment(() => gate.promise)
+  const saving = env.context.saveSub()
+  assert.equal(env.open.value, true)
+  assert.equal(env.context.subSaving.value, true)
+  await env.context.saveSub()
+  assert.equal(env.requests.length, 1)
+  assert.equal(env.requests[0].subs.length, 2)
+  assert.deepEqual(env.requests[0].assigned, { gk: 'four', b1: 'three' })
+  gate.resolve(true)
+  await saving
+  assert.equal(env.open.value, false)
+  assert.equal(env.game.value.halfStatus, 'H1_done')
+  assert.equal(env.context.subSaving.value, false)
+})
+
+test('failed substitution save stays open and retry does not duplicate history', async () => {
+  let success = false
+  const env = substitutionSaveEnvironment(() => success)
+  await env.context.saveSub()
+  assert.equal(env.open.value, true)
+  assert.match(env.context.subSaveError.value, /저장/)
+  assert.equal(env.game.value.subs.length, 2)
+  success = true
+  await env.context.saveSub()
+  assert.equal(env.open.value, false)
+  assert.equal(env.game.value.subs.length, 2)
+  assert.deepEqual(env.requests[0], env.requests[1])
+})
+
+test('substitution preview does not trigger a separate formation autosave', () => {
+  const context = functions('TeamSelection.vue', ['recordFormationChange'], {
+    applyingRemoteSetup: false, bootstrapApplied: ref(true), matchInfoEditable: ref(true),
+    game: ref({ matchId: 'm', halfStatus: 'H2' }), subOpen: ref(true),
+    pendingSetupFingerprint: '', currentSetupFingerprint: () => 'preview', formationSaveTimer: undefined,
+    setTimeout: () => { throw new Error('Preview must wait for Submit') },
+  })
+  context.recordFormationChange()
+  assert.equal(context.pendingSetupFingerprint, 'preview')
+})
+
+test('cancelling match-info edits restores lineup and substitutions together', async () => {
+  let persisted
+  const old = [{ id: 'old' }]
+  const context = functions('TeamSelection.vue', ['cancelMatchInfoEdit'], {
+    game: ref({ formationKey: '4-3-3', side: 'left', assigned: { gk: 'in' }, subs: [...old, { id: 'new' }], formationChanges: [] }),
+    matchInfoEditMode: ref(true), lifecycleBusy: ref(false), formationSaveTimer: undefined,
+    matchInfoEditBackup: { formationKey: '4-3-3', side: 'left', assigned: { gk: 'out' }, subs: old, formationChangeCount: 0 },
+    toggleMatchInfoEdit: async () => { persisted = JSON.parse(JSON.stringify(context.game.value)) },
+  })
+  await context.cancelMatchInfoEdit()
+  assert.deepEqual(persisted.assigned, { gk: 'out' })
+  assert.deepEqual(persisted.subs, old)
+})
+
 function functions(file, names, globals) {
   const text = source(file)
   const code = names.map(name => text.match(new RegExp(`(?:async )?function ${name}\\([\\s\\S]*?\\n}`))[0]).join('\n')

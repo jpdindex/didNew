@@ -2,6 +2,7 @@
 from copy import deepcopy
 from functools import wraps
 from types import SimpleNamespace
+import re
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -12,7 +13,7 @@ from pydantic import ValidationError
 from backend.api import api_player_requests as api
 from backend.system import system_player_requests as registration
 from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData
-from backend.system.system_player_requests import PlayerRegistration, PlayerRequestService, ReviewDecision
+from backend.system.system_player_requests import PlayerRegistration, DirectPlayerRegistration, PlayerRequestService, ReviewDecision
 
 
 class Snapshot:
@@ -51,14 +52,29 @@ class Collection:
         return Reference(self.db, f'{self.path}/{key}')
 
     def where(self, filter):
-        return Collection(self.db, self.path, lambda d: (d.get(filter.field_path) in filter.value)
-                          if filter.op_string == 'in' else d.get(filter.field_path) == filter.value)
+        if filter.field_path == '__name__':
+            predicate = lambda d: d['__id__'] <= filter.value.id
+        else:
+            predicate = lambda d: (d.get(filter.field_path) in filter.value) if filter.op_string == 'in' else d.get(filter.field_path) == filter.value
+        return Collection(self.db, self.path, predicate)
+
+    def order_by(self, field, direction):
+        assert field == '__name__' and direction == 'DESCENDING'
+        self.descending = True
+        return self
+
+    def select(self, fields):
+        assert fields == []
+        return self
 
     def stream(self, transaction=None):
         if transaction:
             assert not transaction.writes
-        for path, value in list(self.db.documents.items()):
-            if path.rsplit('/', 1)[0] == self.path and (not self.predicate or self.predicate(value)):
+        entries = list(self.db.documents.items())
+        if getattr(self, 'descending', False):
+            entries.sort(reverse=True)
+        for path, value in entries:
+            if path.rsplit('/', 1)[0] == self.path and (not self.predicate or self.predicate({**value, '__id__': path.rsplit('/', 1)[-1]})):
                 yield Snapshot(Reference(self.db, path), value)
 
 
@@ -91,6 +107,7 @@ class MemoryDB:
         self.fail_commit = False
         self.documents = {
             'teams/T': {'name': '세비야', 'currentLeagueId': 'LALIGA'},
+            'teams/T/seasons/20262027': {'leagueId': 'LALIGA', 'division': 'D1'},
             'leagues/LALIGA': {'name': '라리가', 'competitionType': 'league'},
             'seasons/20262027': {'name': '2026/27'},
             'matches/M': {'leagueId': 'LALIGA', 'seasonId': '20262027', 'homeTeamId': 'T', 'awayTeamId': 'A', 'date': '2026-10-17'},
@@ -169,11 +186,68 @@ def test_failed_commit_does_not_partially_register_or_approve(db, payload):
     assert db.documents == before
 
 
+@pytest.mark.parametrize('kind', ['YOUTH', 'TRANSFER', 'LOAN'])
+def test_request_kind_is_preserved_as_contract_transfer_type(db, payload, kind):
+    changed = PlayerRegistration.model_validate({**payload.model_dump(), 'kind': kind})
+    service, request_id = submitted(db, changed)
+    result = service.review(request_id, ReviewDecision(action='approve', version=1), manager)
+    assert db.documents[f"players/{result['playerId']}/contracts/request-{request_id}"]['transferType'] == kind
+
+
+@pytest.mark.parametrize('omit_date', [False, True])
+def test_blank_start_date_can_be_submitted_and_completed_during_review(db, payload, omit_date):
+    values = {**payload.model_dump(), 'fromDate': ''}
+    if omit_date:
+        values.pop('fromDate')
+    service, request_id = submitted(db, PlayerRegistration.model_validate(values))
+    request_path = f'playerRegistrationRequests/{request_id}'
+    assert db.documents[request_path]['payload']['fromDate'] == ''
+    assert not any(path.startswith('players/') for path in db.documents)
+    with pytest.raises(BackendError) as rejected:
+        service.review(request_id, ReviewDecision(action='approve', version=1), manager)
+    assert rejected.value.code == 'start_date_required'
+    assert db.documents[request_path]['status'] == 'pending'
+    service.review(request_id, ReviewDecision(action='edit', version=1, payload=payload), manager)
+    result = service.review(request_id, ReviewDecision(action='approve', version=2), manager)
+    contract = db.documents[f"players/{result['playerId']}/contracts/request-{request_id}"]
+    assert contract['from'] == payload.fromDate.replace('-', '.')
+    assert db.documents[request_path]['submittedPayload']['fromDate'] == ''
+
+
+def test_league_visibility_does_not_restrict_backend_references(db, payload):
+    db.documents['leagues/OTHER'] = {'name': 'Other league', 'competitionType': 'league'}
+    db.documents['teams/T']['currentLeagueId'] = 'OTHER'
+    db.documents['teams/T/seasons/20262027'] = {'leagueId': 'OTHER'}
+    changed = PlayerRegistration.model_validate({**payload.model_dump(), 'leagueId': 'OTHER', 'matchId': '', 'fromDate': ''})
+    _, request_id = submitted(db, changed)
+    assert db.documents[f'playerRegistrationRequests/{request_id}']['payload']['leagueId'] == 'OTHER'
+
+
 def test_analyst_cannot_approve_even_with_admin_claim(db, payload):
     service, request_id = submitted(db, payload)
     with pytest.raises(BackendError) as error:
         service.review(request_id, ReviewDecision(action='approve', version=1), CurrentUser(uid='other', claims={'admin': True}))
     assert error.value.status_code == 403
+
+
+@pytest.mark.parametrize('entry', [None, {'leagueId': 'LALIGA', 'division': 'D2'},
+    {'leagueId': 'LALIGA'}, {'division': 'D1', 'leagueId': 'SEGUNDA', 'competitionIds': ['LALIGA'], 'cupIds': ['LALIGA']},
+    {'division': 'D1', 'leagueId': 'LALIGA', 'leagueIds': ['SEGUNDA']}])
+def test_request_submit_and_approval_require_season_first_division(db, payload, entry):
+    service, request_id = submitted(db, payload)
+    path = 'teams/T/seasons/20262027'
+    if entry is None:
+        db.documents.pop(path)
+    else:
+        db.documents[path] = entry
+    before = deepcopy(db.documents)
+    with pytest.raises(BackendError) as rejected:
+        service.submit(payload, analyst)
+    assert rejected.value.code == 'team_season_mismatch'
+    with pytest.raises(BackendError) as rejected:
+        service.review(request_id, ReviewDecision(action='approve', version=1), manager)
+    assert rejected.value.code == 'team_season_mismatch'
+    assert db.documents == before
 
 
 def test_duplicate_identity_requires_link_and_keeps_existing_profile(db, payload):
@@ -253,6 +327,7 @@ def test_registration_api_does_not_trust_local_uid_header_or_swagger():
 
     with TestClient(app) as client:
         assert client.get('/player-requests', headers={'X-Did-Local-User': 'manager', 'X-Swagger-Key': 'local'}).status_code == 401
+        assert client.post('/player-requests/create-player', json={}, headers={'X-Did-Local-User': 'manager'}).status_code == 401
 
 
 def test_registration_verifies_bearer_claims_instead_of_uid_header(monkeypatch):
@@ -300,3 +375,104 @@ def test_reentry_refreshes_approved_roster_without_changing_saved_lineups(db):
     assert not cached and squads['H'][-1]['playerId'] == 'approved'
     assert snapshot['lobby']['H']['lineup'] == [{'playerId': 'old', 'slot': 'gk'}]
     assert data._get_or_create_input_squads_snapshot('M', match)[1] is True
+
+
+def direct_payload(payload, request_id='manual-request', **changes):
+    return DirectPlayerRegistration.model_validate({**payload.model_dump(), 'kind': 'TRANSFER',
+        'matchId': '', 'requestId': request_id, **changes})
+
+
+def test_approval_and_direct_registration_share_latest_numeric_id_and_atomic_links(db, payload):
+    db.documents['players/0000000099'] = {'name': 'Old'}
+    db.documents['players/PR-legacy'] = {'name': 'Legacy request'}
+    db.documents['players/9random'] = {'name': 'Old random ID'}
+    db.documents['playerRegistrationState/numbering'] = {'lastAssigned': 8}
+    service, request_id = submitted(db, payload)
+    result = service.review(request_id, ReviewDecision(action='approve', version=1), manager)
+    assert result['playerId'] == '0000000100'
+    assert db.documents[f'players/0000000100/contracts/request-{request_id}']['teamId'] == 'T'
+    assert db.documents['teams/T/squad/0000000100']['contractId'] == f'request-{request_id}'
+    assert service.review(request_id, ReviewDecision(action='approve', version=1), manager) == result
+    direct = direct_payload(payload, name='Other player', nameFull='Other player')
+    assert service.create_player(direct, manager) == {'playerId': '0000000101'}
+    before = deepcopy(db.documents)
+    assert service.create_player(direct, manager) == {'playerId': '0000000101'}
+    assert db.documents == before
+    # A later SQL import can advance the numeric ceiling beyond our counter.
+    db.documents['players/0000000500'] = {'name': 'New legacy import'}
+    next_player = direct_payload(payload, 'next-manual', name='Third', nameFull='Third')
+    assert service.create_player(next_player, manager)['playerId'] == '0000000501'
+    assert db.documents['playerRegistrationState/numbering']['lastAssigned'] == 501
+
+
+def test_existing_player_link_does_not_allocate_or_rename_id(db, payload):
+    db.documents['players/PR-existing'] = {'name': payload.name, 'birth': payload.birth}
+    service, request_id = submitted(db, payload)
+    result = service.review(request_id, ReviewDecision(action='approve', version=1, existingPlayerId='PR-existing'), manager)
+    assert result['playerId'] == 'PR-existing'
+    assert 'playerRegistrationState/numbering' not in db.documents
+
+
+def test_direct_registration_preserves_optional_profile_fields_and_rolls_back_failure(db, payload):
+    service = PlayerRequestService(db)
+    direct = direct_payload(payload, nameFull='', birth='', nation='', no='', pos='')
+    before = deepcopy(db.documents)
+    db.fail_commit = True
+    with pytest.raises(RuntimeError): service.create_player(direct, manager)
+    assert db.documents == before
+    db.fail_commit = False
+    assert service.create_player(direct, manager)['playerId'] == '0000000001'
+    assert db.documents['players/0000000001']['birth'] is None
+    with pytest.raises(BackendError) as denied: service.create_player(direct, analyst)
+    assert denied.value.code == 'manager_required'
+    changed = direct_payload(payload, name='Changed')
+    with pytest.raises(BackendError) as conflict: service.create_player(changed, manager)
+    assert conflict.value.code == 'request_conflict'
+
+
+@pytest.mark.parametrize('same_identity', [False, True])
+@pytest.mark.parametrize('other_flow', ['approval', 'direct'])
+def test_concurrent_numeric_allocations_retry_without_duplicates(db, payload, monkeypatch, same_identity, other_flow):
+    class Conflict(Exception): pass
+    original_get, original_commit = Reference.get, Transaction.commit
+    def tracked_get(ref, transaction=None, **kwargs):
+        if transaction:
+            if not hasattr(transaction, 'reads'): transaction.reads = {}
+            transaction.reads[ref.path] = deepcopy(db.documents.get(ref.path))
+        return original_get(ref, transaction=transaction, **kwargs)
+    pending = []
+    def commit(tx):
+        if pending: pending.pop()()
+        if any(db.documents.get(path) != value for path, value in getattr(tx, 'reads', {}).items()):
+            raise Conflict()
+        original_commit(tx)
+    def transactional(fn):
+        def run(_):
+            for _attempt in range(5):
+                tx = db.transaction()
+                try:
+                    result = fn(tx)
+                    tx.commit()
+                    return result
+                except Conflict: pass
+            raise AssertionError('Transaction did not converge')
+        return run
+    monkeypatch.setattr(Reference, 'get', tracked_get)
+    monkeypatch.setattr(Transaction, 'commit', commit)
+    monkeypatch.setattr(registration.firestore, 'transactional', transactional)
+    service, first = submitted(db, payload)
+    other = payload if same_identity else PlayerRegistration.model_validate({**payload.model_dump(), 'name': 'Other', 'nameFull': 'Other'})
+    if other_flow == 'approval':
+        second = service.submit(other, analyst)['id']
+        pending.append(lambda: service.review(second, ReviewDecision(action='approve', version=1), manager))
+    else:
+        pending.append(lambda: service.create_player(direct_payload(other), manager))
+    if same_identity:
+        with pytest.raises(BackendError) as duplicate:
+            service.review(first, ReviewDecision(action='approve', version=1), manager)
+        assert duplicate.value.code == 'duplicate_player'
+        assert db.documents[f'playerRegistrationRequests/{first}']['status'] == 'pending'
+    else:
+        assert service.review(first, ReviewDecision(action='approve', version=1), manager)['playerId'] == '0000000002'
+    ids = sorted(path for path in db.documents if re.fullmatch(r'players/[0-9]{10}', path))
+    assert len(ids) == (1 if same_identity else 2)

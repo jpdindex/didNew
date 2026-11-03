@@ -90,6 +90,26 @@ function pageFunctions(names, globals) {
 }
 const ref = value => ({ value })
 
+test('manual player registration uses the server numeric allocator with a stable retry key', async () => {
+  const requests = []
+  const context = pageFunctions(['submitAddPlayer'], {
+    newPlayer: ref({ name: 'Player', nameEn: '', nameFull: '', birth: '', height: '', foot: '', nation: '',
+      teamId: 'T', no: '7', pos: 'MF', from: '2026.08.01', transferType: 'TRANSFER', fee: '', currency: 'EUR' }),
+    selectedSeason: ref('2026/27'), selectedLeague: ref('LALIGA'),
+    newPlayerRequestId: 'same-idempotency-key', newPlayerError: ref(''), savingNewPlayer: ref(false),
+    findDuplicatePlayers: async () => [], backendRequest: async (url, options) => { requests.push({ url, body: JSON.parse(options.body) }); return { playerId: '0000000101' } },
+    allPlayersCache: null, addOpen: ref(true), loadPlayers: async () => {},
+  })
+  await context.submitAddPlayer()
+  await context.submitAddPlayer()
+  assert.equal(requests.length, 2)
+  assert.equal(requests[0].url, '/api/v1/player-requests/create-player')
+  assert.equal(requests[0].body.requestId, requests[1].body.requestId)
+  assert.equal(requests[0].body.seasonId, '20262027')
+  assert.equal(requests[0].body.fromDate, '2026-08-01')
+  assert.equal(context.newPlayerError.value, '')
+})
+
 test('late filter response cannot replace the latest season/team list', async () => {
   let resolveOld
   const old = new Promise(resolve => { resolveOld = resolve })

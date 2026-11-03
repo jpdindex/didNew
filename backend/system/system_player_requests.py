@@ -29,7 +29,8 @@ class PlayerRegistration(BaseModel):
     seasonId: str = Field(pattern=r'^\d{8}$')
     teamId: str = Field(min_length=1, max_length=80)
     matchId: str = Field(default='', max_length=100)
-    kind: Literal['NEW', 'YOUTH'] = 'NEW'
+    # Keep NEW readable for requests submitted before the form changed.
+    kind: Literal['NEW', 'YOUTH', 'TRANSFER', 'LOAN'] = 'YOUTH'
     name: str = Field(min_length=1, max_length=100)
     nameEn: str = Field(default='', max_length=100)
     nameFull: str = Field(min_length=1, max_length=160)
@@ -39,17 +40,22 @@ class PlayerRegistration(BaseModel):
     pos: Literal['GK', 'DF', 'MF', 'FW']
     foot: Literal['', 'L', 'R', 'B'] = ''
     height: int | None = Field(default=None, ge=100, le=250)
-    fromDate: str
+    fromDate: str = ''
     sourceUrl: str = Field(default='', max_length=2000)
     note: str = Field(default='', max_length=2000)
 
-    @field_validator('birth', 'fromDate')
+    @field_validator('birth')
     @classmethod
     def valid_date(cls, value: str) -> str:
         parsed = date.fromisoformat(value)
         if parsed.isoformat() != value or parsed > datetime.now(timezone(timedelta(hours=9))).date():
             raise ValueError('오늘까지의 날짜를 YYYY-MM-DD 형식으로 입력하세요.')
         return value
+
+    @field_validator('fromDate')
+    @classmethod
+    def optional_start_date(cls, value: str) -> str:
+        return cls.valid_date(value) if value else ''
 
     @field_validator('leagueId', 'teamId', 'matchId')
     @classmethod
@@ -81,6 +87,57 @@ class ReviewDecision(BaseModel):
     existingPlayerId: str = Field(default='', max_length=100, pattern=r'^[^/]*$')
 
 
+class DirectPlayerRegistration(PlayerRegistration):
+    requestId: str = Field(min_length=1, max_length=100, pattern=r'^[A-Za-z0-9_-]+$')
+    nameFull: str = Field(default='', max_length=160)
+    birth: str = ''
+    nation: str = Field(default='', pattern=r'^(?:[A-Z]{3})?$')
+    no: str = Field(default='', pattern=r'^\d{0,3}$')
+    pos: Literal['', 'GK', 'DF', 'MF', 'FW'] = ''
+    kind: Literal['TRANSFER', 'LOAN', 'FREE', 'YOUTH'] = 'TRANSFER'
+    fee: float | None = Field(default=None, ge=0)
+    currency: str = Field(default='', max_length=10)
+
+    @field_validator('birth')
+    @classmethod
+    def valid_date(cls, value: str) -> str:
+        return PlayerRegistration.valid_date(value.replace('.', '-')) if value else ''
+
+
+def registration_identity(payload: PlayerRegistration) -> str:
+    return sha256(f'{normalize(payload.nameFull or payload.name)}:{normalize(payload.birth)}'.encode()).hexdigest()[:32]
+
+
+def reserve_player_id(db, tx):
+    """Read the numeric ceiling and counter; callers commit the reservation atomically.
+
+    Project only document IDs. PR/random IDs never become numeric candidates.
+    Recheck the ceiling to also see later numeric legacy imports.
+    """
+    state = db.collection('playerRegistrationState').document('numbering')
+    counter = state.get(transaction=tx).to_dict() or {}
+    latest = int(counter.get('lastAssigned') or 0)
+    players = db.collection('players')
+    query = players.where(filter=FieldFilter('__name__', '<=', players.document('9999999999')))
+    query = query.order_by('__name__', direction='DESCENDING').select([])
+    for snapshot in query.stream(transaction=tx):
+        if re.fullmatch(r'[0-9]{1,10}', snapshot.id):
+            latest = max(latest, int(snapshot.id))
+            if len(snapshot.id) == 10:
+                break
+    if latest >= 9999999999:
+        raise BackendError('선수 번호 범위를 초과했습니다.', 409, 'player_id_exhausted')
+    return f'{latest + 1:010d}', state, latest + 1
+
+
+def profile_values(payload: PlayerRegistration, user_id: str) -> dict:
+    return {'name': payload.name, 'nameEn': payload.nameEn or None, 'nameFull': payload.nameFull or None,
+            'birth': payload.birth.replace('-', '.') or None, 'birthKey': normalize(payload.birth),
+            'nation': payload.nation or None, 'foot': payload.foot or None, 'height': payload.height,
+            'active': True, 'searchTerms': search_terms(payload), 'createdAt': firestore.SERVER_TIMESTAMP,
+            'createdBy': user_id, 'updatedAt': firestore.SERVER_TIMESTAMP, 'updatedBy': user_id}
+
+
 def is_manager(user: CurrentUser) -> bool:
     return str(user.claims.get('email', '')).strip().lower() == MANAGER_EMAIL
 
@@ -90,7 +147,7 @@ def require_manager(user: CurrentUser) -> None:
         raise BackendError('관리자 계정만 검토할 수 있습니다.', 403, 'manager_required')
 
 
-def check_references(db, payload: PlayerRegistration) -> dict:
+def check_references(db, payload: PlayerRegistration, *, first_division_only: bool = False) -> dict:
     team = db.collection('teams').document(payload.teamId).get()
     league = db.collection('leagues').document(payload.leagueId).get()
     if not team.exists or not league.exists:
@@ -101,16 +158,21 @@ def check_references(db, payload: PlayerRegistration) -> dict:
     if not entry and not payload.matchId and not db.collection('seasons').document(payload.seasonId).get().exists:
         raise BackendError('DB에 등록된 시즌을 선택하세요.', 422, 'invalid_season')
     memberships = [entry.get('leagueId'), *(entry.get('competitionIds') or []), *(entry.get('leagueIds') or []), *(entry.get('cupIds') or [])]
-    if payload.leagueId not in memberships and not (not entry and team_data.get('currentLeagueId') == payload.leagueId):
+    if first_division_only and payload.leagueId in {'EPL', 'LALIGA'}:
+        league_ids = entry.get('leagueIds') or [entry.get('leagueId')]
+        belongs = entry.get('division') == 'D1' and payload.leagueId in league_ids
+    else:
+        belongs = payload.leagueId in memberships or (not entry and team_data.get('currentLeagueId') == payload.leagueId)
+    if not belongs:
         raise BackendError('선택한 시즌·리그에 해당하는 팀을 선택하세요.', 422, 'team_season_mismatch')
-    if payload.birth >= payload.fromDate:
+    if payload.fromDate and payload.birth >= payload.fromDate:
         raise BackendError('명단 적용 시작일은 생년월일 이후여야 합니다.', 422, 'invalid_dates')
     if payload.matchId:
         match = db.collection('matches').document(payload.matchId).get()
         data = match.to_dict() or {}
         if not match.exists or payload.teamId not in {data.get('homeTeamId'), data.get('awayTeamId')} or data.get('leagueId') != payload.leagueId or data.get('seasonId') != payload.seasonId:
             raise BackendError('요청의 경기·리그·시즌·팀 정보가 일치하지 않습니다.', 422, 'match_mismatch')
-        if payload.fromDate > str(data.get('date', '')).replace('.', '-'):
+        if payload.fromDate and payload.fromDate > str(data.get('date', '')).replace('.', '-'):
             raise BackendError('명단 적용 시작일은 해당 경기일 이하여야 합니다.', 422, 'after_match')
     return {'teamName': team_data.get('nameKr') or team_data.get('name') or payload.teamId,
             'leagueName': league_data.get('name') or payload.leagueId,
@@ -154,7 +216,7 @@ class PlayerRequestService:
         self.db = db if db is not None else get_firestore_client()
 
     def submit(self, payload: PlayerRegistration, user: CurrentUser):
-        labels = check_references(self.db, payload)
+        labels = check_references(self.db, payload, first_division_only=True)
         ref = self.db.collection('playerRegistrationRequests').document()
 
         @firestore.transactional
@@ -182,14 +244,13 @@ class PlayerRequestService:
         if initial.get('status') == 'approved' and decision.action == 'approve':
             return {'id': request_id, 'status': 'approved', 'playerId': initial['playerId']}
         payload = decision.payload or PlayerRegistration.model_validate(initial['payload'])
-        labels = check_references(self.db, payload)
+        labels = check_references(self.db, payload, first_division_only=True)
+        if decision.action == 'approve' and not payload.fromDate:
+            raise BackendError('승인 전에 명단 적용 시작일을 확인해 입력하세요.', 422, 'start_date_required')
         duplicates = duplicate_players(self.db, payload) if decision.action == 'approve' else []
         if decision.action == 'approve' and not decision.existingPlayerId and any(p['sameBirth'] for p in duplicates):
             raise BackendError('이름·생년월일이 일치하는 기존 선수를 선택하세요.', 409, 'duplicate_player')
-        identity = sha256(f'{normalize(payload.nameFull)}:{normalize(payload.birth)}'.encode()).hexdigest()[:32]
-        player_id = decision.existingPlayerId or f'PR-{identity}'
-        player_ref = self.db.collection('players').document(player_id)
-        contract_ref = player_ref.collection('contracts').document(f'request-{request_id}')
+        identity = registration_identity(payload)
 
         @firestore.transactional
         def publish(tx):
@@ -203,6 +264,17 @@ class PlayerRequestService:
             if decision.action == 'edit':
                 tx.update(ref, {**audit, **labels, 'payload': payload.model_dump()})
                 return {'id': request_id, 'status': 'pending'}
+            allocation = None
+            identity_ref = self.db.collection('playerRegistrationState').document('numbering').collection('identities').document(identity)
+            if decision.existingPlayerId:
+                player_id = decision.existingPlayerId
+            else:
+                if identity_ref.get(transaction=tx).exists:
+                    raise BackendError('이미 등록된 선수입니다. 기존 선수를 선택하세요.', 409, 'duplicate_player')
+                player_id, counter_ref, number = reserve_player_id(self.db, tx)
+                allocation = (counter_ref, number)
+            player_ref = self.db.collection('players').document(player_id)
+            contract_ref = player_ref.collection('contracts').document(f'request-{request_id}')
             player = player_ref.get(transaction=tx)
             if player.exists and not decision.existingPlayerId:
                 raise BackendError('이미 등록된 선수입니다. 기존 선수를 선택하세요.', 409, 'duplicate_player')
@@ -228,19 +300,18 @@ class PlayerRequestService:
             revision = revision_ref.get(transaction=tx).to_dict() or {}
             audit_player = {'updatedAt': firestore.SERVER_TIMESTAMP, 'updatedBy': user.uid}
             if not player.exists:
-                tx.create(player_ref, {
-                    'name': payload.name, 'nameEn': payload.nameEn or None, 'nameFull': payload.nameFull,
-                    'birth': payload.birth.replace('-', '.'), 'birthKey': normalize(payload.birth),
-                    'nation': payload.nation, 'foot': payload.foot or None, 'height': payload.height,
-                    'active': True, 'searchTerms': search_terms(payload), 'createdAt': firestore.SERVER_TIMESTAMP,
-                    'createdBy': user.uid, **audit_player,
+                tx.create(player_ref, {**profile_values(payload, user.uid),
                     **({'currentTeamId': payload.teamId, 'currentNo': payload.no, 'currentPos': payload.pos}
                        if labels['competitionType'] != 'national' else {}),
                 })
+                if allocation:
+                    tx.set(allocation[0], {'lastAssigned': allocation[1]}, merge=True)
+                    tx.create(identity_ref, {'playerId': player_id})
             if not covering:
                 tx.create(contract_ref, {'teamId': payload.teamId, 'leagueId': payload.leagueId,
                     'competitionType': labels['competitionType'], 'from': payload.fromDate.replace('-', '.'), 'to': None,
-                    'no': payload.no, 'pos': payload.pos, 'transferType': 'YOUTH' if payload.kind == 'YOUTH' else 'TRANSFER',
+                    'no': payload.no, 'pos': payload.pos,
+                    'transferType': 'YOUTH' if payload.kind == 'YOUTH' else ('LOAN' if payload.kind == 'LOAN' else 'TRANSFER'),
                     'registrationRequestId': request_id, 'sourceUrl': payload.sourceUrl,
                     'createdAt': firestore.SERVER_TIMESTAMP, 'createdBy': user.uid, **audit_player})
                 if labels['competitionType'] != 'national':
@@ -251,4 +322,50 @@ class PlayerRequestService:
                 tx.set(revision_ref, {'version': revision.get('version', 0) + 1})
             tx.update(ref, {**audit, **labels, 'status': 'approved', 'payload': payload.model_dump(), 'playerId': player_id})
             return {'id': request_id, 'status': 'approved', 'playerId': player_id}
+        return publish(self.db.transaction())
+
+    def create_player(self, payload: DirectPlayerRegistration, user: CurrentUser):
+        """Manager's direct registration shares approval's numeric ID allocator."""
+        require_manager(user)
+        if not payload.fromDate:
+            raise BackendError('입단일을 입력하세요.', 422, 'start_date_required')
+        labels = check_references(self.db, payload)
+        state = self.db.collection('playerRegistrationState').document('numbering')
+        receipt = state.collection('directRequests').document(payload.requestId)
+        identity_ref = state.collection('identities').document(registration_identity(payload))
+
+        @firestore.transactional
+        def publish(tx):
+            previous = receipt.get(transaction=tx).to_dict() or {}
+            if previous:
+                if previous.get('payload') != payload.model_dump() or previous.get('createdBy') != user.uid:
+                    raise BackendError('등록 요청 번호가 다른 내용에 사용됐습니다.', 409, 'request_conflict')
+                return {'playerId': previous['playerId']}
+            if identity_ref.get(transaction=tx).exists:
+                raise BackendError('이름·생년월일이 같은 선수가 이미 등록됐습니다.', 409, 'duplicate_player')
+            player_id, counter_ref, number = reserve_player_id(self.db, tx)
+            player_ref = self.db.collection('players').document(player_id)
+            if player_ref.get(transaction=tx).exists:
+                raise BackendError('선수 번호가 이미 사용 중입니다. 다시 시도하세요.', 409, 'player_id_conflict')
+            contract_ref = player_ref.collection('contracts').document('manual-' + payload.requestId)
+            revision_ref = self.db.collection('playerRegistrationRosterVersions').document(payload.teamId)
+            revision = revision_ref.get(transaction=tx).to_dict() or {}
+            audit = {'updatedAt': firestore.SERVER_TIMESTAMP, 'updatedBy': user.uid,
+                     'createdAt': firestore.SERVER_TIMESTAMP, 'createdBy': user.uid}
+            tx.create(player_ref, {**profile_values(payload, user.uid),
+                **({'currentTeamId': payload.teamId, 'currentNo': payload.no or None, 'currentPos': payload.pos or None}
+                   if labels['competitionType'] != 'national' else {})})
+            tx.create(contract_ref, {**audit, 'teamId': payload.teamId, 'leagueId': payload.leagueId,
+                'competitionType': labels['competitionType'], 'from': payload.fromDate.replace('-', '.'), 'to': None,
+                'no': payload.no or None, 'pos': payload.pos or None, 'transferType': payload.kind,
+                'fee': payload.fee, 'currency': payload.currency or None})
+            if labels['competitionType'] != 'national':
+                tx.set(self.db.collection('teams').document(payload.teamId).collection('squad').document(player_id),
+                    {'name': payload.name, 'no': payload.no, 'pos': payload.pos,
+                     'contractId': contract_ref.id, 'since': payload.fromDate.replace('-', '.')})
+            tx.set(revision_ref, {'version': revision.get('version', 0) + 1})
+            tx.set(counter_ref, {'lastAssigned': number}, merge=True)
+            tx.create(identity_ref, {'playerId': player_id})
+            tx.create(receipt, {'playerId': player_id, 'payload': payload.model_dump(), 'createdBy': user.uid})
+            return {'playerId': player_id}
         return publish(self.db.transaction())

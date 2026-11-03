@@ -16,6 +16,8 @@ import {
 const OTHER_LEAGUE = '__OTHER_LEAGUE__'
 
 const { $db } = useNuxtApp()
+const { request: backendRequest } = useBackendApi()
+let newPlayerRequestId = ''
 const db = $db as Firestore
 
 type TeamRow = TeamDoc & { id: string }
@@ -548,6 +550,7 @@ function keydownNewPlayerFrom(event: KeyboardEvent) {
 }
 
 function openAddPlayer() {
+  newPlayerRequestId = crypto.randomUUID()
   addOpen.value = true
   newPlayerError.value = ''
   newPlayer.value = {
@@ -587,24 +590,20 @@ async function submitAddPlayer() {
       )
       if (!confirm(`중복 가능성이 있는 선수가 있습니다.\n\n${lines.join('\n')}\n\n그래도 새 선수로 추가하시겠습니까?`)) return
     }
-    const id = doc(collection(db, 'players')).id
-    const birth = newPlayer.value.birth.trim() || null
-    const nameEn = newPlayer.value.nameEn.trim() || null
-    const nameFull = newPlayer.value.nameFull.trim() || null
-    await setDoc(doc(db, 'players', id), {
-      name, nameEn, nameFull, birth,
-      height: newPlayer.value.height ? Number(newPlayer.value.height) : null,
-      foot: newPlayer.value.foot || null,
-      nation: newPlayer.value.nation.trim() || null, active: true,
-      birthKey: normalizePlayerSearch(birth ?? ''),
-      searchTerms: buildPlayerSearchTerms({ name, nameEn, nameFull, birth }),
-      createdAt: Timestamp.now(), createdBy: 'manage-ui', updatedAt: Timestamp.now(), updatedBy: 'manage-ui',
-    })
-    await transferPlayer(db, id, name, {
-      teamId: newPlayer.value.teamId, no: newPlayer.value.no || undefined, pos: newPlayer.value.pos || undefined,
-      leagueId: selectedLeague.value, competitionType: 'league', transferType: newPlayer.value.transferType, from: newPlayer.value.from.trim(),
-      fee: newPlayer.value.fee ? Number(newPlayer.value.fee) : undefined,
-      currency: newPlayer.value.fee ? newPlayer.value.currency : undefined,
+    const startYear = Number(selectedSeason.value.slice(0, 4))
+    await backendRequest('/api/v1/player-requests/create-player', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requestId: newPlayerRequestId, name, nameEn: newPlayer.value.nameEn.trim(),
+        nameFull: newPlayer.value.nameFull.trim(), birth: newPlayer.value.birth.trim().replaceAll('.', '-'),
+        height: newPlayer.value.height ? Number(newPlayer.value.height) : null,
+        foot: newPlayer.value.foot, nation: newPlayer.value.nation.trim(),
+        teamId: newPlayer.value.teamId, no: newPlayer.value.no, pos: newPlayer.value.pos,
+        leagueId: selectedLeague.value, seasonId: `${startYear}${startYear + 1}`,
+        kind: newPlayer.value.transferType, fromDate: newPlayer.value.from.trim().replaceAll('.', '-'),
+        fee: newPlayer.value.fee ? Number(newPlayer.value.fee) : null,
+        currency: newPlayer.value.fee ? newPlayer.value.currency : '',
+      }),
     })
     allPlayersCache = null
     addOpen.value = false

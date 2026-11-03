@@ -685,6 +685,34 @@ def test_real_sdk_command_transactions_merge_events_and_deduplicate(sdk_data):
     assert draft['_liveSetup']['subs'][0]['id'] == 's'
 
 
+def test_halftime_setup_submit_restores_lineup_and_subs_without_changing_raw(sdk_data):
+    rpc = sdk_data.db._firestore_api_internal
+    raw_path = 'matches/m/recordings/H'
+    rpc.documents[raw_path] = {'status': 'H1_done', 'lineup': {'one': {'type': 'START'}}, 'marker': 'published'}
+    raw_before = deepcopy(rpc.documents[raw_path])
+    root = rpc.documents['inputDrafts/m_H']
+    root.update(status='H1_done', sharedState={'halfStatus': 'H1_done', 'h1Seconds': 2700})
+    root['payload']['status'] = 'H1_done'
+    # TeamSelection submits the swapped lineup and its substitution history together.
+    lineup = [{'playerId': 'one', 'slot': 'b0', 'type': 'BENCH', 'order': 1, 'no': '10', 'name': 'One', 'pos': 'FW'},
+              {'playerId': 'two', 'slot': 'o0', 'type': 'START', 'order': 1, 'no': '20', 'name': 'Two', 'pos': 'FW'}]
+    sub = {'id': 'halftime-sub', 'half': 'H2', 'seconds': 2700, 'outPlayer': 'one', 'inPlayer': 'two'}
+    request = InputSetupWriteRequest(commandId='halftime-submit', baseRevision=0, roomEpoch=0,
+        payload={**payload(), 'status': 'H1_done', 'lineup': lineup},
+        clientState={'side': 'left', 'subs': [sub]}, syncScope='setup')
+    receipt = live.execute_command(sdk_data, 'm', 'H', 'setup', request, 'p')
+    assert live.execute_command(sdk_data, 'm', 'H', 'setup', request, 'p') == receipt
+    heads, setups = live.read_lobby_snapshot(sdk_data, 'm')
+    assert heads['H']['status'] == 'H1_done'
+    assert setups['H']['lineup'] == request.payload.model_dump(mode='json')['lineup']
+    assert setups['H']['lineupIsBaseline'] is True
+    assert setups['H']['subs'] == [sub]
+    restored = sdk_data.get_input_draft('m', 'H')
+    assert restored['_liveSetup']['subs'] == [sub]
+    assert restored['payload']['records'][0]['id'] == 'r'
+    assert rpc.documents[raw_path] == raw_before
+
+
 def test_empty_legacy_base_does_not_hide_saved_players():
     lineup = [{'playerId': 'starter', 'slot': 'gk', 'type': 'START', 'order': 1},
               {'playerId': 'bench', 'slot': 'b0', 'type': 'BENCH', 'order': 1}]

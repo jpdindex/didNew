@@ -853,6 +853,8 @@ function recordFormationChange() {
   // response from the old server snapshot must not erase a just-picked player.
   pendingSetupFingerprint = currentSetupFingerprint()
   if (formationSaveTimer) clearTimeout(formationSaveTimer)
+  formationSaveTimer = undefined
+  if (subOpen.value) return // Preview swaps are persisted together by Submit.
   // Before either half, the visible save button owns setup persistence.
   if (game.value.halfStatus === 'ready' || game.value.halfStatus === 'H1_done') {
     formationSaveTimer = undefined
@@ -1198,7 +1200,7 @@ function reenterHalf() {
 // 진행 중 대기방에서는 경기 정보가 기본 잠금 상태다.
 // 이 버튼을 눌렀을 때만 라인업/포메이션/진영을 바꿀 수 있고, 변경 완료 시 Draft를 다시 저장한다.
 // 변경 취소 시 되돌릴 진입 시점의 라인업/포메이션/진영.
-let matchInfoEditBackup: { formationKey: MatchState['formationKey'], assigned: MatchState['assigned'], side: MatchState['side'], formationChangeCount: number } | null = null
+let matchInfoEditBackup: { formationKey: MatchState['formationKey'], assigned: MatchState['assigned'], side: MatchState['side'], subs: MatchState['subs'], formationChangeCount: number } | null = null
 async function toggleMatchInfoEdit() {
   lifecycleError.value = ''
   if (!matchInfoEditMode.value) {
@@ -1206,6 +1208,7 @@ async function toggleMatchInfoEdit() {
       formationKey: game.value.formationKey,
       assigned: { ...game.value.assigned },
       side: game.value.side,
+      subs: game.value.subs.map(sub => ({ ...sub })),
       formationChangeCount: game.value.formationChanges.length,
     }
     matchInfoEditMode.value = true
@@ -1253,12 +1256,14 @@ async function cancelMatchInfoEdit() {
     return
   }
   const changed = backup.formationKey !== game.value.formationKey || backup.side !== game.value.side ||
+    JSON.stringify(backup.subs) !== JSON.stringify(game.value.subs) ||
     backup.formationChangeCount !== game.value.formationChanges.length ||
     JSON.stringify(Object.entries(backup.assigned).sort(([a], [b]) => a.localeCompare(b))) !==
     JSON.stringify(Object.entries(game.value.assigned).sort(([a], [b]) => a.localeCompare(b)))
   game.value.formationKey = backup.formationKey
   game.value.assigned = backup.assigned
   game.value.side = backup.side
+  game.value.subs = backup.subs
   game.value.formationChanges.splice(backup.formationChangeCount)
   if (!changed) {
     lifecycleError.value = ''
@@ -1617,6 +1622,8 @@ onUnmounted(() => document.removeEventListener('pointerdown', handleOutsideClick
 // PPT 슬라이드 37: 좌측 = 교체 아웃 선수, 우측 = 교체 투입 선수, 선택 → 목록추가 → Submit.
 // Player List 자리에서 화면을 전환한다.
 const subOpen = ref(false)
+const subSaving = ref(false)
+const subSaveError = ref('')
 const cardForPlayer = (playerId: string) => game.value.cards.filter(c => c.player === playerId)
 const subOut = ref<string | null>(null) // 빠질 선수의 슬롯 id (선발)
 const subIn = ref<string | null>(null) //  들어올 선수의 슬롯 id (후보)
@@ -1695,6 +1702,7 @@ function openSub() {
   subOut.value = null
   subIn.value = null
   pendingSubs.value = []
+  subSaveError.value = ''
   const moment = subMoment()
   subTimeMinute.value = moment ? Math.floor(moment.seconds / 60) : 0
   subTimeSecond.value = moment ? moment.seconds % 60 : 0
@@ -1714,6 +1722,7 @@ function closeSub() {
  * 이전 기록이 사라지지 않고 목록에 별도 항목으로 남는다.
  */
 function swapSlots(a: string, b: string) {
+  if (subSaving.value) return
   const starterSlot = isBenchSlot(a) ? b : a
   const benchSlot = isBenchSlot(a) ? a : b
   const outPlayer = game.value.assigned[starterSlot]!
@@ -1734,9 +1743,11 @@ function swapSlots(a: string, b: string) {
 }
 // 고르기만 하고, 실제 교체는 "목록추가"/"Submit" 에서 한다. 같은 선수를 다시 누르면 선택 해제.
 function pickOut(id: string) {
+  if (subSaving.value) return
   subOut.value = subOut.value === id ? null : id
 }
 function pickIn(id: string) {
+  if (subSaving.value) return
   subIn.value = subIn.value === id ? null : id
 }
 const canAddSub = computed(() => subOut.value !== null && subIn.value !== null)
@@ -1779,16 +1790,29 @@ function subMoment(): { half: Half; seconds: number } | null {
 }
 
 /** Submit: 지금 고른 교체가 있으면 목록에 넣고, 미리보기로 떠 있던 교체를 실제 기록(game.subs)으로 확정하고 닫는다. */
-function saveSub() {
+async function saveSub() {
+  if (subSaving.value || lifecycleBusy.value || !matchInfoEditable.value) return
   addSub()
-  if (pendingSubs.value.length) {
-    game.value.subs = [...game.value.subs, ...pendingSubs.value].sort(
+  subSaving.value = true
+  lifecycleBusy.value = true
+  subSaveError.value = ''
+  try {
+    // Keep IDs stable across a failed save/retry; pending history is a preview
+    // until Submit, while lineup + history share the durable setup command.
+    game.value.subs = [...new Map([...game.value.subs, ...pendingSubs.value].map(sub => [sub.id, sub])).values()].sort(
       (a, b) => HALF_ORDER[a.half]! * 100000 + a.seconds - (HALF_ORDER[b.half]! * 100000 + b.seconds)
     )
+    pendingSubs.value = []
+    if (formationSaveTimer) clearTimeout(formationSaveTimer)
+    formationSaveTimer = undefined
+    if (!await persistCurrentSetup()) throw new Error('교체와 라인업을 저장하지 못했습니다. 다시 Submit 해주세요.')
+    closeSub()
+  } catch (error) {
+    subSaveError.value = error instanceof Error ? error.message : '교체 저장에 실패했습니다.'
+  } finally {
+    subSaving.value = false
+    lifecycleBusy.value = false
   }
-  // 추가/취소한 교체는 Submit 에서만 저장한다. 팀 전환 후 돌아올 때는 서버 Draft가 정본이므로 서버에도 올린다.
-  if (pendingSubs.value.length || game.value.subs.length !== subsSnapshot?.length) void saveDraft(game.value)
-  closeSub()
 }
 /** 아직 저장 전인 교체 미리보기 한 건을 되돌린다 — 배치만 원래대로, game.subs 는 손대지 않는다. */
 function cancelPendingSub(index: number) {
@@ -1804,6 +1828,7 @@ function cancelPendingSub(index: number) {
 }
 /** Close: 저장하지 않고, 열었을 때 상태(배치·교체 목록)로 되돌린 뒤 닫는다. */
 function cancelSub() {
+  if (subSaving.value) return
   if (subSnapshot) {
     Object.keys(game.value.assigned).forEach(k => delete game.value.assigned[k])
     Object.assign(game.value.assigned, subSnapshot)
@@ -1825,6 +1850,7 @@ function fmtTime(sec: number) {
 const findPlayer = (playerId: string) => players.value.find(item => item.playerId === playerId)
 /** 잘못 저장된 교체 되돌리기 — 자리도 원래대로 돌려놓는다(DidInput.vue 의 undoSub 와 동일 로직). 확정은 Submit 에서. */
 function undoSub(index: number) {
+  if (subSaving.value) return
   const s = game.value.subs[index]
   if (!s) return
   const entries = Object.entries(game.value.assigned)
@@ -1997,7 +2023,7 @@ function undoSub(index: number) {
               <template v-else>
                 <div class="tabs subTabs">
                   <h2 class="subTitle"><span class="subTitleIcon">⇄</span>선수 교체</h2>
-                  <button type="button" class="subClose" aria-label="닫기" @click="cancelSub">✕</button>
+                  <button type="button" class="subClose" aria-label="닫기" :disabled="subSaving" @click="cancelSub">✕</button>
                 </div>
                 <div class="subTimeRow">
                   <span>교체 시각</span>
@@ -2068,10 +2094,11 @@ function undoSub(index: number) {
                 </div>
 
                 <div class="subActions">
-                  <button class="subCancel" @click="cancelSub">Close</button>
-                  <button class="subQueue" :disabled="!canAddSub" @click="addSub">목록추가</button>
-                  <button class="subSave" @click="saveSub">Submit</button>
+                  <button class="subCancel" :disabled="subSaving" @click="cancelSub">Close</button>
+                  <button class="subQueue" :disabled="!canAddSub || subSaving" @click="addSub">목록추가</button>
+                  <button class="subSave" :disabled="subSaving" @click="saveSub">{{ subSaving ? '저장 중…' : 'Submit' }}</button>
                 </div>
+                <p v-if="subSaveError" class="lifecycleError" role="alert">{{ subSaveError }}</p>
               </template>
             </section>
           </div>

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Request
 from firebase_admin import auth
 
 from backend.system.system_firestore import AuthenticationError, CurrentUser, ensure_firebase_app, get_settings
-from backend.system.system_player_requests import PlayerRegistration, PlayerRequestService, ReviewDecision, duplicate_players, require_manager
+from backend.system.system_player_requests import PlayerRegistration, DirectPlayerRegistration, PlayerRequestService, ReviewDecision, duplicate_players, require_manager
 
 router = APIRouter(prefix='/player-requests', tags=['선수 등록 요청'])
 
@@ -39,6 +39,11 @@ def duplicates(payload: PlayerRegistration, user: User):
     require_manager(user)
     service = PlayerRequestService()
     return {'players': duplicate_players(service.db, payload)}
+
+
+@router.post('/create-player')
+def create_player(payload: DirectPlayerRegistration, user: User):
+    return PlayerRequestService().create_player(payload, user)
 
 
 @router.post('/{request_id}/review')
