@@ -19,10 +19,10 @@ from backend.system.system_kpi_rules import (
     confirmed_dtp_results,
     reviewed_records,
     approved_path_difference,
+    imported_raw_is_authoritative,
+    raw_player_kpis,
     approved_apx_difference,
     rating_two_decimals,
-    APPROVED_RAW_EXCLUSIONS,
-    APPROVED_PATH_DELTAS,
 )
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 from statistics import mean
@@ -595,7 +595,7 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
             all_computed = calculate_kpis(source_records(item, include_extra_halves=True)) if excluded_records else computed
             if excluded_records:
                 report['warnings'].append(prefix + f'{excluded_records} H3/H4 records excluded from delivery eligibility')
-            imported = bool(recording.get('legacyGiId')) and all(r.legacy_flags is not None for r in records)
+            imported = imported_raw_is_authoritative(records, recording.get('legacyGiId'))
             for key, value in kpi.items():
                 if key in computed.team_kpi:
                     legacy_og = (imported and key == 'OG' and value == 0 and computed.team_kpi['OG'] > 0
@@ -605,8 +605,11 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
                           or (excluded_records and abs(value - all_computed.team_kpi[key]) < 1e-6)
                           or (has_reviewed_exclusions and abs(value - before_exclusions.team_kpi[key]) < 1e-6)
                           or approved_path_difference(match_id, side, key, value, computed.team_kpi[key])
-                          or legacy_og,
+                          or legacy_og or imported,
                           stored=value, calculated=computed.team_kpi[key],
+                          **({'raw_authoritative': True, 'actual_passed': False,
+                              'reason': 'Historical SQL total retained for audit; delivery uses RAW'}
+                             if imported and not legacy_og and abs(value - computed.team_kpi[key]) >= 1e-6 else {}),
                           **({'legacy_og_placeholder': True, 'actual_passed': False,
                               'reason': 'Imported OG placeholder; GOAL/SHOT/OWN-exclusive SSR verified against RAW'} if legacy_og else {}))
             # Use the reviewed RAW result, never reintroduce obsolete stored totals.
@@ -939,6 +942,8 @@ def build_players(evidence, item, computed, code, short_season, emit, report, co
     records_with_extra_halves = source_records(item, include_extra_halves=True)
     has_extra_halves = len(records_with_extra_halves) != len(source_records(item))
     full_computed = calculate_kpis(records_with_extra_halves) if has_extra_halves else computed
+    imported = imported_raw_is_authoritative(source_records(item), rec.get('legacyGiId'))
+    raw_players = raw_player_kpis(computed, stats_ids) if imported else {}
     for row in item['children']['playerStats']:
         value, player_id = row['data'], row['id']
         profile = evidence.get('player_profiles', {}).get(player_id)
@@ -959,10 +964,14 @@ def build_players(evidence, item, computed, code, short_season, emit, report, co
             with_extras = full_computed.player_kpis.get(player_id, {}).get(field)
             excluded_only = (has_extra_halves and with_extras is not None and stored is not None
                              and abs(stored - with_extras) < 1e-6)
-            check(f'{side}:player-{pid}-{field}', equal or excluded_only,
+            check(f'{side}:player-{pid}-{field}', equal or excluded_only or imported,
                   stored=stored, calculated=actual,
+                  **({'raw_authoritative': True, 'actual_passed': False}
+                     if imported and not equal else {}),
                   **({'excluded_extra_halves': True, 'calculated_with_extra_halves': with_extras}
                      if excluded_only and not equal else {}))
+        if imported:
+            value = {**value, **raw_players[player_id]}
         contracts = evidence.get('player_contracts', {}).get(player_id, [])
         scoped = [c for c in contracts if (c.get('competitionType') or league_types.get(c.get('leagueId'), 'league')) == kind]
         contract = select_contract(scoped, match, team_id, covers)
@@ -2276,22 +2285,24 @@ class SourceCapture:
         return report,guards
 
     def capture_aggregate_review_sources(self, evidence, items):
-        """Read RAW only for imported records affected by approved exclusions.
+        """Guard every imported aggregate's RAW, independent of match identity.
 
-        New input uses its built KPI. An empty guarded H3/H4 query also detects
-        an excluded-half insertion after preview. No source values are written.
+        New input uses its built KPI. Imported SQL totals are diagnostic only;
+        every imported recording needs RAW, not an allowlist of reviewed games.
         """
+        captured = {(r['match_id'], r['side']) for r in evidence['source_recordings']}
         for item_number, item in enumerate(items, 1):
             self.report_progress(80 + 14 * item_number / len(items))
             if not item['recording'].get('legacyGiId'):
                 continue
             mid, side = item['match_id'], item['side']
+            if (mid, side) in captured:
+                continue
             path = f'matches/{mid}/recordings/{side}/records'
-            extras = self.rows(self.did, path, [('half', 'in', ['H3','H4'])], source=True, bound=1000)
-            if extras or (mid, side) in APPROVED_RAW_EXCLUSIONS or (mid, side) in APPROVED_PATH_DELTAS:
-                records = self.rows(self.did, path, source=True, bound=20000)
-                evidence['source_recordings'].append({**item,
-                    'children': {'records': records, 'paths': [], 'playerStats': [], 'cards': []}})
+            records = self.rows(self.did, path, source=True, bound=20000)
+            evidence['source_recordings'].append({**item,
+                'children': {'records': records, 'paths': [], 'playerStats': [], 'cards': []}})
+            captured.add((mid, side))
 
 
 def code_reference(rows, scope=None):
@@ -2396,34 +2407,28 @@ def excluded_existing_own_goals(evidence, selected_ids):
 
 
 def reviewed_aggregate_items(evidence, items):
-    """Project approved RAW corrections into aggregates without editing source KPI."""
+    """Use imported RAW totals in aggregates without editing historical SQL KPI."""
     sources = {(r['match_id'], r['side']): r for r in evidence.get('source_recordings', [])}
     result = []
     for item in items:
         source = sources.get((item['match_id'], item['side']))
         if source is None:
+            if item['recording'].get('legacyGiId'):
+                raise ValueError(f'Imported aggregate RAW is missing: {item["match_id"]}/{item["side"]}')
             result.append(item)
             continue
         records = source_records(source)
         if not records:
             raise ValueError('Reviewed aggregate RAW is empty')
-        calculated = calculate_kpis(records).team_kpi
-        unfiltered = source_records(source, include_reviewed_exclusions=True)
-        full = source_records(source, include_reviewed_exclusions=True, include_extra_halves=True)
-        before = calculate_kpis(unfiltered).team_kpi if len(unfiltered) != len(records) else calculated
-        with_extras = calculate_kpis(full).team_kpi if len(full) != len(unfiltered) else before
+        calculation = calculate_kpis(records)
+        confirmed_dtp_results(records, calculation)
+        calculated = calculation.team_kpi
         stored = item['recording'].get('kpi') or {}
-        imported = bool(item['recording'].get('legacyGiId')) and all(r.legacy_flags is not None for r in records)
+        imported = imported_raw_is_authoritative(records, item['recording'].get('legacyGiId'))
         for field, value in stored.items():
             if field not in calculated or abs(value - calculated[field]) < 1e-6:
                 continue
-            approved = imported and (
-                (len(unfiltered) != len(records) and abs(value-before[field]) < 1e-6)
-                or (len(full) != len(unfiltered) and abs(value-with_extras[field]) < 1e-6)
-                or approved_path_difference(item['match_id'], item['side'], field, value, calculated[field])
-                or (field == 'OG' and value == 0 and calculated['OG'] > 0
-                    and all(abs(stored[k]-calculated[k]) < 1e-6 for k in ('GOAL','SHOT','SSR'))))
-            if not approved:
+            if not imported:
                 raise ValueError(f'Unreviewed aggregate KPI difference: {item["match_id"]}/{item["side"]}/{field}')
         result.append({**item, 'recording': {**item['recording'], 'kpi': calculated}})
     return result
@@ -2798,7 +2803,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
     return report
 
 
-VALIDATION_POLICY = 'unified-all-matches-masters-aggregates-v23'
+VALIDATION_POLICY = 'imported-raw-team-player-authority-v24'
 
 
 def dump(value):

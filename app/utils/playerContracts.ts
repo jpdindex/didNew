@@ -11,12 +11,35 @@
 // =============================================================================
 
 import {
-  collection, collectionGroup, deleteDoc, doc, getDoc, getDocs, query, setDoc, Timestamp, where, type Firestore,
+  collection, collectionGroup, deleteDoc, doc, documentId, getDoc, getDocs, query, setDoc, Timestamp, where, type Firestore,
 } from 'firebase/firestore'
 import type { ContractDoc, PlayerDoc } from '~/types/schema'
 
 export type PlayerContract = ContractDoc & { id: string }
 export type PlayerRow = PlayerDoc & { id: string }
+
+export function comparePlayerIds(a: string, b: string): number {
+  return a.localeCompare(b, 'en', { numeric: true })
+}
+
+async function boundedMap<T, R>(items: T[], action: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length)
+  let next = 0
+  await Promise.all(Array.from({ length: Math.min(4, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++
+      results[index] = await action(items[index]!)
+    }
+  }))
+  return results
+}
+
+/** Fetch only the visible profiles, in bounded groups instead of one request per player. */
+export async function fetchPlayerProfiles(db: Firestore, ids: string[]): Promise<PlayerRow[]> {
+  const snapshots = await boundedMap(chunk([...new Set(ids)], 30), batch =>
+    getDocs(query(collection(db, 'players'), where(documentId(), 'in', batch))))
+  return snapshots.flatMap(snapshot => snapshot.docs.map(item => ({ ...(item.data() as PlayerDoc), id: item.id })))
+}
 
 function currentClubContract(contracts: PlayerContract[]): PlayerContract | undefined {
   // National-team selection is an independent affiliation. It must never
@@ -60,17 +83,29 @@ export function sortContracts(list: PlayerContract[]): PlayerContract[] {
  *  같은 선수가 팀을 옮긴 적이 있으면 계약이 여러 개 실려 올 수 있다. */
 export async function fetchPlayersByTeamsAndSeason(
   db: Firestore, teamIds: string[], season: string,
+  options: { deferProfiles?: boolean } = {},
 ): Promise<{ player: PlayerRow; contracts: PlayerContract[] }[]> {
   if (!teamIds.length) return []
   const range = seasonRange(season)
-  const snaps = await Promise.all(chunk(teamIds, 30).map(ids =>
-    getDocs(query(collectionGroup(db, 'contracts'), where('teamId', 'in', ids))),
-  ))
+  // Open contracts and contracts ending during/after the season are separate
+  // queries so expired history and future signings do not cross the network.
+  const jobs = chunk([...new Set(teamIds)], 30).flatMap(ids => [
+    query(collectionGroup(db, 'contracts'), where('teamId', 'in', ids), where('to', '==', null), where('from', '<=', range.to)),
+    query(collectionGroup(db, 'contracts'), where('teamId', 'in', ids), where('to', '>=', range.from), where('from', '<=', range.to)),
+  ])
+  const snaps = await boundedMap(jobs, job => getDocs(job)).catch((error: any) => {
+    // Keep the list usable while the new composite indexes are deploying.
+    // Permission and transport errors must still surface normally.
+    if (error?.code !== 'failed-precondition' || !/index/i.test(error.message || '')) throw error
+    return boundedMap(chunk([...new Set(teamIds)], 30), ids =>
+      getDocs(query(collectionGroup(db, 'contracts'), where('teamId', 'in', ids))))
+  })
   const byPlayer = new Map<string, PlayerContract[]>()
   for (const snap of snaps) {
     for (const d of snap.docs) {
       const c = d.data() as ContractDoc
       if (!overlapsRange(c, range)) continue
+      if (d.ref.parent.parent?.parent.id !== 'players') continue
       const playerId = d.ref.parent.parent?.id
       if (!playerId) continue
       const arr = byPlayer.get(playerId) ?? []
@@ -78,14 +113,14 @@ export async function fetchPlayersByTeamsAndSeason(
       byPlayer.set(playerId, arr)
     }
   }
-  const playerIds = [...byPlayer.keys()]
-  const playerSnaps = await Promise.all(playerIds.map(id => getDoc(doc(db, 'players', id))))
+  const playerIds = [...byPlayer.keys()].sort(comparePlayerIds)
+  if (options.deferProfiles) return playerIds.map(id => ({ player: { id } as PlayerRow, contracts: sortContracts(byPlayer.get(id) ?? []) }))
+  const profiles = await fetchPlayerProfiles(db, playerIds)
   const out: { player: PlayerRow; contracts: PlayerContract[] }[] = []
-  for (const snap of playerSnaps) {
-    if (!snap.exists()) continue
-    out.push({ player: { id: snap.id, ...(snap.data() as PlayerDoc) }, contracts: sortContracts(byPlayer.get(snap.id) ?? []) })
+  for (const player of profiles) {
+    out.push({ player, contracts: sortContracts(byPlayer.get(player.id) ?? []) })
   }
-  return out
+  return out.sort((a, b) => comparePlayerIds(a.player.id, b.player.id))
 }
 
 export async function fetchPlayerContracts(db: Firestore, playerId: string): Promise<PlayerContract[]> {

@@ -323,6 +323,18 @@ def _ratio(numerator: int, denominator: int) -> float:
     return numerator / denominator if denominator else 0.0
 
 
+def imported_raw_is_authoritative(records: list[KpiRecord], legacy_id: str | None) -> bool:
+    """SQL totals are historical baselines when complete imported RAW is present."""
+    return bool(legacy_id and records and all(r.legacy_flags is not None for r in records))
+
+
+def raw_player_kpis(calculation: KpiCalculation, player_ids=()) -> dict[str, dict]:
+    """Use the same RAW totals for rating and delivery, retaining unused players."""
+    return {pid: {'playerId': pid, **_empty(PLAYER_KPI_FIELDS),
+                  **calculation.player_kpis.get(pid, {})}
+            for pid in sorted(set(player_ids) | set(calculation.player_kpis)) if pid != 'OWN'}
+
+
 def calculate_kpis(records: list[KpiRecord], *, close_trailing_bap: bool = True) -> KpiCalculation:
     if records and all(record.legacy_flags is not None for record in records):
         return _calculate_legacy_kpis(records)

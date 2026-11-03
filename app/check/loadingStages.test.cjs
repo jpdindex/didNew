@@ -12,6 +12,77 @@ const deferred = () => {
   return { promise, resolve, reject }
 }
 const ref = value => ({ value })
+
+test('calendar final RAW status wins over correction half without hiding live drafts', () => {
+  const context = functions('schedule.vue', ['teamAnalysisLabel', 'teamStatusTone', 'isMatchComplete'], {})
+  for (const half of ['H1', 'H2_done']) {
+    const final = { rawStatus: 'final', completed: false, lifecycleStatus: half }
+    assert.equal(context.teamAnalysisLabel(final), '분석 종료')
+    assert.equal(context.teamStatusTone(final), 'done')
+    assert.equal(context.isMatchComplete({ inputStatus: { H: final, A: final } }), true)
+  }
+  const live = { rawStatus: null, completed: false, lifecycleStatus: 'H1' }
+  assert.equal(context.teamAnalysisLabel(live), '전반 진행중')
+  assert.equal(context.teamStatusTone(live), 'live')
+  assert.equal(context.isMatchComplete({ inputStatus: { H: live, A: live } }), false)
+})
+
+test('manager final controls wait for participant confirmation', async () => {
+  const gate = deferred()
+  const ready = ref(false)
+  const context = functions('TeamSelection.vue', ['ensureLobbyParticipant'], {
+    game: ref({ participantRole: 'manager' }), joinedLobbyRole: undefined, lobbyJoinPromise: undefined,
+    lobbyParticipantReady: ready, lobbyHistoryLoaded: false, lobbyHistoryPromise: undefined,
+    joinCollaboration: () => gate.promise, ensureLobbyHistory: async () => {},
+  })
+  const joining = context.ensureLobbyParticipant('manager')
+  assert.equal(ready.value, false)
+  gate.resolve()
+  await joining
+  assert.equal(ready.value, true)
+})
+
+function finalEditEnvironment({ ready = true, control = true, failRestore = false } = {}) {
+  const events = []
+  const context = functions('TeamSelection.vue', ['editFinal'], {
+    lifecycleBusy: ref(false), lobbyParticipantReady: ref(ready), lifecycleError: ref(''),
+    inputStatus: ref({ H: { rawStatus: 'final' } }),
+    game: ref({ team: 'home', halfStatus: 'final', lifecycleControl: control, recorderLevel: 'advanced' }),
+    restoreFinalRaw: async () => { events.push('restore'); if (failRestore) throw new Error('restore failed') },
+    navigateTo: () => { events.push('navigate') }, didInputQuery: () => ({}),
+  })
+  return { context, events }
+}
+
+test('unconfirmed manager cannot enter final editing or change the half status', async () => {
+  const env = finalEditEnvironment({ ready: false, control: false })
+  await env.context.editFinal()
+  assert.deepEqual(env.events, [])
+  assert.equal(env.context.game.value.halfStatus, 'final')
+})
+
+test('final RAW cannot enter the assistant shortcut after permission is denied', async () => {
+  const env = finalEditEnvironment({ control: false })
+  await env.context.editFinal()
+  assert.deepEqual(env.events, [])
+  assert.equal(env.context.game.value.halfStatus, 'final')
+  assert.match(env.context.lifecycleError.value, /권한/)
+})
+
+test('confirmed final editing navigates only after RAW restore succeeds', async () => {
+  const success = finalEditEnvironment()
+  await success.context.editFinal()
+  assert.deepEqual(success.events, ['restore', 'navigate'])
+  const failure = finalEditEnvironment({ failRestore: true })
+  await failure.context.editFinal()
+  assert.deepEqual(failure.events, ['restore'])
+  assert.equal(failure.context.game.value.halfStatus, 'final')
+  assert.equal(failure.context.lifecycleBusy.value, false)
+})
+
+test('completed match no longer renders the temporary half-edit button', () => {
+  assert.ok(!source('TeamSelection.vue').includes('전반/후반 수정'))
+})
 function functions(file, names, globals) {
   const text = source(file)
   const code = names.map(name => text.match(new RegExp(`(?:async )?function ${name}\\([\\s\\S]*?\\n}`))[0]).join('\n')

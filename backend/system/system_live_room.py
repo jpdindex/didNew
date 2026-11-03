@@ -78,8 +78,18 @@ def _queue_summary(data, gm_id, side):
             try:
                 # Read the latest head, rather than publishing a captured old
                 # lifecycle after a newer start/pause/finalization command.
-                document = source._input_setup_reference(match_id, match_side).get().to_dict() or {}
-                source.sync_input_summary_from_draft(match_id, match_side, document)
+                draft_ref = source._input_setup_reference(match_id, match_side)
+                raw_ref = source.db.collection('matches').document(match_id).collection('recordings').document(match_side)
+                # Read current Draft/RAW state in one RPC. No persisted or
+                # process-local status cache can outlive a finalization here.
+                fields = ['participants', 'primaryUid', 'status',
+                          'payload.status', 'payload.homeScore', 'payload.awayScore',
+                          'sharedState.halfStatus', 'sharedState.homeScore', 'sharedState.awayScore']
+                snapshots = {s.reference.path: s.to_dict() or {} for s in source.db.get_all(
+                    [draft_ref, raw_ref], field_paths=fields, retry=None, timeout=10)}
+                source.sync_input_summary_from_draft(
+                    match_id, match_side, snapshots.get(draft_ref.path, {}),
+                    recording_state=snapshots.get(raw_ref.path, {}))
             except Exception:
                 import logging
                 logging.getLogger(__name__).exception('Draft committed; schedule summary refresh failed')

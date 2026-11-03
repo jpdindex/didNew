@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import logging
 import httpx
 from dataclasses import dataclass
 from typing import Any
@@ -11,10 +12,12 @@ from backend.system.system_kpi_rules import (
     calculate_kpis,
     calculate_team_kpi_5min,
     reviewed_records,
-    approved_path_difference,
+    imported_raw_is_authoritative,
+    raw_player_kpis,
 )
 
 PLAYER_KPI_FIELDS = tuple(PlayerKpi.model_fields)
+logger = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class BuildMatchRatingResult:
     gm_id: str
@@ -59,29 +62,28 @@ class BuildMatchRating:
         normal_records = [r for r in all_records if r.half in ('H1','H2')]
         records = reviewed_records(gm_id, side, normal_records)
         team_kpi = source.recording.kpi.model_dump(mode="json")
-        raw_kpi = calculate_kpis(records).team_kpi
-        imported = bool(getattr(source.recording, 'legacyGiId', None)) and all(r.legacy_flags is not None for r in records)
-        before = calculate_kpis(normal_records).team_kpi if len(records) != len(normal_records) else raw_kpi
-        full = calculate_kpis(all_records).team_kpi if len(all_records) != len(normal_records) else before
-        def reviewed_import_difference(field, value):
-            return imported and (
-                (len(records) != len(normal_records) and abs(value-before[field]) < 1e-6)
-                or (len(all_records) != len(normal_records) and abs(value-full[field]) < 1e-6)
-                or approved_path_difference(gm_id, side, field, value, raw_kpi[field])
-                or (field == 'OG' and value == 0 and raw_kpi['OG'] > 0
-                    and all(abs(team_kpi[k]-raw_kpi[k]) < 1e-6 for k in ('GOAL','SHOT','SSR'))))
-        if (any(field not in team_kpi for field in ("GOAL", "OG", "SHOT", "SSR"))
-                or any(abs(value - raw_kpi[field]) >= 1e-6 and not reviewed_import_difference(field, value)
+        calculation = calculate_kpis(records)
+        raw_kpi = calculation.team_kpi
+        imported = imported_raw_is_authoritative(records, getattr(source.recording, 'legacyGiId', None))
+        if not imported and (any(field not in team_kpi for field in ("GOAL", "OG", "SHOT", "SSR"))
+                or any(abs(value - raw_kpi[field]) >= 1e-6
                        for field, value in team_kpi.items() if field in raw_kpi)):
             raise BackendError(
                 message=f"Stored KPI differs from reviewed RAW; rebuild KPI before rating: {gm_id}/{side}",
                 status_code=409, code="rating_kpi_definition_mismatch",
             )
         if imported:
-            # Import deliberately skips KPI POST. Correct only the request,
-            # preserving stored KPI/version and validating every other delta.
+            # SQL aggregates may include orphaned paths or stale role totals.
+            # Request team/player totals come from RAW; source stays unchanged.
             team_kpi = raw_kpi
+            differences = {key: {'stored': value, 'raw': raw_kpi[key]}
+                           for key, value in source.recording.kpi.model_dump(mode='json').items()
+                           if key in raw_kpi and abs(value - raw_kpi[key]) >= 1e-6}
+            if differences:
+                logger.info('Using imported RAW KPI for rating: %s/%s differences=%s', gm_id, side, differences)
         player_stats = self.data.list_player_stats(gm_id, side)
+        if imported:
+            player_stats = raw_player_kpis(calculation, player_stats)
         request_body = {
             "gm_id": gm_id,
             "side": side,
@@ -110,7 +112,7 @@ class BuildMatchRating:
             raise BackendError('Final five-minute rating input differs from RAW KPI',
                                status_code=409, code='rating_interval_kpi_mismatch')
         input_fingerprint = sha256(json.dumps(
-            {'policy': 'finalized-raw-flags-own-exclusive-ssr-confirmed-dtp-v3', 'request': request_body},
+            {'policy': 'raw-team-player-kpis-confirmed-dtp-v4', 'request': request_body},
             sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
         if (not force and source.recording.ratingBasedOn == source.recording.kpiVersion
                 and source.recording.teamRating is not None

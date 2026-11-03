@@ -536,6 +536,10 @@ class JpdDidData:
                 primary_uid = next((item["uid"] for item in participants if item.get("role") == "primary"), None)
                 status = "final" if raw_status == "final" else "ready"
             primary_uids[side] = primary_uid
+            # Editing a completed recording creates a temporary live Draft;
+            # it must not reopen the official match on the calendar.
+            if raw_status == "final":
+                status = "final"
             sides[side] = {"rawStatus": raw_status, "completed": status == "final", "lifecycleStatus": status, "participants": participants}
             if live_score is None and isinstance(draft.get("score"), dict):
                 live_score = draft["score"]
@@ -609,11 +613,22 @@ class JpdDidData:
             self.refresh_input_summary(gm_id)
             reference.update(values, retry=None, timeout=20)
 
-    def sync_input_summary_from_draft(self, gm_id: str, side: Side, draft: dict[str, Any]) -> None:
+    def sync_input_summary_from_draft(
+        self, gm_id: str, side: Side, draft: dict[str, Any], *,
+        recording_state: dict[str, Any] | None = None,
+    ) -> None:
         """Mirror the accepted Draft ownership/state directly into the schedule."""
         payload = draft.get("payload") if isinstance(draft.get("payload"), dict) else {}
         shared = draft.get("sharedState") if isinstance(draft.get("sharedState"), dict) else {}
         lifecycle = shared.get("halfStatus") or payload.get("status") or draft.get("status") or "ready"
+        # A correction Draft's clock/half is editing context, not the lifecycle
+        # of an already-final RAW. Read only the compact recording status.
+        if recording_state is None:
+            recording = self.db.collection('matches').document(gm_id).collection('recordings').document(side)
+            recording_state = recording.get(field_paths=['status'], retry=None, timeout=10).to_dict() or {}
+        raw_status = recording_state.get('status')
+        if raw_status == 'final':
+            lifecycle = 'final'
         participants = self._summary_participants(draft)
         primary_uid = draft.get("primaryUid") if isinstance(draft.get("primaryUid"), str) else None
         score = None
@@ -623,7 +638,7 @@ class JpdDidData:
         self._update_input_summary_side(
             gm_id,
             side,
-            input_state={"rawStatus": "final" if lifecycle == "final" else None, "completed": lifecycle == "final", "lifecycleStatus": lifecycle, "participants": participants},
+            input_state={"rawStatus": raw_status, "completed": lifecycle == "final", "lifecycleStatus": lifecycle, "participants": participants},
             collaboration={"status": lifecycle, "primaryUid": primary_uid, "participants": participants},
             score=score,
         )
@@ -2867,8 +2882,20 @@ class JpdDidData:
             summary_snapshot = summary_future.result()
             summary = summary_snapshot.to_dict() or {} if summary_snapshot.exists else {}
             summary_status = summary.get("inputStatus") if isinstance(summary.get("inputStatus"), dict) else {}
-            input_status = summary_status if all(isinstance(summary_status.get(item), dict) for item in ("H", "A")) else self.get_recording_input_states(gm_id)
+            from_summary = all(isinstance(summary_status.get(item), dict) for item in ("H", "A"))
+            input_status = summary_status if from_summary else self.get_recording_input_states(gm_id)
             selected_status = input_status[side]
+            if from_summary and selected_status.get('rawStatus') != 'final':
+                # Older correction sessions could overwrite the cached final
+                # status. Verify the small head before reopening such a match;
+                # never stream RAW events just to establish completion. The
+                # no-summary fallback already read these heads in this request.
+                head = self.db.collection('matches').document(gm_id).collection('recordings').document(side)
+                raw = head.get(field_paths=['status', 'fieldSide'], retry=None, timeout=10).to_dict() or {}
+                if raw.get('status') == 'final':
+                    selected_status = {**selected_status, 'rawStatus': 'final', 'completed': True,
+                                       'lifecycleStatus': 'final', 'fieldSide': raw.get('fieldSide')}
+                    input_status = {**input_status, side: selected_status}
             squads, cached, squad_snapshot = squads_future.result()
 
         # A completed recording has no live collaboration state.  The lobby

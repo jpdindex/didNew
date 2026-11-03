@@ -19,6 +19,9 @@ class MemoryDB:
     def transaction(self, **kwargs):
         return MemoryTransaction(self)
 
+    def get_all(self, references, **kwargs):
+        return iter(reference.get() for reference in references)
+
     def batch(self):
         return MemoryBatch(self)
 
@@ -92,7 +95,7 @@ def data(monkeypatch):
     result = object.__new__(JpdDidData)
     result.db = MemoryDB({'inputDrafts/m_H': {'gmId': 'm', 'side': 'H', 'revision': 0, 'primaryUid': 'p',
         'participants': {'p': {'role': 'primary'}, 'a': {'role': 'assistant'}}, 'payload': payload()}})
-    result.sync_input_summary_from_draft = lambda *args: None
+    result.sync_input_summary_from_draft = lambda *args, **kwargs: None
     return result
 
 
@@ -476,6 +479,56 @@ def test_full_raw_restore_creates_editable_draft_with_all_records(data):
     assert not data.db.documents['inputDrafts/m_H']['liveClosed']
 
 
+@pytest.mark.parametrize('half', ['ready', 'H1', 'H2_done', 'final'])
+@pytest.mark.parametrize('raw_status', [None, 'final'])
+def test_correction_draft_never_reopens_final_raw_on_schedule(data, half, raw_status):
+    del data.sync_input_summary_from_draft
+    if raw_status:
+        data.db.documents['matches/m/recordings/H'] = {'status': raw_status}
+    updates = []
+    data._update_input_summary_side = lambda *args, **kwargs: updates.append(kwargs)
+    draft = {'sharedState': {'halfStatus': half}, 'participants': {'manager': {'role': 'manager'}}}
+    data.sync_input_summary_from_draft('m', 'H', draft)
+    state = updates[0]['input_state']
+    assert state['rawStatus'] == raw_status
+    assert state['lifecycleStatus'] == ('final' if raw_status == 'final' else half)
+    assert state['completed'] == (raw_status == 'final' or half == 'final')
+    assert state['participants'][0]['role'] == 'manager'
+    assert draft['sharedState']['halfStatus'] == half
+
+
+def test_final_bootstrap_ignores_old_summary_that_was_overwritten_by_correction(data):
+    from types import SimpleNamespace
+    match = SimpleNamespace(homeTeamId='home', awayTeamId='away', leagueId='EPL', seasonId='20242025',
+                            round=36, date='2025.05.11', kickoffTime='14:15', stadiumId=None, matchType='league')
+    data.get_match = lambda _: match
+    data.db.documents['matches/m/recordings/H'] = {'status': 'final', 'fieldSide': 'left'}
+    data.db.documents['matches/m/inputSummaries/current'] = {'inputStatus': {
+        'H': {'rawStatus': None, 'completed': False, 'lifecycleStatus': 'H1'},
+        'A': {'rawStatus': 'final', 'completed': True, 'lifecycleStatus': 'final'},
+    }}
+    data._get_or_create_input_squads_snapshot = lambda *args: ({'H': [], 'A': []}, True, {})
+    data._final_lobby_session_from_snapshot = lambda *args: {'status': 'ok', 'gmId': 'm', 'side': 'H'}
+    result = data.build_input_bootstrap('m', 'H')
+    assert result['inputStatus']['H']['rawStatus'] == 'final'
+    assert result['inputStatus']['H']['lifecycleStatus'] == 'final'
+    assert result['inputStatus']['H']['completed']
+    assert result['inputSetup'] == {'H': None, 'A': None}
+
+
+def test_summary_refresh_keeps_final_raw_done_while_preserving_manager_roster(data):
+    from types import SimpleNamespace
+    match = SimpleNamespace(homeTeamId='home', awayTeamId='away', leagueId='EPL', seasonId='20242025',
+                            round=36, date='2025.05.11', kickoffTime='14:15', stadiumId=None, score=SimpleNamespace(home=0, away=2))
+    data.get_documents_by_ids = lambda *args: {}
+    data.get_recording_heads_many = lambda *args: {'m': {'H': {'status': 'final'}, 'A': {'status': 'final'}}}
+    data.get_input_draft_participants_many = lambda *args: {'m': {'H': {'status': 'H1', 'participants': [{'uid': 'p', 'role': 'manager'}]}, 'A': {}}}
+    result = data.refresh_input_summary('m', match)
+    assert result['inputStatus']['H']['lifecycleStatus'] == 'final'
+    assert result['inputStatus']['H']['completed']
+    assert result['collaboration']['H']['participants'][0]['role'] == 'manager'
+
+
 def test_basic_participant_cannot_claim_advanced_final_authority(data):
     data.db.documents['inputDrafts/m_H']['participants']['p']['level'] = 'basic'
     with pytest.raises(BackendError) as caught:
@@ -551,7 +604,7 @@ def sdk_data():
     client._firestore_api_internal = transport
     result = object.__new__(JpdDidData)
     result.db = client
-    result.sync_input_summary_from_draft = lambda *args: None
+    result.sync_input_summary_from_draft = lambda *args, **kwargs: None
     yield result
     client.close()
 
@@ -1008,6 +1061,72 @@ def test_ready_and_final_bootstrap_still_skip_event_reads(sdk_data, lifecycle):
         assert result['inputSetup'] == {'H': None, 'A': None}
         assert rpc.queries == []
 
+
+
+@pytest.mark.parametrize('raw_status', [None, 'final'])
+def test_queued_summary_batches_latest_raw_and_draft_without_changing_live_score(sdk_data, monkeypatch, raw_status):
+    del sdk_data.sync_input_summary_from_draft
+    rpc = sdk_data.db._firestore_api_internal
+    if raw_status:
+        rpc.documents['matches/m/recordings/H'] = {'status': raw_status}
+    draft = rpc.documents['inputDrafts/m_H']
+    draft['sharedState'] = {'halfStatus': 'H1', 'homeScore': 2, 'awayScore': 3}
+    draft['participants'] = {'manager': {'role': 'manager', 'name': 'Manager'}}
+    before = deepcopy(rpc.documents)
+    updates = []
+    sdk_data._update_input_summary_side = lambda *args, **kwargs: updates.append(kwargs)
+    tasks = []
+    class QueuedPool:
+        def submit(self, action): tasks.append(action)
+    monkeypatch.setattr(live, '_summary_pool', QueuedPool())
+    monkeypatch.setattr(live, '_summary_pending', {})
+    monkeypatch.setattr(live, '_summary_running', False)
+    live._queue_summary(sdk_data, 'm', 'H')
+    assert rpc.read_calls == 0  # Submission/ACK does not run derived reads.
+    tasks.pop(0)()
+    assert rpc.read_calls == 1 and len(rpc.reads) == 2
+    assert rpc.queries == [] and rpc.commits == 0
+    state = updates[0]['input_state']
+    assert state['rawStatus'] == raw_status
+    assert state['lifecycleStatus'] == ('final' if raw_status else 'H1')
+    assert state['participants'][0]['role'] == 'manager'
+    assert updates[0]['score'] == {'home': 2, 'away': 3}
+    assert rpc.documents == before
+    # No status survives in a process cache: the next refresh sees new RAW.
+    rpc.documents['matches/m/recordings/H'] = {'status': 'final'}
+    live._queue_summary(sdk_data, 'm', 'H')
+    tasks.pop(0)()
+    assert rpc.read_calls == 2 and updates[-1]['input_state']['rawStatus'] == 'final'
+
+
+@pytest.mark.parametrize('recording_state', [{}, {'status': 'final'}])
+def test_summary_reuses_explicit_recording_read_even_when_document_was_missing(sdk_data, recording_state):
+    del sdk_data.sync_input_summary_from_draft
+    updates = []
+    sdk_data._update_input_summary_side = lambda *args, **kwargs: updates.append(kwargs)
+    sdk_data.sync_input_summary_from_draft('m', 'H', {'sharedState': {'halfStatus': 'H1'}},
+                                          recording_state=recording_state)
+    assert sdk_data.db._firestore_api_internal.read_calls == 0
+    assert updates[0]['input_state']['rawStatus'] == recording_state.get('status')
+
+
+@pytest.mark.parametrize('raw_status', [None, 'final'])
+def test_bootstrap_without_summary_does_not_reread_fresh_raw_heads(sdk_data, raw_status):
+    from types import SimpleNamespace
+    rpc = sdk_data.db._firestore_api_internal
+    if raw_status:
+        rpc.documents['matches/m/recordings/H'] = {'status': raw_status, 'fieldSide': 'left'}
+    sdk_data.get_match = lambda _: SimpleNamespace(homeTeamId='h', awayTeamId='a', leagueId='l', seasonId='s',
+        round=1, date='2026.10.15', kickoffTime=None, stadiumId=None, matchType='league', score=SimpleNamespace(home=0, away=0))
+    sdk_data._get_or_create_input_squads_snapshot = lambda *args: ({'H': [], 'A': []}, True, {})
+    sdk_data._final_lobby_session_from_snapshot = lambda *args: {'status': 'ok', 'gmId': 'm', 'side': 'H'}
+    before = deepcopy(rpc.documents)
+    result = sdk_data.build_input_bootstrap('m', 'H')
+    assert result['inputStatus']['H']['rawStatus'] == raw_status
+    assert sum(path.endswith('/matches/m/recordings/H') for path in rpc.reads) == 1
+    assert not any(path.endswith(('/records', '/cards')) for path in rpc.queries)
+    assert rpc.documents == before
+    assert rpc.transaction_modes == (['read_only'] if not raw_status else [])
 
 
 def test_lobby_setup_snapshot_retries_with_a_fresh_consistent_revision(sdk_data, monkeypatch):

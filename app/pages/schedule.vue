@@ -376,6 +376,7 @@ const selectedMatch = computed(() => {
 })
 
 function teamAnalysisLabel(status: TeamInputStatus) {
+  if (status.rawStatus === 'final') return '분석 종료'
   const labels: Record<string, string> = {
     ready: '분석 대기', H1: '전반 진행중', H1_done: '전반 종료',
     H2: '후반 진행중', H2_done: '후반 종료', final: '분석 종료',
@@ -384,13 +385,14 @@ function teamAnalysisLabel(status: TeamInputStatus) {
 }
 
 function teamStatusTone(status: TeamInputStatus) {
-  if (status.lifecycleStatus === 'final') return 'done'
+  if (status.rawStatus === 'final' || status.lifecycleStatus === 'final') return 'done'
   if (!status.lifecycleStatus || status.lifecycleStatus === 'ready') return 'waiting'
   return 'live'
 }
 
 function isMatchComplete(match: MatchItem) {
-  return match.inputStatus.H.completed && match.inputStatus.A.completed
+  return (match.inputStatus.H.rawStatus === 'final' || match.inputStatus.H.completed)
+    && (match.inputStatus.A.rawStatus === 'final' || match.inputStatus.A.completed)
 }
 
 // 경기장 이름 끝의 '스타디움'은 항상 둘째 줄로 내린다. 이름 길이와 상관없이 같은 모양으로 보이게 한다.
@@ -461,7 +463,8 @@ const selectedSummary = computed(() => (
 // 매니저 입장은 별도로 유지한다.
 const selectedTeamFinished = computed(() => {
   if (!selectedMatch.value || !selectedTeam.value) return false
-  return selectedMatch.value.inputStatus[selectedTeam.value === 'home' ? 'H' : 'A'].lifecycleStatus === 'final'
+  const status = selectedMatch.value.inputStatus[selectedTeam.value === 'home' ? 'H' : 'A']
+  return status.rawStatus === 'final' || status.lifecycleStatus === 'final'
 })
 
 const selectedTeamHasOtherPrimary = computed(() => {

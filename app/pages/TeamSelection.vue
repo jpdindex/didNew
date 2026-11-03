@@ -103,6 +103,7 @@ if (matchId.value && game.value.matchId !== matchId.value) {
 // 다시 들어오는 경우에도 useState에 남아 있던 이전 팀을 재사용하면 안 된다.
 game.value.team = route.query.team === 'away' ? 'away' : 'home'
 const requestedRole = route.query.role === 'assistant' || route.query.role === 'manager' ? route.query.role : 'primary'
+const lobbyParticipantReady = ref(false)
 game.value.participantRole = requestedRole
 game.value.lifecycleControl = requestedRole === 'primary'
 
@@ -251,6 +252,7 @@ function ensureLobbyParticipant(role = game.value.participantRole) {
   const join = joinCollaboration(game.value, role)
     .then(async () => {
       joinedLobbyRole = game.value.participantRole
+      lobbyParticipantReady.value = true
       // Replace the lobby's recovery reader with a participant connection.
       // Clear the in-flight join before starting so it cannot await itself.
       if (lobbyJoinPromise === join) lobbyJoinPromise = undefined
@@ -1338,10 +1340,10 @@ onMounted(async () => {
   void loadInitialKpis()
 
   const selectedState = game.value.team === 'home' ? inputStatus.value.H : inputStatus.value.A
-  // 끝난 팀 입력에는 매니저만 들어온다. 수정 Draft의 제어 권한을 받으려면 여기서도 join한다.
+  // 완료 경기에서도 서버가 현재 역할·수정 권한을 확인한 뒤에만 버튼을 연다.
   // 시작 전 로비 방문은 등록하지 않는다. 주 분석관은 "세팅 저장"에서 확정된다.
   const lobby = (selectedState.lifecycleStatus ?? 'ready') === 'ready' && game.value.halfStatus === 'ready'
-  if (!lobby && (selectedState.rawStatus !== 'final' || requestedRole === 'manager')) {
+  if (!lobby) {
     // Participation writes must not hold back the player list, formation or KPI paint.
     void ensureLobbyParticipant(requestedRole).catch(error => {
       lifecycleError.value = error instanceof Error
@@ -1405,6 +1407,16 @@ async function finishMatch() {
 }
 
 async function editFinal() {
+  if (lifecycleBusy.value || !lobbyParticipantReady.value) return
+  const side = game.value.team === 'away' ? 'A' : 'H'
+  // A final RAW must always enter through confirmed restoration. In
+  // particular, a still-unconfirmed manager must never take the assistant
+  // shortcut and turn an empty lobby shell into an editable Draft.
+  if (inputStatus.value[side].rawStatus === 'final'
+    && (!game.value.lifecycleControl || game.value.recorderLevel !== 'advanced')) {
+    lifecycleError.value = '최종 기록을 수정할 권한이 없습니다. 관리자 참여 상태를 확인하세요.'
+    return
+  }
   // 부 분석관은 최종 RAW를 직접 교체하지 않는다. 마지막 half의 Draft 편집으로
   // 들어가면 입력 화면에서 전반/후반을 모두 선택해 수정할 수 있다.
   if (!game.value.lifecycleControl) {
@@ -2166,14 +2178,15 @@ function undoSub(index: number) {
                 </div>
               </template>
               <template v-else>
-                <p>{{ !game.lifecycleControl ? '분석 협업 종료' : (game.recorderLevel === 'basic' ? '관리자 승인 대기' : statusLabel) }}</p>
+                <p v-if="!lobbyParticipantReady && !lifecycleError">참여 권한 확인 중…</p>
+                <p v-else-if="lobbyParticipantReady">{{ !game.lifecycleControl ? '분석 협업 종료' : (game.recorderLevel === 'basic' ? '관리자 승인 대기' : statusLabel) }}</p>
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">관리자 페이지에서 RAW 승격 전까지 Draft만 유지됩니다.</p>
                 <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
-                <div class="halfActions">
+                <div v-if="lobbyParticipantReady" class="halfActions">
                   <button v-if="canToggleMatchInfoEdit" :class="matchInfoEditMode ? 'startBtn' : 'editBtn'" :disabled="lifecycleBusy"
                     @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? (lifecycleBusy ? '저장 중…' : '변경 완료') : '경기 정보 변경' }}</button>
                   <button v-if="matchInfoEditMode" class="editBtn cancelEditBtn" :disabled="lifecycleBusy" @click="cancelMatchInfoEdit">변경 취소</button>
-                  <button v-if="!matchInfoEditMode" class="editBtn" :disabled="lifecycleBusy" @click="editFinal">{{ !game.lifecycleControl ? '전반/후반 수정' : '수정' }}</button>
+                  <button v-if="!matchInfoEditMode" class="editBtn" :disabled="lifecycleBusy" @click="editFinal">수정</button>
                 </div>
               </template>
               <p v-if="lifecycleError" class="lifecycleError">{{ lifecycleError }}</p>

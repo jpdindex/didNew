@@ -2051,7 +2051,7 @@ def test_existing_relegated_club_registration_uses_latest_did_contract_and_real_
     assert link['teamId']=='E-OUT' and link['from']=='2024.05.31' and link['no']==10
 
 
-def test_reviewed_aggregate_raw_corrections_are_projected_and_unrelated_drift_is_rejected():
+def test_imported_aggregate_totals_use_raw_and_modern_drift_is_rejected():
     evidence, mid = preview_fixture()
     mid='20242025eplj2rgn13na28rd2b8q0070'
     source=evidence['source_recordings'][0]
@@ -2070,11 +2070,14 @@ def test_reviewed_aggregate_raw_corrections_are_projected_and_unrelated_drift_is
     assert corrected[0]['recording']['kpi']['TTP']==computed['TTP']
     assert items==original
     source['recording']['kpi']['SHOT']+=1
+    corrected=delivery.reviewed_aggregate_items(evidence,items)
+    assert corrected[0]['recording']['kpi']['SHOT']==computed['SHOT']
+    source['recording'].pop('legacyGiId')
     with pytest.raises(ValueError,match='Unreviewed aggregate KPI'):
         delivery.reviewed_aggregate_items(evidence,items)
 
 
-def test_master_review_capture_reads_only_affected_imported_raw_with_guards():
+def test_aggregate_capture_reads_all_imported_raw_with_guards_without_match_allowlist():
     capture=object.__new__(delivery.SourceCapture)
     capture.did=object()
     calls=[]
@@ -2083,14 +2086,17 @@ def test_master_review_capture_reads_only_affected_imported_raw_with_guards():
         return []
     capture.rows=rows
     evidence={'source_recordings':[]}
-    mid='20242025eplj2rgn13na28rd2b8q0070'
+    mid='arbitrary-imported-match'
     capture.capture_aggregate_review_sources(evidence,[
         {'match_id':'new-match','side':'H','recording':{},'match':{}},
         {'match_id':mid,'side':'H','recording':{'legacyGiId':'legacy'},'match':{}}])
-    assert len(calls)==2 and all(c[2]['source'] for c in calls)
+    assert len(calls)==1 and all(c[2]['source'] for c in calls)
     assert all(mid in c[0] for c in calls)
-    assert calls[0][1]==[('half','in',['H3','H4'])]
+    assert calls[0][1]==()
     assert evidence['source_recordings'][0]['match_id']==mid
+    capture.capture_aggregate_review_sources(evidence,[
+        {'match_id':mid,'side':'H','recording':{'legacyGiId':'legacy'},'match':{}}])
+    assert len(calls)==1  # Already captured RAW is not read again.
 
 
 def test_0087_apx_waiver_requires_exact_fixture_raw_delta_and_saved_rating():
@@ -3191,6 +3197,125 @@ def test_parallel_freshness_finishes_all_checks_before_constructing_writer(servi
     status = svc.public_status('operator')
     assert status['status'] == 'complete' and status['counts'] == {'success': 1}
     assert calls == ['one']
+
+
+@pytest.fixture
+def imported_raw_fixture():
+    evidence, mid = preview_fixture()
+    item = evidence['source_recordings'][0]
+    pid = '0000000007'
+    for row in item['children']['records']:
+        row['data'].update(playerId=pid, legacyPathId='linked-path', legacyPathType='DTP',
+            legacyPathTtp=True, legacyKpiFlags={'tap': True, 'dap': True,
+                'shot': row['id'] == 'shot', 'goal': row['id'] == 'shot', 'dtm': row['id'] == 'pass'})
+    calculated = calculate_kpis(delivery.source_records(item))
+    item['recording'].update(legacyGiId='sql-import', kpi={**calculated.team_kpi,
+        'TTP': calculated.team_kpi['TTP'] + 31, 'DTP': calculated.team_kpi['DTP'] + 3})
+    item['recording']['teamRating'].update(apx=calculated.team_kpi['DAP']/4,
+        tpx=calculated.team_kpi['DTP']/12*100)
+    item['recording']['lineup'][pid] = {'type': 'START', 'pos': 'MF'}
+    item['children']['playerStats'] = [{'id': pid, 'data': {
+        **{key: value+7 for key, value in calculated.player_kpis[pid].items()},
+        'ratingBasedOn': 1, 'apx': 70, 'tpx': 60, 'fpx': 50, 'jmx': 10}}]
+    # Orphaned historical path summaries are never synthetic RAW input.
+    item['children']['paths'] = [{'id': 'orphan', 'data': {'ptype': 'DTP', 'ttp': True, 'recordIds': []}}]
+    evidence['player_profiles'][pid] = {'name': 'Player'}
+    evidence['player_contracts'][pid] = [{'teamId': 'E-H', 'leagueId': 'EPL', 'from': '2023-01-01'}]
+    return evidence, mid, item, calculated
+
+
+@pytest.mark.parametrize('delta', [3, 17, 99])
+def test_imported_raw_drives_details_players_and_aggregates_without_match_exceptions(imported_raw_fixture, delta):
+    evidence, mid, item, calculated = imported_raw_fixture
+    item['recording']['kpi']['DTP'] = calculated.team_kpi['DTP'] + delta
+    before = deepcopy(evidence)
+    report = build(evidence, mid)
+    assert report['validation_passed'], report['errors']
+    dmst = next(d['data'] for d in report['documents'] if d['collection']=='dMST' and d['data']['H-A']=='H')
+    assert dmst['DTP'] == calculated.team_kpi['DTP'] and dmst['TTP'] == calculated.team_kpi['TTP']
+    wide = next(d['data'] for d in report['documents'] if d['collection']=='multiSheet_ALL' and d['data']['team_type']=='HOME')
+    assert sum(value for key, value in wide.items() if key.startswith('DTP-')) == dmst['DTP']
+    vibe = next(d['data'] for d in report['documents'] if d['collection']=='vibePlayer')
+    raw_player = calculated.player_kpis['0000000007']
+    assert vibe['P-DAP'] == raw_player['DAP']
+    assert vibe['P-DTP'] == raw_player['DTM'] + raw_player['DTA']
+    assert vibe['P-BAP'] == raw_player['DTB']
+    assert any(c.get('raw_authoritative') and c.get('actual_passed') is False for c in report['checks'])
+    aggregate_items = [{'match_id':mid,'side':'H','match':item['match'],'recording':item['recording']}]
+    corrected = delivery.reviewed_aggregate_items(evidence, aggregate_items)
+    assert corrected[0]['recording']['kpi'] == calculated.team_kpi
+    assert evidence == before
+    # Saved ratings still have to agree with the RAW-based inputs.
+    item['recording']['teamRating']['tpx'] += 4
+    assert not build(evidence, mid)['validation_passed']
+
+
+def test_rating_and_delivery_share_imported_raw_team_and_player_inputs(imported_raw_fixture, monkeypatch):
+    evidence, mid, item, calculated = imported_raw_fixture
+    events = []
+    for row in item['children']['records']:
+        v = row['data']
+        events.append((row['id'], SimpleNamespace(**v, shootPosX=None, shootPosY=None,
+            shootDspRange=None, isShot=None, createdBy='legacy-import',
+            createdAt=datetime(2026,1,1,tzinfo=timezone.utc), bapReason=None)))
+    recording = SimpleNamespace(**{**item['recording'], 'kpi':SimpleNamespace(model_dump=lambda **kw:item['recording']['kpi']),
+        'opponentTeamId':'E-A', 'halves':{}, 'ratingBasedOn':None})
+    source = SimpleNamespace(records=events, recording=recording, fingerprint='raw-v1',
+        match=SimpleNamespace(leagueId='EPL', seasonId='20232024', matchType='league', round=1))
+    stats = {row['id']:row['data'] for row in item['children']['playerStats']}
+    stats['bench'] = {'TTP': 99}  # Retain identity, but never recycle stale counts.
+    requests, saves = [], []
+    def request(body):
+        requests.append(deepcopy(body))
+        return {'teamRating':{'jmx':50,'jmxSeries':[50]*20,'apx':.5,'apxGrade':'F',
+                'tpx':100/12,'tpxGrade':'F','fpx':20,'fpxGrade':'F'},'playerRatings':[]}
+    monkeypatch.setattr(BuildMatchRating,'_request_rating',staticmethod(request))
+    data = SimpleNamespace(read_match_kpi_source=lambda *a:source, list_player_stats=lambda *a:stats,
+        save_recording_rating=lambda *a,**kw:(saves.append(kw) or 0))
+    before = deepcopy(item)
+    BuildMatchRating(data).build(mid,'H')
+    body = requests[0]
+    assert body['teamKpi'] == calculated.team_kpi
+    assert body['teamKpi5min'][-1]['DTP'] == calculated.team_kpi['DTP']
+    players = {p['playerId']:p for p in body['playerKpis']}
+    assert players['0000000007'] == {'playerId':'0000000007', **calculated.player_kpis['0000000007']}
+    assert all(value==0 for key,value in players['bench'].items() if key!='playerId')
+    assert item == before and saves[0]['input_fingerprint']
+    # Missing final shot results must still block the external API call.
+    events[-1][1].res = 'O'
+    with pytest.raises(ValueError, match='result is missing'):
+        BuildMatchRating(data).build(mid,'H')
+    events[-1][1].res = 'GOAL'
+    # The same stale baseline must still block new-input recordings.
+    del recording.legacyGiId
+    with pytest.raises(BackendError) as rejected:
+        BuildMatchRating(data).build(mid,'H')
+    assert rejected.value.code == 'rating_kpi_definition_mismatch'
+    assert len(requests) == len(saves) == 1
+
+
+@pytest.mark.parametrize('fault', ['missing-result', 'no-shot'])
+def test_raw_authority_does_not_bypass_confirmed_dtp_for_details_or_aggregates(imported_raw_fixture, fault):
+    evidence, mid, item, _ = imported_raw_fixture
+    shot = item['children']['records'][-1]['data']
+    shot['res'] = 'O'
+    if fault == 'no-shot':
+        shot['act'] = 'P'
+        shot['legacyKpiFlags']['shot'] = False
+    report = build(evidence, mid)
+    assert not report['validation_passed']
+    assert any('DTP' in error for error in report['errors'])
+    items = [{'match_id':mid,'side':'H','match':item['match'],'recording':item['recording']}]
+    with pytest.raises(ValueError, match='DTP'):
+        delivery.reviewed_aggregate_items(evidence, items)
+
+
+def test_aggregate_import_cannot_fall_back_to_stored_totals_without_raw(imported_raw_fixture):
+    evidence, mid, item, _ = imported_raw_fixture
+    items = [{'match_id':mid,'side':'H','match':item['match'],'recording':item['recording']}]
+    evidence['source_recordings'] = []
+    with pytest.raises(ValueError, match='Imported aggregate RAW is missing'):
+        delivery.reviewed_aggregate_items(evidence, items)
 
 
 if __name__ == '__main__':

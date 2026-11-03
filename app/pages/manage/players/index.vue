@@ -7,7 +7,7 @@
 import { collection, doc, getDocs, orderBy, query, setDoc, Timestamp, writeBatch, type Firestore } from 'firebase/firestore'
 import type { LeagueDoc, PlayerDoc, TeamDoc } from '~/types/schema'
 import {
-  fetchPlayerContracts, fetchPlayersByTeamsAndSeason, todayLabel, transferPlayer, retirePlayer, departToOtherLeague,
+  comparePlayerIds, fetchPlayerProfiles, fetchPlayerContracts, fetchPlayersByTeamsAndSeason, todayLabel, transferPlayer, retirePlayer, departToOtherLeague,
   updatePlayerContract, deletePlayerContract, type PlayerContract, type PlayerRow,
 } from '~/utils/playerContracts'
 
@@ -31,13 +31,19 @@ const competitionTypes = ref<Map<string, NonNullable<PlayerContract['competition
 const selectedLeague = ref('EPL')
 const selectedSeason = ref(seasons[0])
 const selectedTeamFilter = ref('') // '' = 전체
-const tableSort = ref<'position' | 'number' | null>(null)
+const tableSort = ref<'id' | 'position' | 'number'>('id')
 const tableSortDirection = ref<'asc' | 'desc'>('asc')
 
 const rows = ref<{ player: PlayerRow; contracts: PlayerContract[] }[]>([])
 const loading = ref(true)
 const loadError = ref('')
 const nameSearch = ref('')
+const pageSize = 50
+const currentPage = ref(1)
+const profileLoading = ref(false)
+const profileCache = new Map<string, PlayerRow>()
+let listRequestId = 0
+let profileRequestId = 0
 
 // 선수명 검색은 리그/시즌/팀 필터를 무시하고 전체 players 컬렉션을 직접 뒤진다 —
 // "전체 선수 다 들어가 있다"는 그 방대한 데이터를 시즌 필터 없이도 찾을 수 있어야 해서다.
@@ -67,7 +73,7 @@ async function loadAllPlayersForSearch(force = false): Promise<PlayerRow[]> {
   if (!force && allPlayersCache) return allPlayersCache
   if (!force && allPlayersRequest) return allPlayersRequest
   allPlayersRequest = getDocs(collection(db, 'players')).then(snap =>
-    snap.docs.map(item => ({ id: item.id, ...(item.data() as PlayerDoc) })),
+    snap.docs.map(item => ({ ...(item.data() as PlayerDoc), id: item.id })),
   )
   try {
     allPlayersCache = await allPlayersRequest
@@ -84,12 +90,15 @@ async function runNameSearch(q: string) {
   searching.value = true
   try {
     const term = normalizePlayerSearch(q)
-    const players = await loadAllPlayersForSearch()
+    // Numeric p_id searches need one document, not the full name-search cache.
+    const players = /^\d{10}$/.test(q)
+      ? await fetchPlayerProfiles(db, [q])
+      : await loadAllPlayersForSearch()
     if (requestId !== searchRequestId) return
     searchResults.value = players
-      .filter(player => [player.name, player.nameEn, player.nameFull, player.birth]
+      .filter(player => [player.id, player.name, player.nameEn, player.nameFull, player.birth]
         .some(value => value && normalizePlayerSearch(String(value)).includes(term)))
-      .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '', 'ko'))
+      .sort((a, b) => comparePlayerIds(a.id, b.id))
       .slice(0, 100)
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : String(e)
@@ -126,10 +135,11 @@ function shirtNumber(r: { player: PlayerRow; contracts: PlayerContract[] }): num
 }
 
 function sortTableRows(list: { player: PlayerRow; contracts: PlayerContract[] }[]) {
-  if (!tableSort.value) return list
   return [...list].sort((a, b) => {
     let order = 0
-    if (tableSort.value === 'position') {
+    if (tableSort.value === 'id') {
+      order = comparePlayerIds(a.player.id, b.player.id)
+    } else if (tableSort.value === 'position') {
       const positionOrder: Record<string, number> = { GK: 0, DF: 1, MF: 2, FW: 3 }
       const aPosition = positionOrder[String(contractForFilter(a)?.pos ?? '').toUpperCase()]
       const bPosition = positionOrder[String(contractForFilter(b)?.pos ?? '').toUpperCase()]
@@ -144,11 +154,11 @@ function sortTableRows(list: { player: PlayerRow; contracts: PlayerContract[] }[
       order = (aNumber ?? 0) - (bNumber ?? 0)
     }
     if (order !== 0) return tableSortDirection.value === 'asc' ? order : -order
-    return (a.player.name ?? '').localeCompare(b.player.name ?? '', 'ko')
+    return comparePlayerIds(a.player.id, b.player.id)
   })
 }
 
-function toggleTableSort(field: 'position' | 'number') {
+function toggleTableSort(field: 'id' | 'position' | 'number') {
   if (tableSort.value === field) tableSortDirection.value = tableSortDirection.value === 'asc' ? 'desc' : 'asc'
   else {
     tableSort.value = field
@@ -156,7 +166,7 @@ function toggleTableSort(field: 'position' | 'number') {
   }
 }
 
-function tableSortIndicator(field: 'position' | 'number') {
+function tableSortIndicator(field: 'id' | 'position' | 'number') {
   if (tableSort.value !== field) return '↕'
   return tableSortDirection.value === 'asc' ? '▲' : '▼'
 }
@@ -165,19 +175,35 @@ const filteredRows = computed(() => {
   if (nameSearch.value.trim()) {
     return sortTableRows(searchResults.value.map(p => ({ player: p, contracts: [] as PlayerContract[] })))
   }
-  if (selectedTeamFilter.value) return sortTableRows(rows.value)
-
-  // 팀 필터가 "전체"일 때는 같은 소속팀 선수끼리 모아서 보여준다.
-  // 팀 안에서는 선수명순으로 정렬해 매번 같은 순서를 유지한다.
-  const teamGroupedRows = [...rows.value].sort((a, b) => {
-    const aTeam = teamLabel(contractForFilter(a)?.teamId ?? '')
-    const bTeam = teamLabel(contractForFilter(b)?.teamId ?? '')
-    const teamOrder = aTeam.localeCompare(bTeam, 'ko')
-    if (teamOrder !== 0) return teamOrder
-    return (a.player.name ?? '').localeCompare(b.player.name ?? '', 'ko')
-  })
-  return sortTableRows(teamGroupedRows)
+  return sortTableRows(rows.value)
 })
+
+const pageCount = computed(() => Math.max(1, Math.ceil(filteredRows.value.length / pageSize)))
+const pagedRows = computed(() => filteredRows.value.slice((currentPage.value - 1) * pageSize, currentPage.value * pageSize))
+watch([selectedLeague, selectedSeason, selectedTeamFilter, nameSearch, tableSort, tableSortDirection], () => { currentPage.value = 1 })
+watch(pageCount, pages => { currentPage.value = Math.min(currentPage.value, pages) })
+watch(() => `${loading.value}:${listRequestId}:${nameSearch.value.trim()}:${pagedRows.value.map(row => row.player.id).join(',')}`, () => { void loadVisibleProfiles() }, { flush: 'post' })
+
+async function loadVisibleProfiles() {
+  const requestId = ++profileRequestId
+  const listVersion = listRequestId
+  if (loading.value || nameSearch.value.trim()) { profileLoading.value = false; return }
+  const ids = pagedRows.value.map(row => row.player.id).filter(id => !profileCache.has(id))
+  profileLoading.value = true
+  try {
+    const players = await fetchPlayerProfiles(db, ids)
+    if (requestId !== profileRequestId || listVersion !== listRequestId) return
+    for (const player of players) profileCache.set(player.id, player)
+    const missing = new Set(ids.filter(id => !profileCache.has(id)))
+    rows.value = rows.value.filter(row => !missing.has(row.player.id)).map(row => ({
+      ...row, player: profileCache.get(row.player.id) ?? row.player,
+    }))
+  } catch (e) {
+    if (requestId === profileRequestId) loadError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    if (requestId === profileRequestId) profileLoading.value = false
+  }
+}
 
 function teamLabel(id: string) {
   const t = teams.value.find(t => t.id === id)
@@ -201,15 +227,21 @@ function contractForFilter(r: { player: PlayerRow; contracts: PlayerContract[] }
 }
 
 async function loadPlayers() {
+  const requestId = ++listRequestId
+  profileRequestId++
+  profileCache.clear()
+  profileLoading.value = false
   loading.value = true
   loadError.value = ''
   try {
     const teamIds = selectedTeamFilter.value ? [selectedTeamFilter.value] : leagueTeams.value.map(t => t.id)
-    rows.value = await fetchPlayersByTeamsAndSeason(db, teamIds, selectedSeason.value)
+    const result = await fetchPlayersByTeamsAndSeason(db, teamIds, selectedSeason.value, { deferProfiles: true })
+    if (requestId !== listRequestId) return
+    rows.value = result
   } catch (e) {
-    loadError.value = e instanceof Error ? e.message : String(e)
+    if (requestId === listRequestId) loadError.value = e instanceof Error ? e.message : String(e)
   } finally {
-    loading.value = false
+    if (requestId === listRequestId) loading.value = false
   }
 }
 
@@ -265,6 +297,7 @@ function setEditFieldsFromRow(r: { player: PlayerRow }) {
 }
 
 async function toggleDetail(r: { player: PlayerRow; contracts: PlayerContract[] }) {
+  if (loading.value || profileLoading.value || !r.player.name) return
   if (selectedPlayerId.value === r.player.id) { closeDetail(); return }
   isEditingDetail.value = false
   transferOpen.value = false
@@ -659,7 +692,7 @@ async function submitAddPlayer() {
 
       <div class="searchRow">
         <label class="searchLabel">검색
-          <input v-model="nameSearch" placeholder="이름·영문명·정식 영문명·생년월일 검색 — 전체 선수 대상" class="nameSearchInput">
+          <input v-model="nameSearch" placeholder="p_id·이름·영문명·정식 영문명·생년월일 검색 — 전체 선수 대상" class="nameSearchInput">
         </label>
       </div>
       <div class="toolbar">
@@ -681,20 +714,22 @@ async function submitAddPlayer() {
             </select>
           </label>
         </div>
-        <span>{{ (loading || searching) ? '불러오는 중...' : `${filteredRows.length}명` }}</span>
+        <span>{{ (loading || searching || profileLoading) ? '불러오는 중...' : `${filteredRows.length}명` }}</span>
       </div>
 
       <div class="playerTable">
         <div class="playerHead">
+          <button class="sortHead" :class="{ active: tableSort === 'id' }" @click="toggleTableSort('id')">p_id <span>{{ tableSortIndicator('id') }}</span></button>
           <span>선수명</span>
           <button class="sortHead" :class="{ active: tableSort === 'position' }" @click="toggleTableSort('position')">포지션 <span>{{ tableSortIndicator('position') }}</span></button>
           <button class="sortHead" :class="{ active: tableSort === 'number' }" @click="toggleTableSort('number')">등번호 <span>{{ tableSortIndicator('number') }}</span></button>
           <span>소속팀</span><span>국적</span><span>생년월일</span>
         </div>
         <div v-if="!loading && !searching && !filteredRows.length" class="playerEmpty">조건에 맞는 선수가 없습니다.</div>
-        <template v-for="r in filteredRows" :key="r.player.id">
+        <template v-for="r in pagedRows" :key="r.player.id">
           <div class="playerRow" :class="{ open: selectedPlayerId === r.player.id }" @click="toggleDetail(r)">
-            <span class="nameCell">{{ r.player.name }}</span>
+            <span class="playerIdCell">{{ r.player.id }}</span>
+            <span class="nameCell">{{ r.player.name || '불러오는 중…' }}</span>
             <span>{{ contractForFilter(r)?.pos || '-' }}</span>
             <span>{{ contractForFilter(r)?.no || '-' }}</span>
             <span>{{ teamLabel(contractForFilter(r)?.teamId ?? '') }}</span>
@@ -703,7 +738,7 @@ async function submitAddPlayer() {
           </div>
           <div v-if="selectedPlayerId === r.player.id" class="detail">
             <div class="detailHead">
-              <h2>{{ r.player.name }} 상세 정보</h2>
+              <h2>{{ r.player.name }} 상세 정보 <small class="playerIdCell">p_id: {{ r.player.id }}</small></h2>
               <div class="detailActions">
                 <template v-if="isEditingDetail">
                   <button class="applyBtn" :disabled="savingPlayer" @click="applyEditDetail">적용</button>
@@ -816,6 +851,11 @@ async function submitAddPlayer() {
           </div>
         </template>
       </div>
+      <nav v-if="filteredRows.length" class="playerPagination" aria-label="선수 목록 페이지">
+        <button :disabled="currentPage <= 1 || loading || searching || profileLoading" @click="closeDetail(); currentPage--">이전</button>
+        <span>{{ currentPage }} / {{ pageCount }} 페이지 · 페이지당 {{ pageSize }}명</span>
+        <button :disabled="currentPage >= pageCount || loading || searching || profileLoading" @click="closeDetail(); currentPage++">다음</button>
+      </nav>
     </div>
   </div>
 </template>
@@ -838,7 +878,11 @@ select option{background:#202731;color:#fff}
 .searchLabel{display:flex;align-items:center;gap:10px;color:#f0b429;font-weight:800;font-size:13px}
 .nameSearchInput{flex:1;background:#11161d;color:#fff;border:1px solid rgba(240,180,41,.5);padding:9px 12px;border-radius:4px;width:100%;max-width:420px;box-sizing:border-box;font-size:13px}
 .playerTable{border:1px solid #303a48;border-radius:5px;overflow:hidden}
-.playerHead,.playerRow{display:grid;grid-template-columns:1.4fr .8fr .6fr 1.2fr .9fr 1fr;align-items:center;gap:16px;padding:10px 14px}
+.playerHead,.playerRow{display:grid;grid-template-columns:minmax(104px,1fr) 1.4fr .8fr .6fr 1.2fr .9fr 1fr;align-items:center;gap:16px;padding:10px 14px}
+.playerIdCell{font-family:monospace;color:#9edce8;font-size:12px;overflow-wrap:anywhere}
+.playerPagination{display:flex;align-items:center;justify-content:center;gap:16px;margin-top:18px;color:#aab3be;font-size:13px}
+.playerPagination button{background:#26303e;border:1px solid #465366;border-radius:4px;color:#fff;padding:8px 16px;cursor:pointer}
+.playerPagination button:disabled{opacity:.45;cursor:default}
 .playerHead{background:#202731;color:#8f9baa;font-size:12px;font-weight:800}
 .sortHead{display:flex;align-items:center;gap:5px;width:max-content;padding:0;border:0;background:transparent;color:inherit;font:inherit;cursor:pointer}
 .sortHead span{font-size:10px;color:#687483}.sortHead:hover,.sortHead.active{color:#f0b429}.sortHead.active span{color:#f0b429}
