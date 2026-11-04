@@ -352,6 +352,7 @@ async function applyEditDetail() {
       height: editFields.value.height ? Number(editFields.value.height) : null,
       foot: editFields.value.foot || null, nation: editFields.value.nation.trim() || null,
       birthKey: normalizePlayerSearch(editFields.value.birth),
+      nameFullKey: normalizePlayerSearch(editFields.value.nameFull),
       searchTerms: buildPlayerSearchTerms(editFields.value),
       currentPos: nextPos, updatedAt: now, updatedBy: 'manage-ui',
     }

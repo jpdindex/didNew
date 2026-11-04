@@ -25,7 +25,9 @@ export function emptyPlayerRegistration(): PlayerRegistration {
 
 export interface PlayerRegistrationRequest {
   id: string
-  payload: PlayerRegistration
+  payload: PlayerRegistration | PlayerNumberChange
+  requestType?: 'REGISTRATION' | 'NUMBER_CHANGE'
+  playerName?: string
   status: 'pending' | 'approved'
   version: number
   requestedBy: string
@@ -34,4 +36,19 @@ export interface PlayerRegistrationRequest {
   leagueName: string
   playerId?: string
   createdAt?: string
+}
+
+export interface PlayerNumberChange {
+  leagueId: string
+  seasonId: string
+  teamId: string
+  playerId: string
+  contractId: string
+  currentNo: string
+  newNo: string
+  changeDate: string
+}
+
+export function emptyPlayerNumberChange(): PlayerNumberChange {
+  return { leagueId: '', seasonId: '', teamId: '', playerId: '', contractId: '', currentNo: '', newNo: '', changeDate: '' }
 }

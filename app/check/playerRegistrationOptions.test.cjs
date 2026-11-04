@@ -64,7 +64,7 @@ function formEnvironment(initial = {}) {
 }
 
 test('new request defaults to latest season and each league shows exactly its 20 D1 teams', async () => {
-  const { state, mount } = formEnvironment()
+  const { state, mount } = formEnvironment({ leagueId: 'EPL' })
   await mount()
   assert.equal(state.model.value.seasonId, '20262027')
   assert.equal(state.seasonOptions.value.length, 2)

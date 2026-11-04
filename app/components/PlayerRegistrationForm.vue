@@ -5,7 +5,7 @@ import type { TeamSeasonEntry } from '~/types/schema'
 import { isRegistrationFirstDivision, registrationSeasonOptions, type RegistrationSeasonOption } from '~/utils/playerRegistrationOptions'
 
 const model = defineModel<PlayerRegistration>({ required: true })
-const props = defineProps<{ disabled?: boolean }>()
+const props = defineProps<{ disabled?: boolean; selectionOnly?: boolean }>()
 const { $db } = useNuxtApp()
 type Option = { id: string; label: string; leagueId?: string }
 const leagues = ref<Option[]>([])
@@ -57,7 +57,7 @@ onMounted(async () => {
     const [leagueDocs, seasonDocs, teamDocs] = await Promise.all([
       getDocs(collection($db, 'leagues')), getDocs(collection($db, 'seasons')), getDocs(collection($db, 'teams')),
     ])
-    leagues.value = leagueDocs.docs.map(d => ({ id: d.id, label: d.data().name || d.id })).sort((a, b) => a.label.localeCompare(b.label, 'ko'))
+    leagues.value = leagueDocs.docs.map(d => ({ id: d.id, label: d.id === 'LALIGA' ? '라리가' : d.data().name || d.id })).sort((a, b) => a.label.localeCompare(b.label, 'ko'))
     seasons.value = registrationSeasonOptions(seasonDocs.docs.map(d => ({ id: d.id, leagueId: d.data().leagueId })))
     if (model.value.seasonId && !seasons.value.some(s => s.id === model.value.seasonId)) seasons.value.unshift({ id: model.value.seasonId, label: seasonLabel(model.value.seasonId), leagueIds: [] })
     teams.value = teamDocs.docs.map(d => ({ id: d.id, label: d.data().nameKr || d.data().name || d.id }))
@@ -79,6 +79,7 @@ onMounted(async () => {
       <label>리그 *<select v-model="model.leagueId" required :disabled="!!model.matchId"><option value="" disabled>리그 선택</option><option v-for="l in visibleLeagues" :key="l.id" :value="l.id">{{ l.label }}</option></select></label>
       <label>시즌 *<select v-model="model.seasonId" required :disabled="!!model.matchId"><option value="" disabled>시즌 선택</option><option v-for="s in seasonOptions" :key="s.id" :value="s.id">{{ s.label }}</option></select></label>
       <label>팀 *<select v-model="model.teamId" required :disabled="teamLoading || !!model.matchId"><option value="" disabled>{{ teamLoading ? '팀 불러오는 중...' : '팀 선택' }}</option><option v-for="t in eligibleTeams" :key="t.id" :value="t.id">{{ t.label }}</option></select></label>
+      <template v-if="!props.selectionOnly">
       <label>요청 구분 *<select v-model="model.kind" required><option value="" disabled>요청 구분 선택</option><option value="YOUTH">2군 유스 콜업 등록</option><option value="TRANSFER">영입</option><option value="LOAN">임대 영입</option></select></label>
       <label>한글·표시 이름 *<input v-model.trim="model.name" required maxlength="100" placeholder="DB에 표시할 이름"></label>
       <label>영문 전체 이름 *<input v-model.trim="model.nameFull" required maxlength="160" placeholder="확인한 영문 전체 이름"></label>
@@ -92,8 +93,9 @@ onMounted(async () => {
       <label>키<select v-model="model.height"><option :value="null">미확인</option><option v-for="h in 151" :key="h" :value="h + 99">{{ h + 99 }} cm</option></select></label>
       <label class="wide">참고 링크<input v-model.trim="model.sourceUrl" type="url" maxlength="2000" placeholder="직접 확인한 선수 정보 페이지 주소"></label>
       <label class="wide">추가 설명<textarea v-model.trim="model.note" rows="2" maxlength="2000" placeholder="확인이 필요한 내용이 있으면 적어주세요." /></label>
+      </template>
     </div>
-    <p class="hint">* 필수 항목 · 명단 적용 시작일은 선수가 해당 팀 명단에 포함되어야 하는 날짜입니다. 모르면 공란으로 제출할 수 있으며, 관리자가 승인 전에 확인합니다. 모르는 주발·키는 미확인으로 제출하세요.</p>
+    <p v-if="!props.selectionOnly" class="hint">* 필수 항목 · 명단 적용 시작일은 선수가 해당 팀 명단에 포함되어야 하는 날짜입니다. 모르면 공란으로 제출할 수 있으며, 관리자가 승인 전에 확인합니다. 모르는 주발·키는 미확인으로 제출하세요.</p>
   </fieldset>
 </template>
 

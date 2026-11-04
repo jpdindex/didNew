@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from backend.api import api_player_requests as api
 from backend.system import system_player_requests as registration
 from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData
-from backend.system.system_player_requests import PlayerRegistration, DirectPlayerRegistration, PlayerRequestService, ReviewDecision
+from backend.system.system_player_requests import PlayerRegistration, PlayerNumberChange, DirectPlayerRegistration, PlayerRequestService, ReviewDecision
 
 
 class Snapshot:
@@ -54,6 +54,8 @@ class Collection:
     def where(self, filter):
         if filter.field_path == '__name__':
             predicate = lambda d: d['__id__'] <= filter.value.id
+        elif filter.op_string == 'array_contains':
+            predicate = lambda d: filter.value in (d.get(filter.field_path) or [])
         else:
             predicate = lambda d: (d.get(filter.field_path) in filter.value) if filter.op_string == 'in' else d.get(filter.field_path) == filter.value
         return Collection(self.db, self.path, predicate)
@@ -252,7 +254,7 @@ def test_request_submit_and_approval_require_season_first_division(db, payload, 
 
 def test_duplicate_identity_requires_link_and_keeps_existing_profile(db, payload):
     service, request_id = submitted(db, payload)
-    db.documents['players/P'] = {'name': '기존 표기', 'nameFull': 'Jesús Cruz', 'birth': '2007.06.24', 'nation': 'ESP'}
+    db.documents['players/P'] = {'name': '기존 표기', 'nameFull': 'Jesús Cruz', 'nameFullKey': 'jesuscruz', 'birth': '2007.06.24', 'nation': 'ESP'}
     with pytest.raises(BackendError) as error:
         service.review(request_id, ReviewDecision(action='approve', version=1), manager)
     assert error.value.code == 'duplicate_player'
@@ -264,7 +266,7 @@ def test_duplicate_identity_requires_link_and_keeps_existing_profile(db, payload
 
 def test_same_team_affiliation_is_not_created_twice(db, payload):
     service, request_id = submitted(db, payload)
-    db.documents['players/P'] = {'name': 'Jesus Cruz', 'birth': '2007.06.24'}
+    db.documents['players/P'] = {'name': 'Jesus Cruz', 'nameFull': payload.nameFull, 'birth': '2007.06.24'}
     db.documents['players/P/contracts/C'] = {'teamId': 'T', 'from': '2026.08.01', 'to': None}
     service.review(request_id, ReviewDecision(action='approve', version=1, existingPlayerId='P'), manager)
     assert 'players/P/contracts/request-' + request_id not in db.documents
@@ -272,7 +274,7 @@ def test_same_team_affiliation_is_not_created_twice(db, payload):
 
 def test_other_club_contract_is_not_silently_closed_or_overwritten(db, payload):
     service, request_id = submitted(db, payload)
-    db.documents['players/P'] = {'name': 'Jesus Cruz', 'birth': '2007.06.24', 'currentTeamId': 'OTHER'}
+    db.documents['players/P'] = {'name': 'Jesus Cruz', 'nameFull': payload.nameFull, 'birth': '2007.06.24', 'currentTeamId': 'OTHER'}
     db.documents['players/P/contracts/C'] = {'teamId': 'OTHER', 'from': '2026.08.01', 'to': None}
     with pytest.raises(BackendError) as error:
         service.review(request_id, ReviewDecision(action='approve', version=1, existingPlayerId='P'), manager)
@@ -406,7 +408,7 @@ def test_approval_and_direct_registration_share_latest_numeric_id_and_atomic_lin
 
 
 def test_existing_player_link_does_not_allocate_or_rename_id(db, payload):
-    db.documents['players/PR-existing'] = {'name': payload.name, 'birth': payload.birth}
+    db.documents['players/PR-existing'] = {'name': payload.name, 'nameFull': payload.nameFull, 'birth': payload.birth}
     service, request_id = submitted(db, payload)
     result = service.review(request_id, ReviewDecision(action='approve', version=1, existingPlayerId='PR-existing'), manager)
     assert result['playerId'] == 'PR-existing'
@@ -476,3 +478,186 @@ def test_concurrent_numeric_allocations_retry_without_duplicates(db, payload, mo
         assert service.review(first, ReviewDecision(action='approve', version=1), manager)['playerId'] == '0000000002'
     ids = sorted(path for path in db.documents if re.fullmatch(r'players/[0-9]{10}', path))
     assert len(ids) == (1 if same_identity else 2)
+
+
+@pytest.fixture
+def number_change(db):
+    db.documents['players/P'] = {'name': 'Existing player', 'birth': '2000.01.01', 'currentTeamId': 'T', 'currentNo': '10'}
+    db.documents['players/P/contracts/C'] = {'teamId': 'T', 'leagueId': 'LALIGA', 'competitionType': 'league',
+        'from': '2026.08.01', 'to': None, 'no': '10', 'pos': 'FW', 'transferType': 'TRANSFER'}
+    db.documents['teams/T/squad/P'] = {'name': 'Existing player', 'no': '10', 'pos': 'FW', 'contractId': 'C', 'since': '2026.08.01'}
+    return PlayerNumberChange(leagueId='LALIGA', seasonId='20262027', teamId='T', playerId='P',
+        contractId='C', currentNo='10', newNo='20', changeDate='2026-10-01')
+
+
+def test_number_request_only_stages_and_approval_splits_number_periods_atomically(db, number_change):
+    service = PlayerRequestService(db)
+    before_player = deepcopy(db.documents['players/P'])
+    result = service.submit(number_change, analyst)
+    request_id = result['id']
+    assert db.documents['players/P'] == before_player
+    assert db.documents['players/P/contracts/C']['no'] == '10'
+    assert db.documents[f'playerRegistrationRequests/{request_id}']['requestType'] == 'NUMBER_CHANGE'
+    # No previously published RAW or input setup may be modified by approval.
+    db.documents['matches/M/recordings/H'] = {'lineup': {'P': {'no': '10'}}}
+    db.documents['inputDrafts/M_H'] = {'setup': {'lineup': [{'playerId': 'P', 'no': '10'}]}}
+    before_input = {path: deepcopy(value) for path, value in db.documents.items() if path.startswith(('matches/', 'inputDrafts/'))}
+    decision = ReviewDecision(action='approve', version=1)
+    approved = service.review(request_id, decision, manager)
+    assert approved['playerId'] == 'P'
+    assert db.documents['players/P/contracts/C']['to'] == '2026.09.30'
+    next_id = 'number-request-' + request_id
+    assert db.documents[f'players/P/contracts/{next_id}']['from'] == '2026.10.01'
+    assert db.documents[f'players/P/contracts/{next_id}']['no'] == '20'
+    assert db.documents['players/P']['currentNo'] == '20'
+    assert db.documents['teams/T/squad/P']['contractId'] == next_id
+    assert db.documents['teams/T/squad/P']['no'] == '20'
+    assert db.documents['playerRegistrationRosterVersions/T']['version'] == 1
+    assert 'playerRegistrationState/numbering' not in db.documents
+    for path, value in before_input.items(): assert db.documents[path] == value
+    after = deepcopy(db.documents)
+    assert service.review(request_id, decision, manager) == approved
+    assert db.documents == after
+
+
+def test_duplicate_lookup_uses_fullname_only_and_returns_player_ids(db, payload):
+    db.documents['players/0000000010'] = {'name': 'Different display', 'nameFull': payload.nameFull, 'birth': '1999.01.01'}
+    db.documents['players/0000000011'] = {'name': payload.name, 'nameEn': payload.nameEn, 'nameFull': 'Different Full Name', 'birth': payload.birth}
+    db.documents['players/0000000012'] = {'name': payload.name, 'birth': payload.birth}
+    db.documents['players/0000000013'] = {'nameFull': 'JESÚS  CRUZ', 'nameFullKey': 'jesuscruz', 'birth': '1998.01.01'}
+    db.documents['players/0000000014'] = {'nameFull': 'Jesús-Cruz', 'searchTerms': ['jesuscruz']}
+    # An abbreviation indexed as a search term is not a full-name match.
+    db.documents['players/0000000015'] = {'nameFull': 'Jesus Cruz Junior', 'searchTerms': ['jesuscruz']}
+    matches = registration.duplicate_players(db, payload)
+    assert [p['id'] for p in matches] == ['0000000010', '0000000013', '0000000014']
+    assert all('sameBirth' not in match for match in matches)
+    service, request_id = submitted(db, payload)
+    before = deepcopy(db.documents)
+    with pytest.raises(BackendError) as rejected:
+        service.review(request_id, ReviewDecision(action='approve', version=1), manager)
+    assert rejected.value.code == 'duplicate_player'
+    assert db.documents == before
+
+
+def test_direct_pid_lookup_validates_legacy_unindexed_fullname_and_rejects_wrong_identity(db, payload):
+    db.documents['players/0000000042'] = {'name': 'Legacy', 'nameFull': 'JESÚS CRUZ'}
+    # Old documents without normalized indexes can still be confirmed by p_id.
+    assert registration.duplicate_players(db, payload) == []
+    matches = registration.duplicate_players(db, payload, '42')
+    assert matches[0]['id'] == '0000000042'
+    db.documents['players/0000000043'] = {'name': payload.name, 'nameFull': 'Someone Else', 'birth': payload.birth}
+    with pytest.raises(BackendError) as rejected: registration.duplicate_players(db, payload, '43')
+    assert rejected.value.code == 'player_fullname_mismatch'
+    with pytest.raises(BackendError) as rejected: registration.duplicate_players(db, payload, 'missing')
+    assert rejected.value.code == 'invalid_player'
+    service, request_id = submitted(db, payload)
+    before = deepcopy(db.documents)
+    with pytest.raises(BackendError) as rejected:
+        service.review(request_id, ReviewDecision(action='approve', version=1, existingPlayerId='0000000043'), manager)
+    assert rejected.value.code == 'player_fullname_mismatch'
+    assert db.documents == before
+    assert service.review(request_id, ReviewDecision(action='approve', version=1, existingPlayerId='0000000042'), manager)['playerId'] == '0000000042'
+
+
+def test_fullname_identity_guard_is_independent_of_birth(db, payload):
+    service, first = submitted(db, payload)
+    service.review(first, ReviewDecision(action='approve', version=1), manager)
+    different_birth = PlayerRegistration.model_validate({**payload.model_dump(), 'birth': '2000-01-01'})
+    assert registration.registration_identity(payload) == registration.registration_identity(different_birth)
+    other = service.submit(different_birth, analyst)['id']
+    with pytest.raises(BackendError) as rejected:
+        service.review(other, ReviewDecision(action='approve', version=1), manager)
+    assert rejected.value.code == 'duplicate_player'
+
+
+def test_duplicate_lookup_api_returns_fullname_and_pid(db, payload, monkeypatch):
+    monkeypatch.setattr(api, 'PlayerRequestService', lambda: PlayerRequestService(db))
+    db.documents['players/0000000042'] = {'nameFull': 'JESÚS CRUZ', 'birth': '1999.01.01'}
+    app = FastAPI()
+    app.include_router(api.router)
+    app.dependency_overrides[api.verified_user] = lambda: manager
+    with TestClient(app) as client:
+        response = client.post('/player-requests/duplicates', json={**payload.model_dump(), 'lookupPlayerId': '42'})
+    assert response.status_code == 200
+    assert response.json()['players'][0]['id'] == '0000000042'
+
+
+def test_number_approval_failure_is_atomic_and_analyst_cannot_approve(db, number_change):
+    service = PlayerRequestService(db)
+    request_id = service.submit(number_change, analyst)['id']
+    with pytest.raises(BackendError) as denied:
+        service.review(request_id, ReviewDecision(action='approve', version=1), analyst)
+    assert denied.value.code == 'manager_required'
+    before = deepcopy(db.documents)
+    db.fail_commit = True
+    with pytest.raises(RuntimeError): service.review(request_id, ReviewDecision(action='approve', version=1), manager)
+    assert db.documents == before
+
+
+@pytest.mark.parametrize('patch,code', [({'playerId': 'missing'}, 'number_contract_mismatch'),
+    ({'contractId': 'wrong'}, 'number_contract_mismatch'), ({'currentNo': '9'}, 'number_changed'),
+    ({'newNo': '010'}, 'same_number'), ({'changeDate': '2026-07-31'}, 'outside_season')])
+def test_invalid_number_request_rejected_without_writes(db, number_change, patch, code):
+    payload = PlayerNumberChange.model_validate({**number_change.model_dump(), **patch})
+    before = deepcopy(db.documents)
+    with pytest.raises(BackendError) as rejected: PlayerRequestService(db).submit(payload, analyst)
+    assert rejected.value.code == code
+    assert db.documents == before
+
+
+def test_stale_number_request_and_wrong_payload_type_cannot_publish(db, number_change, payload):
+    service = PlayerRequestService(db)
+    request_id = service.submit(number_change, analyst)['id']
+    with pytest.raises(BackendError) as rejected:
+        service.review(request_id, ReviewDecision(action='approve', version=1, payload=payload), manager)
+    assert rejected.value.code == 'request_type_mismatch'
+    db.documents['players/P/contracts/C']['no'] = '11'
+    before = deepcopy(db.documents)
+    with pytest.raises(BackendError) as rejected:
+        service.review(request_id, ReviewDecision(action='approve', version=1), manager)
+    assert rejected.value.code == 'number_changed'
+    assert db.documents == before
+
+
+def test_number_request_edit_stays_pending_and_start_date_change_preserves_contract(db, number_change):
+    service = PlayerRequestService(db)
+    request_id = service.submit(number_change, analyst)['id']
+    changed = PlayerNumberChange.model_validate({**number_change.model_dump(), 'newNo': '30', 'changeDate': '2026-08-01'})
+    service.review(request_id, ReviewDecision(action='edit', version=1, payload=changed), manager)
+    assert db.documents['players/P/contracts/C']['no'] == '10'
+    assert db.documents[f'playerRegistrationRequests/{request_id}']['status'] == 'pending'
+    service.review(request_id, ReviewDecision(action='approve', version=2), manager)
+    assert db.documents['players/P/contracts/C']['no'] == '30'
+    assert db.documents['players/P/contracts/C']['to'] is None
+    assert len([p for p in db.documents if p.startswith('players/P/contracts/')]) == 1
+
+
+def test_historical_number_change_does_not_replace_current_team_cache(db, number_change):
+    service = PlayerRequestService(db)
+    db.documents['players/P/contracts/C']['to'] = '2026.10.15'
+    db.documents['players/P']['currentTeamId'] = 'OTHER'
+    db.documents['players/P']['currentNo'] = '99'
+    db.documents['teams/T/squad/P']['contractId'] = 'later-contract'
+    request_id = service.submit(number_change, analyst)['id']
+    service.review(request_id, ReviewDecision(action='approve', version=1), manager)
+    assert db.documents['players/P']['currentNo'] == '99'
+    assert db.documents['teams/T/squad/P']['contractId'] == 'later-contract'
+    assert db.documents[f'players/P/contracts/number-request-{request_id}']['to'] == '2026.10.15'
+
+
+def test_number_change_api_shares_authenticated_request_list_and_legacy_requests(db, number_change, payload, monkeypatch):
+    # Emulate Firestore resolving server timestamps before the list is read.
+    monkeypatch.setattr(registration.firestore, 'SERVER_TIMESTAMP', '2026-11-03T00:00:00Z')
+    monkeypatch.setattr(api, 'PlayerRequestService', lambda: PlayerRequestService(db))
+    app = FastAPI()
+    app.include_router(api.router)
+    app.dependency_overrides[api.verified_user] = lambda: analyst
+    with TestClient(app) as client:
+        number_id = client.post('/player-requests', json=number_change.model_dump()).json()['id']
+        registration_id = client.post('/player-requests', json=payload.model_dump()).json()['id']
+        db.documents[f'playerRegistrationRequests/{registration_id}'].pop('requestType')
+        rows = client.get('/player-requests').json()['requests']
+        assert {row['id'] for row in rows} == {number_id, registration_id}
+        app.dependency_overrides[api.verified_user] = lambda: manager
+        result = client.post(f'/player-requests/{number_id}/review', json={'action': 'approve', 'version': 1})
+        assert result.status_code == 200 and result.json()['playerId'] == 'P'

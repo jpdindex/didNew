@@ -44,6 +44,7 @@ export interface PlayerDoc extends AuditFields {
   name: string
   nameEn?: string
   nameFull?: string
+  nameFullKey?: string
   birth?: string
   height?: number
   foot?: 'L' | 'R' | 'B'
