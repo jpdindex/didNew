@@ -7,7 +7,7 @@ from firebase_admin import auth
 from backend.system.system_firestore import AuthenticationError, CurrentUser, ensure_firebase_app, get_settings
 from backend.system.system_player_requests import PlayerRegistration, PlayerDuplicateLookup, PlayerNumberChange, DirectPlayerRegistration, PlayerRequestService, ReviewDecision, duplicate_players, require_manager
 
-router = APIRouter(prefix='/player-requests', tags=['선수 등록 요청'])
+router = APIRouter(prefix='/player-requests', tags=['선수 등록 요청'], include_in_schema=False)
 
 
 def verified_user(request: Request) -> CurrentUser:

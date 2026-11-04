@@ -65,8 +65,9 @@ watch(() => model.value.changeDate, updateCurrentNumber)
       <div v-if="model.playerId" class="numberFields">
         <label>현재 등번호<input :value="model.currentNo" readonly placeholder="미등록"></label>
         <label>변경할 등번호 *<input v-model.trim="model.newNo" required inputmode="numeric" pattern="[0-9]{1,3}" maxlength="3"></label>
-        <label>변경 날짜 *<input v-model="model.changeDate" required type="date" :max="maxDate"></label>
+        <label>변경 날짜<input v-model="model.changeDate" type="date" :max="maxDate"></label>
       </div>
+      <p v-if="model.playerId" class="dateHint">변경 날짜를 모르면 비워서 요청할 수 있습니다. 관리자가 승인 전에 확인합니다.</p>
       <p v-if="model.playerId && model.changeDate && !model.contractId" class="error">변경 날짜에 해당 팀 소속 이력이 없습니다.</p>
     </template>
   </fieldset>

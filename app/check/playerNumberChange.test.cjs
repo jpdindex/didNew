@@ -90,6 +90,27 @@ test('request type menu opens number form; submission sends only number fields a
   assert.equal(state.error.value, '')
 })
 
+test('undated number changes can be requested but approval requires the manager to enter a date', async () => {
+  const { state, requests } = requestPage()
+  await state.startNew('NUMBER_CHANGE')
+  state.form.value = { ...state.form.value, leagueId: 'EPL', seasonId: '20262027', teamId: 'T' }
+  await settle()
+  Object.assign(state.numberForm.value, { playerId: 'P', contractId: 'C', currentNo: '10', newNo: '20' })
+  await state.submit()
+  assert.equal(JSON.parse(requests[0].options.body).changeDate, '')
+  const item = { id: 'R', requestType: 'NUMBER_CHANGE', status: 'pending', version: 1,
+    payload: { ...plain(state.numberForm.value) } }
+  state.open(item)
+  await settle()
+  assert.match(state.requestDetail(item), /날짜 미입력/)
+  await state.review('approve')
+  assert.match(state.error.value, /변경 날짜/)
+  assert.equal(requests.length, 2) // submission and list reload only
+  state.numberForm.value.changeDate = '2026-10-01'
+  await state.review('approve')
+  assert.equal(JSON.parse(requests[2].options.body).payload.changeDate, '2026-10-01')
+})
+
 test('mixed request list keeps legacy registration readable and approves number change without duplicate search', async () => {
   const { state, requests } = requestPage()
   const item = { id: 'R', requestType: 'NUMBER_CHANGE', status: 'pending', version: 1, playerName: 'Player',

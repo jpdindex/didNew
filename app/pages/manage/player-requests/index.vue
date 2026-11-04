@@ -46,7 +46,7 @@ function playerLabel(item: PlayerRegistrationRequest) {
 function requestDetail(item: PlayerRegistrationRequest) {
   if (item.requestType === 'NUMBER_CHANGE') {
     const payload = item.payload as PlayerNumberChange
-    return `${payload.currentNo || '미등록'} → ${payload.newNo}번 · 변경 ${payload.changeDate}`
+    return `${payload.currentNo || '미등록'} → ${payload.newNo}번 · 변경 ${payload.changeDate || '날짜 미입력'}`
   }
   const payload = item.payload as PlayerRegistration
   return `${payload.nameFull} · ${payload.no}번 / ${payload.pos} · 적용 ${payload.fromDate || '미입력'}`
@@ -96,7 +96,7 @@ function open(item: PlayerRegistrationRequest) {
 
 async function submit() {
   if (!isNumberChange.value && !form.value.nation) { error.value = '국적을 목록에서 선택하세요.'; return }
-  if (isNumberChange.value && (!numberForm.value.playerId || !numberForm.value.contractId)) { error.value = '선수와 변경 날짜의 소속을 확인하세요.'; return }
+  if (isNumberChange.value && (!numberForm.value.playerId || !numberForm.value.contractId)) { error.value = '선수와 시즌 소속을 확인하세요.'; return }
   busy.value = true; error.value = ''; message.value = ''
   try {
     await request('/api/v1/player-requests', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -120,6 +120,7 @@ async function checkDuplicates() {
 
 async function review(action: 'approve' | 'edit') {
   if (!active.value) return
+  if (isNumberChange.value && action === 'approve' && !numberForm.value.changeDate) { error.value = '승인 전에 등번호 변경 날짜를 확인해 입력하세요.'; return }
   if (!isNumberChange.value && action === 'approve' && !duplicateChecked.value) { error.value = '승인 전에 기존 선수 중복 확인을 눌러주세요.'; return }
   if (!isNumberChange.value && action === 'approve' && duplicates.value.length && !existingPlayerId.value) { error.value = '영문 FULLNAME이 일치하는 기존 선수의 p_id를 선택하세요.'; return }
   busy.value = true; error.value = ''; message.value = ''

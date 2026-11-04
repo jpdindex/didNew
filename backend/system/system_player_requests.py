@@ -92,7 +92,7 @@ class PlayerNumberChange(BaseModel):
     contractId: str = Field(min_length=1, max_length=100)
     currentNo: str = Field(pattern=r'^\d{0,3}$')
     newNo: str = Field(pattern=r'^\d{1,3}$')
-    changeDate: str
+    changeDate: str = ''
 
     @field_validator('leagueId', 'teamId', 'playerId', 'contractId')
     @classmethod
@@ -107,7 +107,7 @@ class PlayerNumberChange(BaseModel):
     @field_validator('changeDate')
     @classmethod
     def valid_date(cls, value):
-        return PlayerRegistration.valid_date(value)
+        return PlayerRegistration.valid_date(value) if value else ''
 
     # Share reference/date checks without adding registration fields to the form.
     @property
@@ -391,15 +391,17 @@ class PlayerRequestService:
     def number_change_source(self, payload: PlayerNumberChange, tx=None):
         target = payload.changeDate.replace('-', '.')
         year = payload.seasonId[:4]
-        if not f'{year}.08.01' <= target <= f'{payload.seasonId[4:]}.05.31':
+        season_start, season_end = f'{year}.08.01', f'{payload.seasonId[4:]}.05.31'
+        if target and not season_start <= target <= season_end:
             raise BackendError('변경 날짜는 선택한 시즌 기간 안이어야 합니다.', 422, 'outside_season')
         player_ref = self.db.collection('players').document(payload.playerId)
         player = player_ref.get(transaction=tx)
         contracts = list(player_ref.collection('contracts').stream(transaction=tx))
         covering = [snapshot for snapshot in contracts if (entry := snapshot.to_dict() or {}).get('teamId') == payload.teamId
                     and entry.get('competitionType') != 'national'
-                    and str(entry.get('from') or '').replace('-', '.') <= target
-                    and (not entry.get('to') or str(entry['to']).replace('-', '.') >= target)]
+                    and str(entry.get('from') or '').replace('-', '.') <= (target or season_end)
+                    and (not entry.get('to') or str(entry['to']).replace('-', '.') >= (target or season_start))
+                    and (bool(target) or snapshot.id == payload.contractId)]
         if not player.exists or len(covering) != 1 or covering[0].id != payload.contractId:
             raise BackendError('변경 날짜의 팀 소속 이력을 다시 선택하세요.', 409, 'number_contract_mismatch')
         contract = covering[0]
@@ -441,6 +443,8 @@ class PlayerRequestService:
             payload = decision.payload or PlayerNumberChange.model_validate(current['payload'])
             if not isinstance(payload, PlayerNumberChange) or decision.existingPlayerId:
                 raise BackendError('등번호 변경 요청 내용을 확인하세요.', 422, 'request_type_mismatch')
+            if decision.action == 'approve' and not payload.changeDate:
+                raise BackendError('승인 전에 등번호 변경 날짜를 확인해 입력하세요.', 422, 'change_date_required')
             player, source = self.number_change_source(payload, tx)
             revision_ref = self.db.collection('playerRegistrationRosterVersions').document(payload.teamId)
             revision = revision_ref.get(transaction=tx).to_dict() or {}

@@ -4655,10 +4655,10 @@ section.right.sizeUp .kickGrid::after {
 }
 section.right.sizeUp .kickPrimary { height: 100%; }
 section.right.sizeUp .kickResult { height: 100%; }
-section.right.sizeUp .kick-c { grid-column: 1; grid-row: 1; }
-section.right.sizeUp .kick-p { grid-column: 2; grid-row: 1; }
-section.right.sizeUp .kick-x { grid-column: 1; grid-row: 2; }
-section.right.sizeUp .kick-b { grid-column: 2; grid-row: 2; }
+section.right.sizeUp .kick-p { grid-column: 1; grid-row: 1; }
+section.right.sizeUp .kick-c { grid-column: 2; grid-row: 1; }
+section.right.sizeUp .kick-b { grid-column: 1; grid-row: 2; }
+section.right.sizeUp .kick-x { grid-column: 2; grid-row: 2; }
 section.right.sizeUp .stacked { display: contents; }
 section.right.sizeUp .stacked .actBtn:first-child { grid-column: 1; grid-row: 4; }
 section.right.sizeUp .stacked .actBtn:last-child { grid-column: 2; grid-row: 4; }

@@ -520,6 +520,24 @@ def test_number_request_only_stages_and_approval_splits_number_periods_atomicall
     assert db.documents == after
 
 
+def test_number_change_can_be_requested_without_date_but_manager_must_supply_it_for_approval(db, number_change):
+    service = PlayerRequestService(db)
+    undated = PlayerNumberChange.model_validate({**number_change.model_dump(), 'changeDate': ''})
+    before_contract = deepcopy(db.documents['players/P/contracts/C'])
+    request_id = service.submit(undated, analyst)['id']
+    assert db.documents[f'playerRegistrationRequests/{request_id}']['payload']['changeDate'] == ''
+    service.review(request_id, ReviewDecision(action='edit', version=1, payload=undated), manager)
+    before_approval = deepcopy(db.documents)
+    with pytest.raises(BackendError) as error:
+        service.review(request_id, ReviewDecision(action='approve', version=2), manager)
+    assert error.value.code == 'change_date_required'
+    assert db.documents == before_approval
+    assert db.documents['players/P/contracts/C'] == before_contract
+    result = service.review(request_id, ReviewDecision(action='approve', version=2, payload=number_change), manager)
+    assert result['status'] == 'approved'
+    assert db.documents[f'players/P/contracts/number-request-{request_id}']['from'] == '2026.10.01'
+
+
 def test_duplicate_lookup_uses_fullname_only_and_returns_player_ids(db, payload):
     db.documents['players/0000000010'] = {'name': 'Different display', 'nameFull': payload.nameFull, 'birth': '1999.01.01'}
     db.documents['players/0000000011'] = {'name': payload.name, 'nameEn': payload.nameEn, 'nameFull': 'Different Full Name', 'birth': payload.birth}
