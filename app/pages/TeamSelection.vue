@@ -966,7 +966,7 @@ function suppressBenchClickAfterDrag(e: MouseEvent) {
 }
 const starterCount = computed(() => outfieldSlots.value.filter((_, index) => game.value.assigned[`o${index}`]).length + (game.value.assigned.gk ? 1 : 0))
 // 후보는 선택 사항이다. 포메이션의 필드 10명과 GK만 확정되면 시작할 수 있다.
-const canStart = computed(() => !!game.value.formationKey && !!game.value.side && starterCount.value === outfieldSlots.value.length + 1)
+const canStart = computed(() => !!game.value.formationKey && !!game.value.side && starterCount.value === outfieldSlots.value.length + 1 && !(game.value.halfStatus === 'H1_done' && subSaveError.value))
 
 function entrySetupSnapshot() {
   // Compare visible input choices, not server lineup metadata or JSON key
@@ -1691,7 +1691,7 @@ watch(() => pendingSubs.value.length, (next, prev) => {
 
 function openSub() {
   if (!matchInfoEditable.value) return
-  if (subOpen.value) { closeSub(); return }
+  if (subOpen.value) { cancelSub(); return }
   // 다른 팝업/슬롯 선택 상태를 닫고 교체 패널을 최상위 입력 상태로 연다.
   grassOpen.value = false
   menuOpen.value = false
@@ -1702,7 +1702,6 @@ function openSub() {
   subOut.value = null
   subIn.value = null
   pendingSubs.value = []
-  subSaveError.value = ''
   const moment = subMoment()
   subTimeMinute.value = moment ? Math.floor(moment.seconds / 60) : 0
   subTimeSecond.value = moment ? moment.seconds % 60 : 0
@@ -1753,7 +1752,30 @@ function pickIn(id: string) {
 const canAddSub = computed(() => subOut.value !== null && subIn.value !== null)
 /** 목록추가: 고른 OUT/IN 을 맞바꾸고 미리보기 목록에 올린 뒤, 패널은 열어 둔 채 다음 교체를 받는다. */
 function addSub() {
-  if (subOut.value && subIn.value) swapSlots(subOut.value, subIn.value)
+  if (!subOut.value || !subIn.value || subSaving.value || subSaveError.value) return
+  swapSlots(subOut.value, subIn.value)
+  if (game.value.halfStatus === 'H1_done') {
+    game.value.subs = [...game.value.subs, ...pendingSubs.value].sort(
+      (a, b) => HALF_ORDER[a.half]! * 100000 + a.seconds - (HALF_ORDER[b.half]! * 100000 + b.seconds)
+    )
+    pendingSubs.value = []
+    void saveImmediateSub()
+  }
+}
+
+async function saveImmediateSub() {
+  if (subSaving.value) return
+  subSaving.value = true
+  lifecycleBusy.value = true
+  subSaveError.value = ''
+  try {
+    if (!await syncSetup(game.value, 'substitutions')) throw new Error('교체 저장에 실패했습니다. 다시 저장해주세요.')
+  } catch (error) {
+    subSaveError.value = error instanceof Error ? error.message : '교체 저장에 실패했습니다. 다시 저장해주세요.'
+  } finally {
+    subSaving.value = false
+    lifecycleBusy.value = false
+  }
 }
 function onSubDragStart(id: string) {
   subDragId.value = id
@@ -1829,6 +1851,7 @@ function cancelPendingSub(index: number) {
 /** Close: 저장하지 않고, 열었을 때 상태(배치·교체 목록)로 되돌린 뒤 닫는다. */
 function cancelSub() {
   if (subSaving.value) return
+  if (game.value.halfStatus === 'H1_done') { closeSub(); return }
   if (subSnapshot) {
     Object.keys(game.value.assigned).forEach(k => delete game.value.assigned[k])
     Object.assign(game.value.assigned, subSnapshot)
@@ -1853,6 +1876,20 @@ function undoSub(index: number) {
   if (subSaving.value) return
   const s = game.value.subs[index]
   if (!s) return
+  if (game.value.halfStatus === 'H1_done') {
+    if (subSaveError.value) return
+    const swap = (sub: SubRecord) => {
+      const entries = Object.entries(game.value.assigned)
+      const outSlot = entries.find(([, player]) => player === sub.outPlayer)?.[0]
+      const inSlot = entries.find(([, player]) => player === sub.inPlayer)?.[0]
+      if (outSlot && inSlot) game.value.assigned = { ...game.value.assigned, [outSlot]: sub.inPlayer, [inSlot]: sub.outPlayer }
+    }
+    game.value.subs.slice(index).reverse().forEach(swap)
+    game.value.subs = game.value.subs.filter((_, i) => i !== index)
+    game.value.subs.slice(index).forEach(swap)
+    void saveImmediateSub()
+    return
+  }
   const entries = Object.entries(game.value.assigned)
   const inSlot = entries.find(([, idx]) => idx === s.inPlayer)?.[0]
   const outSlot = entries.find(([, idx]) => idx === s.outPlayer)?.[0]
@@ -1866,6 +1903,7 @@ function undoSub(index: number) {
 <template>
   <div class="page">
     <div class="bg" />
+    <div v-if="subSaveError && game.halfStatus === 'H1_done'" class="lifecycleError" role="alert">{{ subSaveError }} <button type="button" :disabled="subSaving" @click="saveImmediateSub">다시 저장</button></div>
     <button type="button" class="topBack" :class="{ overLoading: !lobbyReady }" @click="returnTo('/schedule')">← 경기 선택</button>
     <div v-if="!lobbyReady" class="lobbyLoading" role="status" aria-live="polite">
       <span class="lobbySpinner" />
@@ -2093,12 +2131,12 @@ function undoSub(index: number) {
                   </div>
                 </div>
 
-                <div class="subActions">
+                <div class="subActions" :class="{ twoActions: game.halfStatus === 'H1_done' }">
                   <button class="subCancel" :disabled="subSaving" @click="cancelSub">Close</button>
-                  <button class="subQueue" :disabled="!canAddSub || subSaving" @click="addSub">목록추가</button>
-                  <button class="subSave" :disabled="subSaving" @click="saveSub">{{ subSaving ? '저장 중…' : 'Submit' }}</button>
+                  <button class="subQueue" :disabled="!canAddSub || subSaving || (game.halfStatus === 'H1_done' && !!subSaveError)" @click="addSub">목록추가</button>
+                  <button v-if="game.halfStatus !== 'H1_done'" class="subSave" :disabled="subSaving" @click="saveSub">{{ subSaving ? '저장 중…' : 'Submit' }}</button>
                 </div>
-                <p v-if="subSaveError" class="lifecycleError" role="alert">{{ subSaveError }}</p>
+                <p v-if="subSaveError && game.halfStatus !== 'H1_done'" class="lifecycleError" role="alert">{{ subSaveError }}</p>
               </template>
             </section>
           </div>
@@ -3893,6 +3931,10 @@ button {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
   gap: 8px
+}
+
+.subActions.twoActions {
+  grid-template-columns: 1fr 1fr;
 }
 
 .subCancel,

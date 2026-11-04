@@ -1188,6 +1188,8 @@ const pitchStyle = computed(() => ({
 
 // 좌우 반전: 경기장·기록표(left)와 액트 입력판(right)의 화면 위치를 통째로 바꾼다.
 // 팝업에서 고른 값은 "확인"을 눌러야 실제로 적용된다.
+const sizeUp = ref(false)
+const sizeGoalDismissed = ref(false)
 const mirrorOpen = ref(false)
 const pendingMirrored = ref(game.value.mirrored)
 function openMirrorPopup() {
@@ -1984,6 +1986,12 @@ const GOAL_ZONE_RESULTS = new Set<string>(['GOAL', 'GB', 'GX', 'H', 'HX', 'L', '
 const isEditingShoot = computed(() => editingId.value !== null && (
   editShootZone.value !== null || editAct.value === 'S' || editAct.value === 'H' || editAct.value === 'R'
 ))
+// Opening a different shot or selecting a shot act reopens the goal overlay.
+watch([() => pendingShot.value?.id, editingId, isEditingShoot], () => {
+  sizeGoalDismissed.value = false
+})
+const sizeGoalActive = computed(() => pendingShot.value !== null || isEditingShoot.value)
+
 const infoGoalPos = computed(() => {
   if (editingId.value) {
     if (!editShootZone.value || !editShootPos.value) return null
@@ -2679,7 +2687,7 @@ async function finishHalf() {
           </div>
         </section>
 
-        <section class="right" :class="{ editing: !!editingId || !!pendingOuterResult || !!cardPlayerEditTarget || editingSubIndex !== null }">
+        <section class="right" :class="{ editing: !!editingId || !!pendingOuterResult || !!cardPlayerEditTarget || editingSubIndex !== null, sizeUp: sizeUp && !cardOpen && !subOpen && !playerPickFor }">
           <div v-if="editingId" class="editActions">
             <button class="editApply" @click="applyEdit">적용</button>
             <button class="editDelete" @click="deleteEdit">삭제</button>
@@ -2737,6 +2745,12 @@ async function finishHalf() {
                 </div>
                 <button class="popOk" @click="confirmMirror">확인</button>
               </div>
+            </div>
+            <button v-if="!editingId && !pendingOuterResult && !cardPlayerEditTarget && editingSubIndex === null"
+              type="button" class="sizeUpToggle" :class="{ on: sizeUp }" :aria-pressed="sizeUp"
+              @click="sizeUp = !sizeUp; sizeGoalDismissed = false">SIZE-UP</button>
+            <div v-if="!editingId && !pendingOuterResult && !cardPlayerEditTarget && editingSubIndex === null" class="headerSaveStatus">
+              <LiveRoomStatus compact :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
             </div>
           </div>
 
@@ -2877,8 +2891,8 @@ async function finishHalf() {
           </div>
 
           <template v-else-if="!cardOpen && !subOpen && !playerPickFor">
-            <div class="group">
-              <div class="groupTitle">CID-INPUT(Kick)</div>
+            <div class="group kickGroup">
+              <div v-if="!sizeUp" class="groupTitle">CID-INPUT(Kick)</div>
               <div class="kickGrid">
                 <button v-for="a in kickActs" :key="a.k" class="actBtn kickPrimary"
                   :class="[`kick-${a.k.toLowerCase()}`, { on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k }]"
@@ -2895,16 +2909,16 @@ async function finishHalf() {
               </div>
             </div>
 
-            <div class="group">
-              <div class="groupTitle">CID-INPUT(Shooting)</div>
+            <div class="group shootingGroup">
+              <div v-if="!sizeUp" class="groupTitle">CID-INPUT(Shooting)</div>
               <div class="shootGrid">
                 <button v-for="a in shootActs" :key="a.k" class="actBtn"
                   :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k }"
-                  @pointerdown="clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
+                  @pointerdown="sizeGoalDismissed = false; clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
               </div>
 
-              <div class="liveRoomGap">
-                <LiveRoomStatus compact :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
+              <div v-if="!sizeUp || isEditMode || editingId || pendingOuterResult || cardPlayerEditTarget || editingSubIndex !== null" class="liveRoomGap">
+                <LiveRoomStatus v-if="editingId || pendingOuterResult || cardPlayerEditTarget || editingSubIndex !== null" compact :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
                 <!-- 수정 화면의 기록 더보기·구간 수정은 골대 위에 둔다 (스코어바에 두면 팀 이름이 밀려나고, 경기장 아래에 두면 코너 위치 입력과 겹친다) -->
                 <div v-if="isEditMode" class="editTools">
                   <button class="scoreTool" :class="{ on: tableExpanded }"
@@ -2913,6 +2927,8 @@ async function finishHalf() {
                 </div>
               </div>
 
+              <div class="goalContainer" :class="{ goalOverlay: sizeUp, hiddenGoal: sizeUp && (!sizeGoalActive || sizeGoalDismissed) }">
+              <button v-if="sizeUp" type="button" class="closeGoalOverlay" aria-label="골대 닫기" @click="sizeGoalDismissed = true">✕</button>
               <div class="goal" :class="{ active: pendingShot !== null || isEditingShoot }">
                 <button type="button" class="goalZone goalMissButton hx" @pointerdown="selectOuterMiss('HX')">HX</button>
                 <div class="goalZone goalAimZone h" @pointerdown="clickOuterZone($event, 'H')">H</div>
@@ -2934,6 +2950,7 @@ async function finishHalf() {
                 <button class="goalResultBtn resB" @pointerdown="confirmGoalFrame('B')">B</button>
                 <button class="goalResultBtn resGoal" @pointerdown="confirmGoalFrame('GOAL')">GOAL</button>
                 <button class="goalResultBtn resX" @pointerdown="confirmGoalFrame('X')">X</button>
+              </div>
               </div>
             </div>
 
@@ -4557,9 +4574,129 @@ button {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 40px
+  min-height: 40px;
+  padding-right: 210px;
+  min-width: 0
 }
 
+.headerSaveStatus {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 170px;
+  z-index: 5;
+}
+
+.headerSaveStatus :deep(.liveRoomStatus.compact) {
+  display: flex;
+  flex-wrap: nowrap;
+  padding: 4px 0;
+  max-height: none;
+}
+
+.headerSaveStatus :deep(.compact span) { flex: 1; }
+.headerSaveStatus :deep(.liveRoomStatus > button),
+.headerSaveStatus :deep(.conflictDetails) {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  width: max-content;
+  max-width: 300px;
+  padding: 6px;
+  background: #17212d;
+  z-index: 6;
+}
+.headerSaveStatus :deep(.conflictDetails) { top: calc(100% + 32px); }
+
+
+.sizeUpToggle {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, .22);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .06);
+  color: #ddd;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .03em;
+  cursor: pointer;
+}
+.sizeUpToggle.on {
+  border-color: #f0b429;
+  color: #f0b429;
+  background: rgba(240, 180, 41, .16);
+}
+.goalContainer { display: contents; }
+section.right.sizeUp > .kickGroup,
+section.right.sizeUp > .shootingGroup {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-color: rgba(255, 255, 255, .8);
+}
+section.right.sizeUp > .kickGroup { flex: 1 1 0; }
+section.right.sizeUp > .shootingGroup { flex: 0 0 auto; }
+section.right.sizeUp .kickGrid {
+  flex: 1;
+  min-height: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: 220px minmax(0, 1fr) 6px minmax(0, 1fr);
+}
+section.right.sizeUp .kickGrid::after {
+  content: '';
+  grid-column: 1 / -1;
+  grid-row: 3;
+  align-self: center;
+  height: 1px;
+  background: rgba(255, 255, 255, .8);
+  pointer-events: none;
+}
+section.right.sizeUp .kickPrimary { height: 100%; }
+section.right.sizeUp .kickResult { height: 100%; }
+section.right.sizeUp .kick-c { grid-column: 1; grid-row: 1; }
+section.right.sizeUp .kick-p { grid-column: 2; grid-row: 1; }
+section.right.sizeUp .kick-x { grid-column: 1; grid-row: 2; }
+section.right.sizeUp .kick-b { grid-column: 2; grid-row: 2; }
+section.right.sizeUp .stacked { display: contents; }
+section.right.sizeUp .stacked .actBtn:first-child { grid-column: 1; grid-row: 4; }
+section.right.sizeUp .stacked .actBtn:last-child { grid-column: 2; grid-row: 4; }
+section.right.sizeUp .shootingGroup { position: relative; }
+section.right.sizeUp .shootingGroup .groupTitle { order: 0; }
+section.right.sizeUp .liveRoomGap { order: 1; }
+/* The whole shooting panel, including its 38px header, aligns with the table. */
+section.right.sizeUp .shootGrid { order: 2; flex: 0 0 146px; min-height: 0; margin-bottom: 0; }
+section.right.sizeUp .shootGrid .actBtn { height: 100%; }
+section.right.sizeUp .goalContainer.goalOverlay {
+  position: absolute;
+  z-index: 3;
+  inset: auto 7px 7px;
+  height: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 8px;
+  background: #1e222a;
+  border: 1px solid rgba(255, 255, 255, .22);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .45);
+}
+section.right.sizeUp .goalOverlay .goal {
+  flex: 0 0 auto;
+  width: 100%;
+  aspect-ratio: 628 / 300;
+}
+section.right.sizeUp .goalContainer.hiddenGoal { display: none; }
+.closeGoalOverlay {
+  position: absolute;
+  z-index: 5;
+  top: 2px;
+  right: 3px;
+  width: 28px;
+  height: 28px;
+  color: #ddd;
+  background: #30353c;
+  border: 1px solid rgba(255, 255, 255, .3);
+  border-radius: 4px;
+  cursor: pointer;
+}
 .mirrorWrap {
   position: relative
 }
@@ -4767,9 +4904,14 @@ section.right h1 {
   height: auto;
   min-height: 0;
   flex-direction: row;
-  justify-content: flex-start;
-  padding: 0 14px;
-  gap: 12px
+  justify-content: center;
+  padding: 0 4px;
+  gap: 8px
+}
+
+.actBtn.small b {
+  padding-right: 8px;
+  border-right: 1px solid rgba(255, 255, 255, .22)
 }
 
 .kickPrimary {

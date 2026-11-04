@@ -1286,7 +1286,7 @@ test('lobby bootstrap, locked lineup and assistant changes do not auto-save setu
   let writes = 0, timer
   const context = vm.createContext({ game: { value: { matchId: 'm', formationKey: '4-3-3', lifecycleControl: true,
     halfStatus: 'H2_done', formationChanges: [] } }, applyingRemoteSetup: false,
-    bootstrapApplied: { value: false }, matchInfoEditable: { value: true },
+    bootstrapApplied: { value: false }, matchInfoEditable: { value: true }, subOpen: { value: false },
     pendingSetupFingerprint: '', appliedSetupFingerprint: '', formationSaveTimer: null, setupEpoch: 0,
     currentSetupFingerprint: () => 'changed', persistCurrentSetup: async () => { writes++; return true },
     setTimeout: callback => { timer = callback; return 1 }, clearTimeout() {} })

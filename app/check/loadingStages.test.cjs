@@ -87,7 +87,7 @@ test('completed match no longer renders the temporary half-edit button', () => {
 function substitutionSaveEnvironment(save) {
   const original = { id: 'old', half: 'H1', seconds: 20, outPlayer: 'one', inPlayer: 'two' }
   const incoming = { id: 'new', half: 'H2', seconds: 0, outPlayer: 'three', inPlayer: 'four' }
-  const game = ref({ halfStatus: 'H1_done', subs: [original], assigned: { gk: 'four', b1: 'three' } })
+  const game = ref({ halfStatus: 'ready', subs: [original], assigned: { gk: 'four', b1: 'three' } })
   const open = ref(true), requests = []
   const context = functions('TeamSelection.vue', ['saveSub'], {
     game, subSaving: ref(false), lifecycleBusy: ref(false), matchInfoEditable: ref(true), subSaveError: ref(''),
@@ -98,7 +98,7 @@ function substitutionSaveEnvironment(save) {
   return { context, requests, game, open }
 }
 
-test('halftime substitution Submit waits for lineup and history save before closing', async () => {
+test('pre-match substitution Submit waits for lineup and history save before closing', async () => {
   const gate = deferred()
   const env = substitutionSaveEnvironment(() => gate.promise)
   const saving = env.context.saveSub()
@@ -111,7 +111,7 @@ test('halftime substitution Submit waits for lineup and history save before clos
   gate.resolve(true)
   await saving
   assert.equal(env.open.value, false)
-  assert.equal(env.game.value.halfStatus, 'H1_done')
+  assert.equal(env.game.value.halfStatus, 'ready')
   assert.equal(env.context.subSaving.value, false)
 })
 
@@ -377,4 +377,66 @@ test('failed KPI updates retry on the next version check, and background tabs st
   env.context.loadDashboardKpis = async () => { assert.fail('hidden tab must not fetch KPI') }
   env.timers[1].callback()
   assert.equal(env.context.lastLobbyVersions, '')
+})
+
+function halftimeSubEnvironment(save) {
+  const game = ref({ halfStatus: 'H1_done', subs: [], assigned: { o0: 'A', b0: 'B', b1: 'C' } })
+  const context = functions('TeamSelection.vue', ['swapSlots', 'addSub', 'saveImmediateSub', 'cancelSub', 'closeSub', 'undoSub'], {
+    game, subSaving: ref(false), lifecycleBusy: ref(false), subSaveError: ref(''),
+    subOut: ref('o0'), subIn: ref('b0'), subTimeTotal: ref(2700), pendingSubs: ref([]),
+    subOpen: ref(true), subSnapshot: { ...game.value.assigned }, subsSnapshot: [], subDragId: ref(null),
+    HALF_ORDER: { H1: 1, H2: 2 }, isBenchSlot: id => id.startsWith('b'), subMoment: () => ({ half: 'H2', seconds: 2700 }),
+    crypto: { randomUUID: (() => { let n = 0; return () => `sub-${++n}` })() },
+    syncSetup: save,
+  })
+  return { context, game }
+}
+
+test('halftime list addition saves immediately and Close keeps the saved lineup', async () => {
+  const gate = deferred(), calls = []
+  const { context, game } = halftimeSubEnvironment(async (state, scope) => {
+    calls.push({ scope, assigned: { ...state.assigned }, subs: JSON.parse(JSON.stringify(state.subs)) })
+    return gate.promise
+  })
+  context.addSub()
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].scope, 'substitutions')
+  assert.equal(calls[0].subs[0].id, 'sub-1')
+  assert.equal(context.subSaving.value, true)
+  gate.resolve(true)
+  await new Promise(resolve => setImmediate(resolve))
+  context.cancelSub()
+  assert.equal(context.subOpen.value, false)
+  assert.equal(game.value.assigned.o0, 'B')
+  assert.equal(game.value.subs.length, 1)
+})
+
+test('halftime save failure retains the substitution and retries with the same event ID', async () => {
+  let success = false
+  const calls = []
+  const { context, game } = halftimeSubEnvironment(async (state) => { calls.push(state.subs[0].id); return success })
+  context.addSub()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.match(context.subSaveError.value, /실패/)
+  assert.equal(game.value.assigned.o0, 'B')
+  context.cancelSub()
+  assert.equal(game.value.subs.length, 1)
+  success = true
+  await context.saveImmediateSub()
+  assert.equal(context.subSaveError.value, '')
+  assert.deepEqual(calls, ['sub-1', 'sub-1'])
+})
+
+test('halftime cancellation replays later substitutions and saves the deletion', async () => {
+  const calls = []
+  const { context, game } = halftimeSubEnvironment(async (state, scope) => { calls.push({ scope, ids: state.subs.map(s => s.id) }); return true })
+  game.value.subs = [
+    { id: 'first', outPlayer: 'A', inPlayer: 'B' },
+    { id: 'second', outPlayer: 'B', inPlayer: 'C' },
+  ]
+  game.value.assigned = { o0: 'C', b0: 'A', b1: 'B' }
+  context.undoSub(0)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(JSON.parse(JSON.stringify(game.value.assigned)), { o0: 'A', b0: 'C', b1: 'B' })
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{ scope: 'substitutions', ids: ['second'] }])
 })
