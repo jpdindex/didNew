@@ -1624,6 +1624,7 @@ const editingSubIndex = ref<number | null>(null)
 
 // 수정 중에는 ⇄ 버튼 자리에 적용 버튼이 있어서, 적용을 연달아 누르면 수정이 닫히자마자 나타난
 // ⇄ 버튼까지 눌린다. 수정(기록·카드·교체)이 끝난 직후 잠깐은 ⇄ 버튼 터치를 무시한다.
+// SIZE-UP 버튼도 같은 줄에 있어서 같은 잠금을 쓴다.
 const MIRROR_LOCK_MS = 800
 const mirrorLocked = ref(false)
 let mirrorLockTimer: ReturnType<typeof setTimeout> | undefined
@@ -2747,7 +2748,8 @@ async function finishHalf() {
               </div>
             </div>
             <button v-if="!editingId && !pendingOuterResult && !cardPlayerEditTarget && editingSubIndex === null"
-              type="button" class="sizeUpToggle" :class="{ on: sizeUp }" :aria-pressed="sizeUp"
+              type="button" class="sizeUpToggle" :class="{ on: sizeUp, locked: mirrorLocked }" :disabled="mirrorLocked"
+              :aria-pressed="sizeUp"
               @click="sizeUp = !sizeUp; sizeGoalDismissed = false">SIZE-UP</button>
             <div v-if="!editingId && !pendingOuterResult && !cardPlayerEditTarget && editingSubIndex === null" class="headerSaveStatus">
               <LiveRoomStatus compact :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
@@ -4715,7 +4717,8 @@ section.right.sizeUp .goalContainer.hiddenGoal { display: none; }
   cursor: pointer
 }
 
-.mirrorIcon.locked {
+.mirrorIcon.locked,
+.sizeUpToggle.locked {
   opacity: .35;
   pointer-events: none
 }
