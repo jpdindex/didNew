@@ -2909,7 +2909,12 @@ button {
   border: 1px solid rgba(255, 255, 255, .15);
   border-top: none;
   border-radius: 0 0 4px 4px;
-  box-shadow: 0 8px 20px rgba(0, 0, 0, .4)
+  box-shadow: 0 8px 20px rgba(0, 0, 0, .4);
+  max-height: 80vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y
 }
 
 .menuItem {
