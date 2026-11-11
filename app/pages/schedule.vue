@@ -448,7 +448,7 @@ const recorderLevel = ref<'basic' | 'advanced' | null>(null)
 async function loadRecorderLevel() {
   try {
     const profile = await request<{ level?: 'basic' | 'advanced' }>('/api/v1/match-input/recorder-profile')
-    recorderLevel.value = profile.level === 'basic' ? 'basic' : 'advanced'
+    recorderLevel.value = profile.level === 'advanced' ? 'advanced' : 'basic'
   } catch {
     recorderLevel.value = null
   }

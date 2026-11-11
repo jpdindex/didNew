@@ -2187,7 +2187,7 @@ class JpdDidData:
         current = snapshot.to_dict() or {}
         profile_snapshot = self.db.collection("recorders").document(user_id).get(retry=None, timeout=10)
         profile = profile_snapshot.to_dict() or {}
-        recorder_level = "basic" if profile.get("level") == "basic" else "advanced"
+        recorder_level = "advanced" if profile.get("level") == "advanced" else "basic"
         primary_uid = str(current.get("primaryUid") or "")
         participants = current.get("participants") if isinstance(current.get("participants"), dict) else {}
         existing_participant = participants.get(user_id) if isinstance(participants.get(user_id), dict) else {}
@@ -2295,18 +2295,30 @@ class JpdDidData:
         """Create/update the minimal operational profile after Firebase Auth login."""
         reference = self.db.collection("recorders").document(user_id)
         snapshot = reference.get(retry=None, timeout=10)
-        current = snapshot.to_dict() or {}
         now = utc_now()
-        document = {
-            **current,
+        if not snapshot.exists:
+            document = {
+                "name": name or user_id,
+                "level": "basic",
+                "updatedAt": now,
+                "updatedBy": "backend-login-bootstrap",
+                "createdAt": now,
+            }
+            try:
+                reference.create(document, retry=None, timeout=20)
+                return document
+            except AlreadyExists:
+                snapshot = reference.get(retry=None, timeout=10)
+
+        current = snapshot.to_dict() or {}
+        updates = {
             "name": name or current.get("name") or user_id,
-            "level": current.get("level") if current.get("level") in {"basic", "advanced"} else "advanced",
             "updatedAt": now,
             "updatedBy": "backend-login-bootstrap",
             "createdAt": current.get("createdAt", now),
         }
-        reference.set(document, retry=None, timeout=20)
-        return document
+        reference.update(updates, retry=None, timeout=20)
+        return {**current, **updates}
 
     def get_recorder_profile(self, user_id: str) -> dict[str, Any]:
         snapshot = self.db.collection("recorders").document(user_id).get(retry=None, timeout=10)
@@ -2505,12 +2517,7 @@ class JpdDidData:
         level: Literal["basic", "advanced"] | None = None,
         lifecycle: str | None = None,
     ) -> dict[str, Any]:
-        """Aggregate operational analyst work from collaborative Drafts.
-
-        Analyst identities intentionally never enter finalized RAW. A Draft is
-        retained after promotion, so it is the durable operational audit source
-        for role, team assignment, and the KPI volume of a worked fixture.
-        """
+        """Aggregate analyst work from collaborative Drafts."""
         def normalized_date(value: Any) -> str:
             digits = re.sub(r"\D", "", str(value or ""))
             return digits[:8] if len(digits) >= 8 else ""
@@ -2526,52 +2533,71 @@ class JpdDidData:
 
         from_key = normalized_date(date_from)
         to_key = normalized_date(date_to)
-        drafts: list[tuple[Any, dict[str, Any], str, Side]] = []
-        for snapshot in self.db.collection("inputDrafts").stream(retry=None, timeout=45):
+        drafts = []
+        match_ids: set[str] = set()
+        query = self.db.collection("inputDrafts").select([
+            "gmId", "side", "participants", "updatedAt", "status", "sharedState",
+            "payload.status", "payload.matchSnapshot", "payload.homeScore", "payload.awayScore", "payload.records",
+        ])
+        for snapshot in query.stream(retry=None, timeout=45):
             document = snapshot.to_dict() or {}
             gm_id = str(document.get("gmId") or "")
             side = document.get("side")
             participants = document.get("participants")
-            if not gm_id or side not in {"H", "A"} or not isinstance(participants, dict) or not participants:
+            if not gm_id or side not in {"H", "A"} or not isinstance(participants, dict):
                 continue
-            drafts.append((snapshot, document, gm_id, side))
-
-        match_refs = [self.db.collection("matches").document(gm_id) for _, _, gm_id, _ in drafts]
-        matches: dict[str, dict[str, Any]] = {}
-        for start in range(0, len(match_refs), 300):
-            for snapshot in self.db.get_all(match_refs[start:start + 300], retry=None, timeout=30):
-                if snapshot.exists:
-                    matches[snapshot.id] = snapshot.to_dict() or {}
-
-        team_ids = {
-            str(match.get(team_key) or "")
-            for match in matches.values()
-            for team_key in ("homeTeamId", "awayTeamId")
-            if match.get(team_key)
-        }
-        teams = self.get_documents_by_ids("teams", team_ids)
-
-        sessions: list[dict[str, Any]] = []
-        participant_ids: set[str] = set()
-        for snapshot, document, gm_id, side in drafts:
-            match = matches.get(gm_id, {})
+            participant_rows = [
+                {
+                    "uid": uid,
+                    "name": str(participant.get("name") or uid),
+                    "role": participant["role"],
+                    "level": "basic" if participant.get("level") == "basic" else "advanced",
+                }
+                for uid, participant in participants.items()
+                if isinstance(participant, dict) and participant.get("role") in {"primary", "assistant"}
+            ]
+            if not participant_rows:
+                continue
             payload = document.get("payload") if isinstance(document.get("payload"), dict) else {}
             shared = document.get("sharedState") if isinstance(document.get("sharedState"), dict) else {}
+            status = str(shared.get("halfStatus") or payload.get("status") or document.get("status") or "ready")
+            if not lifecycle or status == lifecycle:
+                match_ids.add(gm_id)
+                drafts.append((snapshot.reference, gm_id, side, document.get("updatedAt"), payload, shared, status, participant_rows))
+
+        matches = self.get_documents_by_ids("matches", match_ids)
+
+        sessions: list[dict[str, Any]] = []
+        record_sources = []
+        for reference, gm_id, side, updated_at, payload, shared, status, participant_rows in drafts:
+            match = matches.get(gm_id, {})
             match_snapshot = payload.get("matchSnapshot") if isinstance(payload.get("matchSnapshot"), dict) else {}
             match_date = normalized_date(match.get("date") or match_snapshot.get("date"))
             if (from_key and (not match_date or match_date < from_key)) or (to_key and (not match_date or match_date > to_key)):
                 continue
-            status = str(shared.get("halfStatus") or payload.get("status") or document.get("status") or "ready")
-            if lifecycle and status != lifecycle:
-                continue
 
-            team_id = str((match.get("awayTeamId") if side == "A" else match.get("homeTeamId")) or "")
-            opponent_id = str((match.get("homeTeamId") if side == "A" else match.get("awayTeamId")) or "")
-            team = teams.get(team_id, {})
-            opponent = teams.get(opponent_id, {})
-            team_name = str(team.get("nameKr") or team.get("name") or team.get("nameShort") or team_id)
-            opponent_name = str(opponent.get("nameKr") or opponent.get("name") or opponent.get("nameShort") or opponent_id)
+            home_id = str(match.get("homeTeamId") or "")
+            away_id = str(match.get("awayTeamId") or "")
+            team_id, opponent_id = (away_id, home_id) if side == "A" else (home_id, away_id)
+            score_source = shared if "homeScore" in shared else payload
+            match_score = match.get("score") if isinstance(match.get("score"), dict) else {}
+            sessions.append({
+                "gmId": gm_id,
+                "side": side,
+                "date": match_date,
+                "status": status,
+                "teamId": team_id,
+                "opponentId": opponent_id,
+                "leagueId": str(match.get("leagueId") or match_snapshot.get("leagueId") or "-"),
+                "round": match.get("round") if match.get("round") is not None else match_snapshot.get("round"),
+                "score": {"home": as_int(score_source.get("homeScore", match_score.get("home", 0))), "away": as_int(score_source.get("awayScore", match_score.get("away", 0)))},
+                "updatedAt": timestamp_value(updated_at),
+                "participants": participant_rows,
+            })
+            record_sources.append((reference, payload))
 
+        def read_session_kpis(source) -> tuple[int, int]:
+            reference, payload = source
             # Prefer each live record document when present. The checkpoint
             # payload supplies the completed-half fallback and old Draft data.
             record_map = {
@@ -2579,7 +2605,7 @@ class JpdDidData:
                 for record in payload.get("records", [])
                 if isinstance(record, dict) and record.get("id")
             }
-            for record_snapshot in snapshot.reference.collection("records").stream(retry=None, timeout=30):
+            for record_snapshot in reference.collection("records").stream(retry=None, timeout=30):
                 record = record_snapshot.to_dict() or {}
                 if record.get("deleted"):
                     record_map.pop(record_snapshot.id, None)
@@ -2604,42 +2630,32 @@ class JpdDidData:
                 for record_id, record in record_map.items()
             ]
             dap = calculate_kpis(kpi_records).team_kpi["DAP"] if kpi_records else 0
-            score_source = shared if "homeScore" in shared else payload
-            match_score = match.get("score") if isinstance(match.get("score"), dict) else {}
-            participants = document.get("participants") if isinstance(document.get("participants"), dict) else {}
-            participant_rows = []
-            for uid, participant in participants.items():
-                if not isinstance(participant, dict) or participant.get("role") not in {"primary", "assistant"}:
-                    continue
-                participant_ids.add(uid)
-                participant_rows.append({
-                    "uid": uid,
-                    "name": str(participant.get("name") or uid),
-                    "role": participant["role"],
-                    "level": "basic" if participant.get("level") == "basic" else "advanced",
-                })
-            if not participant_rows:
-                continue
-            sessions.append({
-                "gmId": gm_id,
-                "side": side,
-                "date": match_date,
-                "status": status,
-                "teamId": team_id,
-                "teamName": team_name,
-                "opponentName": opponent_name,
-                "leagueId": str(match.get("leagueId") or match_snapshot.get("leagueId") or "-"),
-                "round": match.get("round") if match.get("round") is not None else match_snapshot.get("round"),
-                "score": {"home": as_int(score_source.get("homeScore", match_score.get("home", 0))), "away": as_int(score_source.get("awayScore", match_score.get("away", 0)))},
-                "dap": dap,
-                "recordCount": len(kpi_records),
-                "updatedAt": timestamp_value(document.get("updatedAt")),
-                "participants": participant_rows,
-            })
+            return dap, len(kpi_records)
 
-        profiles = self.get_documents_by_ids("recorders", participant_ids)
+        team_ids = {session[key] for session in sessions for key in ("teamId", "opponentId")}
+        participant_ids = {participant["uid"] for session in sessions for participant in session["participants"]}
+        if sessions:
+            # Bound concurrent Firestore reads while avoiding a network round
+            # trip for every team in sequence. Map preserves Draft order.
+            with ThreadPoolExecutor(max_workers=8, thread_name_prefix="analyst-dashboard") as executor:
+                teams_future = executor.submit(self.get_documents_by_ids, "teams", team_ids)
+                profiles_future = executor.submit(self.get_documents_by_ids, "recorders", participant_ids)
+                for session, (dap, record_count) in zip(sessions, executor.map(read_session_kpis, record_sources)):
+                    session["dap"] = dap
+                    session["recordCount"] = record_count
+                teams = teams_future.result()
+                profiles = profiles_future.result()
+        else:
+            teams, profiles = {}, {}
+
+        def team_name(team_id: str) -> str:
+            team = teams.get(team_id, {})
+            return str(team.get("nameKr") or team.get("name") or team.get("nameShort") or team_id)
+
         analysts: dict[str, dict[str, Any]] = {}
         for session in sessions:
+            session["teamName"] = team_name(session["teamId"])
+            session["opponentName"] = team_name(session["opponentId"])
             for participant in session["participants"]:
                 uid = participant["uid"]
                 profile = profiles.get(uid, {})

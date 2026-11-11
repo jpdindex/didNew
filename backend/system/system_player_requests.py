@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from backend.system.system_firestore import BackendError, CurrentUser, get_firestore_client
 
-MANAGER_EMAIL = 'jpdindex@gmail.com'
+MANAGER_EMAILS = frozenset({'jpdindex@gmail.com'})
 
 
 def normalize(value: str) -> str:
@@ -193,7 +193,7 @@ def profile_values(payload: PlayerRegistration, user_id: str) -> dict:
 
 
 def is_manager(user: CurrentUser) -> bool:
-    return str(user.claims.get('email', '')).strip().lower() == MANAGER_EMAIL
+    return str(user.claims.get('email', '')).strip().lower() in MANAGER_EMAILS
 
 
 def require_manager(user: CurrentUser) -> None:

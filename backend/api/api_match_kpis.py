@@ -2,11 +2,12 @@ import logging
 from collections import Counter
 from datetime import datetime
 
-from fastapi import APIRouter, Form
+from fastapi import APIRouter, Depends, Form
 from pydantic import BaseModel
 
+from backend.api.api_player_requests import management_operator
 from backend.build.build_match_kpis import BuildMatchKpis
-from backend.system.system_firestore import BackendError, JpdDidData, RequiredUser
+from backend.system.system_firestore import BackendError, JpdDidData
 from backend.system.system_pipeline_jobs import PipelineJob, pipeline_jobs
 
 
@@ -40,7 +41,7 @@ class MatchKpiStatusResponse(BaseModel):
 logger = logging.getLogger(__name__)
 
 
-router = APIRouter(tags=["match-kpis"])
+router = APIRouter(tags=["match-kpis"], dependencies=[Depends(management_operator)])
 
 
 def _scope_from_job(job: PipelineJob) -> dict[str, object]:
@@ -122,7 +123,7 @@ def _run_kpi_job(job: PipelineJob) -> None:
 
 
 @router.get("/match-kpis/status", response_model=MatchKpiStatusResponse, summary="Read KPI pipeline status")
-def read_match_kpi_status(_: RequiredUser = None) -> MatchKpiStatusResponse:
+def read_match_kpi_status() -> MatchKpiStatusResponse:
     return _status_response(pipeline_jobs.get("match-kpis"))
 
 
@@ -135,7 +136,6 @@ def build_match_kpis(
     team_id: str | None = Form(default=None),
     gm_id: str | None = Form(default=None),
     force: bool = Form(default=False, description="Recalculate current raw after a KPI rule change"),
-    _: RequiredUser = None,
 ) -> MatchKpiStatusResponse:
     if round_from is not None and round_to is not None and round_from > round_to:
         raise BackendError("round_from must not exceed round_to", status_code=422, code="round_range_invalid")

@@ -181,6 +181,48 @@ def test_future_original_cannot_be_approved_with_an_earlier_edited_date(monkeypa
     assert '원본이 미래 예정 이적' in reason
 
 
+
+def test_two_player_delivery_can_be_compared_and_applied_together(db, monkeypatch):
+    from backend.api.api_player_drafts import BulkApplyItem, apply_job
+
+    monkeypatch.setattr(drafts, 'get_firestore_client', lambda: db)
+    monkeypatch.setattr(Reference, 'create', Reference.set, raising=False)
+    monkeypatch.setattr(Snapshot, 'update_time', property(lambda self: str(self.value)), raising=False)
+    monkeypatch.setattr(drafts, '_today', lambda: drafts.date(2026, 11, 11))
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '26-27 roster'
+    sheet.append(['p_id', 'p_name', 'Full-name', 'p_birth', 'p_number', 'p_position'])
+    targets = []
+    for i in (1, 2):
+        player_id, full_name, code = f'P{i}', f'Fixture Player {i}', f'S-TEST{i}'
+        sheet.append([code, f'Test {i}', full_name, '2000.01.01', 10 + i, 'MF'])
+        db.documents[f'players/{player_id}'] = {'nameFull': full_name, 'birth': '2000.01.01', 'currentTeamId': 'T'}
+        db.documents[f'players/{player_id}/contracts/open'] = {
+            'teamId': 'T', 'leagueId': 'LALIGA', 'from': '2026.07.01', 'to': None, 'no': '4', 'pos': 'MF',
+        }
+        targets.append({'id': f'roster-{i}', 'action': 'number', 'kind': 'shirt_number', 'team': '세비야',
+                        'teamCode': 'T', 'code': code, 'nameFull': full_name, 'effectiveDate': '2026-07-01', 'number': str(10 + i)})
+    buf = BytesIO()
+    book.save(buf)
+    workbook = buf.getvalue()
+    upload = SimpleNamespace(filename='test.xlsx', size=len(workbook), file=BytesIO(workbook))
+    manifest = json.dumps({
+        'schemaVersion': 2, 'source': 'transfer-ops', 'runId': 123, 'targets': targets,
+        'files': [{'name': upload.filename, 'team': '세비야', 'sha256': sha256(workbook).hexdigest()}],
+    })
+    service = drafts.PlayerDraftService()
+    job_id = service.receive(manifest, [upload])['job_id']
+    assert service.receive(manifest, [upload])['job_id'] == job_id
+    assert list(service.compare_steps(job_id)) == [{'done': n, 'total': 2} for n in range(3)]
+    items = service.items(job_id)
+    assert [item['status'] for item in items] == ['changed', 'changed']
+    reviewed = [BulkApplyItem(id=item['id'], version=item['version']) for item in items]
+    result = apply_job(job_id, manager, reviewed)
+    assert [item['status'] for item in result['results']] == ['applied', 'applied']
+    assert [db.documents[f'players/P{i}']['currentNo'] for i in (1, 2)] == ['11', '12']
+
+
 def test_render_receive_checks_token_and_persists_excel_values_once(db, monkeypatch):
     from backend.api import api_player_drafts
     from backend.app import app

@@ -4,7 +4,7 @@ service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
     function manager() {
-      return signedIn() && request.auth.token.email == 'jpdindex@gmail.com';
+      return signedIn() && request.auth.token.email in ['jpdindex@gmail.com'];
     }
     function draft(draftId) { return get(/databases/$(database)/documents/inputDrafts/$(draftId)); }
     function participant(draftId) {
@@ -28,10 +28,8 @@ service cloud.firestore {
       }
     }
 
-    // Existing management screens retain their authenticated CRUD surface.
-    // RAW recordings are intentionally omitted: only the backend Admin SDK
-    // promotes a finalized Draft into matches/.../recordings.
-    match /matches/{matchId} { allow read, write: if signedIn(); }
+    // Signed-in analysts still need fixture and roster reference data.
+    match /matches/{matchId} { allow read: if signedIn(); allow write: if manager(); }
     match /matches/{matchId}/inputSnapshots/{document=**} { allow read: if signedIn(); }
     match /players/{document=**} { allow read: if signedIn(); allow write: if manager(); }
     match /teams/{document=**} { allow read: if signedIn(); allow write: if manager(); }
@@ -39,12 +37,15 @@ service cloud.firestore {
     // API. Clients cannot bypass review by writing approval or roster data.
     match /playerRegistrationRequests/{document=**} { allow read, write: if false; }
     match /playerRegistrationRosterVersions/{document=**} { allow read, write: if false; }
-    match /stadiums/{document=**} { allow read, write: if signedIn(); }
-    match /coachContracts/{document=**} { allow read, write: if signedIn(); }
-    match /coaches/{document=**} { allow read, write: if signedIn(); }
-    match /leagues/{document=**} { allow read, write: if signedIn(); }
-    match /seasons/{document=**} { allow read, write: if signedIn(); }
+    match /stadiums/{document=**} { allow read, write: if manager(); }
+    match /coachContracts/{document=**} { allow read, write: if manager(); }
+    match /coaches/{document=**} { allow read, write: if manager(); }
+    match /leagues/{document=**} { allow read: if signedIn(); allow write: if manager(); }
+    match /seasons/{document=**} { allow read: if signedIn(); allow write: if manager(); }
     match /ratingBaseline/{document=**} { allow read: if signedIn(); }
-    match /recorders/{document=**} { allow read, write: if signedIn(); }
+    match /recorders/{uid} {
+      allow read: if manager() || (signedIn() && request.auth.uid == uid);
+      allow write: if manager();
+    }
   }
 }

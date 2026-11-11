@@ -6,11 +6,12 @@ from fastapi import APIRouter, Depends, Form
 from backend.system.system_firestore import RequiredUser, BackendError
 from backend.system.system_aifootballx import delivery_service
 from backend.system.system_aifootballx import season_label
+from backend.system.system_player_requests import is_manager
 from backend.build.build_legacy_import import normalize_season_id
 
 
 def delivery_operator(user: RequiredUser):
-    if user.claims.get('auth') == 'swagger_api_key' or user.claims.get('admin') is True or user.claims.get('role') == 'admin':
+    if user.claims.get('auth') == 'swagger_api_key' or is_manager(user):
         return user
     raise BackendError('Swagger key or administrator account required', status_code=403, code='aifootballx_operator_required')
 

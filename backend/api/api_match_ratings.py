@@ -3,13 +3,14 @@ from collections import Counter
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Form
+from fastapi import APIRouter, Depends, Form
 from pydantic import BaseModel
 
+from backend.api.api_player_requests import management_operator
 from backend.build.build_match_rating import BuildMatchRating
 from backend.system.system_schema import Side
 from backend.system.system_aifootballx import rating_display
-from backend.system.system_firestore import BackendError, JpdDidData, RequiredUser
+from backend.system.system_firestore import BackendError, JpdDidData
 from backend.system.system_pipeline_jobs import PipelineJob, pipeline_jobs
 
 
@@ -51,7 +52,7 @@ class MatchRatingReadResponse(BaseModel):
     playerRatingsDisplay: list[dict[str, Any]]
 
 
-router = APIRouter(tags=["match-ratings"])
+router = APIRouter(tags=["match-ratings"], dependencies=[Depends(management_operator)])
 logger = logging.getLogger(__name__)
 
 
@@ -117,7 +118,7 @@ def _run_rating_job(job: PipelineJob) -> None:
 
 
 @router.get("/match-ratings/status", response_model=MatchRatingStatusResponse, summary="Read rating pipeline status")
-def read_match_rating_status(_: RequiredUser = None) -> MatchRatingStatusResponse:
+def read_match_rating_status() -> MatchRatingStatusResponse:
     return _status_response(pipeline_jobs.get("match-ratings"))
 
 
@@ -130,7 +131,6 @@ def build_match_rating(
     season: str | None = Form(default=None),
     side: Side | None = Form(default=None),
     force: bool = Form(default=False, description="Recalculate and overwrite an existing rating for the current KPI version"),
-    _: RequiredUser = None,
  ) -> MatchRatingStatusResponse:
     if not any((league, gm_id, round_from is not None, round_to is not None, season)):
         raise BackendError(
@@ -154,7 +154,6 @@ def build_match_rating(
 def read_match_rating(
     gm_id: str = Form(...),
     side: Side = Form(...),
-    _: RequiredUser = None,
 ) -> MatchRatingReadResponse:
     data = JpdDidData()
     recording = data.get_recording(gm_id, side)

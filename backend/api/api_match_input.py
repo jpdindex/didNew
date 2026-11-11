@@ -12,12 +12,13 @@ from typing import Any, Literal
 from uuid import uuid4
 from time import monotonic
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from firebase_admin import auth
 from google.api_core.exceptions import FailedPrecondition
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.websockets import WebSocketState
 
+from backend.api.api_player_requests import ManagerUser, manager_user
 from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData, NotFoundError, RequiredUser, ensure_firebase_app, get_settings, utc_now
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
 from backend.system.system_schema import Half, InputMode, Side, MatchDoc
@@ -857,8 +858,8 @@ def _promote(
     )
 
 
-@router.post("/match-input/schedules", include_in_schema=False, status_code=201)
-def create_schedule_matches(request: ScheduleMatchesCreateRequest, _: RequiredUser = None) -> dict:
+@router.post("/match-input/schedules", include_in_schema=False, status_code=201, dependencies=[Depends(manager_user)])
+def create_schedule_matches(request: ScheduleMatchesCreateRequest) -> dict:
     now = utc_now()
     matches: dict[str, MatchDoc] = {}
     for item in request.matches:
@@ -1099,8 +1100,8 @@ def get_final_raw_input_state(gm_id: str, side: Side, _: RequiredUser = None) ->
     return _draft_response(JpdDidData().read_input_state_from_raw(gm_id, side))
 
 
-@router.get("/match-input/approvals", include_in_schema=False)
-def list_approvals(_: RequiredUser = None) -> dict:
+@router.get("/match-input/approvals", include_in_schema=False, dependencies=[Depends(manager_user)])
+def list_approvals() -> dict:
     data = JpdDidData()
     drafts = data.list_input_drafts(recorder_level="basic", status="final")
     gm_ids = {str(item.get("gmId") or "") for item in drafts}
@@ -1170,13 +1171,13 @@ def calculate_input_preview(request: InputPreviewRequest, _: RequiredUser = None
 @router.get("/match-input/recorder-profile", include_in_schema=False)
 def get_recorder_profile(user: RequiredUser = None) -> dict:
     profile = JpdDidData().get_recorder_profile(user.uid)
-    return {"status": "ok", "name": profile.get("name") or user.uid, "level": profile.get("level", "advanced")}
+    return {"status": "ok", "name": profile.get("name") or user.uid, "level": "advanced" if profile.get("level") == "advanced" else "basic"}
 
 
 @router.post("/match-input/recorder-profile", include_in_schema=False)
 def ensure_recorder_profile(request: RecorderProfileRequest, user: RequiredUser = None) -> dict:
     profile = JpdDidData().ensure_recorder_profile(user.uid, name=request.name)
-    return {"status": "ok", "name": profile.get("name") or user.uid, "level": profile.get("level", "advanced")}
+    return {"status": "ok", "name": profile.get("name") or user.uid, "level": "advanced" if profile.get("level") == "advanced" else "basic"}
 
 
 def _join_draft_with_diagnostics(data, gm_id, side, request, user, *, source):
@@ -1301,7 +1302,7 @@ def finalize_advanced(gm_id: str, side: Side, user: RequiredUser = None, request
 
 
 @router.post("/match-input/approvals/{gm_id}/{side}/promote", response_model=PromotionResponse, include_in_schema=False)
-def approve_basic(gm_id: str, side: Side, user: RequiredUser = None) -> PromotionResponse:
+def approve_basic(gm_id: str, side: Side, user: ManagerUser) -> PromotionResponse:
     data = JpdDidData()
     draft = data.get_input_draft(gm_id, side)
     payload = MatchInputPayload.model_validate(draft["payload"])
@@ -1432,13 +1433,13 @@ def get_live_room(gm_id: str, side: Side, user: RequiredUser = None) -> dict:
     return room
 
 
-@router.get('/match-input/assignments', include_in_schema=False)
-def list_input_assignments(_: RequiredUser = None) -> dict:
+@router.get('/match-input/assignments', include_in_schema=False, dependencies=[Depends(manager_user)])
+def list_input_assignments() -> dict:
     return {'status': 'ok', 'assignments': JpdDidData().list_input_assignments()}
 
 
 @router.delete('/match-input/drafts/{gm_id}/{side}/participants/{uid}', include_in_schema=False)
-def release_input_assignment(gm_id: str, side: Side, uid: str, user: RequiredUser = None) -> dict:
+def release_input_assignment(gm_id: str, side: Side, uid: str, user: ManagerUser) -> dict:
     document = JpdDidData().release_input_assignment(gm_id, side, user_id=uid, released_by=user.uid)
     return {'status': 'ok', 'gmId': gm_id, 'side': side,
             'primaryUid': document.get('primaryUid'), 'participants': document.get('participants', {})}

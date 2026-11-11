@@ -1,7 +1,7 @@
-const managementEmail = 'jpdindex@gmail.com'
+const managementEmails = new Set(['jpdindex@gmail.com'])
 
 export function canAccessManagement(email?: string | null): boolean {
-  return email?.trim().toLowerCase() === managementEmail
+  return managementEmails.has(email?.trim().toLowerCase() ?? '')
 }
 
 export function isRestrictedManagementPath(path: string): boolean {

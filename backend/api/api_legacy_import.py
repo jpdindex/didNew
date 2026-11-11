@@ -7,14 +7,14 @@ from tempfile import NamedTemporaryFile
 from threading import Lock, Thread
 from typing import Literal
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from pydantic import BaseModel, Field
 
+from backend.api.api_player_requests import ManagementOperator, management_operator
 from backend.build.build_legacy_import import BuildLegacyImport, LegacyMetadataRepair, LegacyFirestoreImportAudit
 from backend.build.build_player_update import apply_player_update, player_update_season
-from backend.system.system_firestore import BackendError, JpdDidData, RequiredUser
+from backend.system.system_firestore import BackendError, JpdDidData
 from backend.system.system_pipeline_jobs import PipelineJob, pipeline_jobs
-from backend.system.system_player_requests import require_manager
 
 
 JobState = Literal["queued", "preparing", "preflight", "resuming", "replacing", "writing", "cleaning", "complete", "failed"]
@@ -160,7 +160,7 @@ class LegacyVerifyJob:
     lock: Lock = field(default_factory=Lock)
 
 
-router = APIRouter(tags=["legacy-import"])
+router = APIRouter(tags=["legacy-import"], dependencies=[Depends(management_operator)])
 logger = logging.getLogger(__name__)
 _import_job: LegacyImportJob | None = None
 _import_job_lock = Lock()
@@ -425,26 +425,26 @@ def _run_metadata_repair(job: PipelineJob) -> None:
 
 
 @router.get("/legacy-import/status", response_model=LegacyImportStatusResponse, summary="Read SQL import status")
-def read_legacy_import_status(_: RequiredUser = None) -> LegacyImportStatusResponse:
+def read_legacy_import_status() -> LegacyImportStatusResponse:
     with _import_job_lock:
         job = _import_job
     return _import_response(job)
 
 
 @router.get("/legacy-import/verify-status", response_model=LegacyVerifyStatusResponse, summary="Read SQL import verification status")
-def read_legacy_verify_status(_: RequiredUser = None) -> LegacyVerifyStatusResponse:
+def read_legacy_verify_status() -> LegacyVerifyStatusResponse:
     with _verify_job_lock:
         job = _verify_job
     return _verify_response(job)
 
 
 @router.get("/legacy-import/metadata-status", response_model=LegacyMetadataRepairStatusResponse, summary="Read legacy metadata repair status", include_in_schema=False)
-def read_legacy_metadata_repair_status(_: RequiredUser = None) -> LegacyMetadataRepairStatusResponse:
+def read_legacy_metadata_repair_status() -> LegacyMetadataRepairStatusResponse:
     return _metadata_repair_response(pipeline_jobs.get("legacy-metadata-repair"))
 
 
 @router.get("/legacy-import/snapshot-status/{season}", response_model=LegacySnapshotStatusResponse, summary="Read imported lineup snapshot status")
-def read_legacy_snapshot_status(season: str, _: RequiredUser = None) -> LegacySnapshotStatusResponse:
+def read_legacy_snapshot_status(season: str) -> LegacySnapshotStatusResponse:
     with _snapshot_jobs_lock:
         job = _snapshot_jobs.get(season)
     if job is not None:
@@ -467,9 +467,7 @@ def read_legacy_snapshot_status(season: str, _: RequiredUser = None) -> LegacySn
 
 
 @router.get('/legacy-import/player-update/status', response_model=PlayerUpdateStatusResponse, summary='Read aifootballx player update status')
-def read_player_update_status(user: RequiredUser) -> PlayerUpdateStatusResponse:
-    if user.claims.get('auth') != 'swagger_api_key':
-        require_manager(user)
+def read_player_update_status() -> PlayerUpdateStatusResponse:
     with _import_job_lock:
         return _player_update
 
@@ -477,7 +475,6 @@ def read_player_update_status(user: RequiredUser) -> PlayerUpdateStatusResponse:
 @router.post("/legacy-import", response_model=LegacyImportStatusResponse, status_code=202, summary="Start SQL dump import")
 async def import_legacy_sql(
     dump: UploadFile = File(...),
-    _: RequiredUser = None,
 ) -> LegacyImportStatusResponse:
     if not dump.filename or not dump.filename.lower().endswith((".sql", ".txt")):
         raise BackendError("Upload a .sql dump file", status_code=422, code="legacy_file_invalid")
@@ -527,7 +524,6 @@ def _run_player_update(season: str, actor: str) -> None:
 @router.post("/legacy-import/verify", response_model=LegacyVerifyStatusResponse, status_code=202, summary="Start SQL import verification")
 async def verify_legacy_sql(
     dump: UploadFile = File(...),
-    _: RequiredUser = None,
 ) -> LegacyVerifyStatusResponse:
     if not dump.filename or not dump.filename.lower().endswith((".sql", ".txt")):
         raise BackendError("Upload a .sql dump file", status_code=422, code="legacy_file_invalid")
@@ -548,7 +544,7 @@ async def verify_legacy_sql(
 
 
 @router.post("/legacy-import/metadata-repair", response_model=LegacyMetadataRepairStatusResponse, status_code=202, summary="Start legacy league, team, and contract metadata repair", include_in_schema=False)
-def repair_legacy_metadata(_: RequiredUser = None) -> LegacyMetadataRepairStatusResponse:
+def repair_legacy_metadata() -> LegacyMetadataRepairStatusResponse:
     job = pipeline_jobs.start("legacy-metadata-repair", {}, _run_metadata_repair)
     if job is None:
         raise BackendError("Legacy metadata repair is already running", status_code=409, code="legacy_metadata_repair_running")
@@ -561,7 +557,6 @@ def backfill_legacy_snapshots(
     from_gm_id: str | None = Form(default=None, max_length=128),
     to_gm_id: str | None = Form(default=None, max_length=128),
     limit: int | None = Form(default=None, ge=1, le=10_000),
-    _: RequiredUser = None,
 ) -> LegacySnapshotStatusResponse:
     with _snapshot_jobs_lock:
         current = _snapshot_jobs.get(season)
@@ -580,12 +575,10 @@ def backfill_legacy_snapshots(
 
 @router.post('/legacy-import/player-update', response_model=PlayerUpdateStatusResponse, status_code=202, summary='Sync EPL players and contracts from aifootballx')
 async def start_player_update(
-    user: RequiredUser,
+    user: ManagementOperator,
     season: str | None = Form(default=None, description="EPL 시즌. 예: 2026-2027. 비우면 현재 시즌을 사용합니다."),
 ) -> PlayerUpdateStatusResponse:
     """Read aifootballx Player for the requested EPL season and apply changes to didNEW in the background."""
-    if user.claims.get('auth') != 'swagger_api_key':
-        require_manager(user)
     season = player_update_season(season)
     global _player_update
     with _import_job_lock:

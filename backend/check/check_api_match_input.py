@@ -337,6 +337,23 @@ def _schedule_data(monkeypatch, store):
     return data
 
 
+def test_recorder_profile_starts_basic_and_login_preserves_promoted_level():
+    from unittest.mock import Mock
+
+    from backend.system.system_firestore import JpdDidData
+
+    data = object.__new__(JpdDidData)
+    data.db = Mock()
+    reference = data.db.collection.return_value.document.return_value
+    reference.get.return_value = Mock(exists=False)
+    assert data.ensure_recorder_profile("analyst")["level"] == "basic"
+    assert reference.create.call_args.args[0]["level"] == "basic"
+
+    reference.get.return_value = Mock(exists=True, to_dict=lambda: {"level": "advanced"})
+    assert data.ensure_recorder_profile("analyst", name="Analyst")["level"] == "advanced"
+    assert "level" not in reference.update.call_args.args[0]
+
+
 def test_schedule_create_publishes_only_new_matches_in_backfilled_month(monkeypatch):
     import copy
     store = _ScheduleStore({"matches/imported-final": {"status": "final"},
@@ -458,6 +475,7 @@ def test_setup_save_claims_one_primary_and_shows_ready_roster(monkeypatch):
     assert len(draft_reads) == 2
     winner = accepted[0]["primaryUid"]
     assert list(store.documents["inputDrafts/sample-match_H"]["participants"]) == [winner]
+    assert accepted[0]["participants"][winner]["level"] == "basic"
     assert summaries[0]["collaboration"]["status"] == "ready"
     assert summaries[0]["collaboration"]["participants"][0]["uid"] == winner
     # Re-saving one's setup keeps the same seat, rather than creating a conflict.

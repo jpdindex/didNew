@@ -134,7 +134,7 @@ function defaultMatchState(): MatchState {
     matchSnapshot: null,
     clockStartedAt: null,
     formationChanges: [],
-    recorderLevel: 'advanced',
+    recorderLevel: 'basic',
     participantRole: 'primary',
     lifecycleControl: true,
     participantName: '',

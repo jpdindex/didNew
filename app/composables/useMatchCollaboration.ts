@@ -5,6 +5,7 @@ import { payloadFromState, type InputPayload } from '~/composables/useMatchDraft
 import { assignmentsFromLineup } from '~/utils/formationLayout'
 
 type ParticipantRole = 'primary' | 'assistant' | 'manager'
+type Participant = { name?: string; role?: ParticipantRole; level?: MatchState['recorderLevel'] }
 
 function sideFor(game: MatchState) {
   return game.team === 'away' ? 'A' : 'H'
@@ -158,7 +159,7 @@ export interface DraftEnterResponse {
   participant: {
     role?: ParticipantRole
     control?: boolean
-    participants: Record<string, { name?: string; role?: ParticipantRole }>
+    participants: Record<string, Participant>
     primaryUid?: string
   }
   draft: DraftResponse | { status: 'missing'; gmId: string; side: 'H' | 'A' }
@@ -262,11 +263,12 @@ export function useMatchCollaboration() {
 
   async function join(game: MatchState, role: ParticipantRole) {
     const user = await currentIdentity()
-    const response = await request<{ role?: ParticipantRole; control?: boolean; revision?: number; roomEpoch?: number; participants: Record<string, { name?: string; role?: ParticipantRole }> }>(
+    const response = await request<{ role?: ParticipantRole; control?: boolean; revision?: number; roomEpoch?: number; participants: Record<string, Participant> }>(
       `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${sideFor(game)}/participants`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role, displayName: user?.displayName || user?.email || undefined }) },
     )
     game.participantRole = response.role ?? role
+    game.recorderLevel = response.participants?.[user?.uid ?? '']?.level ?? game.recorderLevel
     game.lifecycleControl = response.control === true
     game.participantName = user?.displayName || user?.email || ''
     if (typeof response.revision === 'number') await liveRoom.observe(game.matchId, sideFor(game), response.revision, response.roomEpoch || 0)
@@ -280,6 +282,7 @@ export function useMatchCollaboration() {
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role, displayName: user?.displayName || user?.email || undefined }) },
     )
     game.participantRole = response.participant.role ?? role
+    game.recorderLevel = response.participant.participants?.[user?.uid ?? '']?.level ?? game.recorderLevel
     game.lifecycleControl = response.participant.control === true
     game.participantName = user?.displayName || user?.email || ''
     return response

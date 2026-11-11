@@ -34,7 +34,7 @@ async function loadRecorders() {
         return {
           id: item.id,
           name: String(data.name || data.displayName || item.id),
-          level: data.level === 'basic' ? 'basic' : 'advanced',
+          level: data.level === 'advanced' ? 'advanced' : 'basic',
         }
       })
       .sort((a, b) => a.name.localeCompare(b.name))
