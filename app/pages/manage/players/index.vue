@@ -289,9 +289,13 @@ function selectedRow() {
   return filteredRows.value.find(r => r.player.id === selectedPlayerId.value) ?? null
 }
 
+function formatEnglishShortName(value: string) {
+  return value.trim().replace(/^([A-Za-z])\.\s*(?=\S)/, '$1. ')
+}
+
 function setEditFieldsFromRow(r: { player: PlayerRow }) {
   editFields.value = {
-    name: r.player.name ?? '', nameEn: r.player.nameEn ?? '', nameFull: r.player.nameFull ?? '',
+    name: r.player.name ?? '', nameEn: formatEnglishShortName(r.player.nameEn ?? ''), nameFull: r.player.nameFull ?? '',
     birth: r.player.birth ?? '', height: r.player.height != null ? String(r.player.height) : '',
     foot: (r.player.foot as '' | 'L' | 'R' | 'B') ?? '', nation: r.player.nation ?? '',
     pos: r.player.currentPos ?? '',
@@ -347,7 +351,7 @@ async function applyEditDetail() {
     const nextPos = editFields.value.pos.trim() || null
     const now = Timestamp.now()
     const patch = {
-      name: editFields.value.name.trim(), nameEn: editFields.value.nameEn.trim() || null,
+      name: editFields.value.name.trim(), nameEn: formatEnglishShortName(editFields.value.nameEn) || null,
       nameFull: editFields.value.nameFull.trim() || null, birth: editFields.value.birth.trim() || null,
       height: editFields.value.height ? Number(editFields.value.height) : null,
       foot: editFields.value.foot || null, nation: editFields.value.nation.trim() || null,
@@ -595,7 +599,7 @@ async function submitAddPlayer() {
     await backendRequest('/api/v1/player-requests/create-player', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        requestId: newPlayerRequestId, name, nameEn: newPlayer.value.nameEn.trim(),
+        requestId: newPlayerRequestId, name, nameEn: formatEnglishShortName(newPlayer.value.nameEn),
         nameFull: newPlayer.value.nameFull.trim(), birth: newPlayer.value.birth.trim().replaceAll('.', '-'),
         height: newPlayer.value.height ? Number(newPlayer.value.height) : null,
         foot: newPlayer.value.foot, nation: newPlayer.value.nation.trim(),

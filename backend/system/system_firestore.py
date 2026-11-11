@@ -25,7 +25,7 @@ from google.cloud.firestore_v1 import Client
 from google.cloud.firestore_v1.base_query import FieldFilter
 from google.api_core.exceptions import NotFound as FirestoreDocumentNotFound
 from google.api_core.exceptions import AlreadyExists
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import SecretStr, BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
@@ -91,6 +91,8 @@ class Settings(BaseSettings):
         ]
     )
     firebase_project_id: str | None = None
+    jpd_did_storage_bucket: str = ""
+    jpd_did_transfer_token: SecretStr = SecretStr("")
     firebase_credentials_path: str | None = None
     firebase_credentials_json: str | None = None
     firebase_emulator_host: str | None = None
@@ -315,6 +317,7 @@ class JpdDidData:
     _match_cache: dict[str, tuple[float, MatchDoc]] = {}
     _match_cache_lock = Lock()
     _MATCH_CACHE_TTL_SECONDS = 30.0
+    _MATCH_CACHE_MAX_ENTRIES = 256
 
     def __init__(self) -> None:
         self.db = get_firestore_client()
@@ -331,6 +334,9 @@ class JpdDidData:
             raise NotFoundError(f"Match not found: {gm_id}")
         match = _validate_document(MatchDoc, snapshot.to_dict() or {}, path=reference.path)
         with self._match_cache_lock:
+            self._match_cache.pop(gm_id, None)
+            if len(self._match_cache) >= self._MATCH_CACHE_MAX_ENTRIES:
+                self._match_cache.pop(next(iter(self._match_cache)))
             self._match_cache[gm_id] = (now + self._MATCH_CACHE_TTL_SECONDS, match)
         return match.model_copy(deep=True)
 

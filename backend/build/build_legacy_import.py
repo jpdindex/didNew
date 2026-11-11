@@ -48,7 +48,7 @@ class LegacyImportResult:
 ImportProgress = Callable[[str, int, int, int, int], None]
 CHECKPOINT_DIRECTORY = Path(__file__).resolve().parents[1] / "data" / "legacy-import"
 MAX_MATCH_ATTEMPTS = 3
-IMPORTER_CHECKPOINT_VERSION = "legacy-source-order-v2"
+IMPORTER_CHECKPOINT_VERSION = "legacy-source-order-v3"
 SOURCE_ROW_INDEX = "__legacy_source_index"
 
 # Competition documents remain in the existing ``leagues`` collection.  The
@@ -363,11 +363,6 @@ class BuildLegacyImport:
             if gm_id in completed_gm_ids:
                 continue
             match_documents = expected_by_match[gm_id]
-            # SQL import owns only its known document paths. It overwrites those
-            # paths directly and deliberately leaves UI snapshots and unknown
-            # legacy documents alone. Unexpected RAW documents are handled by
-            # the read-only verifier and a targeted repair, never by a costly
-            # recursive scan during a bulk import.
             def report_match(match_written: int) -> None:
                 if on_progress:
                     on_progress("writing", len(ordered_gm_ids), index - 1, documents_total, written + match_written)
@@ -375,6 +370,7 @@ class BuildLegacyImport:
             def replace_match() -> int:
                 match_written = self._write_documents(match_documents, on_progress=report_match)
                 self._verify_written_match(gm_id, match_documents)
+                self._delete_unexpected_paths(gm_id, match_documents)
                 # A fixture exists as soon as its schedule row is imported.
                 # Pre-warm its roster and schedule/lobby read model now, before
                 # anyone starts an input Draft.
@@ -613,6 +609,23 @@ class BuildLegacyImport:
                 status_code=500,
                 code="legacy_import_write_incomplete",
             )
+
+    def _delete_unexpected_paths(self, gm_id: str, expected_documents: dict[str, dict[str, Any]]) -> None:
+        recording_keys = {_recording_key(path) for path in expected_documents}
+        for side in ("H", "A"):
+            if (gm_id, side) not in recording_keys:
+                continue
+            recording = self.db.document(f"matches/{gm_id}/recordings/{side}")
+            snapshots = recording.collection("paths").select([]).stream(retry=None, timeout=30)
+            stale_references = [
+                snapshot.reference for snapshot in snapshots
+                if snapshot.reference.path not in expected_documents
+            ]
+            for offset in range(0, len(stale_references), 200):
+                batch = self.db.batch()
+                for reference in stale_references[offset:offset + 200]:
+                    batch.delete(reference)
+                batch.commit(timeout=60)
 
     def _build_items(self, tables: dict[str, ParsedTable], games: list[dict[str, Any]]) -> tuple[list[tuple[str, dict[str, Any], bool]], set[str], int]:
         now = datetime.now(timezone.utc)
@@ -1088,7 +1101,7 @@ def main() -> None:
 AuditProgress = Callable[[dict[str, int]], None]
 AUDIT_DIRECTORY = PROJECT_ROOT / "backend" / "data" / "audit"
 VOLATILE_FIELDS = {"createdAt", "updatedAt", "kpiComputedAt"}
-DERIVED_RECORDING_FIELDS = {"teamRating", "ratingBasedOn", "kpiSourceFingerprint"}
+DERIVED_RECORDING_FIELDS = {"teamRating", "ratingBasedOn", "ratingInputFingerprint", "kpiSourceFingerprint"}
 DERIVED_PLAYER_STAT_FIELDS = {
     "scoreRel", "scoreAbs", "score", "jmx", "apx", "apxGrade",
     "tpx", "tpxGrade", "fpx", "fpxGrade", "ratingBasedOn",

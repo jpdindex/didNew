@@ -7,6 +7,7 @@ from __future__ import annotations
 import math
 import re
 import json
+import logging
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -39,6 +40,34 @@ from backend.system.system_firestore import (
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
+
+def log_delivery_stage(job_id, stage, started=None, *, documents=None, scope=None):
+    now = time.monotonic()
+    if job_id is None or not logger.isEnabledFor(logging.INFO):
+        return now
+    memory = {}
+    try:
+        # Render runs on Linux. VmHWM is the peak since the process started.
+        with Path('/proc/self/status').open(encoding='utf-8') as status:
+            for line in status:
+                field, _, value = line.partition(':')
+                if field in ('VmRSS', 'VmHWM'):
+                    memory[field] = int(value.split()[0])
+    except OSError:
+        pass
+    scope = scope or {}
+    logger.info(
+        'AIfootballX job_id=%s stage=%s event=%s rss_kib=%s process_peak_kib=%s '
+        'elapsed_ms=%s documents=%s season=%s round_from=%s round_to=%s',
+        job_id, stage, 'start' if started is None else 'end',
+        memory.get('VmRSS'), memory.get('VmHWM'),
+        0 if started is None else round((now - started) * 1000), documents,
+        scope.get('seasonId'), scope.get('roundFrom'), scope.get('roundTo'),
+    )
+    return now
 
 # ==========================================================================
 # Conversion
@@ -1809,16 +1838,22 @@ class SourceCapture:
         return q
 
     def rows(self, client, path, filters=(), *, source=False, bound=20000, season_range=None):
-        snaps = list(self.query(client, path, filters).limit(bound + 1).stream(timeout=60, retry=None))
-        if len(snaps) > bound:
-            fail(f'Read limit exceeded: {path}')
+        guard = {'path': path, 'filters': list(filters), 'bound': bound, 'versions': {},
+                 **({'season_range': season_range} if season_range else {})}
+        rows = []
+        snapshots = self.query(client, path, filters).limit(bound + 1).stream(timeout=60, retry=None)
+        for count, snapshot in enumerate(snapshots, 1):
+            if count > bound:
+                fail(f'Read limit exceeded: {path}')
+            if source:
+                versions = self.guard_versions((snapshot,), guard)
+                if not versions:
+                    continue
+                guard['versions'].update(versions)
+            rows.append({'id': snapshot.id, 'data': encode(snapshot.to_dict())})
         if source:
-            guard = {'path':path,'filters':list(filters),'bound':bound,
-                     **({'season_range':season_range} if season_range else {})}
-            guard['versions'] = self.guard_versions(snaps,guard)
             self.queries.append(guard)
-            if season_range: snaps=[s for s in snaps if s.id in guard['versions']]
-        return [{'id': s.id, 'data': encode(s.to_dict())} for s in snaps]
+        return rows
 
     def get_many(self, paths):
         paths = sorted(set(paths))
@@ -2104,6 +2139,8 @@ class SourceCapture:
 
     def capture_aggregates(self, scope, slot_path):
         """Capture team KPI/rating context without reading player or coach masters."""
+        job_id = getattr(self, 'delivery_job_id', None)
+        started = log_delivery_stage(job_id, 'aggregate_read', scope=scope)
         self.report_progress(0)
         season = season_label(scope['seasonId'])
         fixtures = self.rows(self.did, 'matches', [('seasonId', '==', scope['seasonId']),
@@ -2151,9 +2188,13 @@ class SourceCapture:
         evidence = {'did_matches': context, 'source_recordings': [], 'player_profiles': {},
                     'target_existing': target, 'ai_samples': {'code': codes + setup['code_rows']}}
         self.capture_aggregate_review_sources(evidence, items)
+        raw_count = sum(len(recording['children']['records']) for recording in evidence['source_recordings'])
+        log_delivery_stage(job_id, 'aggregate_read', started, documents=len(heads) + raw_count, scope=scope)
         self.report_progress(95)
-        report = generate_masters(evidence, context, items, setup['slots'], setup, 'aggregates')
-        report = scoped_aggregate_delivery(report, selected, target, latest=scope.get('latest', False))
+        report = generate_masters(
+            evidence, context, items, setup['slots'], setup, 'aggregates',
+            latest=scope.get('latest', False), selected_fixtures=selected, job_id=job_id,
+        )
         guards = {'documents': self.documents, 'queries': self.queries, 'code_scope': None,
                   'reference_code': code_reference(codes),
                   'new_code': {d['document_id']: d['data'] for d in setup['documents']}}
@@ -2620,7 +2661,7 @@ def retain_changed_documents(report, existing):
     report['summary']['documents'] = len(report['documents'])
 
 
-def scoped_aggregate_delivery(report, selected, target, *, latest=False):
+def select_aggregate_documents(documents, selected):
     """Limit fixture rows; retain affected later round totals and season averages."""
     season = season_label(selected[0]['data']['seasonId'])
     first_round = min(r['data']['round'] for r in selected)
@@ -2634,9 +2675,7 @@ def scoped_aggregate_delivery(report, selected, target, *, latest=False):
         if col == 'mMST':
             return aggregate_key(col, data) in fixture_keys
         return col == 'sAVG' or data.get('Round', 0) >= first_round
-    result = finish_delivery([d for d in report['documents'] if selected_document(d)],
-                             report['errors'], report['checks'], target, 'aggregates', len(selected), latest=latest)
-    return {**report, **result}
+    return [doc for doc in documents if selected_document(doc)]
 
 
 def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, latest=False):
@@ -2674,17 +2713,15 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
                        'errors':len(errors),'failed_checks':sum(not c['passed'] for c in checks)}}
 
 
-def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *, latest=False):
+def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *, latest=False,
+                     selected_fixtures=None, job_id=None):
     evidence = with_registration_references(evidence)
     errors, documents = [], ([] if mode == 'aggregates' else list(setup['documents']))
     context = evidence['did_matches']
     season = season_label(context[0]['data']['seasonId'])
     target = evidence['target_existing']
     indexes = {}
-    destination_ids = {col:{r['id']:r for r in rows} for col,rows in target.items()}
-    for col,rows in target.items():
-        indexes[col] = defaultdict(list)
-        for row in rows: indexes[col][natural_key(col,row['data'])].append(row)
+    destination_ids = {}
     def emit(col,data):
         key = natural_key(col,data)
         found = indexes.get(col,{}).get(key,[])
@@ -2701,6 +2738,10 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
         elif col=='Manager': data['uid']=ident
         documents.append({'collection':col,'document_id':ident,'data':data,'action':'replace-existing' if found else 'create-candidate'})
     if mode != 'aggregates':
+        destination_ids = {col:{r['id']:r for r in rows} for col,rows in target.items()}
+        for col,rows in target.items():
+            indexes[col] = defaultdict(list)
+            for row in rows: indexes[col][natural_key(col,row['data'])].append(row)
         identities = {}
         for pid,profile in evidence['player_profiles'].items():
             try:
@@ -2762,6 +2803,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
             except (KeyError,TypeError,ValueError) as exc: errors.append(str(exc))
     validation, aggregate_errors, aggregate_docs = None, [], []
     if mode != 'masters':
+        started = log_delivery_stage(job_id, 'aggregate_calculate')
         try:
             aggregate_items = reviewed_aggregate_items(evidence, aggregate_items)
         except (KeyError, TypeError, ValueError) as exc:
@@ -2792,11 +2834,17 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
                     documents.extend(aggregate_docs)
             except (BackendError,KeyError,TypeError,ValueError) as exc:
                 aggregate_errors.append(exc.message if isinstance(exc,BackendError) else f'Aggregate validation failed ({type(exc).__name__})')
+        log_delivery_stage(job_id, 'aggregate_calculate', started, documents=len(aggregate_docs))
     if mode == 'aggregates':
         errors.extend(aggregate_errors)
         if not aggregate_docs and not aggregate_errors:
             errors.append('No final DID recordings available for aggregates')
-    report=finish_delivery(documents,errors,[],target,mode,latest=latest)
+    if selected_fixtures is not None:
+        documents = select_aggregate_documents(documents, selected_fixtures)
+    started = log_delivery_stage(job_id, 'aggregate_prepare', documents=len(documents))
+    matches = len(selected_fixtures) if selected_fixtures is not None else 0
+    report = finish_delivery(documents, errors, [], target, mode, matches, latest=latest)
+    log_delivery_stage(job_id, 'aggregate_prepare', started, documents=len(report['documents']))
     report.update(aggregate_validation=validation,new_season=setup['new_season'],slot_definitions=slots,
                   aggregate_status=None if mode == 'masters' else ('blocked' if aggregate_errors else ('ready' if aggregate_docs else 'empty')),
                   warnings=aggregate_errors,blocked_groups=['aggregates'] if aggregate_errors else [])
@@ -3217,7 +3265,8 @@ class DeliveryService:
         self.store = store or JobStore(PROJECT_ROOT / 'backend/data/aifootballx/delivery')
         self.source_factory = source_factory or (lambda: SourceCapture(get_firestore_client(), target_client()))
         self.writer_factory = writer_factory or (lambda: FirestoreWriter(target_client()))
-        self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='aifootballx')
+        # Preview capture can hold a season of source and destination data.
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='aifootballx')
         self.stopping = Event()
 
     def ensure_running(self):
@@ -3235,20 +3284,27 @@ class DeliveryService:
             self.pool.submit(self.run_preview, ident, owner)
         return ident
 
-    def run_preview(self, ident, owner):
+    def run_preview(self, ident, owner, *, operation_id=None):
         if not self.store.claim(ident): return
         try:
+            job_id = operation_id or ident
             job = self.store.job(ident, owner)
             settings = get_settings()
             slot_path = Path(settings.aifootballx_slot_mapping_path) if settings.aifootballx_slot_mapping_path else None
             if slot_path is None and settings.app_env == 'local':
                 candidate = Path('C:/Users/user/footballx/app/utils/team_slot_mapping.json')
                 slot_path = candidate if candidate.is_file() else None
+            started = log_delivery_stage(job_id, 'resolve_scope', scope=job['scope'])
             source = self.source_factory()
             scopes = source.split_scopes(job['scope']) if hasattr(source, 'split_scopes') else [job['scope']]
+            log_delivery_stage(job_id, 'resolve_scope', started, scope=job['scope'])
             for number,scope in enumerate(scopes,1):
                 self.ensure_running()
+                stage = 'capture_' + delivery_mode(scope)
+                started = log_delivery_stage(job_id, stage, scope=scope)
                 source = self.source_factory()
+                if isinstance(source, SourceCapture):
+                    source.delivery_job_id = job_id
                 if hasattr(source, 'set_progress_callback'):
                     source.set_progress_callback(lambda value, chunk=number:
                         self.store.record_progress(ident, 80 * (chunk - 1 + value / 100) / len(scopes)))
@@ -3260,12 +3316,17 @@ class DeliveryService:
                     if scope['mode'] != 'matches':
                         report['summary']['matches'] = 0
                 self.ensure_running()
+                documents = len(report['documents'])
                 self.store.save_preview(ident, report, guards, complete=False)
+                del report, guards
+                log_delivery_stage(job_id, stage, started, documents=documents, scope=scope)
                 self.store.record_progress(ident, 80 * number / len(scopes),
                                            roundsTotal=len(scopes), roundsProcessed=number)
             if hasattr(source, 'set_progress_callback'):
                 source.set_progress_callback(lambda value: self.store.record_progress(ident, 80 + 19 * value / 100))
+            started = log_delivery_stage(job_id, 'final_validation', scope=job['scope'])
             self.store.finalize_preview(ident, owner, source)
+            log_delivery_stage(job_id, 'final_validation', started, scope=job['scope'])
         except Exception as exc:
             self.store.fail_job(ident, exc)
 
@@ -3366,7 +3427,9 @@ class DeliveryService:
                     if self.store.retry(sent['id'], owner):
                         self.store.set_job(ident, 'running', meta={'phase':'send','previewId':preview['id'],'sendId':sent['id']})
                         # run_send performs the mandatory freshness check once.
+                        started = log_delivery_stage(ident, 'send_retry', scope=job['scope'])
                         self.run_send(sent['id'], owner)
+                        log_delivery_stage(ident, 'send_retry', started, scope=job['scope'])
                         completed = self.store.job(sent['id'], owner)
                         if completed['error'] != 'aifootballx_source_changed':
                             blocked = preview['meta']['report'].get('blocked_groups',[])
@@ -3376,7 +3439,7 @@ class DeliveryService:
                             return
             preview_id, _ = self.store.create('preview', job['scope'], owner, public=False)
             self.store.set_job(ident, 'running', meta={'phase':'preview','previewId':preview_id})
-            self.run_preview(preview_id, owner)
+            self.run_preview(preview_id, owner, operation_id=ident)
             preview = self.store.job(preview_id, owner)
             if preview['state'] != 'validated':
                 self.store.set_job(ident, 'invalid' if preview['state']=='invalid' else 'failed',
@@ -3384,7 +3447,10 @@ class DeliveryService:
                 return
             send_id, _ = self.store.create('send', job['scope'], owner, preview_id=preview_id, public=False)
             self.store.set_job(ident, 'running', meta={'phase':'send','previewId':preview_id,'sendId':send_id})
+            documents = preview['meta']['report']['summary']['documents']
+            started = log_delivery_stage(ident, 'send', documents=documents, scope=job['scope'])
             self.run_send(send_id, owner)
+            log_delivery_stage(ident, 'send', started, documents=documents, scope=job['scope'])
             completed = self.store.job(send_id, owner)
             blocked = preview['meta']['report'].get('blocked_groups',[])
             state = 'partial' if blocked and completed['state']=='complete' else completed['state']

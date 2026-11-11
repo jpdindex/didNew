@@ -23,6 +23,10 @@ def normalize(value: str) -> str:
     return re.sub(r'[^a-z0-9가-힣]', '', unicodedata.normalize('NFC', text))
 
 
+def format_english_short_name(value: str) -> str:
+    return re.sub(r'^([A-Za-z])\.\s*(?=\S)', r'\1. ', value.strip())
+
+
 class PlayerRegistration(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
     leagueId: str = Field(min_length=1, max_length=80)
@@ -43,6 +47,11 @@ class PlayerRegistration(BaseModel):
     fromDate: str = ''
     sourceUrl: str = Field(default='', max_length=2000)
     note: str = Field(default='', max_length=2000)
+
+    @field_validator('nameEn')
+    @classmethod
+    def english_short_name(cls, value: str) -> str:
+        return format_english_short_name(value)
 
     @field_validator('birth')
     @classmethod

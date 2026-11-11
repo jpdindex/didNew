@@ -11,8 +11,10 @@ from fastapi import APIRouter, File, Form, UploadFile
 from pydantic import BaseModel, Field
 
 from backend.build.build_legacy_import import BuildLegacyImport, LegacyMetadataRepair, LegacyFirestoreImportAudit
+from backend.build.build_player_update import apply_player_update, player_update_season
 from backend.system.system_firestore import BackendError, JpdDidData, RequiredUser
 from backend.system.system_pipeline_jobs import PipelineJob, pipeline_jobs
+from backend.system.system_player_requests import require_manager
 
 
 JobState = Literal["queued", "preparing", "preflight", "resuming", "replacing", "writing", "cleaning", "complete", "failed"]
@@ -53,6 +55,25 @@ class LegacyImportStatusResponse(BaseModel):
     documentsWritten: int
     recordsWritten: int
     percent: int
+    error: str | None = None
+
+
+class PlayerUpdateStatusResponse(BaseModel):
+    status: Literal['idle', 'queued', 'running', 'complete', 'failed'] = 'idle'
+    season: str | None = None
+    rowsChecked: int = 0
+    playersTotal: int = 0
+    playersProcessed: int = 0
+    playersCreated: int = 0
+    playersUpdated: int = 0
+    contractsCreated: int = 0
+    contractsUpdated: int = 0
+    squadsUpdated: int = 0
+    playersSkipped: int = 0
+    unchanged: int = 0
+    fastPathUnchanged: int = 0
+    issues: list[dict[str, str]] = Field(default_factory=list)
+    percent: int = 0
     error: str | None = None
 
 
@@ -143,6 +164,7 @@ router = APIRouter(tags=["legacy-import"])
 logger = logging.getLogger(__name__)
 _import_job: LegacyImportJob | None = None
 _import_job_lock = Lock()
+_player_update = PlayerUpdateStatusResponse()
 _snapshot_jobs: dict[str, LegacySnapshotBackfillJob] = {}
 _snapshot_jobs_lock = Lock()
 _verify_job: LegacyVerifyJob | None = None
@@ -444,6 +466,14 @@ def read_legacy_snapshot_status(season: str, _: RequiredUser = None) -> LegacySn
     )
 
 
+@router.get('/legacy-import/player-update/status', response_model=PlayerUpdateStatusResponse, summary='Read aifootballx player update status')
+def read_player_update_status(user: RequiredUser) -> PlayerUpdateStatusResponse:
+    if user.claims.get('auth') != 'swagger_api_key':
+        require_manager(user)
+    with _import_job_lock:
+        return _player_update
+
+
 @router.post("/legacy-import", response_model=LegacyImportStatusResponse, status_code=202, summary="Start SQL dump import")
 async def import_legacy_sql(
     dump: UploadFile = File(...),
@@ -456,6 +486,9 @@ async def import_legacy_sql(
         upload_path = Path(upload.name)
     global _import_job
     with _import_job_lock:
+        if _player_update.status in {'queued', 'running'}:
+            upload_path.unlink(missing_ok=True)
+            raise BackendError('선수·계약 업데이트가 진행 중입니다.', 409, 'player_update_running')
         if _import_job is not None:
             with _import_job.lock:
                 if _import_job.state in {"queued", "preparing", "preflight", "resuming", "replacing", "writing", "cleaning"}:
@@ -465,6 +498,30 @@ async def import_legacy_sql(
         _import_job = job
     Thread(target=_run_import, args=(job, upload_path), daemon=True).start()
     return _import_response(job)
+
+
+def _run_player_update(season: str, actor: str) -> None:
+    global _player_update
+    with _import_job_lock:
+        _player_update = PlayerUpdateStatusResponse(status='running', season=season)
+
+    def progress(counts: dict) -> None:
+        global _player_update
+        # Snapshots stay independent of the worker's mutable counters.
+        percent = min(99, int(100 * counts['playersProcessed'] / max(1, counts['playersTotal'])))
+        with _import_job_lock:
+            _player_update = PlayerUpdateStatusResponse(status='running', season=season, percent=percent, **counts)
+
+    try:
+        counts = apply_player_update(season, actor, on_progress=progress)
+        result = PlayerUpdateStatusResponse(status='complete', season=season, percent=100, **counts)
+    except BackendError as exc:
+        result = _player_update.model_copy(update={'status': 'failed', 'error': exc.message})
+    except Exception:
+        logger.exception('aifootballx player update failed')
+        result = _player_update.model_copy(update={'status': 'failed', 'error': '선수·계약 업데이트에 실패했습니다. 서버 로그를 확인하세요.'})
+    with _import_job_lock:
+        _player_update = result
 
 
 @router.post("/legacy-import/verify", response_model=LegacyVerifyStatusResponse, status_code=202, summary="Start SQL import verification")
@@ -519,3 +576,27 @@ def backfill_legacy_snapshots(
         _snapshot_jobs[season] = job
     Thread(target=_run_snapshot_backfill, args=(job,), daemon=True, name=f"snapshot-backfill-{season}").start()
     return _snapshot_response(job)
+
+
+@router.post('/legacy-import/player-update', response_model=PlayerUpdateStatusResponse, status_code=202, summary='Sync EPL players and contracts from aifootballx')
+async def start_player_update(
+    user: RequiredUser,
+    season: str | None = Form(default=None, description="EPL 시즌. 예: 2026-2027. 비우면 현재 시즌을 사용합니다."),
+) -> PlayerUpdateStatusResponse:
+    """Read aifootballx Player for the requested EPL season and apply changes to didNEW in the background."""
+    if user.claims.get('auth') != 'swagger_api_key':
+        require_manager(user)
+    season = player_update_season(season)
+    global _player_update
+    with _import_job_lock:
+        if _player_update.status in {'queued', 'running'} or _import_response(_import_job).status not in {'idle', 'complete', 'failed'}:
+            raise BackendError('다른 SQL 이관 작업이 진행 중입니다.', 409, 'sql_import_running')
+        job = PlayerUpdateStatusResponse(status='queued', season=season)
+        _player_update = job
+    try:
+        Thread(target=_run_player_update, args=(season, user.uid), daemon=True).start()
+    except RuntimeError:
+        with _import_job_lock:
+            _player_update = PlayerUpdateStatusResponse(status='failed', season=season, error='작업을 시작하지 못했습니다.')
+        raise
+    return job

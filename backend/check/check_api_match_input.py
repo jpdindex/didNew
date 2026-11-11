@@ -243,6 +243,7 @@ def test_live_socket_relays_root_delta_and_requests_resync_for_a_gap(monkeypatch
             event = {'type': 'delta', 'gmId': 'm', 'side': 'H', 'revision': 6, 'roomEpoch': 0, 'records': [{'id': 'one'}]}
             root.emit({'revision': 6, 'roomEpoch': 0, 'participants': {}, 'lastEvent': event})
             assert (await receive('mutation'))['event'] == event
+            root.emit({'revision': 7, 'roomEpoch': 0, 'participants': {}, 'lastEvent': {**event, 'revision': 7}})
             root.emit({'revision': 8, 'roomEpoch': 0, 'participants': {}, 'lastEvent': {**event, 'revision': 8}})
             assert (await receive('resync'))['revision'] == 8
             batch = {'type': 'batch', 'gmId': 'm', 'side': 'H', 'fromRevision': 8, 'revision': 10, 'roomEpoch': 0,

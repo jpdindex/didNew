@@ -16,6 +16,7 @@ import time
 
 from firebase_admin import firestore
 from google.api_core.exceptions import Aborted, DeadlineExceeded, ServiceUnavailable
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 from backend.system.system_firestore import BackendError, utc_now
 
@@ -144,10 +145,11 @@ class Collection:
     def stream(self, **kwargs):
         path = self.path
         if path not in self.store.streams:
-            documents = list(self.raw.stream(transaction=self.store.transaction, **kwargs))
-            self.store.streams[path] = [item.reference.path for item in documents]
-            for item in documents:
+            paths = []
+            for item in self.raw.stream(transaction=self.store.transaction, **kwargs):
+                paths.append(item.reference.path)
                 self.store.cache.setdefault(item.reference.path, item.to_dict())
+            self.store.streams[path] = paths
         paths = set(self.store.streams[path])
         paths.update(key for key in self.store.writes if key.rsplit('/', 1)[0] == path)
         return iter(Snapshot(self.document(key.rsplit('/', 1)[1]), self.store.read(self.document(key.rsplit('/', 1)[1]))) for key in sorted(paths))
@@ -689,9 +691,11 @@ def lobby_state(data, gm_id):
 
 def room_state(data, gm_id, side):
     root = data.db.collection('inputDrafts').document(data._input_draft_id(gm_id, side))
-    draft = root.get().to_dict() or {}
+    draft = root.get(field_paths=['revision', 'roomEpoch', 'liveClosed', 'primaryUid', 'participants'],
+                     retry=None, timeout=5).to_dict() or {}
     now = utc_now()
-    online = {values['uid'] for snapshot in root.collection('presence').stream()
+    active = root.collection('presence').where(filter=FieldFilter('expiresAt', '>', now))
+    online = {values['uid'] for snapshot in active.stream(retry=None, timeout=5)
               if (values := snapshot.to_dict() or {}).get('connected') and values.get('expiresAt', now) > now}
     # The room is sent over the live socket as JSON. Participant entries also
     # hold Firestore datetimes (joinedAt/lastSeenAt), which made send_json fail

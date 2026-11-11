@@ -2943,7 +2943,7 @@ def test_latest_option_is_independent_of_the_three_delivery_groups(mode, collect
 
 
 @pytest.mark.parametrize('published_later', [False, True])
-def test_aggregate_capture_scopes_rounds_and_carries_existing_later_totals(tmp_path, published_later):
+def test_aggregate_capture_scopes_rounds_and_carries_existing_later_totals(tmp_path, published_later, monkeypatch):
     items, codes, slots = aggregate_fixture()
     second = deepcopy(items)
     for item in second:
@@ -2981,6 +2981,12 @@ def test_aggregate_capture_scopes_rounds_and_carries_existing_later_totals(tmp_p
     slot_path.write_text(json.dumps(slots), encoding='utf-8')
     scope = {'seasonId': '20242025', 'mode': 'aggregates', 'roundFrom': 1, 'roundTo': 1}
     assert source.split_scopes(scope) == [scope]
+    finish = delivery.finish_delivery
+    prepared = []
+    def record_prepared(documents, *args, **kwargs):
+        prepared.append(len(documents))
+        return finish(documents, *args, **kwargs)
+    monkeypatch.setattr(delivery, 'finish_delivery', record_prepared)
     report, guards = source.capture(scope, slot_path)
     assert report['validation_passed'], report['errors']
     assert {d['collection'] for d in report['documents']} == set(delivery.AGGREGATES)
@@ -2989,6 +2995,17 @@ def test_aggregate_capture_scopes_rounds_and_carries_existing_later_totals(tmp_p
     assert {d['Round'] for d in docs(report, 'mMST')} == {1}
     assert len(source.documents) == (40 if published_later else 20)
     assert 'registration_references' not in guards
+    assert prepared == [len(report['documents'])]
+
+    for doc in report['documents']:
+        rows = existing.setdefault(doc['collection'], [])
+        rows[:] = [row for row in rows if row['id'] != doc['document_id']]
+        rows.append({'id': doc['document_id'], 'data': doc['data']})
+    unchanged, _ = source.capture({**scope, 'latest': True}, slot_path)
+    assert unchanged['validation_passed'], unchanged['errors']
+    assert unchanged['documents'] == []
+    assert unchanged['summary']['unchangedDocuments'] == len(report['documents'])
+    assert prepared == [len(report['documents'])] * 2
 
 
 def test_unified_all_expands_to_all_three_scopes_with_shared_latest_and_filters():
@@ -3007,7 +3024,7 @@ def test_unified_all_expands_to_all_three_scopes_with_shared_latest_and_filters(
 
 
 @pytest.mark.parametrize('invalid_group', [None, 'masters', 'matches', 'aggregates', 'source-change'])
-def test_unified_all_validates_every_group_before_any_writes(service, invalid_group):
+def test_unified_all_validates_every_group_before_any_writes(service, invalid_group, caplog):
     svc, source, writer, calls = service
     writer.fail_two = False
     scope = {'seasonId': '20232024', 'mode': 'all', 'unified': True, 'latest': False}
@@ -3025,7 +3042,8 @@ def test_unified_all_validates_every_group_before_any_writes(service, invalid_gr
                  'queries': [], 'reference_code': {}, 'code_scope': {'teams': [mode]}, 'new_code': {}}
         return report, guard
     source.capture = capture
-    svc.send_scope(scope, 'operator')
+    with caplog.at_level('INFO', logger=delivery.__name__):
+        operation_id = svc.send_scope(scope, 'operator')
     status = svc.public_status('operator')
     assert status['mode'] == 'all'
     assert captured == ['masters', 'matches', 'aggregates']
@@ -3036,6 +3054,9 @@ def test_unified_all_validates_every_group_before_any_writes(service, invalid_gr
         assert status['counts'] == {'success': 3}
         assert status['summary']['matches'] == 1
         assert calls == ['masters', 'matches', 'aggregates']
+        for stage in ('capture_masters', 'capture_matches', 'capture_aggregates', 'final_validation', 'send'):
+            for event in ('start', 'end'):
+                assert f'job_id={operation_id} stage={stage} event={event}' in caplog.text
 
 
 def test_unified_guards_allow_only_planned_code_additions_across_groups():

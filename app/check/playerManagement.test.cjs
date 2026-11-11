@@ -92,8 +92,8 @@ const ref = value => ({ value })
 
 test('manual player registration uses the server numeric allocator with a stable retry key', async () => {
   const requests = []
-  const context = pageFunctions(['submitAddPlayer'], {
-    newPlayer: ref({ name: 'Player', nameEn: '', nameFull: '', birth: '', height: '', foot: '', nation: '',
+  const context = pageFunctions(['formatEnglishShortName', 'submitAddPlayer'], {
+    newPlayer: ref({ name: 'Player', nameEn: 'A.Player', nameFull: '', birth: '', height: '', foot: '', nation: '',
       teamId: 'T', no: '7', pos: 'MF', from: '2026.08.01', transferType: 'TRANSFER', fee: '', currency: 'EUR' }),
     selectedSeason: ref('2026/27'), selectedLeague: ref('LALIGA'),
     newPlayerRequestId: 'same-idempotency-key', newPlayerError: ref(''), savingNewPlayer: ref(false),
@@ -105,6 +105,7 @@ test('manual player registration uses the server numeric allocator with a stable
   assert.equal(requests.length, 2)
   assert.equal(requests[0].url, '/api/v1/player-requests/create-player')
   assert.equal(requests[0].body.requestId, requests[1].body.requestId)
+  assert.equal(requests[0].body.nameEn, 'A. Player')
   assert.equal(requests[0].body.seasonId, '20262027')
   assert.equal(requests[0].body.fromDate, '2026-08-01')
   assert.equal(context.newPlayerError.value, '')

@@ -41,7 +41,7 @@ export function useBackendApi() {
     throw new Error('백엔드를 실행하세요: python -m backend.app')
   }
 
-  async function request<T>(path: string, options: BackendRequestOptions = {}): Promise<T> {
+  async function requestResponse(path: string, options: BackendRequestOptions = {}): Promise<Response> {
     const { $auth, $authReady } = useNuxtApp()
     await $authReady
     const user = ($auth as Auth).currentUser
@@ -68,7 +68,11 @@ export function useBackendApi() {
       try { detail = JSON.parse(body)?.error } catch { /* Non-JSON proxy error. */ }
       throw Object.assign(new Error(detail?.message || body || `백엔드 요청에 실패했습니다. (${response.status})`), { status: response.status, code: detail?.code })
     }
-    return await response.json() as T
+    return response
+  }
+
+  async function request<T>(path: string, options: BackendRequestOptions = {}): Promise<T> {
+    return await (await requestResponse(path, options)).json() as T
   }
 
   async function openSocket<T>(
@@ -136,5 +140,5 @@ export function useBackendApi() {
     })
   }
 
-  return { request, openSocket }
+  return { request, requestResponse, openSocket }
 }

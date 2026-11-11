@@ -430,7 +430,7 @@ async def _socket_user(socket: WebSocket) -> CurrentUser:
     if settings.app_env == "local" and origin in settings.cors_origins:
         return CurrentUser(uid=uid or "local-did-input", claims={"auth": "local_frontend"})
     token = str(hello.get("token") or "").strip()
-    decoded = auth.verify_id_token(token, app=ensure_firebase_app(settings))
+    decoded = await asyncio.to_thread(auth.verify_id_token, token, app=ensure_firebase_app(settings))
     verified_uid = decoded.get("uid")
     if not isinstance(verified_uid, str) or not verified_uid:
         raise ValueError("authentication required")
@@ -455,7 +455,7 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
         user = await _socket_user(websocket)
         stage = 'match_lookup'
         log_draft_event('socket_authenticated', gm_id, side, uid=user.uid, sessionId=session_id)
-        JpdDidData().get_match(gm_id)
+        await asyncio.to_thread(lambda: JpdDidData().get_match(gm_id))
         await draft_sockets.connect(gm_id, side, websocket)
         stage = 'presence_register'
         await asyncio.to_thread(update_presence, JpdDidData(), gm_id, side, user.uid, session_id, True)
@@ -465,24 +465,39 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
         stage = 'subscribe'
         await websocket.send_json({"type": "ready", "gmId": gm_id, "side": side})
         loop = asyncio.get_running_loop()
-        changes = asyncio.Queue()
+        changed_event = asyncio.Event()
+        change_lock = Lock()
+        pending_document = None
+        accepting_changes = True
         subscription = {'revision': None, 'roomEpoch': None, 'document': None}
+
         def changed(snapshots, *args):
-            document = snapshots[0].to_dict() or {} if snapshots else {}
-            try:
-                loop.call_soon_threadsafe(changes.put_nowait, document)
-            except RuntimeError:
-                pass  # The socket's event loop has already closed.
+            nonlocal pending_document
+            with change_lock:
+                if not accepting_changes:
+                    return
+                notify = pending_document is None
+                pending_document = (snapshots[0].to_dict() or {}) if snapshots else {}
+                if notify:
+                    loop.call_soon_threadsafe(changed_event.set)
+
         root = JpdDidData()._input_setup_reference(gm_id, side)
         root_watch = await asyncio.to_thread(root.on_snapshot, changed)
+
         async def watch_room():
+            nonlocal pending_document
             last_room = None
             last_roster = None
             while True:
                 try:
                     try:
-                        document = await asyncio.wait_for(changes.get(), timeout=10)
-                        subscription['document'] = document
+                        await asyncio.wait_for(changed_event.wait(), timeout=10)
+                        changed_event.clear()
+                        with change_lock:
+                            document = pending_document
+                            pending_document = None
+                        if document is not None:
+                            subscription['document'] = document
                     except asyncio.TimeoutError:
                         document = None
                     if document is not None and subscription['revision'] is not None:
@@ -520,7 +535,10 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
                 subscription['revision'] = max(0, int(message.get('revision') or 0))
                 subscription['roomEpoch'] = max(0, int(message.get('roomEpoch') or 0))
                 if subscription['document'] is not None:
-                    changes.put_nowait(subscription['document'])
+                    with change_lock:
+                        if pending_document is None:
+                            pending_document = subscription['document']
+                    changed_event.set()
                 continue
             if isinstance(message, dict) and message.get("type") == "heartbeat":
                 stage = 'heartbeat'
@@ -623,12 +641,18 @@ async def live_draft_socket(websocket: WebSocket, gm_id: str, side: Side) -> Non
         # only reliable way to distinguish a client close from a server error.
         logger.exception("Draft live socket crashed: %s/%s", gm_id, side)
     finally:
-        if root_watch:
-            await asyncio.to_thread(root_watch.unsubscribe)
+        draft_sockets.disconnect(gm_id, side, websocket)
         if watcher:
+            with change_lock:
+                accepting_changes = False
+                pending_document = None
             watcher.cancel()
             await asyncio.gather(watcher, return_exceptions=True)
-        draft_sockets.disconnect(gm_id, side, websocket)
+        if root_watch:
+            try:
+                await asyncio.to_thread(root_watch.unsubscribe)
+            except Exception:
+                logger.exception('Live Room unsubscribe failed: %s/%s', gm_id, side)
         if user and presence_registered:
             try:
                 await asyncio.to_thread(update_presence, JpdDidData(), gm_id, side, user.uid, session_id, False)

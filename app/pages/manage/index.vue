@@ -23,6 +23,7 @@ const operationMenus = [
   { label: '경기 배정 변경', desc: '세팅 저장된 경기 배정을 해제하고 다른 경기로 변경', to: '/manage/locks', ready: true }
 ]
 const dataMenus = [
+  { label: '이적 현황 업데이트', desc: '확정 이적 엑셀 대조 및 선수 관리 반영', to: '/manage/transfer-updates', ready: true },
   { label: 'SQL 데이터 이관', desc: '레거시 SQL 경기 데이터를 Firestore로 이관 (1회성)', to: '/manage/legacy-import', ready: true },
   { label: 'Firestore 데이터 뷰어', desc: '컬렉션 조회 + 값 수정 (삭제는 없음)', to: '/manage/data-viewer', ready: true },
   { label: '입력 데이터 (경기 기록)', desc: '경기 → 팀 → 레코드/KPI/카드 순으로 클릭만으로 조회', to: '/manage/input-data', ready: true }
@@ -32,12 +33,12 @@ const visibleOperationMenus = computed(() => operationMenus.filter(menu =>
 </script>
 
 <template>
-  <div class="page">
+  <div class="page" tabindex="0" role="region" aria-labelledby="manage-page-title">
     <div class="bg" />
 
     <div class="frame">
       <div class="topBar">
-        <div class="title">데이터 관리</div>
+        <div id="manage-page-title" class="title">데이터 관리</div>
         <NuxtLink class="backBtn" to="/schedule">← 경기 선택으로</NuxtLink>
       </div>
 
@@ -116,10 +117,9 @@ const visibleOperationMenus = computed(() => operationMenus.filter(menu =>
   box-sizing: border-box;
   width: 1280px;
   height: 800px;
-  display: grid;
-  place-items: center;
   position: relative;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   background: #0b0f17;
 }
 
@@ -132,8 +132,8 @@ const visibleOperationMenus = computed(() => operationMenus.filter(menu =>
 .frame {
   box-sizing: border-box;
   position: relative;
-  width: 1280px;
-  height: 800px;
+  width: 100%;
+  min-height: 100%;
   border-radius: 0;
   background: #151a21;
   border: 1px solid #29313b;

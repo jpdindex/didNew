@@ -79,6 +79,15 @@ class MemoryCollection:
     def document(self, key):
         return MemoryReference(self.db, self._collection_path + '/' + key)
 
+    def where(self, *, filter):
+        assert filter.field_path == 'expiresAt' and filter.op_string == '>'
+        snapshots = [snapshot for snapshot in self.stream()
+                     if (expires := snapshot.to_dict().get('expiresAt')) and expires > filter.value]
+        class Query:
+            def stream(self, **kwargs):
+                return iter(snapshots)
+        return Query()
+
     def stream(self, **kwargs):
         return iter(live.Snapshot(MemoryReference(self.db, path), values) for path, values in list(self.db.documents.items()) if path.rsplit('/', 1)[0] == self._collection_path)
 
