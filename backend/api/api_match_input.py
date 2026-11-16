@@ -254,6 +254,7 @@ class PromotionResponse(BaseModel):
     draftDeleted: bool
     commandId: str | None = None
     savedRevision: int | None = None
+    roomEpoch: int | None = None
 
 
 class FinalizeCommandRequest(BaseModel):

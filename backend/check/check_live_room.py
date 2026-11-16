@@ -447,7 +447,7 @@ def test_final_update_freezes_edits_closes_room_and_deduplicates(data):
     assert live.finalize_command(data, 'm', 'H', request, 'p', promote) == first
     assert len(calls) == 1
     assert data.db.documents['inputDrafts/m_H']['liveClosed']
-    assert data.db.documents['inputDrafts/m_H']['roomEpoch'] == 1
+    assert first['roomEpoch'] == data.db.documents['inputDrafts/m_H']['roomEpoch'] == 1
 
 
 def test_interrupted_final_update_resumes_same_command(data):

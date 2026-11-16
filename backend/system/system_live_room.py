@@ -756,12 +756,14 @@ def finalize_command(data, gm_id, side, request, uid, promote):
             current = root.get(transaction=transaction).to_dict() or {}
             if current.get('liveClosing') != request.commandId:
                 raise BackendError('Final update ownership changed', status_code=409, code='room_changed')
+            epoch = int(current.get('roomEpoch') or 0) + 1
+            confirmed = {**result, 'roomEpoch': epoch}
             transaction.set(root, {'liveClosed': True, 'liveClosing': None, 'payload': None, 'clientState': {},
-                'revision': result['savedRevision'], 'roomEpoch': int(current.get('roomEpoch') or 0) + 1,
+                'revision': result['savedRevision'], 'roomEpoch': epoch,
                 'updatedAt': utc_now()}, merge=True)
-            transaction.set(receipt_ref, {'result': result, 'leaseUntil': utc_now()}, merge=True)
-        finish(data.db.transaction())
-        return result
+            transaction.set(receipt_ref, {'result': confirmed, 'leaseUntil': utc_now()}, merge=True)
+            return confirmed
+        return finish(data.db.transaction())
     except Exception:
         receipt_ref.set({'leaseUntil': utc_now()}, merge=True)
         raise

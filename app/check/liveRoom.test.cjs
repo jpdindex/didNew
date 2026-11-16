@@ -252,6 +252,30 @@ test('finalization validation failure stops immediately and keeps its request fo
   assert.equal(env.indexedDB.rows.size, 1)
 })
 
+for (const receiptEpoch of [1, undefined]) {
+  test(`RAW restore uses the closed room version after a late finalization receipt (${receiptEpoch})`, async () => {
+    const writes = []
+    const env = environment(async (url, options = {}) => {
+      assert.equal(options.method, 'POST')
+      const body = JSON.parse(options.body)
+      writes.push({ url, body })
+      if (url.endsWith('/finalize')) {
+        await env.room.observe('m', 'H', 8, 1)
+        return { commandId: body.commandId, savedRevision: 8, roomEpoch: receiptEpoch }
+      }
+      return { commandId: body.commandId, savedRevision: 9, roomEpoch: 1 }
+    })
+    await env.room.observe('m', 'H', 7, 0)
+    assert.equal(await env.room.submit('m', 'H', 'finalize', {}, { throwOnFailure: true }), true)
+    await env.room.seed('m', 'H', { revision: 7, roomEpoch: 0 })
+    assert.equal(await env.room.submit('m', 'H', 'restore', {}, { throwOnFailure: true }), true)
+    assert.equal(writes.length, 2)
+    assert.ok(writes[1].url.endsWith('/restore-raw'))
+    assert.equal(writes[1].body.baseRevision, 8)
+    assert.equal(writes[1].body.roomEpoch, 1)
+  })
+}
+
 test('RAW restore refreshes a rejected stale version without replacing the command ID', async () => {
   const sent = []
   const env = environment(async (url, options = {}) => {

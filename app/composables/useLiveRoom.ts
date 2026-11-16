@@ -241,7 +241,12 @@ export function useLiveRoom() {
       for (const target of commandTargets(command)) {
         if (room.pendingInputs.get(target)?.commandId === command.commandId) room.pendingInputs.delete(target)
       }
-      if (command.kind === 'finalize') room.status.roomEpoch += 1
+      if (command.kind === 'finalize') {
+        // The socket or a recovery read can receive the new epoch before this
+        // ACK. Older saved receipts can derive it from the original request.
+        const savedEpoch = ack.roomEpoch ?? (Number(command.request.roomEpoch ?? 0) + 1)
+        room.status.roomEpoch = Math.max(room.status.roomEpoch, savedEpoch)
+      }
       room.status.pending -= 1
       if (!room.status.pending) { room.status.phase = 'saved'; room.status.error = '' }
       notifyRoom(room, { ...response, ackCommand: command, finalized: command.kind === 'finalize' })
@@ -371,9 +376,9 @@ export function useLiveRoom() {
           if (transient) { activeCommand = transient.command; throw Object.assign(new Error(transient.message), transient) }
           continue
         }
-        // Only unset revisions are initialized here. Never silently rebase an
-        // attempted command; retries retain the original ID and base version.
-        if (command.request.baseRevision == null) {
+        // A new restore queued behind finalize must use the closed room version.
+        // Attempted commands retain their original ID and base version on retry.
+        if (command.request.baseRevision == null || (command.kind === 'restore' && !command.attempted)) {
           command.request.baseRevision = room.status.revision
           command.request.roomEpoch = room.status.roomEpoch
           await store.update(command)
@@ -560,6 +565,7 @@ export function useLiveRoom() {
 
   async function observe(gmId: string, side: 'H' | 'A', revision: number, roomEpoch = 0) {
     const { room } = await roomFor(gmId, side)
+    if (roomEpoch < room.status.roomEpoch) return
     room.status.revision = Math.max(room.status.revision, revision)
     room.status.roomEpoch = roomEpoch
     room.initialized = true
@@ -568,9 +574,10 @@ export function useLiveRoom() {
 
   function seedRoom(room: Room, response: any) {
     if (typeof response.serverTimeMs === 'number') room.clockOffset = response.serverTimeMs - Date.now()
-    if (Number(response.revision || 0) < room.status.revision && Number(response.roomEpoch || 0) === room.status.roomEpoch) return
+    const epoch = Number(response.roomEpoch || 0)
+    if (epoch < room.status.roomEpoch || (epoch === room.status.roomEpoch && Number(response.revision || 0) < room.status.revision)) return
     room.status.revision = Math.max(room.status.revision, Number(response.revision || 0))
-    room.status.roomEpoch = Number(response.roomEpoch || 0)
+    room.status.roomEpoch = epoch
     room.initialized = true
     room.needsRecovery = false
     if (room.status.phase === 'loading' && !room.status.pending) room.status.phase = 'saved'
@@ -619,6 +626,7 @@ export function useLiveRoom() {
 
   async function observeDelta(gmId: string, side: 'H' | 'A', event: any) {
     const { room } = await roomFor(gmId, side)
+    if (Number(event.roomEpoch || 0) < room.status.roomEpoch) return
     rememberDelta(room, event)
     await observe(gmId, side, Math.max(room.status.revision, Number(event.revision || 0)), event.roomEpoch || 0)
   }
