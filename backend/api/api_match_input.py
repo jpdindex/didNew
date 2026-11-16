@@ -22,7 +22,7 @@ from backend.api.api_player_requests import ManagerUser, manager_user
 from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData, NotFoundError, RequiredUser, ensure_firebase_app, get_settings, utc_now
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
 from backend.system.system_schema import Half, InputMode, Side, MatchDoc
-from backend.system.system_live_room import execute_command, execute_batch, finalize_command, restore_command, room_state, update_presence, draft_context, log_draft_event, require_draft_writer, lobby_state
+from backend.system.system_live_room import execute_command, execute_batch, finalize_command, restore_command, correction_access, room_state, update_presence, draft_context, log_draft_event, require_draft_writer, lobby_state
 
 
 logger = logging.getLogger(__name__)
@@ -268,6 +268,21 @@ class ParticipantJoinRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     role: Literal["primary", "assistant", "manager"]
     displayName: str | None = Field(default=None, max_length=100)
+
+
+class RestoreCommandRequest(FinalizeCommandRequest):
+    role: Literal['primary', 'assistant', 'manager'] = 'manager'
+    displayName: str | None = Field(default=None, max_length=100)
+
+
+class CorrectionAccess(BaseModel):
+    role: Literal['primary', 'assistant', 'manager']
+    level: Literal['basic', 'advanced']
+    control: bool
+
+
+class DraftRestoreResponse(DraftResponse):
+    participant: CorrectionAccess
 
 
 class DraftEnterResponse(BaseModel):
@@ -1272,20 +1287,38 @@ def enter_draft(gm_id: str, side: Side, request: ParticipantJoinRequest, user: R
     )
 
 
-@router.post("/match-input/drafts/{gm_id}/{side}/restore-raw", response_model=DraftResponse, include_in_schema=False)
-def restore_raw_to_draft(gm_id: str, side: Side, user: RequiredUser = None, request: FinalizeCommandRequest | None = None) -> DraftResponse:
+@router.post('/match-input/drafts/{gm_id}/{side}/correction-access', include_in_schema=False)
+def read_correction_access(gm_id: str, side: Side, request: ParticipantJoinRequest, user: RequiredUser = None) -> dict:
+    data = JpdDidData()
+    fields = ['primaryUid', 'participants', 'revision', 'roomEpoch', 'status', 'sharedState.halfStatus', 'payload.status']
+    current = data._input_setup_reference(gm_id, side).get(field_paths=fields, retry=None, timeout=10).to_dict() or {}
+    participant = data.resolve_input_draft_participant(
+        gm_id, side, current, user_id=user.uid, role=request.role, display_name=request.displayName, correction=True,
+    )
+    return {**correction_access(participant, user.uid), 'revision': int(current.get('revision') or 0),
+            'roomEpoch': int(current.get('roomEpoch') or 0)}
+
+
+@router.post("/match-input/drafts/{gm_id}/{side}/restore-raw", response_model=DraftRestoreResponse, include_in_schema=False)
+def restore_raw_to_draft(gm_id: str, side: Side, user: RequiredUser = None, request: RestoreCommandRequest | None = None) -> DraftRestoreResponse:
     if not request:
         raise BackendError('RAW restoration requires a command ID and server version', status_code=422, code='command_required')
     data = JpdDidData()
-    room = room_state(data, gm_id, side)
-    if user.uid not in room['participants']:
-        data.join_input_draft_participant(gm_id, side, user_id=user.uid, role='manager', display_name=user.uid)
-    receipt = restore_command(data, gm_id, side, request, user.uid)
-    response = _draft_response(data.get_input_draft(gm_id, side))
+    def admit(current):
+        return data.resolve_input_draft_participant(
+            gm_id, side, current, user_id=user.uid, role=request.role, display_name=request.displayName, correction=True,
+        )
+
+    receipt = restore_command(data, gm_id, side, request, user.uid, admission=admit)
+    document = data.get_input_draft(gm_id, side)
+    response = _draft_response(document)
     response.commandId = receipt['commandId']
     response.savedRevision = receipt['savedRevision']
     _publish_draft_response(response)
-    return response
+    access = correction_access(document, user.uid)
+    if not access['control'] or access['level'] != 'advanced':
+        raise BackendError('RAW correction access changed', status_code=403, code='primary_required')
+    return DraftRestoreResponse(**dict(response), participant=access)
 
 
 @router.post("/match-input/drafts/{gm_id}/{side}/promote-h1", response_model=PromotionResponse, include_in_schema=False)

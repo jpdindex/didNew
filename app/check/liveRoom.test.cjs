@@ -1266,6 +1266,7 @@ test('prepared half navigates while the start ACK remains pending', async () => 
   let navigations = 0, writes = 0
   const game = { value: { lifecycleControl: true, halfStatus: 'ready', seconds: 0, clockStartedAt: null } }
   const context = vm.createContext({ game, lifecycleBusy: { value: false }, setupSaved: { value: true },
+    restoredEntryPromise: undefined,
     canStart: { value: true }, matchInfoEditMode: { value: false }, lifecycleError: { value: '' },
     preparedInput: { value: { draft: { status: 'ok', sharedState: {} } } },
     syncState: () => { writes++; return ack.promise }, saveLocal: async () => true,
@@ -1680,7 +1681,8 @@ function halfEntryEnvironment({ baseline = false, delayed = false, differentPeer
   const context = vm.createContext({ ...vue, ...formation, game, HALF_ORDER: { H1: 0, H2: 1 },
     appliedSetupRevision: -1, pendingSetupFingerprint: '', appliedSetupFingerprint: '', applyingRemoteSetup: false,
     lifecycleBusy: vue.ref(false), lifecycleError: vue.ref(''), bootstrapApplied: vue.ref(true), canStart: vue.ref(true), matchInfoEditMode: vue.ref(false),
-    preparedInput: vue.ref(null), savedEntryFingerprint: vue.ref(''), restoredSetupSaved: vue.ref(false), requestedRole: 'primary', formationSaveTimer: undefined,
+    preparedInput: vue.ref(null), savedEntryFingerprint: vue.ref(''), restoredSetupSaved: vue.ref(false), restoredEntryPromise: undefined,
+    requestedRole: 'primary', formationSaveTimer: undefined,
     preloadRouteComponents: async () => {}, clearTimeout() {},
     ensureLobbyHistory: async () => {},
     ensureLobbyParticipant: async () => { game.value.participantRole = 'primary'; game.value.lifecycleControl = true },

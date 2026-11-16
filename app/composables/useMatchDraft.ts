@@ -1,6 +1,7 @@
 import type { DidRecord } from '~/utils/didLogic'
 import type { CardRecord } from '~/utils/card'
 import type { FormationChange, MatchSnapshot, MatchState, MatchSquadPlayer } from '~/composables/useMatchState'
+import type { DraftRestoreResponse } from '~/composables/useMatchCollaboration'
 import { assignmentsFromLineup, lineupOrderForSlot } from '~/utils/formationLayout'
 
 type Side = 'H' | 'A'
@@ -378,18 +379,22 @@ export function useMatchDraft() {
 
   async function restoreFinalRaw(game: MatchState) {
     const side = inputSide(game)
-    let restored: { payload: InputPayload; clientState: MatchState } | undefined
-    if (!await liveRoom.submit(game.matchId, side, 'restore', {}, {
+    const user = useNuxtApp().$auth.currentUser
+    let restored: DraftRestoreResponse | undefined
+    if (!await liveRoom.submit(game.matchId, side, 'restore', {
+      role: game.participantRole, displayName: user?.displayName || user?.email || undefined,
+    }, {
       throwOnFailure: true,
       onConfirmed: response => { if (response.payload) restored = response },
     })) throw new Error('RAW 복원 완료를 아직 확인하지 못했습니다. 요청은 보관되어 있으며, 수정 버튼을 다시 누르면 같은 요청으로 확인합니다.')
     // The confirmed restore response already contains the complete Draft.
     // A recovery that completed before this subscription still uses GET.
-    const response = restored || await request<{ payload: InputPayload; clientState: MatchState }>(
+    const response = restored || await request<DraftRestoreResponse>(
       `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${side}`,
     )
     hydrateFromPayload(game, response.payload, response.clientState)
     await writeLocal({ key: keyFor(game), payload: response.payload, clientState: cloneState(game), updatedAt: Date.now() })
+    return restored
   }
 
   async function recoverFinalRaw(game: MatchState) {

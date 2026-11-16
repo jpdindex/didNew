@@ -769,7 +769,16 @@ def finalize_command(data, gm_id, side, request, uid, promote):
         raise
 
 
-def restore_command(data, gm_id, side, request, uid):
+def correction_access(document, uid):
+    participant = (document.get('participants') or {}).get(uid) or {}
+    primary_uid = document.get('primaryUid')
+    return {
+        'role': participant.get('role'), 'level': participant.get('level'),
+        'control': primary_uid == uid or (not primary_uid and participant.get('role') == 'manager'),
+    }
+
+
+def restore_command(data, gm_id, side, request, uid, *, admission=None):
     root = data.db.collection('inputDrafts').document(data._input_draft_id(gm_id, side))
     receipt_ref = root.collection('commands').document(request.commandId)
 
@@ -780,11 +789,13 @@ def restore_command(data, gm_id, side, request, uid):
         if receipt:
             if receipt.get('uid') != uid or receipt.get('kind') != 'restore':
                 raise BackendError('Command ID already used', status_code=409, code='command_id_reused')
-            if receipt.get('savedRevision') is not None:
-                return receipt
-        participant = (draft.get('participants') or {}).get(uid) or {}
-        if participant.get('role') not in {'primary', 'manager'} or participant.get('level', 'advanced') != 'advanced':
+        updates = admission(draft) if admission else None
+        access = correction_access(updates or draft, uid)
+        if (access['role'] not in {'primary', 'manager'} or (access['level'] or 'advanced') != 'advanced'
+                or (admission and not access['control'])):
             raise BackendError('Only an authorized advanced analyst can restore RAW', status_code=403, code='primary_required')
+        if receipt.get('savedRevision') is not None:
+            return receipt
         if not receipt and (request.roomEpoch != int(draft.get('roomEpoch') or 0) or request.baseRevision != int(draft.get('revision') or 0)):
             raise BackendError('Reload the server state before restoring RAW', status_code=409, code='draft_conflict')
         if draft.get('liveClosing'):
@@ -794,11 +805,15 @@ def restore_command(data, gm_id, side, request, uid):
             raise BackendError('Another RAW restoration is running', status_code=503, code='command_in_progress')
         if receipt.get('leaseUntil') and receipt['leaseUntil'] > now:
             raise BackendError('RAW restoration is still running', status_code=503, code='command_in_progress')
+        previous = correction_access(draft, uid)
+        participant_updates = updates if updates and (previous != access or draft.get('primaryUid') != updates['primaryUid']) else {}
         if draft.get('payload') and not draft.get('liveClosed') and not draft.get('liveRestoring'):
+            if participant_updates:
+                transaction.set(root, participant_updates, merge=True)
             receipt = {'uid': uid, 'kind': 'restore', 'commandId': request.commandId, 'savedRevision': int(draft.get('revision') or 0)}
             transaction.set(receipt_ref, receipt)
             return receipt
-        transaction.set(root, {'liveRestoring': request.commandId}, merge=True)
+        transaction.set(root, {**participant_updates, 'liveRestoring': request.commandId}, merge=True)
         transaction.set(receipt_ref, {'uid': uid, 'kind': 'restore', 'commandId': request.commandId, 'leaseUntil': now + timedelta(minutes=10)}, merge=True)
         return None
 

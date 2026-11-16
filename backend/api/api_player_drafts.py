@@ -17,7 +17,7 @@ from backend.system.system_firestore import BackendError, CurrentUser, get_setti
 from backend.system.system_player_drafts import DraftEdit, PlayerDraftService, MAX_REQUEST_SIZE, MAX_FILES
 from backend.system.system_player_requests import require_manager
 
-router = APIRouter(prefix='/player-drafts', tags=['이적 현황 업데이트'])
+router = APIRouter(prefix='/player-drafts', tags=['이적 현황 업데이트'], include_in_schema=False)
 bearer = HTTPBearer(scheme_name='FirebaseManagerToken', auto_error=False,
                     description='JPD-DID 관리자 계정의 Firebase ID 토큰입니다.')
 
@@ -33,7 +33,7 @@ JobId = Annotated[str, Path(pattern=r'^transfer-ops-[0-9]+-[0-9a-f]{20}$')]
 ItemId = Annotated[str, Path(pattern=r'^(?:transfer|roster)-[0-9]+$')]
 
 
-@router.post('/receive', status_code=201, include_in_schema=False)
+@router.post('/receive', status_code=201)
 async def receive(request: Request):
     """Accept a Transfer Ops upload using a separate server-to-server credential."""
     expected = get_settings().jpd_did_transfer_token.get_secret_value().strip()

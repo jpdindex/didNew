@@ -2172,28 +2172,33 @@ class JpdDidData:
     ) -> dict[str, Any]:
         # Two analysts can press setup save together, including on different
         # backend workers. The Draft read and seat claim must commit together.
+        reference = self._input_setup_reference(gm_id, side)
+
         @firestore.transactional
         def claim(transaction):
-            return self._join_input_draft_participant(
-                gm_id, side, user_id=user_id, role=role,
-                display_name=display_name, transaction=transaction,
+            current = reference.get(transaction=transaction, retry=None, timeout=10).to_dict() or {}
+            updates = self.resolve_input_draft_participant(
+                gm_id, side, current, user_id=user_id, role=role, display_name=display_name,
             )
+            transaction.set(reference, updates, merge=True)
+            return {**current, **updates}
 
         document = claim(self.db.transaction())
         self.sync_input_summary_from_draft(gm_id, side, document)
         return document
 
-    def _join_input_draft_participant(
+    def resolve_input_draft_participant(
         self,
         gm_id: str,
         side: Side,
+        current: dict[str, Any],
         *,
         user_id: str,
         role: Literal["primary", "assistant", "manager"],
         display_name: str | None = None,
-        transaction: Any,
+        correction: bool = False,
     ) -> dict[str, Any]:
-        """Register a recorder on the existing Draft root without touching records.
+        """Resolve participant metadata without changing the Draft.
 
         Seats: one primary, one assistant. Once both are taken, managers may
         join when allowed. A finished team still accepts its original primary or
@@ -2203,21 +2208,17 @@ class JpdDidData:
         server endpoint only establishes the durable role assignment used by rules
         and by final RAW promotion.
         """
-        reference = self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
-        snapshot = reference.get(transaction=transaction, retry=None, timeout=10)
         now = utc_now()
-        current = snapshot.to_dict() or {}
         profile_snapshot = self.db.collection("recorders").document(user_id).get(retry=None, timeout=10)
         profile = profile_snapshot.to_dict() or {}
         recorder_level = "advanced" if profile.get("level") == "advanced" else "basic"
         primary_uid = str(current.get("primaryUid") or "")
-        participants = current.get("participants") if isinstance(current.get("participants"), dict) else {}
+        participants = dict(current["participants"]) if isinstance(current.get("participants"), dict) else {}
         existing_participant = participants.get(user_id) if isinstance(participants.get(user_id), dict) else {}
         existing_role = existing_participant.get("role")
 
-        def raw_roster_role_for_user() -> str | None:
-            heads = self.get_recording_heads_many([gm_id]).get(gm_id, {}).get(side, {})
-            recorders = heads.get("recorders") if isinstance(heads.get("recorders"), dict) else {}
+        def raw_roster_role_for_user(head: dict) -> str | None:
+            recorders = head.get("recorders") if isinstance(head.get("recorders"), dict) else {}
             rank_roles = {"main": "primary", "sub": "assistant", "manager": "manager"}
             direct = recorders.get(user_id) if isinstance(recorders.get(user_id), dict) else {}
             direct_role = rank_roles.get(direct.get("rank"))
@@ -2248,7 +2249,6 @@ class JpdDidData:
                     and legacy_primary.get("name") == display_name
                 ):
                     participants.pop(primary_uid, None)
-                    current["participants"] = participants
                     primary_uid = user_id
                 elif legacy_primary.get("role") != "primary":
                     primary_uid = user_id
@@ -2257,11 +2257,22 @@ class JpdDidData:
         else:
             shared = current.get("sharedState") if isinstance(current.get("sharedState"), dict) else {}
             payload = current.get("payload") if isinstance(current.get("payload"), dict) else {}
+            recording_head = None
+            if correction:
+                recording = self.db.collection('matches').document(gm_id).collection('recordings').document(side)
+                recording_head = recording.get(field_paths=['status', 'recorders'], retry=None, timeout=10).to_dict() or {}
+            raw_status = recording_head.get('status') if recording_head is not None else self.get_recording_statuses(gm_id)[side]
             finished = (
-                self.get_recording_statuses(gm_id)[side] == "final"
+                raw_status == "final"
                 or (shared.get("halfStatus") or payload.get("status") or current.get("status")) == "final"
             )
-            raw_role = raw_roster_role_for_user() if finished else None
+            if correction and not finished:
+                raise BackendError('Only final RAW can be opened for correction', status_code=409, code='recording_not_final')
+            raw_role = None
+            if finished:
+                if recording_head is None:
+                    recording_head = self.get_recording_heads_many([gm_id]).get(gm_id, {}).get(side, {})
+                raw_role = raw_roster_role_for_user(recording_head)
             if finished and role != "manager" and raw_role == role:
                 finished_role_reentry = True
             elif role == "manager":
@@ -2298,7 +2309,7 @@ class JpdDidData:
             "joinedAt": participants.get(user_id, {}).get("joinedAt", now),
             "lastSeenAt": now,
         }
-        updates = {
+        return {
             "gmId": gm_id,
             "side": side,
             "primaryUid": primary_uid,
@@ -2307,11 +2318,6 @@ class JpdDidData:
             "updatedBy": user_id,
             "createdAt": current.get("createdAt", now),
         }
-        # A participant refresh must not overwrite setup with a stale document
-        # read. Merge only collaboration metadata into the Draft root.
-        transaction.set(reference, updates, merge=True)
-        document = {**current, **updates}
-        return document
 
     def ensure_recorder_profile(self, user_id: str, *, name: str | None = None) -> dict[str, Any]:
         """Create/update the minimal operational profile after Firebase Auth login."""
@@ -2924,6 +2930,7 @@ class JpdDidData:
         """Return the lobby-critical data in one response with parallel independent reads."""
         lobby_versions = None
         match = self.get_match(gm_id)
+        score = {"home": match.score.home, "away": match.score.away}
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="input-bootstrap") as executor:
             squads_future = executor.submit(self._get_or_create_input_squads_snapshot, gm_id, match)
             summary_future = executor.submit(lambda: self._input_summary_reference(gm_id).get(retry=None, timeout=10))
@@ -2944,7 +2951,18 @@ class JpdDidData:
                     selected_status = {**selected_status, 'rawStatus': 'final', 'completed': True,
                                        'lifecycleStatus': 'final', 'fieldSide': raw.get('fieldSide')}
                     input_status = {**input_status, side: selected_status}
+            other_side = "A" if side == "H" else "H"
+            opponent_future = None
+            if selected_status.get("rawStatus") == "final" and input_status[other_side].get("rawStatus") != "final":
+                opponent_future = executor.submit(
+                    self._input_setup_reference(gm_id, other_side).get,
+                    field_paths=["sharedState", "payload.homeScore", "payload.awayScore"], retry=None, timeout=10,
+                )
             squads, cached, squad_snapshot = squads_future.result()
+            if opponent_future is not None:
+                own_score = draft_team_score(opponent_future.result().to_dict() or {}, other_side)
+                if own_score is not None:
+                    score["away" if other_side == "A" else "home"] = own_score
 
         # A completed recording has no live collaboration state.  The lobby
         # only needs the cached squads and the compact RAW lineup shell to
@@ -2955,16 +2973,7 @@ class JpdDidData:
         # The lobby joins nobody before "세팅 저장", so a Draft primary means
         # that analyst already saved this setup and can re-enter without saving.
         primary_uid = None
-        score = {"home": match.score.home, "away": match.score.away}
         if is_final_lobby:
-            other_side = "A" if side == "H" else "H"
-            if input_status[other_side].get("rawStatus") != "final":
-                opponent = self._input_setup_reference(gm_id, other_side).get(
-                    field_paths=["sharedState", "payload.homeScore", "payload.awayScore"], retry=None, timeout=10,
-                ).to_dict() or {}
-                own_score = draft_team_score(opponent, other_side)
-                if own_score is not None:
-                    score["away" if other_side == "A" else "home"] = own_score
             input_setup: dict[Side, dict[str, Any] | None] = {"H": None, "A": None}
             dashboard_kpis = self._empty_input_dashboard_kpis()
             # The completed lobby still renders the final formation.  Read the
@@ -3041,13 +3050,7 @@ class JpdDidData:
         }
 
     def restore_input_draft_from_raw(self, gm_id: str, side: Side, *, user_id: str) -> dict[str, Any]:
-        """Make (or reuse) an editable Draft from an already-final RAW recording."""
-        try:
-            existing = self.get_input_draft(gm_id, side)
-            if existing.get("payload"):
-                return existing
-        except NotFoundError:
-            pass
+        """Rebuild the Draft after the restore command claims its lease."""
         raw_state = self.read_input_state_from_raw(gm_id, side)
         reference = self._input_setup_reference(gm_id, side)
         previous = reference.get(retry=None, timeout=10).to_dict() or {}

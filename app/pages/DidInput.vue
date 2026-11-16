@@ -264,10 +264,12 @@ onMounted(async () => {
   const preparedEntry = preparedInput.value
   preparedInput.value = null
   const canUsePreparedEntry = Boolean(
-    hasActiveClientState && !isEditMode && preparedEntry?.gmId === matchId &&
+    hasActiveClientState && preparedEntry?.gmId === matchId &&
     preparedEntry.side === (requestedTeam === 'away' ? 'A' : 'H') &&
     preparedEntry.participant.role === requestedRole && preparedEntry.draft.status === 'ok' &&
-    preparedEntry.draft.payload.status === game.value.halfStatus
+    (isEditMode
+      ? isFinalCorrection && preparedEntry.finalCorrection && preparedEntry.participant.control
+      : !preparedEntry.finalCorrection && preparedEntry.draft.payload.status === game.value.halfStatus)
   )
   if (matchId) {
     try {
@@ -275,6 +277,7 @@ onMounted(async () => {
         ? preparedEntry
         : await enterCollaboration(game.value, requestedRole)
       game.value.participantRole = entry.participant.role ?? requestedRole
+      if (entry.participant.level) game.value.recorderLevel = entry.participant.level
       game.value.lifecycleControl = entry.participant.control === true
       enterSucceeded = true
       if (!game.value.squads.home.length || !game.value.squads.away.length) {

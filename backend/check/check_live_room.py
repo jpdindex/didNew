@@ -492,6 +492,38 @@ def test_full_raw_restore_creates_editable_draft_with_all_records(data):
     assert not data.db.documents['inputDrafts/m_H']['liveClosed']
 
 
+def test_final_correction_access_is_read_only_and_restore_rechecks_current_level(data, monkeypatch):
+    from backend.api import api_match_input as api
+    from backend.system.system_firestore import CurrentUser
+
+    data.db.documents['inputDrafts/m_H'].update(liveClosed=True, payload=None, participants={}, primaryUid=None, roomEpoch=2)
+    data.db.documents['recorders/p'] = {'level': 'advanced'}
+    data.db.documents['matches/m/recordings/H'] = {'status': 'final', 'recorders': {'p': {'rank': 'main'}}}
+    raw = payload([record()])
+    raw['status'] = 'final'
+    data.read_input_state_from_raw = lambda *args: {'payload': raw, 'clientState': {'restoredFromRaw': True}}
+    monkeypatch.setattr(api, 'JpdDidData', lambda: data)
+    monkeypatch.setattr(api, '_publish_draft_response', lambda response: None)
+    user = CurrentUser(uid='p', claims={})
+    original = deepcopy(data.db.documents)
+
+    access = api.read_correction_access('m', 'H', api.ParticipantJoinRequest(role='primary'), user)
+    assert access == {'role': 'primary', 'level': 'advanced', 'control': True, 'revision': 0, 'roomEpoch': 2}
+    assert data.db.documents == original
+
+    request = api.RestoreCommandRequest(commandId='restore', baseRevision=0, roomEpoch=2, role='primary')
+    data.db.documents['recorders/p']['level'] = 'basic'
+    with pytest.raises(BackendError, match='authorized advanced analyst'):
+        api.restore_raw_to_draft('m', 'H', user, request)
+    assert data.db.documents['inputDrafts/m_H'] == original['inputDrafts/m_H']
+
+    data.db.documents['recorders/p']['level'] = 'advanced'
+    response = api.restore_raw_to_draft('m', 'H', user, request)
+    assert response.participant.model_dump() == {'role': 'primary', 'level': 'advanced', 'control': True}
+    assert response.payload.records[0].id == 'r'
+    assert api.restore_raw_to_draft('m', 'H', user, request).savedRevision == response.savedRevision
+
+
 @pytest.mark.parametrize('half', ['ready', 'H1', 'H2_done', 'final'])
 @pytest.mark.parametrize('raw_status', [None, 'final'])
 def test_correction_draft_never_reopens_final_raw_on_schedule(data, half, raw_status):

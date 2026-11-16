@@ -46,9 +46,14 @@ function finalEditEnvironment({ ready = true, control = true, failRestore = fals
   const events = []
   const context = functions('TeamSelection.vue', ['editFinal'], {
     lifecycleBusy: ref(false), lobbyParticipantReady: ref(ready), lifecycleError: ref(''),
-    inputStatus: ref({ H: { rawStatus: 'final' } }),
-    game: ref({ team: 'home', halfStatus: 'final', lifecycleControl: control, recorderLevel: 'advanced' }),
-    restoreFinalRaw: async () => { events.push('restore'); if (failRestore) throw new Error('restore failed') },
+    inputStatus: ref({ H: { rawStatus: 'final' } }), preparedInput: ref(null),
+    game: ref({ team: 'home', halfStatus: 'final', lifecycleControl: control, recorderLevel: 'advanced', squads: { home: [], away: [] } }),
+    isCurrentLobby: () => true, preloadRouteComponents: async () => {},
+    restoreFinalRaw: async () => {
+      events.push('restore')
+      if (failRestore) throw new Error('restore failed')
+      return { gmId: 'm', side: 'H', status: 'ok', revision: 8, participant: { role: 'manager', control: true, level: 'advanced' }, payload: { records: ['raw-record'] } }
+    },
     navigateTo: () => { events.push('navigate') }, didInputQuery: () => ({}),
   })
   return { context, events }
@@ -73,6 +78,9 @@ test('confirmed final editing navigates only after RAW restore succeeds', async 
   const success = finalEditEnvironment()
   await success.context.editFinal()
   assert.deepEqual(success.events, ['restore', 'navigate'])
+  assert.equal(success.context.preparedInput.value.finalCorrection, true)
+  assert.equal(success.context.preparedInput.value.participant.role, 'manager')
+  assert.equal(success.context.preparedInput.value.draft.payload.records[0], 'raw-record')
   const failure = finalEditEnvironment({ failRestore: true })
   await failure.context.editFinal()
   assert.deepEqual(failure.events, ['restore'])
@@ -177,7 +185,7 @@ test('saved setup paints without waiting for profile, then only the current half
     request: url => { events.push(url); return half.promise },
     loadDashboardKpis: async half => { events.push(half) },
     ensureLobbyHistory: async () => { events.push('history') },
-    ensureLobbyParticipant: async () => {}, requestedRole: 'primary',
+    ensureLobbyParticipant: async () => {}, requestedRole: 'primary', restoredEntryPromise: undefined,
     refreshLobbyState: async () => {},
     setInterval: (callback, delay) => { intervals.push(delay); return 1 }, lifecycleError: ref(''),
     onMounted: callback => { context.mount = callback },
@@ -196,6 +204,32 @@ test('saved setup paints without waiting for profile, then only the current half
   assert.equal(context.dashboardKpiLoaded.H2, true)
   assert.equal(context.dashboardKpiLoaded.H1, undefined)
   assert.deepEqual(events.slice(2), ['all', 'history'])
+})
+
+test('re-entering a saved lobby paints before the input entry response arrives', async () => {
+  const entry = deferred()
+  let preparations = 0
+  const context = vm.createContext({
+    game: ref({ halfStatus: 'ready', team: 'home' }),
+    inputStatus: ref({ H: { lifecycleStatus: 'ready' }, A: {} }),
+    loadRecorderProfile: async () => {}, loadBootstrap: async () => ({}), applyBootstrap: () => true,
+    isCurrentLobby: () => true, bootstrapApplied: ref(false), lobbyReady: ref(false), nextTick: async () => {},
+    requestedRole: 'primary', canStart: ref(true), bootstrapPrimaryUid: 'p', lobbyAuth: { currentUser: { uid: 'p' } },
+    activeSlot: ref('gk'), savedEntryFingerprint: ref(''), entryFingerprint: ref('saved'), restoredSetupSaved: ref(false),
+    prepareRestoredEntry: () => { preparations++; return entry.promise }, restoredEntryPromise: undefined,
+    loadInitialKpis: async () => {}, setupSaved: ref(true), lobbyTeam: 'home',
+    setInterval: () => 1, lobbyClockTimer: undefined, dashboardKpiTimer: undefined,
+    onMounted: callback => { context.mount = callback },
+  })
+  const mount = source('TeamSelection.vue').match(/onMounted\(async \(\) => \{[\s\S]*?\n}\)/)[0]
+  vm.runInContext(transformSync(mount, { loader: 'ts', format: 'cjs' }).code, context)
+  const mounting = context.mount()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(context.lobbyReady.value, true)
+  assert.equal(context.restoredSetupSaved.value, true)
+  assert.equal(preparations, 1)
+  entry.resolve()
+  await mounting
 })
 
 test('KPI refresh cannot replace saved lineup, and late replies cannot reach another lobby', async () => {

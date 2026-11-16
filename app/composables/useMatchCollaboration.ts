@@ -159,12 +159,18 @@ export interface DraftEnterResponse {
   participant: {
     role?: ParticipantRole
     control?: boolean
+    level?: MatchState['recorderLevel']
     participants: Record<string, Participant>
     primaryUid?: string
   }
   draft: DraftResponse | { status: 'missing'; gmId: string; side: 'H' | 'A' }
   squads: { H: MatchSquadPlayer[]; A: MatchSquadPlayer[] }
   inputSetup: { H: DraftResponse['inputSetup']; A: DraftResponse['inputSetup'] }
+  finalCorrection?: boolean
+}
+
+export interface DraftRestoreResponse extends DraftResponse {
+  participant?: { role: ParticipantRole; control: boolean; level: MatchState['recorderLevel'] }
 }
 
 type SyncScope = 'state' | 'records' | 'state_records' | 'cards'
@@ -275,12 +281,13 @@ export function useMatchCollaboration() {
     return response
   }
 
-  async function enter(game: MatchState, role: ParticipantRole): Promise<DraftEnterResponse> {
+  async function enter(game: MatchState, role: ParticipantRole, isCurrent = () => true): Promise<DraftEnterResponse> {
     const user = await currentIdentity()
     const response = await request<DraftEnterResponse>(
       `/api/v1/match-input/drafts/${encodeURIComponent(game.matchId)}/${sideFor(game)}/enter`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role, displayName: user?.displayName || user?.email || undefined }) },
     )
+    if (!isCurrent()) return response
     game.participantRole = response.participant.role ?? role
     game.recorderLevel = response.participant.participants?.[user?.uid ?? '']?.level ?? game.recorderLevel
     game.lifecycleControl = response.participant.control === true

@@ -3,6 +3,7 @@ import { useInputPreview } from '~/composables/useInputPreview'
 import type { HalfStatus, MatchSnapshot, MatchSquadPlayer, MatchState, SubRecord } from '~/composables/useMatchState'
 import type { Half } from '~/types/schema'
 import type { InputPayload } from '~/composables/useMatchDraft'
+import type { DraftRestoreResponse } from '~/composables/useMatchCollaboration'
 import { cloneState, payloadFromState } from '~/composables/useMatchDraft'
 import { formatMatchClock, formatMatchMinute } from '~/utils/matchClock'
 import {
@@ -69,12 +70,14 @@ const isCurrentLobby = () => lobbyActive && game.value.matchId === lobbyMatchId 
 // selectedTeam/formationKey/assigned/side/inputMode/잔디 설정을 전부 여기로 옮겼다.
 const game = useMatchState()
 const { request } = useBackendApi()
+const liveRoom = useLiveRoom()
 const { preview: previewInput, schedule: scheduleInputPreview } = useInputPreview()
 const { saveLocal, save: saveDraft, finalizeAdvanced, restoreFinalRaw, recoverFinalRaw, recover: recoverDraft, hydrate } = useMatchDraft()
 const { join: joinCollaboration, enter: enterCollaboration, start: startCollaboration, stop: stopCollaboration, syncSetup, syncState, roomStatus, acceptServer, keepLocal } = useMatchCollaboration()
 const preparedInput = usePreparedInput()
 const savedEntryFingerprint = ref('')
 const restoredSetupSaved = ref(false)
+let restoredEntryPromise: Promise<void> | undefined
 // 서버 세팅과 저장 여부를 확인하기 전에는 이전에 남아 있던 화면을 보여주지 않는다.
 const lobbyReady = ref(false)
 let bootstrapPrimaryUid: string | null = null
@@ -279,6 +282,24 @@ function ensureLobbyParticipant(role = game.value.participantRole) {
     })
   lobbyJoinPromise = join
   return join
+}
+
+async function loadCorrectionAccess(side: 'H' | 'A') {
+  const user = lobbyAuth.currentUser
+  const access = await request<NonNullable<DraftRestoreResponse['participant']> & { revision: number; roomEpoch: number }>(
+    `/api/v1/match-input/drafts/${encodeURIComponent(lobbyMatchId)}/${side}/correction-access`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: requestedRole, displayName: user?.displayName || user?.email || undefined }),
+    },
+  )
+  if (!isCurrentLobby() || lobbyAuth.currentUser?.uid !== user?.uid) return
+  await liveRoom.observe(lobbyMatchId, side, access.revision, access.roomEpoch)
+  if (!isCurrentLobby() || lobbyAuth.currentUser?.uid !== user?.uid) return
+  game.value.participantRole = access.role
+  game.value.recorderLevel = access.level
+  game.value.lifecycleControl = access.control
+  game.value.participantName = user?.displayName || user?.email || ''
+  lobbyParticipantReady.value = true
 }
 
 function setupFingerprint(setup: Pick<InputSetup, 'formationKey' | 'fieldSide' | 'lineup' | 'subs' | 'inputMode'>) {
@@ -1017,7 +1038,7 @@ const entryFingerprint = computed(() => JSON.stringify({
   matchId: game.value.matchId, team: game.value.team, status: game.value.halfStatus,
   setup: entrySetupFingerprint.value,
 }))
-// 재입장 복원은 입장 데이터 없이 저장 상태만 되살린다. 입장 데이터는 "입장"을 누를 때 받는다.
+// 저장된 세팅을 먼저 복원하고 입장 데이터는 화면 뒤에서 준비한다.
 const setupSaved = computed(() => savedEntryFingerprint.value === entryFingerprint.value && game.value.lifecycleControl &&
   (preparedInput.value ? preparedInput.value.participant.role === game.value.participantRole : restoredSetupSaved.value))
 watch(entryFingerprint, () => {
@@ -1082,20 +1103,28 @@ async function saveEntrySetup({ persist = true } = {}) {
 // 재입장 복원 전용: 이미 주 분석관으로 확정된 경기에서 입장 데이터만 받는다.
 // /enter 가 참가 확인과 Draft·라인업 읽기를 한 번에 하므로 /participants·poll 은 생략한다.
 async function prepareRestoredEntry() {
-  preparedInput.value = null
+  const fingerprint = entryFingerprint.value
+  const editRevision = entryEditRevision
+  const isCurrent = () => isCurrentLobby() && entryEditRevision === editRevision && entryFingerprint.value === fingerprint
   try {
-    const inputChunk = preloadRouteComponents('/DidInput').catch(() => undefined)
-    const entry = await enterCollaboration(game.value, requestedRole)
-    if (!isCurrentLobby() || !game.value.lifecycleControl || entry.draft.status !== 'ok') return
+    void preloadRouteComponents('/DidInput').catch(() => undefined)
+    const entry = await enterCollaboration(game.value, requestedRole, isCurrent)
+    if (!isCurrent() || !game.value.lifecycleControl || entry.draft.status !== 'ok') return
     if (entry.gmId !== game.value.matchId || entry.side !== (game.value.team === 'away' ? 'A' : 'H')) return
     const selectedSetup = (game.value.team === 'away' ? entry.inputSetup.A : entry.inputSetup.H) || entry.draft.inputSetup
     if (selectedSetup) applyInputSetup(selectedSetup)
-    await inputChunk
-    if (!isCurrentLobby()) return
     preparedInput.value = entry
+    savedEntryFingerprint.value = entryFingerprint.value
+    if (game.value.halfStatus === 'H1_done') {
+      joinedLobbyRole = game.value.participantRole
+      lobbyParticipantReady.value = true
+      if (!initialKpisLoading) {
+        lobbyHistoryPromise = undefined
+        void ensureLobbyHistory().catch(() => false)
+      }
+    }
   } catch {
     // 입장 버튼의 기존 경로(saveEntrySetup persist:false)가 다시 시도한다.
-    preparedInput.value = null
   }
 }
 
@@ -1148,6 +1177,10 @@ function closeConfirm(ok: boolean) {
 
 async function enterPreparedHalf(target: 'H1' | 'H2') {
   if (lifecycleBusy.value || !setupSaved.value || !canStart.value || matchInfoEditMode.value) return
+  if (restoredEntryPromise) {
+    await restoredEntryPromise
+    if (lifecycleBusy.value || !isCurrentLobby() || !setupSaved.value || !canStart.value || matchInfoEditMode.value) return
+  }
   if (!preparedInput.value) await saveEntrySetup({ persist: false })
   const entry = preparedInput.value
   if (!entry || entry.draft.status !== 'ok') return
@@ -1230,6 +1263,19 @@ let matchInfoEditBackup: { formationKey: MatchState['formationKey'], assigned: M
 async function toggleMatchInfoEdit() {
   lifecycleError.value = ''
   if (!matchInfoEditMode.value) {
+    const side = game.value.team === 'away' ? 'A' : 'H'
+    if (inputStatus.value[side].rawStatus === 'final' && joinedLobbyRole === undefined) {
+      lifecycleBusy.value = true
+      try {
+        await ensureLobbyParticipant(game.value.participantRole)
+        if (!isCurrentLobby() || !game.value.lifecycleControl) return
+      } catch (error) {
+        lifecycleError.value = lifecycleErrorMessage(error, '경기 정보 변경 권한을 확인하지 못했습니다.')
+        return
+      } finally {
+        lifecycleBusy.value = false
+      }
+    }
     matchInfoEditBackup = {
       formationKey: game.value.formationKey,
       assigned: { ...game.value.assigned },
@@ -1323,8 +1369,6 @@ async function startSecondHalf() {
 }
 
 onMounted(async () => {
-  // Profile and KPI latency must not hold the saved setup behind a barrier.
-  void loadRecorderProfile().catch(() => false)
   let recovered = false
   try {
     const payload = await loadBootstrap()
@@ -1350,33 +1394,37 @@ onMounted(async () => {
     }
   }
   bootstrapApplied.value = true
+  const selectedSide = game.value.team === 'home' ? 'H' : 'A'
+  const selectedState = inputStatus.value[selectedSide]
+  // A final lobby gets the recorder level in its correction-access response.
+  if (selectedState.rawStatus !== 'final') void loadRecorderProfile().catch(() => false)
   // 이미 세팅 저장으로 주 분석관이 된 경기라면, 다시 저장하지 않고 저장된 화면으로 연다.
   // 첫 화면을 그리기 전에 판단해 저장 전 화면이 잠깐 보이지 않게 한다.
   const canRestoreSaved = () => requestedRole === 'primary' && (game.value.halfStatus === 'ready' || game.value.halfStatus === 'H1_done') &&
     canStart.value && !!bootstrapPrimaryUid && bootstrapPrimaryUid === lobbyAuth.currentUser?.uid
   if (canRestoreSaved()) {
-    // 로딩 화면에서 입장 데이터까지 받아 둔다. 그래야 "전반전 입장"이 바로 경기장으로 간다.
-    // 실패해도 저장 상태는 그대로 복원하고, 입장 버튼에서 다시 받는다.
-    await prepareRestoredEntry()
-    if (!isCurrentLobby()) return
-    if (canRestoreSaved()) {
-      activeSlot.value = null
-      savedEntryFingerprint.value = entryFingerprint.value
-      restoredSetupSaved.value = true
-    } else preparedInput.value = null
+    activeSlot.value = null
+    savedEntryFingerprint.value = entryFingerprint.value
+    restoredSetupSaved.value = true
+    restoredEntryPromise = prepareRestoredEntry().finally(() => { restoredEntryPromise = undefined })
   }
   lobbyReady.value = true
   await nextTick()
   if (!isCurrentLobby()) return
   void loadInitialKpis()
 
-  const selectedState = game.value.team === 'home' ? inputStatus.value.H : inputStatus.value.A
   // 완료 경기에서도 서버가 현재 역할·수정 권한을 확인한 뒤에만 버튼을 연다.
   // 시작 전 로비 방문은 등록하지 않는다. 주 분석관은 "세팅 저장"에서 확정된다.
   const lobby = (selectedState.lifecycleStatus ?? 'ready') === 'ready' && game.value.halfStatus === 'ready'
   if (!lobby) {
     // Participation writes must not hold back the player list, formation or KPI paint.
-    void ensureLobbyParticipant(requestedRole).catch(error => {
+    const check = selectedState.rawStatus === 'final'
+      ? loadCorrectionAccess(selectedSide)
+      : restoredEntryPromise
+        ? restoredEntryPromise.then(() => isCurrentLobby() ? ensureLobbyParticipant(requestedRole) : undefined)
+        : ensureLobbyParticipant(requestedRole)
+    void check.catch(error => {
+      if (!isCurrentLobby()) return
       lifecycleError.value = error instanceof Error
         ? error.message
         : `${roleLabel(requestedRole)} 참여 상태를 확인하지 못했습니다.`
@@ -1463,8 +1511,20 @@ async function editFinal() {
   lifecycleBusy.value = true
   lifecycleError.value = ''
   try {
-    if (game.value.recorderLevel === 'advanced') await restoreFinalRaw(game.value)
-    else game.value.halfStatus = 'H2_done'
+    void preloadRouteComponents('/DidInput').catch(() => undefined)
+    const restored = await restoreFinalRaw(game.value)
+    if (!isCurrentLobby()) return
+    if (restored?.participant?.control) {
+      const { participant } = restored
+      game.value.participantRole = participant.role
+      game.value.recorderLevel = participant.level
+      preparedInput.value = {
+        status: 'ok', gmId: restored.gmId, side: restored.side, finalCorrection: true,
+        participant: { ...participant, participants: {} }, draft: restored,
+        squads: { H: game.value.squads.home, A: game.value.squads.away },
+        inputSetup: { H: side === 'H' ? restored.inputSetup : null, A: side === 'A' ? restored.inputSetup : null },
+      }
+    }
     navigateTo({ path: '/DidInput', query: didInputQuery('후반', true, 'H2_done', true) })
   } catch (error) {
     lifecycleError.value = error instanceof Error ? error.message : '최종 RAW를 수정용 Draft로 복원하지 못했습니다.'
