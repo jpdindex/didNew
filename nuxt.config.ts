@@ -5,6 +5,8 @@ export default defineNuxtConfig({
   ssr: false,
   app: {
     head: {
+      // 태블릿에서 핀치·더블탭으로 화면이 확대/축소되지 않게 고정한다.
+      viewport: 'width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no',
       link: [{ rel: 'manifest', href: '/manifest.webmanifest' }],
       meta: [
         { name: 'mobile-web-app-capable', content: 'yes' },

@@ -132,6 +132,23 @@ async function review(action: 'approve' | 'edit') {
   finally { busy.value = false }
 }
 
+// 대기방에서 들어온 경우 대기방으로 돌아간다. 바로 이전 기록이 대기방이면 history back 으로
+// 돌아가 기록이 쌓이지 않게 하고, 새로고침 등으로 기록이 없으면 넘겨받은 주소로 교체한다.
+const router = useRouter()
+const lobbyPath = computed(() => {
+  const from = String(route.query.from ?? '')
+  return from.startsWith('/TeamSelection') ? from : ''
+})
+function goBack() {
+  const target = lobbyPath.value || '/manage'
+  const back = window.history.state?.back
+  if (typeof back === 'string' && router.resolve(back).path === router.resolve(target).path) {
+    router.back()
+    return
+  }
+  router.replace(target)
+}
+
 onMounted(async () => {
   await $authReady
   await load()
@@ -141,7 +158,7 @@ onMounted(async () => {
 
 <template>
   <main class="requestsPage">
-    <header><div><NuxtLink to="/manage">← 데이터 관리</NuxtLink><h1>선수 등록 요청하기</h1><p>선수 등록·등번호 변경을 요청하면 관리자가 검토 후 DB에 반영합니다.</p></div><div class="newRequest" @keydown.esc="newMenuOpen = false"><button :disabled="busy || loading" :aria-expanded="newMenuOpen" aria-controls="new-request-menu" @click="newMenuOpen = !newMenuOpen">+ 새 요청 ▾</button><div v-if="newMenuOpen" id="new-request-menu" class="newRequestMenu"><button @click="startNew('REGISTRATION')">새 선수 등록 요청</button><button @click="startNew('NUMBER_CHANGE')">등번호 변경 요청</button></div></div></header>
+    <header><div><a :href="lobbyPath || '/manage'" @click.prevent="goBack">{{ lobbyPath ? '← 경기 대기방' : '← 데이터 관리' }}</a><h1>선수 등록 요청하기</h1><p>선수 등록·등번호 변경을 요청하면 관리자가 검토 후 DB에 반영합니다.</p></div><div class="newRequest" @keydown.esc="newMenuOpen = false"><button :disabled="busy || loading" :aria-expanded="newMenuOpen" aria-controls="new-request-menu" @click="newMenuOpen = !newMenuOpen">+ 새 요청 ▾</button><div v-if="newMenuOpen" id="new-request-menu" class="newRequestMenu"><button @click="startNew('REGISTRATION')">새 선수 등록 요청</button><button @click="startNew('NUMBER_CHANGE')">등번호 변경 요청</button></div></div></header>
     <p v-if="error" class="error" role="alert">{{ error }}</p><p v-if="message" class="success" role="status">{{ message }}</p>
     <section v-if="editing" class="editor">
       <div class="sectionHead"><h2>{{ requestTitle }}<template v-if="active"> · {{ statuses[active.status] }} · {{ active.requestedName }}</template></h2><button type="button" :disabled="busy" @click="editing = false">닫기</button></div>

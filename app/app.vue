@@ -58,6 +58,39 @@ function fitCanvas() {
     : Math.min(top, Math.max(minOffset, wanted))
 }
 
+// iOS Safari는 user-scalable=no를 무시하므로, 핀치·제스처·Ctrl+휠 확대를 직접 막는다.
+function blockGesture(event: Event) {
+  event.preventDefault()
+}
+
+function blockMultiTouch(event: TouchEvent) {
+  if (event.touches.length > 1) event.preventDefault()
+}
+
+function blockCtrlWheel(event: WheelEvent) {
+  if (event.ctrlKey) event.preventDefault()
+}
+
+function blockZoomKeys(event: KeyboardEvent) {
+  if ((event.ctrlKey || event.metaKey) && ['+', '-', '=', '0'].includes(event.key)) event.preventDefault()
+}
+
+onMounted(() => {
+  document.addEventListener('gesturestart', blockGesture, { passive: false })
+  document.addEventListener('gesturechange', blockGesture, { passive: false })
+  document.addEventListener('touchmove', blockMultiTouch, { passive: false })
+  window.addEventListener('wheel', blockCtrlWheel, { passive: false })
+  window.addEventListener('keydown', blockZoomKeys)
+})
+
+onUnmounted(() => {
+  document.removeEventListener('gesturestart', blockGesture)
+  document.removeEventListener('gesturechange', blockGesture)
+  document.removeEventListener('touchmove', blockMultiTouch)
+  window.removeEventListener('wheel', blockCtrlWheel)
+  window.removeEventListener('keydown', blockZoomKeys)
+})
+
 onMounted(() => {
   fitCanvas()
   window.addEventListener('resize', fitCanvas)
@@ -85,6 +118,11 @@ html, body, #__nuxt {
   width: 100%;
   height: 100%;
   margin: 0;
+}
+
+/* 하위 요소의 touch-action: manipulation도 이 값과 교집합이 되어 핀치·더블탭 확대가 꺼진다. */
+html {
+  touch-action: pan-x pan-y;
 }
 
 body {

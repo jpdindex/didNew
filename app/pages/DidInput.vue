@@ -151,6 +151,39 @@ function stepSeconds(delta: number) {
   void syncState(game.value).catch(() => false)
 }
 
+// 시계 −/+ 버튼: 짧게 누르면 1초, 길게 누르고 있으면 30초씩 반복해서 움직인다(터치펜 기준).
+// click 대신 pointer 이벤트로 처리해서, 길게 누른 뒤 손을 뗐을 때 1초가 한 번 더 붙지 않게 한다.
+const HOLD_DELAY_MS = 500
+const HOLD_REPEAT_MS = 350
+const HOLD_STEP_SECONDS = 30
+let holdTimer: ReturnType<typeof setTimeout> | undefined
+let holdDir = 0
+let holdRepeated = false
+function stopTimeHold() {
+  if (holdTimer) clearTimeout(holdTimer)
+  holdTimer = undefined
+  holdDir = 0
+}
+function startTimeHold(dir: number, e: PointerEvent) {
+  stopTimeHold()
+  ;(e.currentTarget as HTMLElement | null)?.setPointerCapture?.(e.pointerId)
+  holdDir = dir
+  holdRepeated = false
+  const repeat = () => {
+    holdRepeated = true
+    stepSeconds(holdDir * HOLD_STEP_SECONDS)
+    holdTimer = setTimeout(repeat, HOLD_REPEAT_MS)
+  }
+  holdTimer = setTimeout(repeat, HOLD_DELAY_MS)
+}
+function endTimeHold() {
+  const dir = holdDir
+  const repeated = holdRepeated
+  stopTimeHold()
+  if (dir && !repeated) stepSeconds(dir)
+}
+onUnmounted(stopTimeHold)
+
 // 수정 화면 전용: 시계의 "전반"/"후반" 라벨을 눌러 편집 대상 half 를 바꾼다.
 // 지금 보던 half 의 조정값을 먼저 저장해두고, 누른 half 의 저장된 시간을 불러온다.
 function selectHalf(target: '전반' | '후반') {
@@ -2590,13 +2623,17 @@ async function finishHalf() {
             <div class="score">{{ homeScore }}</div>
             <div class="halfBox">
               <div class="clockRow">
-                <button class="timeStep" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(-1)">−</button>
+                <button class="timeStep" :disabled="!isPrimary && !historyPinned && !editingId"
+                  @pointerdown.prevent="startTimeHold(-1, $event)" @pointerup="endTimeHold"
+                  @pointercancel="stopTimeHold" @contextmenu.prevent>−</button>
                 <div class="halfLabel" :class="{ on: half === '전반', clickable: isEditMode }" @click="selectHalf('전반')">
                   전반</div>
                 <div class="clock" :class="{ paused }">{{ displayClock }}</div>
                 <div class="halfLabel" :class="{ on: half === '후반', clickable: isEditMode }" @click="selectHalf('후반')">
                   후반</div>
-                <button class="timeStep" :disabled="!isPrimary && !historyPinned && !editingId" @click="stepSeconds(1)">+</button>
+                <button class="timeStep" :disabled="!isPrimary && !historyPinned && !editingId"
+                  @pointerdown.prevent="startTimeHold(1, $event)" @pointerup="endTimeHold"
+                  @pointercancel="stopTimeHold" @contextmenu.prevent>+</button>
               </div>
             </div>
             <div class="score">{{ awayScore }}</div>
@@ -3717,7 +3754,14 @@ button {
   padding: 0
 }
 
-.timeStep:hover {
+.timeStep {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none
+}
+
+.timeStep:active:not(:disabled) {
   background: rgba(240, 180, 41, .15);
   border-color: #f0b429;
   color: #f0b429

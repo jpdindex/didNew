@@ -1979,7 +1979,7 @@ function undoSub(index: number) {
           <div class="analystInfo analystRole" :class="{ assistant: game.participantRole !== 'primary' }">
             분석 역할: {{ roleLabel(game.participantRole) }}
           </div>
-          <NuxtLink class="playerRegistrationLink" :to="{ path: '/manage/player-requests', query: { matchId: matchId, team: game.team } }">선수 등록 요청하기</NuxtLink>
+          <NuxtLink class="playerRegistrationLink" :to="{ path: '/manage/player-requests', query: { matchId: matchId, team: game.team, from: route.fullPath } }">선수 등록 요청하기</NuxtLink>
           <div v-if="roomStatus" class="sidebarRoomStatus">
             <LiveRoomStatus compact :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
           </div>
