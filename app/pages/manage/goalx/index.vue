@@ -3,6 +3,7 @@ type Grade = 'high' | 'medium' | 'low'
 type Category = 'artistry' | 'defense' | 'trajectory'
 type Grades = Record<Category, Grade>
 type Metric = 'distance' | 'speed'
+type RankingSortKey = Metric | 'finalSpeed' | Category | 'score'
 type Point = { x: number; y: number; z: number }
 type League = { id: string; name: string }
 type Season = { id: string; leagueId: string; name: string; from: string | null; to: string | null }
@@ -35,6 +36,13 @@ const labels = { high: '상', medium: '중', low: '하' }
 const categories: { key: Category; label: string }[] = [
   { key: 'artistry', label: '예술성' }, { key: 'defense', label: '수비 환경' }, { key: 'trajectory', label: '궤적' },
 ]
+const rankingColumns: { label: string; sortKey?: RankingSortKey; numeric?: boolean }[] = [
+  { label: '순위' }, { label: '득점자' }, { label: '경기' }, { label: '득점 시각' },
+  { label: '거리', sortKey: 'distance' }, { label: '초기 속도', sortKey: 'speed' },
+  { label: '종료 속도', sortKey: 'finalSpeed' }, { label: '평가 인원' },
+  ...categories.map(({ label, key }) => ({ label, sortKey: key, numeric: true })),
+  { label: '평균 점수', sortKey: 'score', numeric: true },
+]
 const metrics = [
   { key: 'distance', label: '슈팅 거리', unit: 'm' }, { key: 'speed', label: '초기 속도', unit: 'km/h' },
   { key: 'launchAngle', label: '발사각', unit: '°' }, { key: 'spin', label: '회전수', unit: 'rpm' },
@@ -64,6 +72,7 @@ const rankingRound = ref('all')
 const rankingTeam = ref('')
 const rankingRounds = ref<Round[]>([])
 const rankingResult = ref<Goals | null>(null)
+const rankingSort = ref<{ key: RankingSortKey; direction: 'ascending' | 'descending' }>({ key: 'score', direction: 'descending' })
 const rankingError = ref('')
 const rankingRoundsError = ref('')
 const loadingRanking = ref(false)
@@ -94,12 +103,31 @@ const ranking = computed(() => {
     .filter(goal => goal.score !== null && (!rankingTeam.value || goal.teamId === rankingTeam.value))
     .sort((a, b) => b.score! - a.score!)
   let rank = 0
-  return rows.map((goal, index) => {
+  const ranked = rows.map((goal, index) => {
     if (index === 0 || goal.score !== rows[index - 1]?.score) rank = index + 1
     return { ...goal, rank }
   })
+  const { key, direction } = rankingSort.value
+  return ranked.sort((a, b) => {
+    const left = rankingValue(a, key)
+    const right = rankingValue(b, key)
+    if (left == null) return right == null ? 0 : 1
+    if (right == null) return -1
+    return direction === 'ascending' ? left - right : right - left
+  })
 })
-const hasRankedMeasurements = computed(() => ranking.value.some(goal => goal.metrics.distance != null || goal.metrics.speed != null))
+
+function rankingValue(goal: Goal, key: RankingSortKey) {
+  if (key === 'score') return goal.score
+  if (key === 'distance' || key === 'speed' || key === 'finalSpeed') return goal.metrics[key]
+  return goal.categoryScores?.[key]
+}
+
+function setRankingSort(key: RankingSortKey) {
+  const direction = rankingSort.value.key === key && rankingSort.value.direction === 'descending' ? 'ascending' : 'descending'
+  rankingSort.value = { key, direction }
+}
+
 const selectedKey = ref('')
 const selected = computed(() => goals.value.find(goal => keyOf(goal) === selectedKey.value))
 const pages = computed(() => {
@@ -809,11 +837,14 @@ onBeforeUnmount(() => {
         <table>
           <thead>
             <tr>
-              <th scope="col">순위</th><th scope="col">득점자</th><th scope="col">경기</th><th scope="col">득점 시각</th>
-              <th v-if="hasRankedMeasurements" scope="col">거리</th><th v-if="hasRankedMeasurements" scope="col">초기 속도</th>
-              <th scope="col">평가 인원</th>
-              <th v-for="category in categories" :key="category.key" scope="col" class="ranking-score">{{ category.label }}</th>
-              <th scope="col" class="ranking-score">평균 점수</th>
+              <th v-for="column in rankingColumns" :key="column.label" scope="col" :class="{ 'ranking-score': column.numeric }"
+                :aria-sort="column.sortKey === rankingSort.key ? rankingSort.direction : undefined">
+                <button v-if="column.sortKey" type="button" class="ranking-sort" @click="setRankingSort(column.sortKey)">
+                  {{ column.label }}
+                  <span aria-hidden="true">{{ column.sortKey !== rankingSort.key ? '↕' : rankingSort.direction === 'ascending' ? '↑' : '↓' }}</span>
+                </button>
+                <template v-else>{{ column.label }}</template>
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -832,8 +863,9 @@ onBeforeUnmount(() => {
                 <span class="ranking-round">{{ seasonLabel(goal.seasonId) }} · {{ roundLabel(goal.round) }}</span>
               </td>
               <td>{{ goal.clock }}</td>
-              <td v-if="hasRankedMeasurements">{{ formatMetric(goal.metrics.distance, 'm') }}</td>
-              <td v-if="hasRankedMeasurements">{{ formatMetric(goal.metrics.speed, 'km/h') }}</td>
+              <td>{{ formatMetric(goal.metrics.distance, 'm') }}</td>
+              <td>{{ formatMetric(goal.metrics.speed, 'km/h') }}</td>
+              <td>{{ formatMetric(goal.metrics.finalSpeed, 'km/h') }}</td>
               <td><button type="button" class="text-button participants-button" aria-haspopup="dialog" @click="showParticipants(goal)">{{ goal.evaluationCount }}명</button></td>
               <td v-for="category in categories" :key="category.key" class="ranking-score">
                 {{ goal.categoryScores?.[category.key]?.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) ?? '—' }}
@@ -1008,6 +1040,9 @@ th { color: var(--muted); font-size: 12px; }
 .ranking-scoring-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .ranking-round { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
 .ranking-score { text-align: right; font-variant-numeric: tabular-nums; }
+.ranking-sort { display: inline-flex; gap: 4px; align-items: center; padding: 3px 0; border: 0; background: none; color: inherit; font: inherit; }
+.ranking-sort:hover, th[aria-sort] .ranking-sort { color: var(--accent); }
+.ranking-sort:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .participants-button { color: var(--accent); }
 .participants-dialog { width: min(440px, calc(100vw - 32px)); max-height: 80vh; box-sizing: border-box; padding: 0; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
 .participants-dialog::backdrop { background: #071014b8; }
