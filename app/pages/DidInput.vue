@@ -1119,6 +1119,14 @@ function applyEdit() {
       rec.shootDspRange = undefined
       if (pendingShot.value?.id === rec.id) pendingShot.value = null
     }
+    // C|B 처럼 액트+결과 기록에서 액트를 해제했으면 이 기록이 X/B 단독 기록이 된다.
+    // 짝 결과 기록(act 없음)은 건드리지 않는다 — 필요하면 직접 보고 삭제한다.
+    if (editResClearable.value && !rec.act && (rec.res === 'X' || rec.res === 'B')) {
+      rec.isShot = false
+      rec.shootPosX = undefined
+      rec.shootPosY = undefined
+      rec.shootDspRange = undefined
+    }
     // 자책골(OWN)은 슛 득점에만 붙는다 — 결과·액트를 바꿔 득점 슛이 아니게 되면 같이 지운다.
     if (!editPlayerEligible.value || (rec.playerId === 'OWN' && !canBeOwnGoal(rec))) {
       rec.playerId = undefined
@@ -2140,6 +2148,20 @@ function areaFromPos(pos: { x: number; y: number }) {
 function clickAct(actKey: string, isShot: boolean) {
   // 수정 중이면 새 레코드를 만들지 않고, 지금 수정 중인 레코드의 액트만 바꾼다.
   if (editingId.value) {
+    // 선택된 액트를 한 번 더 누르면 해제한다. 결과(X/B)가 남는 경우에만 풀어 준다 —
+    // 액트도 결과도 없는 빈 기록은 만들지 않는다.
+    if (editAct.value === actKey) {
+      if (editActConvertible.value) {
+        // X/B 단독 기록에 액트를 골랐다가 다시 누르면 원래 X/B 로 되돌린다.
+        const orig = records.value.find(r => r.id === editingId.value)?.res
+        editAct.value = ''
+        editRes.value = orig === 'X' || orig === 'B' ? orig : null
+      } else if (editResClearable.value && editRes.value) {
+        // C|B 같은 기록은 액트만 풀어 B 단독 기록으로 바꾼다(적용 시 반영).
+        editAct.value = ''
+      }
+      return
+    }
     editAct.value = actKey as Exclude<ActCode, ''>
     // X/B 로 바꾸려던 중에 액트를 다시 고르면 X/B 변환은 취소한다.
     if (editResConvertible.value || editActConvertible.value) editRes.value = null
@@ -2193,7 +2215,8 @@ function clickResult(res: 'X' | 'B') {
       editRes.value = res
       editAct.value = ''
     } else if (editResClearable.value) {
-      editRes.value = editRes.value === res ? null : res
+      // 액트를 해제한 상태면 결과까지 풀 수 없다(빈 기록 방지) — X↔B 전환만 한다.
+      editRes.value = editRes.value === res && editAct.value ? null : res
     } else if (editRes.value !== null) editRes.value = res
     return
   }
