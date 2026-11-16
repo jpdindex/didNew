@@ -2,6 +2,7 @@
 const props = defineProps<{ status: {
   phase: string; revision: number; pending: number; error: string
   connection?: string
+  finalizationRetryRequired?: boolean
   participants: Record<string, { name?: string; role?: string; online?: boolean }>
   conflict?: { commandId: string; local: string; server: string }
 } | null; compact?: boolean }>()
@@ -35,7 +36,7 @@ function keep() {
   <div v-if="status" class="liveRoomStatus" :class="{ compact }" role="status" aria-live="polite">
     <!-- 참가자(역할·이름·접속) 목록은 표시하지 않는다. 저장 상태만 보여준다. -->
     <span :title="status.phase === 'error' || status.phase === 'conflict' ? status.error : `서버 버전 ${status.revision}`">{{ label }}<template v-if="status.phase === 'error' || status.phase === 'conflict'"> · {{ errorLabel }}</template></span>
-    <button v-if="status.phase === 'conflict' || status.phase === 'error'" @click="accept">서버 기준 재동기화</button>
+    <button v-if="(status.phase === 'conflict' || status.phase === 'error') && !status.finalizationRetryRequired" @click="accept">서버 기준 재동기화</button>
     <details v-if="status.phase === 'conflict' && status.conflict" class="conflictDetails">
       <summary>충돌 내용 비교</summary>
       <p>내 저장 요청</p><pre>{{ status.conflict.local }}</pre>

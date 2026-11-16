@@ -45,6 +45,17 @@ def _summary_display_name(document: dict[str, Any], fallback: str) -> str:
     return str(document.get("nameKr") or document.get("name") or document.get("nameFull") or document.get("nameEn") or fallback)
 
 
+def draft_team_score(document: dict[str, Any], side: Side) -> int | None:
+    key = "homeScore" if side == "H" else "awayScore"
+    shared = document.get("sharedState")
+    payload = document.get("payload")
+    for source in (shared, payload):
+        value = source.get(key) if isinstance(source, dict) else None
+        if type(value) is int:
+            return value
+    return None
+
+
 @dataclass(slots=True)
 class BackendError(Exception):
     message: str
@@ -98,6 +109,7 @@ class Settings(BaseSettings):
     firebase_emulator_host: str | None = None
     swagger_api_key: str | None = None
     aifootballx_credentials_path: str | None = None
+    goalx_shotx_credentials_path: str | None = None
     aifootballx_write_enabled: bool = True
     aifootballx_slot_mapping_path: str | None = None
     jpd_rating_base_url: str = "https://jpd-rating-296087686925.asia-northeast3.run.app"
@@ -521,7 +533,7 @@ class JpdDidData:
         drafts = self.get_input_draft_participants_many([gm_id]).get(gm_id, {"H": {}, "A": {}})
         sides: dict[str, dict[str, Any]] = {}
         primary_uids: dict[str, str | None] = {}
-        live_score = None
+        score = {"home": match.score.home, "away": match.score.away}
         for side in ("H", "A"):
             draft = drafts.get(side, {})
             raw = heads.get(side, {})
@@ -547,8 +559,12 @@ class JpdDidData:
             if raw_status == "final":
                 status = "final"
             sides[side] = {"rawStatus": raw_status, "completed": status == "final", "lifecycleStatus": status, "participants": participants}
-            if live_score is None and isinstance(draft.get("score"), dict):
-                live_score = draft["score"]
+            if raw_status != "final":
+                key = "home" if side == "H" else "away"
+                own_score = (draft.get("score") or {}).get(key)
+                if isinstance(own_score, int):
+                    score[key] = own_score
+                    sides[side]["score"] = own_score
         values = {
             "gmId": gm_id,
             "date": self._normalise_match_date(match.date),
@@ -560,7 +576,7 @@ class JpdDidData:
             "stadiumName": stadium_name,
             "home": {"teamId": match.homeTeamId, "name": home_name},
             "away": {"teamId": match.awayTeamId, "name": away_name},
-            "score": live_score or {"home": match.score.home, "away": match.score.away},
+            "score": score,
             "inputStatus": sides,
             "collaboration": {
                 side: {
@@ -609,7 +625,12 @@ class JpdDidData:
             "updatedAt": utc_now(),
         }
         if score is not None:
-            values["score"] = score
+            key = "home" if side == "H" else "away"
+            if key in score:
+                values[f"score.{key}"] = score[key]
+                values[f"inputStatus.{side}"] = {**input_state, "score": score[key]}
+        elif input_state.get("rawStatus") != "final":
+            values[f"inputStatus.{side}"] = {**input_state, "score": None}
         reference = self._input_summary_reference(gm_id)
         try:
             reference.update(values, retry=None, timeout=20)
@@ -638,9 +659,10 @@ class JpdDidData:
         participants = self._summary_participants(draft)
         primary_uid = draft.get("primaryUid") if isinstance(draft.get("primaryUid"), str) else None
         score = None
-        score_source = shared if "homeScore" in shared or "awayScore" in shared else payload
-        if isinstance(score_source.get("homeScore"), int) and isinstance(score_source.get("awayScore"), int):
-            score = {"home": score_source["homeScore"], "away": score_source["awayScore"]}
+        key = "home" if side == "H" else "away"
+        own_score = draft_team_score(draft, side)
+        if raw_status != "final" and own_score is not None:
+            score = {key: own_score}
         self._update_input_summary_side(
             gm_id,
             side,
@@ -2333,8 +2355,10 @@ class JpdDidData:
             self.db.collection("inputDrafts").document(self._input_draft_id(gm_id, side))
             for gm_id in result for side in ("H", "A")
         ]
+        fields = ["gmId", "side", "primaryUid", "participants", "status", "sharedState",
+                  "payload.status", "payload.homeScore", "payload.awayScore"]
         for start in range(0, len(refs), 300):
-            for snapshot in self.db.get_all(refs[start:start + 300], retry=None, timeout=20):
+            for snapshot in self.db.get_all(refs[start:start + 300], field_paths=fields, retry=None, timeout=20):
                 if not snapshot.exists:
                     continue
                 document = snapshot.to_dict() or {}
@@ -2348,10 +2372,8 @@ class JpdDidData:
                 # Live input writes scores to sharedState. A lifecycle checkpoint
                 # keeps the same values in payload, which also covers a Draft
                 # opened before direct Firestore sync has started.
-                score_source = shared if "homeScore" in shared or "awayScore" in shared else payload
-                score = None
-                if isinstance(score_source.get("homeScore"), int) and isinstance(score_source.get("awayScore"), int):
-                    score = {"home": score_source["homeScore"], "away": score_source["awayScore"]}
+                own_score = draft_team_score(document, side)
+                score = None if own_score is None else {"home" if side == "H" else "away": own_score}
                 result[gm_id][side] = {
                     "status": lifecycle,
                     "primaryUid": document.get("primaryUid"),
@@ -2378,8 +2400,12 @@ class JpdDidData:
         previous = reference.get(retry=None, timeout=10).to_dict() or {}
         # Keep a closed aggregate head: stale offline commands must not create
         # another active Draft after final RAW promotion.
+        shared = {'halfStatus': 'final', 'clockStartedAt': None}
+        own_score = draft_team_score(previous, side)
+        if own_score is not None:
+            shared["homeScore" if side == "H" else "awayScore"] = own_score
         reference.set({'liveClosed': True, 'liveClosing': None, 'payload': None, 'clientState': {},
-            'status': 'final', 'sharedState': {'halfStatus': 'final', 'clockStartedAt': None},
+                       'status': 'final', 'sharedState': shared,
             'revision': int(previous.get('revision') or 0) + 1,
             'roomEpoch': int(previous.get('roomEpoch') or 0) + 1}, merge=True, retry=None, timeout=20)
 
@@ -2929,7 +2955,16 @@ class JpdDidData:
         # The lobby joins nobody before "세팅 저장", so a Draft primary means
         # that analyst already saved this setup and can re-enter without saving.
         primary_uid = None
+        score = {"home": match.score.home, "away": match.score.away}
         if is_final_lobby:
+            other_side = "A" if side == "H" else "H"
+            if input_status[other_side].get("rawStatus") != "final":
+                opponent = self._input_setup_reference(gm_id, other_side).get(
+                    field_paths=["sharedState", "payload.homeScore", "payload.awayScore"], retry=None, timeout=10,
+                ).to_dict() or {}
+                own_score = draft_team_score(opponent, other_side)
+                if own_score is not None:
+                    score["away" if other_side == "A" else "home"] = own_score
             input_setup: dict[Side, dict[str, Any] | None] = {"H": None, "A": None}
             dashboard_kpis = self._empty_input_dashboard_kpis()
             # The completed lobby still renders the final formation.  Read the
@@ -2960,6 +2995,10 @@ class JpdDidData:
             from backend.system.system_live_room import read_lobby_snapshot, lobby_head_state
             heads, input_setup = read_lobby_snapshot(self, gm_id)
             lobby_versions = {item: lobby_head_state(heads[item]) for item in ('H', 'A')}
+            for item, key in (("H", "home"), ("A", "away")):
+                own_score = draft_team_score(heads[item], item)
+                if input_status[item].get("rawStatus") != "final" and own_score is not None:
+                    score[key] = own_score
             head = heads[side]
             primary_uid = head.get("primaryUid") if isinstance(head.get("primaryUid"), str) else None
             payload = head.get("payload") if isinstance(head.get("payload"), dict) else {}
@@ -2967,12 +3006,11 @@ class JpdDidData:
             lifecycle = shared.get("halfStatus") or payload.get("status") or selected_status.get("lifecycleStatus") or "ready"
             input_status[side] = {**selected_status, "lifecycleStatus": lifecycle}
             session = {"status": "missing", "gmId": gm_id, "side": side, "summaryOnly": True,
-                       "sharedState": {"homeScore": (summary.get("score") or {}).get("home", match.score.home),
-                                       "awayScore": (summary.get("score") or {}).get("away", match.score.away),
+                       "sharedState": {"homeScore": score["home"],
+                                       "awayScore": score["away"],
                                        "h1Seconds": (payload.get("halves", {}).get("H1") or {}).get("seconds", 0),
                                        "h2Seconds": (payload.get("halves", {}).get("H2") or {}).get("seconds", 0),
-                                       **{key: payload[key] for key in ("homeScore", "awayScore") if key in payload},
-                                       **{key: shared[key] for key in ("seconds", "h1Seconds", "h2Seconds", "clockStartedAt", "homeScore", "awayScore") if key in shared},
+                                       **{key: shared[key] for key in ("seconds", "h1Seconds", "h2Seconds", "clockStartedAt") if key in shared},
                                        "halfStatus": lifecycle}}
             # A pre-setup-field legacy Draft can still supply its formation
             # shell without reading event tables or writing during a GET.
@@ -2995,6 +3033,7 @@ class JpdDidData:
             },
             "inputSetup": input_setup,
             "session": session,
+            "score": score,
             "primaryUid": primary_uid,
             **({'lobbyState': lobby_versions} if lobby_versions is not None else {}),
             "dashboardKpiHalves": bootstrap_kpi_halves,
@@ -3053,11 +3092,15 @@ class JpdDidData:
     ) -> None:
         # Validate the complete shared RAW contract before deleting any prior
         # final tree. This is the new-input counterpart to importer preflight.
-        RecordingDoc.model_validate(recording)
-        for _, values in records:
-            RecordDoc.model_validate(values)
-        for _, values in cards:
-            CardDoc.model_validate(values)
+        try:
+            RecordingDoc.model_validate(recording)
+            for _, values in records:
+                RecordDoc.model_validate(values)
+            for _, values in cards:
+                CardDoc.model_validate(values)
+        except ValidationError as error:
+            raise BackendError('최종 갱신에 필요한 경기 기록 형식이 올바르지 않습니다.',
+                               status_code=422, code='finalize_invalid_draft') from error
         recording_ref = self.db.collection("matches").document(gm_id).collection("recordings").document(side)
         for name in ("records", "cards", "paths", "playerStats"):
             collection = recording_ref.collection(name)
@@ -3089,7 +3132,10 @@ class JpdDidData:
                 pending = 0
         if pending:
             batch.commit(retry=None, timeout=30)
-        self.db.collection("matches").document(gm_id).update({"score": score, "updatedAt": utc_now()})
+        key = "home" if side == "H" else "away"
+        self.db.collection("matches").document(gm_id).update({f"score.{key}": score[key], "updatedAt": utc_now()})
+        with self._match_cache_lock:
+            self._match_cache.pop(gm_id, None)
 
     def save_recording_kpi(
         self,

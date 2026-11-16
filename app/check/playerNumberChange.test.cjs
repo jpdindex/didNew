@@ -64,7 +64,7 @@ function requestPage(duplicateResult = { players: [] }) {
     emptyPlayerNumberChange: emptyNumber,
     emptyPlayerRegistration: () => ({ leagueId: '', seasonId: '', teamId: '', matchId: '', nation: '', sourceUrl: '' }),
     useNuxtApp: () => ({ $auth: { currentUser: { email: 'manager' } }, $db: {}, $authReady: Promise.resolve() }),
-    canAccessManagement: () => true, useRoute: () => ({ query: {} }), onMounted: () => {},
+    canAccessManagement: () => true, useRoute: () => ({ query: {} }), useRouter: () => ({}), onMounted: () => {},
     useBackendApi: () => ({ request: async (url, options) => {
       requests.push({ url, options })
       if (url.endsWith('/duplicates')) {

@@ -563,6 +563,32 @@ def test_card_mutation_broadcasts_only_cards_not_an_incomplete_draft(monkeypatch
     assert published == ["cards"]
 
 
+@pytest.mark.parametrize("card_id", [None, "draft-card-id"])
+def test_draft_cards_convert_to_valid_raw_documents(card_id):
+    from backend.system.system_schema import CardDoc
+
+    payload = api_match_input.MatchInputPayload.model_validate({
+        "gmId": "sample-match", "side": "H", "inputMode": "분석", "fieldSide": "left",
+        "formationKey": "4-3-3", "status": "final", "lineup": [], "records": [],
+        "homeScore": 1, "awayScore": 0, "halves": {"H1": {"seconds": 45}, "H2": {"seconds": 45}},
+        "cards": [{"id": card_id, "playerId": "player-1", "half": "H2", "halfSeconds": 12, "card": "Y"}],
+    })
+    recording, records, cards = api_match_input._raw_values(payload, status="final", halves={"H1", "H2"})
+    [(document_id, body)] = cards
+    assert document_id == "H2_12_player-1_0"
+    assert CardDoc.model_validate(body).card == "Y"
+    assert payload.cards[0].id == card_id
+
+    # A malformed RAW card is a permanent input error before any writes.
+    from backend.system.system_firestore import BackendError, JpdDidData
+    data = object.__new__(JpdDidData)
+    recording.update(teamId="home", opponentTeamId="away")
+    with pytest.raises(BackendError) as rejected:
+        data.replace_recording_raw("sample-match", "H", recording=recording, records=records,
+                                   cards=[(document_id, {**body, "id": "extra"})], score={"home": 1, "away": 0})
+    assert (rejected.value.status_code, rejected.value.code) == (422, "finalize_invalid_draft")
+
+
 def test_state_mutation_broadcasts_only_state_not_an_incomplete_draft(monkeypatch) -> None:
     payload = {
         "gmId": "sample-match", "side": "H", "inputMode": "분석", "fieldSide": "left",
@@ -756,6 +782,28 @@ def test_daily_match_list_never_reads_the_whole_month(monkeypatch):
     data.input_summary_backfill_complete_for_month = lambda *args: pytest.fail('day request does not need migration markers')
     data.get_recording_heads_many = lambda *args: pytest.fail('covered fixture must not open RAW')
     assert api_match_input.list_input_matches(2026, 10, day='2026-10-08')['matches'] == [summary]
+
+
+def test_schedule_recovers_both_scores_from_old_unfinalized_summaries(monkeypatch):
+    store = _ScheduleStore()
+    data = _schedule_data(monkeypatch, store)
+    summary = {"gmId": "match", "date": "2026.10.08", "score": {"home": 0, "away": 3},
+               "inputStatus": {"H": {"lifecycleStatus": "final"}, "A": {"lifecycleStatus": "H2_done"}}}
+    data.list_input_summaries_for_month = lambda *args: [summary]
+    data.input_summary_backfill_complete_for_month = lambda *args: True
+    reads = []
+
+    def draft_scores(ids):
+        reads.extend(ids)
+        return {"match": {"H": {"score": {"home": 1, "away": 0}}, "A": {"score": {"home": 0, "away": 3}}}}
+
+    data.get_input_draft_participants_many = draft_scores
+    assert api_match_input.list_input_matches(2026, 10)["matches"][0]["score"] == {"home": 1, "away": 3}
+    assert reads == ["match"]
+    summary["inputStatus"]["H"]["score"] = 1
+    summary["inputStatus"]["A"]["score"] = 3
+    assert api_match_input.list_input_matches(2026, 10)["matches"][0]["score"] == {"home": 1, "away": 3}
+    assert reads == ["match"]
 
 
 @pytest.mark.parametrize('day', ['2026-11-01', '2026-10-99'])

@@ -289,6 +289,7 @@ function lobbyRefreshEnvironment() {
     lastLobbyVersions: JSON.stringify([[1, 0, false], [1, 0, false]]),
     dashboardKpiLoaded: { all: true, H1: true, H2: true },
     game: ref({ formationKey: '4-3-3', halfStatus: 'ready' }),
+    lobbyScore: ref({ home: 0, away: 0 }),
     inputStatus: ref({ H: { rawStatus: null }, A: { rawStatus: null } }), kpiHalf: ref('all'),
     document: { hidden: false },
     setTimeout: (callback, delay) => { const timer = { callback, delay }; timers.push(timer); return timer },
@@ -306,6 +307,17 @@ function lobbyRefreshEnvironment() {
   })
   return { context, urls, timers, kpiLoads, applied, state, setSides: value => { sides = value } }
 }
+
+test('lobby uses the score of each team even when the selected Draft has a stale opponent total', async () => {
+  const env = lobbyRefreshEnvironment()
+  env.setSides({
+    H: { ...env.state(), score: 1, sharedState: { homeScore: 1, awayScore: 0 } },
+    A: { ...env.state(), score: 3, sharedState: { homeScore: 0, awayScore: 3 } },
+  })
+  await env.context.refreshLobbyState()
+  assert.equal(env.context.game.value.homeScore, 1)
+  assert.equal(env.context.game.value.awayScore, 3)
+})
 
 test('unchanged lobby checks read only compact versions, with no KPI or setup reload', async () => {
   const env = lobbyRefreshEnvironment()

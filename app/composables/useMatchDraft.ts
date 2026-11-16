@@ -363,11 +363,13 @@ export function useMatchDraft() {
   }
 
   async function finalizeAdvanced(game: MatchState) {
-    if (!await save(game)) throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 안전하게 저장되었습니다.')
-    const payload = payloadFromState(game)
-    if (!await liveRoom.flush(payload.gmId, payload.side)) throw new Error('대기 중인 입력을 저장한 뒤 갱신하세요.')
-    const result = await liveRoom.submit(payload.gmId, payload.side, 'finalize', {})
-    if (!result) throw new Error('최종 갱신 확인을 기다리고 있습니다. 연결 복구 후 같은 명령으로 재시도합니다.')
+    const { matchId } = game
+    const side = inputSide(game)
+    const resumeFinalize = (await liveRoom.pending(matchId, side)).find(command => command.kind === 'finalize')
+    if (!resumeFinalize && !await save(game)) {
+      throw new Error('네트워크 연결 후 다시 시도하세요. Draft는 이 기기에 안전하게 저장되었습니다.')
+    }
+    const result = await liveRoom.submit(matchId, side, 'finalize', {}, { throwOnFailure: true, resumeFinalize })
     // Final promotion clears its server Draft. A later explicit edit recreates
     // a short-lived Draft from RAW, so final RAW remains the only source.
     await saveLocal(game, true)

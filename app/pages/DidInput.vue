@@ -30,6 +30,7 @@ import { canPickForCard, groupCardsByPlayer, isSentOff, secondYellowCards, type 
 import type { HalfStatus, MatchSquadPlayer, SubRecord } from '~/composables/useMatchState'
 import type { DraftResponse } from '~/composables/useMatchCollaboration'
 import { FORMATIONS, GK_SLOT, assignmentsFromLineup, formationPickAreas } from '~/utils/formationLayout'
+import { formatMatchClock, formatMatchMinute } from '~/utils/matchClock'
 
 const route = useRoute()
 const home = computed(() => String(route.query.home ?? route.query.homeName ?? 'Vallecano').trim() || 'Vallecano')
@@ -108,11 +109,7 @@ const seconds = ref(
 // 수정 화면에서는 시간이 멈춰 있어야 한다 — 끝난(또는 나가기 직전 멈춘) 시각 그대로 고정.
 const paused = ref(isEditMode)
 const halfFinishBusy = ref(false)
-const clock = computed(() => {
-  const m = String(Math.floor(seconds.value / 60)).padStart(2, '0')
-  const s = String(seconds.value % 60).padStart(2, '0')
-  return `${m}:${s}`
-})
+const clock = computed(() => formatMatchClock(seconds.value, halfCode.value))
 function commitClockState(status = game.value.halfStatus) {
   const currentSeconds = Math.max(0, seconds.value)
   seconds.value = currentSeconds
@@ -744,10 +741,6 @@ function placeInsertedRecords(ids: string[]) {
 // 수정 화면에서 마지막으로 끼워 넣은 기록. 표를 맨 아래가 아니라 이 행으로 스크롤한다.
 const lastInsertedId = ref<string | null>(null)
 
-function fmtTime(sec: number) {
-  return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
-}
-
 // 표시용 행. 시간순 그대로 — 가장 최근 기록이 맨 아래에 온다.
 const rows = computed(() => {
   const flags = analysis.value.flags
@@ -755,7 +748,7 @@ const rows = computed(() => {
     .map((r, i) => ({
       id: r.id,
       no: i + 1,
-      time: fmtTime(r.seconds),
+      time: formatMatchClock(r.seconds, r.half ?? 'H1'),
       act: r.act,
       result: r.res, // 성공이면 'O' 를 그대로 보여준다
       area: String(r.area),
@@ -784,7 +777,7 @@ const rows = computed(() => {
       ? visibleRecords.value.filter(r => r.seconds <= draftSeconds.value).length
       : list.length
     list.splice(at, 0, {
-      id: '__draft__', no: at + 1, time: fmtTime(draftSeconds.value),
+      id: '__draft__', no: at + 1, time: formatMatchClock(draftSeconds.value, halfCode.value),
       act: '', result: '', area: areaFromPos(pendingPos.value),
       isDap: false, playerName: '', edited: false, draft: true,
     })
@@ -1048,7 +1041,6 @@ function openEdit(id: string) {
 function stepEditSeconds(delta: number) {
   editSeconds.value = Math.max(0, editSeconds.value + delta)
 }
-const editMinute = computed(() => Math.floor(editSeconds.value / 60))
 const editSecond = computed(() => editSeconds.value % 60)
 function stepEditMinute(delta: number) {
   editSeconds.value = Math.max(0, editSeconds.value + delta * 60)
@@ -1524,7 +1516,12 @@ function applyCardTimeIfEditing() {
   if (rec) rec.seconds = cardMinute.value * 60 + cardSecond.value
 }
 function bumpCardMinute(d: number) { cardMinute.value = Math.max(0, cardMinute.value + d); applyCardTimeIfEditing() }
-function bumpCardSecond(d: number) { let s = cardSecond.value + d; if (s < 0) { s = 59; bumpCardMinute(-1) }; if (s > 59) { s = 0; bumpCardMinute(1) }; cardSecond.value = s; applyCardTimeIfEditing() }
+function bumpCardSecond(delta: number) {
+  const elapsed = Math.max(0, cardMinute.value * 60 + cardSecond.value + delta)
+  cardMinute.value = Math.floor(elapsed / 60)
+  cardSecond.value = elapsed % 60
+  applyCardTimeIfEditing()
+}
 // 선수 목록에서 하이라이트할 대상 — 수정 중이면 그 카드의 현재 선수, 아니면 새 카드 입력 중인 선수.
 const cardHighlightPlayer = computed(() => cardPlayerEditTarget.value ? cardEditingRecord.value?.player ?? null : cardPlayer.value)
 // 상단 경고/퇴장 토글도 마찬가지 — 수정 중이면 그 카드의 실제 종류를 보여주고, 눌렀을 때도
@@ -1573,12 +1570,9 @@ function bumpSubMinute(delta: number) {
 }
 function bumpSubSecond(delta: number) {
   subTimeFollowsClock.value = false
-  let s = subSecond.value + delta
-  let m = subMinute.value
-  if (s < 0) { s += 60; m = Math.max(0, m - 1) }
-  else if (s > 59) { s -= 60; m += 1 }
-  subSecond.value = s
-  subMinute.value = m
+  const elapsed = Math.max(0, subTotalSeconds.value + delta)
+  subMinute.value = Math.floor(elapsed / 60)
+  subSecond.value = elapsed % 60
 }
 
 /** 슬롯 id → 그 자리에 있는 선수. 배치가 없으면 null */
@@ -1654,6 +1648,8 @@ const canSubmitSub = computed(() => subOutSlot.value !== null && subInSlot.value
 // 교체 기록을 "수정" 중이면 그 인덱스를 들고 있는다 — null 이면 새 교체를 추가하는 중.
 // 수정 중에도 game.subs 에서 지우지 않아서 목록에 계속 보인다.
 const editingSubIndex = ref<number | null>(null)
+const subRecordHalf = computed(() => editingSubIndex.value === null
+  ? halfCode.value : game.value.subs[editingSubIndex.value]?.half ?? halfCode.value)
 
 // 수정 중에는 ⇄ 버튼 자리에 적용 버튼이 있어서, 적용을 연달아 누르면 수정이 닫히자마자 나타난
 // ⇄ 버튼까지 눌린다. 수정(기록·카드·교체)이 끝난 직후 잠깐은 ⇄ 버튼 터치를 무시한다.
@@ -1778,7 +1774,7 @@ function submitSub() {
 
   const index = editingSubIndex.value
   // 수정할 때는 원래 교체가 있던 half 를 유지한다(지금 보고 있는 half 로 바뀌면 안 된다).
-  const recordHalf = index !== null ? (game.value.subs[index]?.half ?? halfCode.value) : halfCode.value
+  const recordHalf = subRecordHalf.value
   const record: SubRecord = {
     id: index !== null ? (game.value.subs[index]?.id ?? crypto.randomUUID()) : crypto.randomUUID(),
     half: recordHalf,
@@ -1935,12 +1931,16 @@ const cellRect = computed(() => {
 // 없으면(좌표 없이 만들어진 옛 레코드) area 가 속한 구역 사각형으로 대신 보여준다.
 const peekRecord = computed(() => records.value.find(r => r.id === peekId.value) ?? null)
 const editingRecord = computed(() => records.value.find(r => r.id === editingId.value) ?? null)
+const editClockHalf = computed(() => editingRecord.value?.half ?? halfCode.value)
 const infoRecord = computed(() => editingRecord.value ?? peekRecord.value)
 
 // 길게 눌러 수정 중인 레코드가 있으면, 위쪽 시계는 진행 시각 대신 그 레코드의 시간을
 // 보여준다. 수정 화면에서 짧게 눌러 기준 시각을 잡았으면 그 시각을 보여준다(clockSeconds).
 // seconds.value(전/후반 종료 시각, 나가기 시 저장되는 값)는 그대로 유지되므로 화면 표시만 바뀐다.
-const displayClock = computed(() => (editingRecord.value ? fmtTime(editSeconds.value) : fmtTime(clockSeconds.value)))
+const displayClock = computed(() => formatMatchClock(
+  editingRecord.value ? editSeconds.value : clockSeconds.value,
+  editingRecord.value ? editClockHalf.value : halfCode.value,
+))
 
 // Kick/Shooting 패널에 "채워서" 보여줄 레코드. 레코드를 클릭/롱프레스해서 보고 있는
 // 중이면 그 레코드를 그대로 보여준다. 아무것도 안 보고 있을 때는 마지막 레코드가
@@ -2685,7 +2685,7 @@ async function finishHalf() {
                 <template v-if="editingId === r.id">
                   <!-- 수정 중에도 Act/Result/Area 가 보이도록 원래 줄을 그대로 두고, 시간 조정·적용/삭제/취소는 그 아래 줄에 둔다 -->
                   <div class="editInfoRow" @pointerdown.stop @click="cancelEdit">
-                    <span class="noCell"><i v-if="r.edited" class="editedDot" />{{ r.no }}</span><span>{{ fmtTime(editSeconds) }}</span><span>{{ editPreview?.act ?? r.act }}</span><span>{{
+                    <span class="noCell"><i v-if="r.edited" class="editedDot" />{{ r.no }}</span><span>{{ formatMatchClock(editSeconds, editClockHalf) }}</span><span>{{ editPreview?.act ?? r.act }}</span><span>{{
                       editPreview?.result ?? r.result }}</span><span>{{ editPreview?.area ?? r.area }}</span>
                     <span>
                       <button v-if="editPlayerEligible" class="playerBtn" :class="{ assigned: !!r.playerName }"
@@ -2696,7 +2696,7 @@ async function finishHalf() {
                   <div class="editTimeRow" @pointerdown.stop @click.self="cancelEdit">
                     <div class="editClock" @click.self="cancelEdit">
                       <span class="editUnit"><button class="editStep" @click.stop="stepEditMinute(-1)">−</button><b>{{
-                        String(editMinute).padStart(2, '0') }}</b><button class="editStep"
+                        formatMatchMinute(editSeconds, editClockHalf) }}</b><button class="editStep"
                           @click.stop="stepEditMinute(1)">+</button></span>
                       <span class="editColon">:</span>
                       <span class="editUnit"><button class="editStep" @click.stop="stepEditSecond(-1)">−</button><b>{{
@@ -2798,7 +2798,7 @@ async function finishHalf() {
             <div v-if="cardPlayerEditTarget" class="cardEditBar">
               <div class="cardEditTime">
                 <button class="timeBtn" @click="bumpCardMinute(-1)">−</button>
-                <strong>{{ String(cardMinute).padStart(2, '0') }}</strong>
+                <strong>{{ formatMatchMinute(cardMinute * 60, cardEditingRecord?.half ?? halfCode) }}</strong>
                 <button class="timeBtn" @click="bumpCardMinute(1)">＋</button>
                 <b class="timeColon">:</b>
                 <button class="timeBtn" @click="bumpCardSecond(-1)">−</button>
@@ -2832,7 +2832,7 @@ async function finishHalf() {
                 <span>Half</span><span>Time</span><span>Player</span><span>Card</span><span></span>
               </div>
               <div v-for="{ c, queue, index } in cardHistory" :key="`${queue ? 'q' : 'c'}${index}`" class="cardHistRow">
-                <span>{{ subHalfLabel[c.half] }}</span><span>{{ fmtTime(c.seconds) }}</span><span class="histPlayer"><b
+                <span>{{ subHalfLabel[c.half] }}</span><span>{{ formatMatchClock(c.seconds, c.half) }}</span><span class="histPlayer"><b
                     v-if="findPlayer(c.player)" class="histNo" :class="`pos${findPlayer(c.player)!.pos}`">{{
                       findPlayer(c.player)!.no }}</b>{{
                       findPlayer(c.player)?.name ?? '-' }}</span><span class="cardKind">{{ c.card === 'Y' ? '🟨 경고' : '🟥 퇴장' }}<template v-if="secondYellows.has(c)"> · 🟥 퇴장</template></span>
@@ -2858,7 +2858,7 @@ async function finishHalf() {
             <div v-if="editingSubIndex !== null" class="cardEditBar">
               <div class="cardEditTime">
                 <button class="timeBtn" @click="bumpSubMinute(-1)">−</button>
-                <strong>{{ String(subMinute).padStart(2, '0') }}</strong>
+                <strong>{{ formatMatchMinute(subTotalSeconds, subRecordHalf) }}</strong>
                 <button class="timeBtn" @click="bumpSubMinute(1)">＋</button>
                 <b class="timeColon">:</b>
                 <button class="timeBtn" @click="bumpSubSecond(-1)">−</button>
@@ -2906,7 +2906,7 @@ async function finishHalf() {
               <div v-for="(s, i) in game.subs" v-else :key="i" class="subHistRow"
                 :class="{ editing: editingSubIndex === i }" @click="onSubHistRowClick(i)">
                 <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
-                <span class="hTime">{{ fmtTime(s.seconds) }}</span>
+                <span class="hTime">{{ formatMatchClock(s.seconds, s.half) }}</span>
                 <span class="hP inP histPlayer"><b v-if="findPlayer(s.inPlayer)" class="histNo">{{
                   findPlayer(s.inPlayer)!.no }}</b>{{ findPlayer(s.inPlayer)?.name ?? '-' }}</span>
                 <span class="hP outP histPlayer"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{

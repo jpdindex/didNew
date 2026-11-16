@@ -18,6 +18,7 @@ from backend.api.api_legacy_import import router as legacy_import_router
 from backend.api.api_match_kpis import router as match_kpis_router
 from backend.api.api_match_input import router as match_input_router
 from backend.api.api_match_ratings import router as match_ratings_router
+from backend.api.api_goalx import router as goalx_router
 from backend.system.system_aifootballx import close_delivery_service
 from backend.system.system_firestore import (
     BackendError,
@@ -104,6 +105,7 @@ app.include_router(legacy_import_router, prefix=settings.api_prefix)
 app.include_router(match_kpis_router, prefix=settings.api_prefix)
 app.include_router(match_input_router, prefix=settings.api_prefix)
 app.include_router(match_ratings_router, prefix=settings.api_prefix)
+app.include_router(goalx_router, prefix=settings.api_prefix)
 
 
 @app.get("/", include_in_schema=False)

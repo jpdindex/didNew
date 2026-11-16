@@ -15,7 +15,7 @@ from time import monotonic
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from firebase_admin import auth
 from google.api_core.exceptions import FailedPrecondition
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from starlette.websockets import WebSocketState
 
 from backend.api.api_player_requests import ManagerUser, manager_user
@@ -744,7 +744,7 @@ def _raw_values(
         }))
     cards = [
         (f"{item.half}_{item.halfSeconds}_{item.playerId}_{index}", {
-            **item.model_dump(mode="python"), "createdAt": now,
+            **item.model_dump(exclude={"id"}, mode="python"), "createdAt": now,
         })
         for index, item in enumerate(payload.cards)
         if item.half in selected_halves
@@ -903,6 +903,20 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
         logger.info("Schedule summary index is still building; using legacy monthly query")
         summaries = []
         summary_query_available = False
+    # Older summaries saved both score fields from the last Draft to write.
+    # Recover only active sides whose summary predates side-specific scores.
+    legacy_scores = []
+    for summary in summaries:
+        for side, key in (("H", "home"), ("A", "away")):
+            state = (summary.get("inputStatus") or {}).get(side) or {}
+            if state.get("lifecycleStatus") not in (None, "ready") and state.get("rawStatus") != "final" and "score" not in state:
+                legacy_scores.append((summary, side, key))
+    if legacy_scores:
+        drafts = data.get_input_draft_participants_many(list({item["gmId"] for item, _, _ in legacy_scores}))
+        for summary, side, key in legacy_scores:
+            own_score = (drafts.get(summary["gmId"], {}).get(side, {}).get("score") or {}).get(key)
+            if isinstance(own_score, int):
+                summary["score"] = {**summary["score"], key: own_score}
     if not day and summary_query_available and data.input_summary_backfill_complete_for_month(year, month):
         # The schedule read model carries every card's participant roster and
         # state. Once a season migration is complete this is the normal path:
@@ -965,15 +979,11 @@ def list_input_matches(year: int = Query(..., ge=2000, le=2100), month: int = Qu
             roster += [item for item in collaboration[side].get("participants") or [] if item.get("uid") not in known]
             collaboration[side] = {**collaboration[side], "participants": roster}
 
-        # Imported/finalized fixtures keep their official score on matches.
-        # During live input, both team Drafts carry the same scoreboard; use a
-        # shared Draft score when present so the schedule does not lag behind.
-        live_score = next(
-            (summary.get("score") for summary in (collaboration["H"], collaboration["A"])
-            if isinstance(summary.get("score"), dict)),
-            None,
-        )
-        score = live_score or {"home": match.score.home, "away": match.score.away}
+        score = {"home": match.score.home, "away": match.score.away}
+        for side, key in (("H", "home"), ("A", "away")):
+            own_score = (collaboration[side].get("score") or {}).get(key)
+            if recording_status[side] != "final" and isinstance(own_score, int):
+                score[key] = own_score
 
         def _input_state(side: Side) -> dict[str, Any]:
             raw_status = recording_status[side]
@@ -1295,8 +1305,13 @@ def finalize_advanced(gm_id: str, side: Side, user: RequiredUser = None, request
     data = JpdDidData()
     if not request:
         raise BackendError('Final update requires a command ID and server version', status_code=422, code='command_required')
+
     def promote(draft):
-        payload = MatchInputPayload.model_validate(draft['payload'])
+        try:
+            payload = MatchInputPayload.model_validate(draft['payload'])
+        except ValidationError as error:
+            raise BackendError('최종 갱신용 Draft의 형식이 올바르지 않습니다.',
+                               status_code=422, code='finalize_invalid_draft') from error
         return _promote(data, payload, draft, user.uid, status='final', halves={'H1', 'H2'}, delete_draft=False).model_dump(mode='json')
     return PromotionResponse.model_validate(finalize_command(data, gm_id, side, request, user.uid, promote))
 

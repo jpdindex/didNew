@@ -68,14 +68,14 @@ function load(file, globals, imports = {}) {
   return module.exports
 }
 
-function environment(transport, indexedDB = fakeIndexedDB(), nativeBatch = false) {
+function environment(transport, indexedDB = fakeIndexedDB(), nativeBatch = false, clock = Date) {
   const timers = []
   let serial = 0
   const auth = { currentUser: { uid: 'p' } }
   const globals = {
-    indexedDB, AbortSignal,
+    indexedDB, AbortSignal, Date: clock,
     crypto: { randomUUID: () => `command-${++serial}` },
-    setTimeout: callback => { timers.push(callback); return callback }, clearTimeout(callback) {
+    setTimeout: (callback, delay) => { callback.delay = delay; timers.push(callback); return callback }, clearTimeout(callback) {
       const index = timers.indexOf(callback)
       if (index >= 0) timers.splice(index, 1)
     },
@@ -193,6 +193,65 @@ test('RAW restoration exposes server failure while retaining automatic retry', a
   assert.equal(env.timers.length, 1)
 })
 
+test('finalization backs off, stops after three attempts, and retries the same request explicitly', async () => {
+  let now = 10_000
+  let available = false
+  const sent = []
+  const clock = { now: () => now }
+  const transport = async (url, options = {}) => {
+    assert.ok(url.endsWith('/finalize'), 'a retry must not reload or save the entire Draft')
+    const body = JSON.parse(options.body)
+    sent.push(body)
+    if (!available) throw Object.assign(new Error('server unavailable'), { status: 500 })
+    return { commandId: body.commandId, savedRevision: 8 }
+  }
+  const env = environment(transport, undefined, false, clock)
+  await env.room.observe('m', 'H', 7, 1)
+  const attached = await env.room.attach('m', 'H', () => {})
+  assert.equal(await env.room.submit('m', 'H', 'finalize', {}), false)
+  assert.equal(sent.length, 1)
+  assert.equal(env.timers[0].delay, 3_000)
+  await env.room.flush('m', 'H')
+  assert.equal(sent.length, 1)
+  now += 3_000
+  env.timers.shift()()
+  await new Promise(setImmediate)
+  assert.equal(sent.length, 2)
+  assert.equal(env.timers[0].delay, 10_000)
+  now += 10_000
+  env.timers.shift()()
+  await new Promise(setImmediate)
+  assert.equal(sent.length, 3)
+  assert.equal(attached.status.phase, 'error')
+  assert.equal(env.timers.length, 0)
+
+  const reloaded = environment(transport, env.indexedDB, false, clock)
+  assert.equal(await reloaded.room.flush('m', 'H'), false)
+  assert.equal(sent.length, 3)
+  assert.equal(reloaded.timers.length, 0)
+  const [resumeFinalize] = await reloaded.room.pending('m', 'H')
+  available = true
+  assert.equal(await reloaded.room.submit('m', 'H', 'finalize', {}, { resumeFinalize }), true)
+  assert.equal(sent.length, 4)
+  assert.ok(sent.every(body => JSON.stringify(body) === JSON.stringify(sent[0])))
+  assert.equal(env.indexedDB.rows.size, 0)
+})
+
+test('finalization validation failure stops immediately and keeps its request for a manual retry', async () => {
+  let writes = 0
+  const env = environment(async (url, options = {}) => {
+    assert.ok(url.endsWith('/finalize'))
+    writes++
+    throw Object.assign(new Error('invalid Draft'), { status: 422, code: 'finalize_invalid_draft' })
+  })
+  await env.room.observe('m', 'H', 7, 0)
+  await assert.rejects(env.room.submit('m', 'H', 'finalize', {}, { throwOnFailure: true }), /finalize_invalid_draft/)
+  assert.equal(await env.room.flush('m', 'H'), false)
+  assert.equal(writes, 1)
+  assert.equal(env.timers.length, 0)
+  assert.equal(env.indexedDB.rows.size, 1)
+})
+
 test('RAW restore refreshes a rejected stale version without replacing the command ID', async () => {
   const sent = []
   const env = environment(async (url, options = {}) => {
@@ -231,7 +290,7 @@ test('previously blocked RAW restore is recovered instead of permanently blockin
   assert.equal(env.indexedDB.rows.size, 0)
 })
 
-function inputPageEnvironment() {
+function inputPageEnvironment(resumeHalf = '전반') {
   const vue = require('vue')
   const text = fs.readFileSync(path.resolve(__dirname, '../pages/DidInput.vue'), 'utf8')
   const script = text.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
@@ -239,7 +298,7 @@ function inputPageEnvironment() {
   const globals = {
     ...vue, onMounted() {}, onUnmounted() {}, onBeforeRouteLeave() {},
     watch: (...args) => { const stop = vue.watch(...args); watchers.push(stop); return stop },
-    useRoute: () => ({ query: { matchId: 'm', role: 'assistant', mode: '분석', resumeHalf: '전반' } }),
+    useRoute: () => ({ query: { matchId: 'm', role: 'assistant', mode: '분석', resumeHalf } }),
     useBackendApi: () => ({ request: async () => ({}) }),
     useMatchDraft: () => ({ saveLocal: async () => true }),
     useReturnNavigation: () => () => {},
@@ -264,6 +323,7 @@ function inputPageEnvironment() {
     '~/utils/didLogic': load('utils/didLogic.ts', {}), '~/utils/formationLayout': formation,
     '~/utils/grass': load('utils/grass.ts', {}), '~/utils/goalCoordinates': load('utils/goalCoordinates.ts', {}),
     '~/utils/card': load('utils/card.ts', {}),
+    '~/utils/matchClock': load('utils/matchClock.ts', {}),
     '~/composables/useInputPreview': { useInputPreview: () => ({ preview: records => ({ flags: new Map(records.map(r => [r.id, { isDap: true }])) }), schedule() {} }) },
   }
   const context = vm.createContext({ ...globals, console, module: { exports: {} }, exports: {}, require: name => {
@@ -274,7 +334,7 @@ function inputPageEnvironment() {
   const api = vm.runInContext('({ clickRecord, pinHistory, followLatestRecords, openPlayerPick, openEdit, startPress, movePress, endPress, cancelPress, stepSeconds, clickPitch, clickAct, records, rows, peekId, historyPinned, anchorSeconds, clockSeconds, seconds, editingId, playerPickFor, outfieldPickAreas, pickGoalkeeper, subPickPlayers, pendingPos, isPrimary, tableEl })', context)
   const receive = text.match(/applyRecords: \(remoteRecords\) => \{([\s\S]*?)\r?\n    },\r?\n    applyCards/)[1]
   vm.runInContext(`globalThis.receiveRemoteRecords = (remoteRecords) => { const isCurrentSession = () => true; ${receive} }`, context)
-  const shots = vm.runInContext('({ clickOuterZone, clickGoalFrame, selectOuterMiss, confirmGoalFrame, applyEdit, cancelEdit, confirmOuterPosition, cancelOuterPosition, pendingOuterResult, pendingShot, editSeconds, clearPendingEntry })', context)
+  const shots = vm.runInContext('({ clickOuterZone, clickGoalFrame, selectOuterMiss, confirmGoalFrame, applyEdit, cancelEdit, confirmOuterPosition, cancelOuterPosition, pendingOuterResult, pendingShot, editSeconds, stepEditSecond, displayClock, clearPendingEntry })', context)
   return { ...api, ...shots, game, timers, sentRecords, receive: context.receiveRemoteRecords, tick: vue.nextTick,
     enableSaves: () => vm.runInContext('draftReady = true', context),
     dispose: () => { api.cancelPress(); watchers.forEach(stop => stop()) } }
@@ -296,6 +356,24 @@ async function flushRecordSaves(env) {
   }
   await settle()
 }
+
+test('saved second-half records display match time and edits save elapsed seconds', async () => {
+  const env = inputPageEnvironment('후반')
+  try {
+    const record = env.records.value[0]
+    Object.assign(record, { half: 'H2', seconds: 913 })
+    assert.equal(env.rows.value.find(row => row.id === record.id).time, '60:13')
+    env.enableSaves()
+    env.openEdit(record.id)
+    assert.equal(env.displayClock.value, '60:13')
+    env.stepEditSecond(1)
+    assert.equal(env.displayClock.value, '60:14')
+    env.applyEdit()
+    await flushRecordSaves(env)
+    assert.equal(env.sentRecords[0][0].seconds, 914)
+    assert.equal(env.rows.value.find(row => row.id === record.id).time, '60:14')
+  } finally { env.dispose() }
+})
 
 for (const zone of ['L', 'R', 'H']) {
   test(`editing shot ${zone} keeps all position adjustments local until Apply`, async () => {

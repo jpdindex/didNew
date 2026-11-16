@@ -395,6 +395,8 @@ def test_lobby_state_is_two_projected_heads_without_event_or_presence_scans(data
     calls = []
     root = data.db.documents['inputDrafts/m_H']
     root.update(revision=7, roomEpoch=2, setup={'revision': 3}, sharedState={'halfStatus': 'H1', 'seconds': 20, 'participantRole': 'primary'})
+    root['sharedState'].update(homeScore=1, awayScore=0)
+    data.db.documents['inputDrafts/m_A'] = {'payload': {'homeScore': 0, 'awayScore': 3}}
     for index in range(event_count):
         data.db.documents[f'inputDrafts/m_H/records/r{index}'] = record(f'r{index}')
     def get_all(references, *, field_paths, **kwargs):
@@ -403,10 +405,12 @@ def test_lobby_state_is_two_projected_heads_without_event_or_presence_scans(data
     data.db.get_all = get_all
     result = live.lobby_state(data, 'm')
     assert len(calls) == 1 and calls[0][0] == 2
-    assert set(calls[0][1]) == {'revision', 'roomEpoch', 'setup.revision', 'liveClosed', 'sharedState'}
+    assert set(calls[0][1]) == {'revision', 'roomEpoch', 'setup.revision', 'liveClosed', 'sharedState',
+                               'payload.homeScore', 'payload.awayScore'}
     assert result['H'] == {'revision': 7, 'roomEpoch': 2, 'setupRevision': 3, 'closed': False,
-                           'sharedState': {'halfStatus': 'H1', 'seconds': 20}}
+                           'score': 1, 'sharedState': {'halfStatus': 'H1', 'seconds': 20, 'homeScore': 1, 'awayScore': 0}}
     assert result['A']['revision'] == 0
+    assert result['A']['score'] == 3
     assert all('records' not in state and 'participants' not in state and 'payload' not in state for state in result.values())
 
 
@@ -509,7 +513,8 @@ def test_correction_draft_never_reopens_final_raw_on_schedule(data, half, raw_st
 def test_final_bootstrap_ignores_old_summary_that_was_overwritten_by_correction(data):
     from types import SimpleNamespace
     match = SimpleNamespace(homeTeamId='home', awayTeamId='away', leagueId='EPL', seasonId='20242025',
-                            round=36, date='2025.05.11', kickoffTime='14:15', stadiumId=None, matchType='league')
+                            round=36, date='2025.05.11', kickoffTime='14:15', stadiumId=None, matchType='league',
+                            score=SimpleNamespace(home=1, away=3))
     data.get_match = lambda _: match
     data.db.documents['matches/m/recordings/H'] = {'status': 'final', 'fieldSide': 'left'}
     data.db.documents['matches/m/inputSummaries/current'] = {'inputStatus': {
@@ -523,6 +528,7 @@ def test_final_bootstrap_ignores_old_summary_that_was_overwritten_by_correction(
     assert result['inputStatus']['H']['lifecycleStatus'] == 'final'
     assert result['inputStatus']['H']['completed']
     assert result['inputSetup'] == {'H': None, 'A': None}
+    assert result['score'] == {'home': 1, 'away': 3}
 
 
 def test_summary_refresh_keeps_final_raw_done_while_preserving_manager_roster(data):
@@ -1127,7 +1133,7 @@ def test_queued_summary_batches_latest_raw_and_draft_without_changing_live_score
     assert state['rawStatus'] == raw_status
     assert state['lifecycleStatus'] == ('final' if raw_status else 'H1')
     assert state['participants'][0]['role'] == 'manager'
-    assert updates[0]['score'] == {'home': 2, 'away': 3}
+    assert updates[0]['score'] == (None if raw_status == 'final' else {'home': 2})
     assert rpc.documents == before
     # No status survives in a process cache: the next refresh sees new RAW.
     rpc.documents['matches/m/recordings/H'] = {'status': 'final'}

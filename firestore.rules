@@ -37,6 +37,7 @@ service cloud.firestore {
     // API. Clients cannot bypass review by writing approval or roster data.
     match /playerRegistrationRequests/{document=**} { allow read, write: if false; }
     match /playerRegistrationRosterVersions/{document=**} { allow read, write: if false; }
+    match /GoalAalysis/{document=**} { allow read, write: if false; }
     match /stadiums/{document=**} { allow read, write: if manager(); }
     match /coachContracts/{document=**} { allow read, write: if manager(); }
     match /coaches/{document=**} { allow read, write: if manager(); }

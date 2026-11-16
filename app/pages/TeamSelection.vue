@@ -4,6 +4,7 @@ import type { HalfStatus, MatchSnapshot, MatchSquadPlayer, MatchState, SubRecord
 import type { Half } from '~/types/schema'
 import type { InputPayload } from '~/composables/useMatchDraft'
 import { cloneState, payloadFromState } from '~/composables/useMatchDraft'
+import { formatMatchClock, formatMatchMinute } from '~/utils/matchClock'
 import {
   BENCH_COUNT,
   BENCH_IDS,
@@ -149,6 +150,7 @@ type InputBootstrap = {
   inputStatus: { H: InputSideStatus; A: InputSideStatus }
   inputSetup: { H: InputSetup | null; A: InputSetup | null }
   session: InputBootstrapSession
+  score?: { home: number; away: number }
   dashboardKpiHalves?: Array<'all' | 'H1' | 'H2'>
   dashboardKpis: { H: Record<'all' | 'H1' | 'H2', DashboardKpi>; A: Record<'all' | 'H1' | 'H2', DashboardKpi> }
   lobbyState?: Record<'H' | 'A', LobbySideState>
@@ -160,8 +162,11 @@ type LobbySideState = {
   roomEpoch: number
   setupRevision: number
   closed: boolean
+  score?: number | null
   sharedState: Partial<MatchState>
 }
+
+const lobbyScore = ref<{ home: number; away: number } | null>(null)
 
 function applyInputSetup(setup: InputSetup | null | undefined) {
   if (!setup || !FORMATIONS[setup.formationKey]) return
@@ -216,6 +221,15 @@ async function startLobbyCollaboration() {
       // Draft shared state contains only lifecycle, score and timer fields.
       // Keep route-selected team/role and the loaded squads local to this lobby.
       Object.assign(game.value, state)
+      if (lobbyScore.value) {
+        const ownKey = targetTeam === 'away' ? 'away' : 'home'
+        const ownScore = targetTeam === 'away' ? state.awayScore : state.homeScore
+        if (inputStatus.value[targetTeam === 'away' ? 'A' : 'H'].rawStatus !== 'final' && typeof ownScore === 'number') {
+          lobbyScore.value[ownKey] = ownScore
+        }
+        game.value.homeScore = lobbyScore.value.home
+        game.value.awayScore = lobbyScore.value.away
+      }
       game.value.matchId = targetMatchId
       game.value.team = targetTeam
       game.value.participantRole = targetRole
@@ -347,6 +361,11 @@ function applyBootstrap(payload: InputBootstrap) {
   // Drafts are transient collaboration state. The snapshot is the lobby
   // authority for formation, field side and player placement.
   applyInputSetup(selectedSetup)
+  if (payload.score) {
+    lobbyScore.value = { ...payload.score }
+    game.value.homeScore = payload.score.home
+    game.value.awayScore = payload.score.away
+  }
   return Boolean(selectedSetup) || (payload.session.status === 'ok' && Boolean(payload.session.payload))
 }
 
@@ -410,6 +429,9 @@ async function refreshLobbyState() {
       `/api/v1/match-input/matches/${encodeURIComponent(lobbyMatchId)}/lobby-state`,
     )
     if (!isCurrentLobby()) return
+    if (!lobbyScore.value && (typeof response.sides.H.score === 'number' || typeof response.sides.A.score === 'number')) {
+      lobbyScore.value = { home: game.value.homeScore, away: game.value.awayScore }
+    }
     const selectedSide = lobbyTeam === 'away' ? 'A' : 'H'
     const selected = response.sides[selectedSide]
     if (joinedLobbyRole === undefined && inputStatus.value[selectedSide].rawStatus !== 'final') {
@@ -418,11 +440,18 @@ async function refreshLobbyState() {
     }
     for (const side of ['H', 'A'] as const) {
       const state = response.sides[side]
+      if (lobbyScore.value && typeof state.score === 'number' && (state.closed || inputStatus.value[side].rawStatus !== 'final')) {
+        lobbyScore.value[side === 'H' ? 'home' : 'away'] = state.score
+      }
       if (state.closed) {
         inputStatus.value[side] = { ...inputStatus.value[side], rawStatus: 'final', completed: true, lifecycleStatus: 'final' }
       } else if (state.sharedState.halfStatus && inputStatus.value[side].rawStatus !== 'final') {
         inputStatus.value[side].lifecycleStatus = state.sharedState.halfStatus
       }
+    }
+    if (lobbyScore.value) {
+      game.value.homeScore = lobbyScore.value.home
+      game.value.awayScore = lobbyScore.value.away
     }
     const needsSetup = (['H', 'A'] as const).some(side => response.sides[side].setupRevision > lobbySetupRevisions[side])
     if (needsSetup) {
@@ -1190,10 +1219,7 @@ async function enterAsAssistant() {
 // 나갔던 시간 그대로 다시 들어간다. game.seconds 를 건드리지 않는 것이 핵심이다.
 const isPaused = computed(() => game.value.halfStatus === 'H1' || game.value.halfStatus === 'H2')
 const pausedHalf = computed<'전반' | '후반'>(() => (game.value.halfStatus === 'H2' ? '후반' : '전반'))
-const pausedClock = computed(() => {
-  const s = game.value.seconds
-  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
-})
+const pausedClock = computed(() => formatMatchClock(game.value.seconds, game.value.halfStatus === 'H2' ? 'H2' : 'H1'))
 function reenterHalf() {
   navigateTo({ path: '/DidInput', query: didInputQuery(pausedHalf.value) })
 }
@@ -1373,7 +1399,7 @@ onMounted(async () => {
   }, 250)
   // Check only two compact head versions after the initial paint. Fetch KPI
   // or setup only after a change; never scan full Drafts just for viewing.
-  if (selectedState.rawStatus !== 'final') {
+  if (selectedState.rawStatus !== 'final' || inputStatus.value[lobbyTeam === 'away' ? 'H' : 'A'].rawStatus !== 'final') {
     dashboardKpiTimer = setInterval(() => {
       void refreshLobbyState()
     }, 5000)
@@ -1399,9 +1425,9 @@ async function finishMatch() {
     game.value.halfStatus = 'final'
     game.value.clockStartedAt = null
     if (!game.value.lifecycleControl) throw new Error('주 분석관만 제출 또는 최종 갱신을 할 수 있습니다.')
-    if (!await saveDraft(game.value)) throw new Error('최종 Draft를 검증 API에 전달하지 못했습니다.')
     // BASIC 주 분석관은 최종 Draft를 제출만 한다. RAW 승격은 관리자 승인 화면에서만 가능하다.
     if (game.value.recorderLevel === 'advanced') await finalizeAdvanced(game.value)
+    else if (!await saveDraft(game.value)) throw new Error('최종 Draft를 검증 API에 전달하지 못했습니다.')
   } catch (error) {
     game.value.halfStatus = 'H2_done'
     lifecycleError.value = error instanceof Error ? error.message : '최종 데이터 처리에 실패했습니다.'
@@ -1632,12 +1658,9 @@ const subTimeSecond = ref(0)
 const subTimeTotal = computed(() => subTimeMinute.value * 60 + subTimeSecond.value)
 function bumpSubMinute(delta: number) { subTimeMinute.value = Math.max(0, subTimeMinute.value + delta) }
 function bumpSubSecond(delta: number) {
-  let next = subTimeSecond.value + delta
-  let minute = subTimeMinute.value
-  if (next < 0) { next = 59; minute = Math.max(0, minute - 1) }
-  if (next > 59) { next = 0; minute += 1 }
-  subTimeSecond.value = next
-  subTimeMinute.value = minute
+  const elapsed = Math.max(0, subTimeTotal.value + delta)
+  subTimeMinute.value = Math.floor(elapsed / 60)
+  subTimeSecond.value = elapsed % 60
 }
 
 const byNo = (a: { p: { no: string } | null }, b: { p: { no: string } | null }) => Number(a.p?.no ?? 0) - Number(b.p?.no ?? 0)
@@ -1867,9 +1890,6 @@ function playerAt(id: string) {
 // ---- 교체 이력 표시 — DidInput.vue 의 교체 패널과 같은 형식으로 보여준다 ----
 const HALF_ORDER: Record<string, number> = { H1: 1, H2: 2, H3: 3, H4: 4 }
 const subHalfLabel: Record<string, string> = { H1: '전반', H2: '후반', H3: '연장전반', H4: '연장후반' }
-function fmtTime(sec: number) {
-  return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
-}
 const findPlayer = (playerId: string) => players.value.find(item => item.playerId === playerId)
 /** 잘못 저장된 교체 되돌리기 — 자리도 원래대로 돌려놓는다(DidInput.vue 의 undoSub 와 동일 로직). 확정은 Submit 에서. */
 function undoSub(index: number) {
@@ -1923,7 +1943,7 @@ function undoSub(index: number) {
             </button>
             <!-- 가운데 VS 자리에 스코어와 경기 상태(전반 종료 등)를 둔다 -->
             <div class="versus">
-              <div class="score">{{ game.homeScore }} : {{ game.awayScore }}</div>
+              <div class="score">{{ lobbyScore?.home ?? game.homeScore }} : {{ lobbyScore?.away ?? game.awayScore }}</div>
               <div class="status">{{ statusLabel }}</div>
             </div>
             <button class="club" :class="{ active: game.team === 'away' }"
@@ -2066,7 +2086,7 @@ function undoSub(index: number) {
                 <div class="subTimeRow">
                   <span>교체 시각</span>
                   <button class="subTimeBtn" @click="bumpSubMinute(-1)">−</button>
-                  <strong>{{ String(subTimeMinute).padStart(2, '0') }}</strong>
+                  <strong>{{ formatMatchMinute(subTimeTotal, subMoment()?.half ?? 'H1') }}</strong>
                   <button class="subTimeBtn" @click="bumpSubMinute(1)">＋</button>
                   <b>:</b>
                   <button class="subTimeBtn" @click="bumpSubSecond(-1)">−</button>
@@ -2112,7 +2132,7 @@ function undoSub(index: number) {
                     <div v-if="!game.subs.length && !pendingSubs.length" class="subHistEmpty">교체 기록이 없습니다.</div>
                     <div v-for="(s, i) in game.subs" :key="`saved${i}`" class="subHistRow">
                       <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
-                      <span class="hTime">{{ fmtTime(s.seconds) }}</span>
+                      <span class="hTime">{{ formatMatchClock(s.seconds, s.half) }}</span>
                       <span class="hP inP"><b v-if="findPlayer(s.inPlayer)" class="histNo">{{
                         findPlayer(s.inPlayer)!.no }}</b>{{ findPlayer(s.inPlayer)?.name ?? '-' }}</span>
                       <span class="hP outP"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
@@ -2121,7 +2141,7 @@ function undoSub(index: number) {
                     </div>
                     <div v-for="(s, i) in pendingSubs" :key="`pending${i}`" class="subHistRow pending">
                       <span class="hHalf">{{ subHalfLabel[s.half] }}</span>
-                      <span class="hTime">{{ fmtTime(s.seconds) }}</span>
+                      <span class="hTime">{{ formatMatchClock(s.seconds, s.half) }}</span>
                       <span class="hP inP"><b v-if="findPlayer(s.inPlayer)" class="histNo">{{
                         findPlayer(s.inPlayer)!.no }}</b>{{ findPlayer(s.inPlayer)?.name ?? '-' }}</span>
                       <span class="hP outP"><b v-if="findPlayer(s.outPlayer)" class="histNo">{{
@@ -2252,6 +2272,8 @@ function undoSub(index: number) {
                     @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? (lifecycleBusy ? '저장 중…' : '변경 완료') : '경기 정보 변경' }}</button>
                   <button v-if="matchInfoEditMode" class="editBtn cancelEditBtn" :disabled="lifecycleBusy" @click="cancelMatchInfoEdit">변경 취소</button>
                   <button v-if="!matchInfoEditMode" class="editBtn" :disabled="lifecycleBusy" @click="editFinal">수정</button>
+                  <button v-if="!matchInfoEditMode && game.lifecycleControl && game.recorderLevel === 'advanced' && roomStatus?.finalizationPending"
+                    class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">최종 갱신 재시도</button>
                 </div>
               </template>
               <p v-if="lifecycleError" class="lifecycleError">{{ lifecycleError }}</p>

@@ -18,7 +18,7 @@ from firebase_admin import firestore
 from google.api_core.exceptions import Aborted, DeadlineExceeded, ServiceUnavailable
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-from backend.system.system_firestore import BackendError, utc_now
+from backend.system.system_firestore import BackendError, draft_team_score, utc_now
 
 
 logger = logging.getLogger(__name__)
@@ -677,7 +677,8 @@ def lobby_head_state(document):
 def lobby_state(data, gm_id):
     """Two projected head reads, independent of ACT/card/substitution counts."""
     references = {side: data._input_setup_reference(gm_id, side) for side in ('H', 'A')}
-    fields = ['revision', 'roomEpoch', 'setup.revision', 'liveClosed', 'sharedState']
+    fields = ['revision', 'roomEpoch', 'setup.revision', 'liveClosed', 'sharedState',
+              'payload.homeScore', 'payload.awayScore']
     snapshots = {snapshot.reference.path: snapshot for snapshot in data.db.get_all(
         list(references.values()), field_paths=fields, retry=None, timeout=10,
     )}
@@ -686,6 +687,7 @@ def lobby_state(data, gm_id):
         snapshot = snapshots.get(reference.path)
         document = snapshot.to_dict() or {} if snapshot else {}
         result[side] = lobby_head_state(document)
+        result[side]['score'] = draft_team_score(document, side)
     return result
 
 

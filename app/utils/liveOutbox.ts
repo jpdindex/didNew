@@ -9,6 +9,8 @@ export interface LiveCommand {
   order?: number
   blocked?: string
   attempted?: boolean
+  finalizeAttempts?: number
+  finalizeRetryAt?: number
 }
 
 // Separate from UI checkpoints: a snapshot is never an offline command.

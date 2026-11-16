@@ -8,6 +8,8 @@ interface RoomStatus {
   roomEpoch: number
   savedCommandId: string | null
   pending: number
+  finalizationPending?: boolean
+  finalizationRetryRequired?: boolean
   error: string
   participants: Record<string, { role?: string; name?: string; online?: boolean }>
   conflict?: { commandId: string; local: string; server: string; revision: number }
@@ -40,6 +42,15 @@ interface Room {
 }
 const rooms = new Map<string, Room>()
 const store = new LiveCommandStore()
+const FINALIZE_RETRY_DELAYS = [3_000, 10_000]
+const FINALIZE_MAX_ATTEMPTS = FINALIZE_RETRY_DELAYS.length + 1
+const FINALIZE_RETRY_EXHAUSTED = 'finalize_retry_exhausted'
+const FINALIZE_RETRY_MESSAGE = '자동 재시도 횟수를 모두 사용했습니다. 최종 갱신을 다시 눌러주세요.'
+
+function canRetryFinalization(command: LiveCommand) {
+  return command.kind === 'finalize'
+    && (command.blocked === FINALIZE_RETRY_EXHAUSTED || command.blocked === 'finalize_invalid_draft')
+}
 let deviceId: string | undefined
 function editingDevice() {
   if (deviceId) return deviceId
@@ -193,9 +204,9 @@ export function useLiveRoom() {
         },
         send: command => request<any>(`/api/v1/match-input/drafts/${encodeURIComponent(gmId)}/${side}${command.kind === 'setup' ? '/setup' : command.kind === 'finalize' ? '/finalize' : command.kind === 'restore' ? '/restore-raw' : ''}`, {
           expectedUid: uid, method: command.kind === 'finalize' || command.kind === 'restore' ? 'POST' : 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(command.request),
-          // RAW restoration reads and writes the complete match in chunks;
+          // RAW restoration and finalization read and write the match in chunks;
           // it cannot share the short timeout of a single live input event.
-          signal: AbortSignal.timeout(command.kind === 'restore' ? 120_000 : 15_000),
+          signal: AbortSignal.timeout(command.kind === 'restore' || command.kind === 'finalize' ? 120_000 : 15_000),
         }),
       }
       rooms.set(key, room)
@@ -209,6 +220,7 @@ export function useLiveRoom() {
     if (room.timer) clearTimeout(room.timer)
     room.timer = undefined
     let activeCommand: LiveCommand | undefined
+    let finalizeRetryAt: number | undefined
     const confirmCommand = async (command: LiveCommand, response: any) => {
       // Only the setup endpoint nests its command receipt in inputSetup.
       // Restore/Draft responses include display setup too, but their receipt
@@ -249,10 +261,11 @@ export function useLiveRoom() {
         }
       }
       room.status.pending = commands.length
+      room.status.finalizationPending = commands.some(item => item.kind === 'finalize')
       if (!commands.length) { room.status.phase = 'saved'; room.status.error = ''; return }
       // Prepared entry data is already a durable baseline. Read only when it
       // is unavailable or a transport failure requires recovery.
-      if (!room.initialized || room.needsRecovery) {
+      if (commands[0].kind !== 'finalize' && (!room.initialized || room.needsRecovery)) {
         const baseline = await room.read()
         seedRoom(room, baseline)
         if (baseline.status === 'ok') notifyRoom(room, baseline)
@@ -288,7 +301,11 @@ export function useLiveRoom() {
         }
         if (command.blocked) {
           room.status.phase = command.blocked === 'draft_conflict' ? 'conflict' : 'error'
-          room.status.error = command.blocked
+          room.status.error = command.blocked === FINALIZE_RETRY_EXHAUSTED
+            ? FINALIZE_RETRY_MESSAGE
+            : command.blocked === 'finalize_invalid_draft'
+              ? 'Draft 데이터 검증에 실패했습니다. 저장된 기록을 확인해주세요.'
+              : command.blocked
           if (command.blocked === 'draft_conflict' && room.status.conflict?.commandId !== command.commandId) {
             try {
               const baseline = await room.read()
@@ -296,6 +313,26 @@ export function useLiveRoom() {
             } catch { /* comparison can be retried; keep the rejected request */ }
           }
           break
+        }
+        if (command.kind === 'finalize') {
+          const attempts = command.finalizeAttempts ?? 0
+          if (attempts >= FINALIZE_MAX_ATTEMPTS) {
+            command.blocked = FINALIZE_RETRY_EXHAUSTED
+            await store.update(command)
+            continue
+          }
+          if (command.finalizeRetryAt && command.finalizeRetryAt > Date.now()) {
+            finalizeRetryAt = command.finalizeRetryAt
+            room.status.phase = 'saving'
+            break
+          }
+          // Persist the attempt before contacting the server so a reload
+          // cannot reset the retry budget of an unacknowledged finalization.
+          command.finalizeAttempts = attempts + 1
+          await store.update(command)
+          if (command.request.baseRevision == null && !room.initialized) {
+            seedRoom(room, await room.read())
+          }
         }
         room.status.phase = 'saving'
         if (selected.length > 1) {
@@ -383,44 +420,68 @@ export function useLiveRoom() {
     } catch (error: any) {
       const commands = await store.list(key)
       const code = error?.code
-      const permanent = (error?.status === 403 && code !== 'account_changed') || error?.status === 422 || error?.status === 409
+      const failed = commands.find(item => item.commandId === activeCommand?.commandId)
+      const finalize = failed?.kind === 'finalize'
+      const status = error?.status
+      const permanent = (status === 403 && code !== 'account_changed') || status === 422 || status === 409
+        || (finalize && status >= 400 && status < 500 && status !== 408 && status !== 429 && code !== 'account_changed')
       room.status.phase = code === 'draft_conflict' ? 'conflict' : permanent || code === 'account_changed' ? 'error' : code === 'command_in_progress' ? 'saving' : 'offline'
       room.status.error = `${code ? `[${code}] ` : ''}${error instanceof Error ? error.message : String(error)}`
-      if (!permanent && code !== 'account_changed') room.needsRecovery = true
-      const failed = commands.find(item => item.commandId === activeCommand?.commandId)
-      if (permanent && failed) {
+      if (!finalize && !permanent && code !== 'account_changed') room.needsRecovery = true
+      if (finalize && failed && !permanent && code !== 'account_changed') {
+        const delay = FINALIZE_RETRY_DELAYS[(failed.finalizeAttempts ?? 1) - 1]
+        if (delay === undefined) {
+          failed.blocked = FINALIZE_RETRY_EXHAUSTED
+          room.status.phase = 'error'
+          room.status.error = FINALIZE_RETRY_MESSAGE
+        } else {
+          finalizeRetryAt = failed.finalizeRetryAt = Date.now() + delay
+          room.status.phase = 'saving'
+        }
+        await store.update(failed)
+      } else if (permanent && failed) {
         failed.blocked = code || 'command_rejected'
         await store.update(failed)
-        try {
-          const baseline = await room.read()
-          if (code === 'draft_conflict') room.status.conflict = { commandId: failed.commandId, local: describeInput(failed), server: describeInput(failed, baseline), revision: Number(baseline.revision || 0) }
-          if (baseline.status === 'ok') notifyRoom(room, baseline)
-        } catch { /* The queue stays durable until the user resolves it. */ }
+        if (!finalize || code === 'draft_conflict') {
+          try {
+            const baseline = await room.read()
+            if (code === 'draft_conflict') room.status.conflict = { commandId: failed.commandId, local: describeInput(failed), server: describeInput(failed, baseline), revision: Number(baseline.revision || 0) }
+            if (baseline.status === 'ok') notifyRoom(room, baseline)
+          } catch { /* The queue stays durable until the user resolves it. */ }
+        }
       }
     } finally {
-      room.status.pending = (await store.list(key)).length
+      const commands = await store.list(key)
+      room.status.pending = commands.length
+      room.status.finalizationPending = commands.some(item => item.kind === 'finalize')
+      room.status.finalizationRetryRequired = commands.some(canRetryFinalization)
       for (const resolve of room.waiters.values()) resolve(false)
       room.waiters.clear()
       room.running = false
       for (const resolve of room.idle) resolve()
       room.idle.clear()
       if (room.status.pending && room.status.phase !== 'conflict' && room.status.phase !== 'error') {
-        room.timer = setTimeout(() => { void pump(key, room) }, room.status.phase === 'saving' ? 0 : 2_000)
+        const delay = finalizeRetryAt === undefined
+          ? (room.status.phase === 'saving' ? 0 : 2_000)
+          : Math.max(0, finalizeRetryAt - Date.now())
+        room.timer = setTimeout(() => { void pump(key, room) }, delay)
       }
     }
   }
 
   async function submit(gmId: string, side: 'H' | 'A', kind: LiveCommand['kind'], body: Record<string, unknown>,
-    options: { scoreOnly?: boolean; throwOnFailure?: boolean; onConfirmed?: (response: any) => void } = {}) {
+    options: { scoreOnly?: boolean; throwOnFailure?: boolean; onConfirmed?: (response: any) => void;
+      resumeFinalize?: Pick<LiveCommand, 'commandId' | 'request'> } = {}) {
     const localEditedAt = Date.now()
     const { room, key, uid } = await roomFor(gmId, side)
     // 점수만 바꾸는 상태 전송(수정 화면): 서버는 scoreOnly 명령에서 시계·반 상태를 무시하고
     // homeScore/awayScore 만 합친다. 이 경우엔 보조 분석관·매니저도 보낼 수 있다.
     if (options.scoreOnly) body = { ...body, scoreOnly: true }
-    let commandId = crypto.randomUUID()
+    const resume = kind === 'finalize' ? options.resumeFinalize : undefined
+    let commandId = resume?.commandId ?? crypto.randomUUID()
     const changedAtMs = room.lastEditAt = Math.max(room.lastEditAt, localEditedAt + room.clockOffset)
     let command: LiveCommand = { commandId, key, uid, gmId, side, kind,
-      request: JSON.parse(JSON.stringify({ ...body, commandId, baseRevision: room.status.phase === 'loading' ? null : room.status.revision,
+      request: JSON.parse(JSON.stringify(resume?.request ?? { ...body, commandId, baseRevision: room.status.phase === 'loading' ? null : room.status.revision,
         roomEpoch: room.status.phase === 'loading' ? null : room.status.roomEpoch })) }
     const targets = commandTargets(command)
     const pendingAtCreation = new Set(room.pendingInputs.keys())
@@ -430,16 +491,22 @@ export function useLiveRoom() {
       for (const [target, value] of commandInputs(command)) room.pendingInputs.set(target, { commandId, value: JSON.parse(JSON.stringify(value)) })
     }
     const added = room.enqueue.then(async () => {
-      // A timed-out restoration may still own the server lease. Keep its ID
-      // when the user presses Edit again instead of queuing a competing restore.
-      if (kind === 'restore') {
-        const existing = (await store.list(key)).find(item => item.kind === 'restore')
+      // A timed-out lifecycle request may still own the server lease.
+      if (kind === 'restore' || kind === 'finalize') {
+        const existing = (await store.list(key)).find(item => item.kind === kind)
         if (existing) {
           command = existing
           commandId = existing.commandId
+          if (canRetryFinalization(existing)) {
+            existing.blocked = undefined
+            existing.finalizeAttempts = 0
+            existing.finalizeRetryAt = undefined
+            await store.update(existing)
+          }
           return
         }
       }
+      if (resume && (room.status.savedCommandId === commandId || room.completed.has(commandId))) return
       if (kind === 'draft' || kind === 'setup') {
         for (const earlier of await store.list(key)) {
           if (earlier.request.roomEpoch !== command.request.roomEpoch) continue
@@ -467,6 +534,7 @@ export function useLiveRoom() {
       if (room.running) await new Promise<void>(resolve => room.idle.add(resolve))
       if (room.cancelled.delete(commandId)) return false
       if (room.completed.delete(commandId)) return true
+      if (kind === 'finalize' && room.status.savedCommandId === commandId) return true
       const result = new Promise<boolean>(resolve => room.waiters.set(commandId, resolve))
       void pump(key, room)
       const saved = await result
@@ -609,7 +677,7 @@ export function useLiveRoom() {
     const { room, key } = await roomFor(gmId, side)
     if (room.running) return
     const commands = await store.list(key)
-    if (!commands[0]?.blocked) return
+    if (!commands[0]?.blocked || canRetryFinalization(commands[0])) return
     const baseline = await room.read()
     await store.remove(commands[0].order!)
     seedRoom(room, baseline)
