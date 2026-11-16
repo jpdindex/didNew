@@ -1330,10 +1330,10 @@ const lineup = computed(() => {
 // 필드 선수 영역은 줄 수로 높이를, 각 줄의 인원수로 폭을 균등 분할한다.
 // 골키퍼와 Reset·Submit 토글은 별도 줄에 둬 터치 영역이 겹치지 않게 한다.
 const outfieldPickAreas = computed(() => {
-  const players = pickLineup.value.filter(p => p.slot !== GK_LINEUP_SLOT)
+  const players = pickDisplayLineup.value.filter(p => p.slot !== GK_LINEUP_SLOT)
   return formationPickAreas(players.map(p => p.slot)).map(area => ({ ...area, player: players[area.index]! }))
 })
-const pickGoalkeeper = computed(() => pickLineup.value.find(p => p.slot === GK_LINEUP_SLOT))
+const pickGoalkeeper = computed(() => pickDisplayLineup.value.find(p => p.slot === GK_LINEUP_SLOT))
 
 const subKey = (s: SubRecord) => (HALF_ORDER[s.half] ?? 0) * 100000 + s.seconds
 // 선수선택 창의 경기장 배치는 "그 기록 시각" 기준이다. 수정 화면에서 02:37 기록을 고르는데
@@ -1370,6 +1370,40 @@ const subPickPlayers = computed(() => {
     .filter((p): p is MatchSquadPlayer & { tag: 'IN' | 'OUT' } => Boolean(p))
     .sort((a, b) => Number(a.no) - Number(b.no))
 })
+// 교체 IN 보기: 경기장 배치와 아래 줄을 뒤집는다. 기록 시각 전에 교체가 있었던 자리에는
+// 원래(나간) 선수를 Out 표시·비활성으로 두고, 들어온 선수는 아래 "교체 IN" 줄에서 고른다.
+// 열 때마다 기본(교체 OUT 보기)으로 돌아간다.
+const pickSwapView = ref(false)
+const pickSubApplied = (s: SubRecord) => pickRecordKey.value === null || subKey(s) < pickRecordKey.value
+const pickDisplayLineup = computed(() => {
+  const lineupAtTime = pickLineup.value
+  if (!pickSwapView.value) return lineupAtTime.map(p => ({ ...p, out: false }))
+  const applied = game.value.subs.filter(pickSubApplied)
+  return lineupAtTime.map(p => {
+    // 들어온 선수 → 그 자리의 처음 선수까지 교체 사슬을 거꾸로 따라간다.
+    let originId = p.playerId
+    for (let guard = 0; guard < applied.length; guard++) {
+      const sub = applied.find(s => s.inPlayer === originId)
+      if (!sub) break
+      originId = sub.outPlayer
+    }
+    if (originId === p.playerId) return { ...p, out: false }
+    const origin = squad.value.find(item => item.playerId === originId)
+    return origin ? { ...origin, slot: p.slot, out: true } : { ...p, out: false }
+  })
+})
+const pickSubInPlayers = computed(() => {
+  const recordKey = pickRecordKey.value
+  const ids = new Set(game.value.subs
+    .filter(s => recordKey === null || subKey(s) <= recordKey)
+    .map(s => s.inPlayer))
+  return [...ids]
+    .map(id => squad.value.find(p => p.playerId === id))
+    .filter((p): p is MatchSquadPlayer => Boolean(p))
+    .map(p => ({ ...p, tag: 'IN' as const }))
+    .sort((a, b) => Number(a.no) - Number(b.no))
+})
+const pickRowPlayers = computed(() => pickSwapView.value ? pickSubInPlayers.value : subPickPlayers.value)
 // 선수 선택창 표시용: 교체로 들어온 선수(In)와 카드(경고/퇴장). 퇴장은 레드 1장 또는 경고 2장.
 const pickSubbedIn = computed(() => new Set(game.value.subs.map(s => s.inPlayer)))
 const pickCardsByPlayer = computed(() => groupCardsByPlayer(game.value.cards))
@@ -2422,6 +2456,10 @@ function openPlayerPick(recordId: string) {
   pinHistory(recordId)
   playerPickFor.value = recordId
   pickedPlayerId.value = records.value.find(r => r.id === recordId)?.playerId ?? null
+  pickSwapView.value = false
+}
+function togglePickSwapView() {
+  pickSwapView.value = !pickSwapView.value
 }
 function cancelPlayerPick() {
   playerPickFor.value = null
@@ -3028,8 +3066,9 @@ async function finishHalf() {
                 <button v-for="area in outfieldPickAreas" :key="area.player.playerId" class="jersey pickTarget"
                   :class="{ on: pickedPlayerId === area.player.playerId }"
                   :style="{ left: area.left + '%', top: area.top + '%', width: area.width + '%', height: area.height + '%' }"
-                  :disabled="isPickGone(area.player.playerId)" @click="pickPlayer(area.player.playerId)">
-                  <span class="shirtWrap"><span class="shirt">{{ area.player.no }}</span><span v-if="pickSubbedIn.has(area.player.playerId)"
+                  :disabled="area.player.out || isPickGone(area.player.playerId)" @click="pickPlayer(area.player.playerId)">
+                  <span class="shirtWrap"><span class="shirt">{{ area.player.no }}</span><span v-if="area.player.out"
+                    class="shirtTag outTag">Out</span><span v-else-if="pickSubbedIn.has(area.player.playerId)"
                     class="shirtTag">In</span><i v-if="pickCardMark(area.player.playerId)" class="cardMark"
                     :class="pickCardMark(area.player.playerId)!" /></span>
                   <span class="jname">{{ area.player.name }}</span>
@@ -3039,23 +3078,29 @@ async function finishHalf() {
                 <button class="pickLineBtn pickReset" @click="resetPlayerPick">Reset</button>
                 <button v-if="pickGoalkeeper" class="jersey goalkeeperTarget"
                   :class="{ on: pickedPlayerId === pickGoalkeeper.playerId }"
-                  :disabled="isPickGone(pickGoalkeeper.playerId)" @click="pickPlayer(pickGoalkeeper.playerId)">
-                  <span class="shirtWrap"><span class="shirt">{{ pickGoalkeeper.no }}</span><span v-if="pickSubbedIn.has(pickGoalkeeper.playerId)" class="shirtTag">In</span>
+                  :disabled="pickGoalkeeper.out || isPickGone(pickGoalkeeper.playerId)" @click="pickPlayer(pickGoalkeeper.playerId)">
+                  <span class="shirtWrap"><span class="shirt">{{ pickGoalkeeper.no }}</span><span v-if="pickGoalkeeper.out" class="shirtTag outTag">Out</span><span v-else-if="pickSubbedIn.has(pickGoalkeeper.playerId)" class="shirtTag">In</span>
                     <i v-if="pickCardMark(pickGoalkeeper.playerId)" class="cardMark" :class="pickCardMark(pickGoalkeeper.playerId)!" /></span>
                   <span class="jname">{{ pickGoalkeeper.name }}</span>
                 </button>
                 <span v-else />
-                <button class="pickLineBtn pickSubmitToggle" :class="{ on: pickSubmitOn }" @click="togglePickSubmit">
-                  Submit<br>{{ pickSubmitOn ? 'ON' : 'OFF' }}
-                </button>
+                <div class="pickLineTools">
+                  <button class="pickLineBtn pickSubmitToggle" :class="{ on: pickSubmitOn }" @click="togglePickSubmit">
+                    Submit<br>{{ pickSubmitOn ? 'ON' : 'OFF' }}
+                  </button>
+                  <button class="pickLineBtn pickSwapToggle" :class="{ on: pickSwapView }"
+                    :disabled="!game.subs.length" @click="togglePickSwapView">
+                    <span class="swapSub">교체 선수창</span><br>{{ pickSwapView ? 'OUT' : 'IN' }} 선수 보기
+                  </button>
+                </div>
               </div>
             </div>
-            <div v-if="subPickPlayers.length || pickOwnGoalAllowed" class="pickSubs">
-              <span class="pickSubsLabel">교체<br>OUT</span>
-              <button v-for="p in subPickPlayers" :key="p.playerId" class="jersey subJersey"
+            <div v-if="pickRowPlayers.length || pickOwnGoalAllowed" class="pickSubs">
+              <span class="pickSubsLabel">교체<br>{{ pickSwapView ? 'IN' : 'OUT' }}</span>
+              <button v-for="p in pickRowPlayers" :key="p.playerId" class="jersey subJersey"
                 :class="{ on: pickedPlayerId === p.playerId }" :disabled="isPickGone(p.playerId)"
                 @click="pickPlayer(p.playerId)">
-                <span class="shirtWrap"><span class="shirt">{{ p.no }}</span><span v-if="p.tag === 'IN'"
+                <span class="shirtWrap"><span class="shirt">{{ p.no }}</span><span v-if="p.tag === 'IN' && !pickSwapView"
                     class="shirtTag">In</span><i v-if="pickCardMark(p.playerId)" class="cardMark"
                     :class="pickCardMark(p.playerId)!" /></span>
                 <span class="jname">{{ p.name }}</span>
@@ -4342,13 +4387,13 @@ button {
 
 .pickOutfield {
   position: absolute;
-  inset: 0 0 100px
+  inset: 0 0 116px
 }
 
 .pickGoalkeeperRow {
   position: absolute;
   inset: auto 0 0;
-  height: 100px;
+  height: 116px;
   display: grid;
   grid-template-columns: 1fr 1.4fr 1fr;
   align-items: center;
@@ -4467,6 +4512,43 @@ button {
   border-color: #f0b429;
   background: #f0b429;
   color: #191919
+}
+
+/* Submit ON/OFF 아래에 교체 IN/OUT 보기 토글을 세로로 쌓는다 */
+.pickLineTools {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 10px
+}
+
+.pickLineTools .pickLineBtn {
+  margin: 0
+}
+
+.pickSwapToggle {
+  white-space: nowrap
+}
+
+.pickSwapToggle .swapSub {
+  display: inline-block;
+  font-size: 10px
+}
+
+.pickSwapToggle.on {
+  border-color: #4cc38a;
+  background: #4cc38a;
+  color: #191919
+}
+
+.pickSwapToggle:disabled {
+  opacity: .3;
+  pointer-events: none
+}
+
+.shirtTag.outTag {
+  color: #e5484d;
+  border-color: rgba(229, 72, 77, .6)
 }
 
 .pickSubs {
