@@ -15,8 +15,11 @@ def test_kpi_engine_builds_team_player_and_twenty_rating_snapshots() -> None:
     assert result.team_kpi["TAP"] == 3
     # PHP gi_ctp counts CTP only; an isolated H2 shot is STP, not DTP.
     assert result.team_kpi["DTP"] == 1
+    assert result.team_kpi["DTS"] == 1
     assert result.team_kpi["GOAL"] == 2
     assert result.player_kpis["p2"]["GOAL"] == 1
+    assert result.player_kpis["p2"]["DTS"] == 1
+    assert result.player_kpis["p3"]["DTS"] == 0
     snapshots = calculate_team_kpi_5min(records)
     assert len(snapshots) == 20
     assert snapshots[-1]["GOAL"] == result.team_kpi["GOAL"]
@@ -78,6 +81,38 @@ def test_only_shots_linked_from_a_connect_act_are_dtp() -> None:
     assert [path.path_type for path in shot_to_shot] == ["STP"]
 
 
+def test_dts_counts_only_the_final_shot_of_each_dtp() -> None:
+    records = []
+    for index in range(14):
+        start = index * 10
+        records.extend([
+            KpiRecord(f"pass-{index}", "H1", start, 0, "P", "O", 8, "passer"),
+            KpiRecord(f"shot-{index}", "H1", start + 1, 0, "S", "", 4, "shooter" if index else None),
+            KpiRecord(f"result-{index}", "H1", start + 2, 0, "", "X", 4),
+        ])
+    records.extend(KpiRecord(f"solo-{index}", "H2", index * 10, 0, "S", "X", 4, "solo") for index in range(5))
+
+    result = calculate_kpis(records)
+
+    assert result.team_kpi["DTP"] == result.team_kpi["DTS"] == 14
+    assert result.team_kpi["SHOT"] == 19
+    assert result.flags["shot-0"].is_dts
+    assert not result.flags["result-0"].is_dts
+    assert result.player_kpis["shooter"]["DTS"] == 13
+    assert result.player_kpis["solo"]["DTS"] == 0
+
+
+def test_dtp_requires_a_shot_as_the_last_action() -> None:
+    result = calculate_kpis([
+        KpiRecord("pass", "H1", 1, 0, "P", "O", 8, "p1"),
+        KpiRecord("shot", "H1", 2, 0, "S", "O", 4, "p2"),
+        KpiRecord("following", "H1", 3, 0, "C", "O", 4, "p3"),
+    ])
+
+    assert result.team_kpi["DTP"] == result.team_kpi["DTS"] == 0
+    assert result.team_kpi["SHOT"] == 1
+
+
 def test_legacy_path_cache_drift_is_limited_to_one_count_path_fields() -> None:
     assert _is_legacy_baseline_drift(
         {"TTP": {"expected": 53, "calculated": 52}},
@@ -130,6 +165,7 @@ def test_legacy_records_use_persisted_sql_flags_and_path_identity() -> None:
     result = calculate_kpis(records)
     assert result.team_kpi["TTP"] == 1
     assert result.team_kpi["DTP"] == 0
+    assert result.team_kpi["DTS"] == 0
     assert result.team_kpi["TAP"] == 2
     assert result.team_kpi["GOAL"] == 1
     assert result.player_kpis["p2"]["UTP"] == 1
@@ -144,5 +180,6 @@ def test_legacy_aggregate_only_path_counts_for_team_but_not_players() -> None:
 
     assert result.team_kpi["TTP"] == 1
     assert result.team_kpi["DTP"] == 1
+    assert result.team_kpi["DTS"] == 1
     assert result.player_kpis["p1"]["TTP"] == 0
     assert result.player_kpis["p1"]["DTP"] == 0

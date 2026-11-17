@@ -160,18 +160,18 @@ def _classify_chain(chain: list[KpiRecord], path_id: str) -> tuple[AttackPath, d
     dsp = False
     act_count = 0
     utp_begin_id: str | None = None
-    seen_connect = False  # a C/P/K/F appeared before the shot
-    linked_shot = False  # a shot followed a C/P/K/F within the same path
+    seen_connect = False
+    final_action_id: str | None = None
+    final_shot_id: str | None = None
 
     for record in chain:
         own_goal = _is_goal(record.res) and record.player_id == "OWN"
         act = "" if own_goal else record.act
         if act:
             act_count += 1
+            final_action_id = record.id
         if act and _is_shot_act(act):
-            path_type = "DTP"
-            # Only a shot linked (<= 4s, same path) from a C/P/K/F counts as DTP.
-            linked_shot = linked_shot or seen_connect
+            final_shot_id = record.id
             is_goal_chain = is_goal_chain or _is_goal(record.res)
             has_position = bool((record.shoot_pos_x or 0) > 0 or (record.shoot_pos_y or 0) > 0)
             if record.res in {"GOAL", "R", "L", "H", "GB"} or (record.res == "B" and has_position) or record.shoot_dsp_range:
@@ -182,8 +182,11 @@ def _classify_chain(chain: list[KpiRecord], path_id: str) -> tuple[AttackPath, d
             path_type = "UTP"
             utp_begin_id = record.id
 
-    if path_type == "DTP" and not linked_shot:
-        path_type = "STP"
+    if final_shot_id is not None and final_shot_id == final_action_id:
+        path_type = "DTP" if seen_connect else "STP"
+        mutable_flags[final_shot_id]["is_dts"] = path_type == "DTP"
+    else:
+        dsp = False
     if path_type == "UTP" and act_count < 2 and chain[0].act not in {"K", "F"}:
         path_type = "UPP"
 
@@ -202,7 +205,6 @@ def _classify_chain(chain: list[KpiRecord], path_id: str) -> tuple[AttackPath, d
                 if shooter is None and act and _is_shot_act(act):
                     if record.player_id:
                         shooter = record.player_id
-                        flags["is_dts"] = True
                 elif assister is None and shooter and shooter != record.player_id:
                     if record.player_id:
                         assister = record.player_id
@@ -402,25 +404,42 @@ def calculate_kpis(records: list[KpiRecord], *, close_trailing_bap: bool = True)
 
 
 def _calculate_legacy_kpis(records: list[KpiRecord]) -> KpiCalculation:
-    """Use PHP's persisted per-record flags for SQL-imported RAW exactly."""
+    """Keep imported path classifications and derive DTS from their final shot."""
     team = _empty(TEAM_KPI_FIELDS)
     players: defaultdict[str, dict[str, int]] = defaultdict(lambda: _empty(PLAYER_KPI_FIELDS))
     flags: dict[str, RecordFlags] = {}
     paths: dict[str, AttackPath] = {}
+    final_shot_ids: dict[str, str] = {}
     player_paths: defaultdict[str, set[str]] = defaultdict(set)
     dap_success = 0
     player_dap_success: Counter[str] = Counter()
     for record in records:
+        if record.legacy_path_id and record.legacy_path_type:
+            paths.setdefault(record.legacy_path_id, AttackPath(record.legacy_path_id, (), record.legacy_path_type, False, bool(record.legacy_path_ttp), ""))
+    for record in _ordered(records):
+        if record.legacy_path_id and _is_shot_act(record.act) and not (_is_goal(record.res) and record.player_id == "OWN"):
+            final_shot_ids[record.legacy_path_id] = record.id
+    dts_record_ids = {
+        shot_id for path_id, shot_id in final_shot_ids.items()
+        if path_id in paths and paths[path_id].path_type == "DTP"
+    }
+    for record in records:
         legacy = record.legacy_flags or {}
         value = lambda name: bool(legacy.get(name, False))
-        flag = RecordFlags(record.legacy_path_id or record.id, value("tap"), value("tapSuccess"), value("dap"), value("dapSuccess"), value("shot"), value("shotSuccess"), value("goal"), value("ast"), value("dts"), value("dta"), value("dtm"), value("dtb"), value("gtm"), value("gtb"))
+        flag = RecordFlags(
+            path_id=record.legacy_path_id or record.id,
+            is_tap=value("tap"), is_tap_success=value("tapSuccess"),
+            is_dap=value("dap"), is_dap_success=value("dapSuccess"),
+            is_shot=value("shot"), is_shot_success=value("shotSuccess"),
+            is_goal=value("goal"), is_ast=value("ast"), is_dts=record.id in dts_record_ids,
+            is_dta=value("dta"), is_dtm=value("dtm"), is_dtb=value("dtb"),
+            is_gtm=value("gtm"), is_gtb=value("gtb"),
+        )
         flags[record.id] = flag
-        for field, enabled in (("TAP", flag.is_tap), ("DAP", flag.is_dap), ("SHOT", flag.is_shot), ("GOAL", flag.is_goal), ("DTB", flag.is_dtb), ("DTM", flag.is_dtm), ("DTA", flag.is_dta), ("DTS", flag.is_dts)):
+        for field, enabled in (("TAP", flag.is_tap), ("DAP", flag.is_dap), ("SHOT", flag.is_shot), ("GOAL", flag.is_goal), ("DTB", flag.is_dtb), ("DTM", flag.is_dtm), ("DTA", flag.is_dta)):
             team[field] += int(enabled)
         team["OG"] += int(flag.is_goal and record.player_id == "OWN")
         dap_success += int(flag.is_dap_success)
-        if record.legacy_path_id and record.legacy_path_type:
-            paths.setdefault(record.legacy_path_id, AttackPath(record.legacy_path_id, (), record.legacy_path_type, False, bool(record.legacy_path_ttp), ""))
         if not record.player_id or record.player_id == "OWN":
             continue
         player = players[record.player_id]
@@ -431,6 +450,8 @@ def _calculate_legacy_kpis(records: list[KpiRecord]) -> KpiCalculation:
             player_paths[record.player_id].add(record.legacy_path_id)
     team["TTP"] = sum(int(path.ttp) for path in paths.values())
     team["DTP"] = sum(int(path.path_type == "DTP") for path in paths.values())
+    # Imported path summaries can establish a team DTP without an attributable shot record.
+    team["DTS"] = team["DTP"]
     team["BAP"] = sum(int(bool(record.bap_reason)) for record in records)
     team["ASR"] = _ratio(dap_success, team["DAP"])
     team["SSR"] = _ratio(team["GOAL"] - team["OG"], team["SHOT"])

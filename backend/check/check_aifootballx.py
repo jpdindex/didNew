@@ -2161,7 +2161,7 @@ def test_kpi_builder_never_synthesizes_raw_from_obsolete_path_metadata(monkeypat
         createdAt=datetime(2026, 1, 1, tzinfo=timezone.utc), legacyPathId='current',
         legacyPathType='DTP', legacyPathTtp=True, legacyKpiFlags={'shot': True}, bapReason=None)
     source = SimpleNamespace(records=[('one', record)], fingerprint='raw-version',
-        recording=SimpleNamespace(kpi=RecordingKpi(**calculate_kpis([event]).team_kpi),
+        recording=SimpleNamespace(kpi=RecordingKpi(**{**calculate_kpis([event]).team_kpi, 'DTS': 0}),
                                  kpiVersion=1, kpiSourceFingerprint=None, lineup={}),
         paths=[('obsolete', SimpleNamespace(gtId='obsolete', ptype='DTP', ttp=True))])
     saved = []
@@ -2170,7 +2170,11 @@ def test_kpi_builder_never_synthesizes_raw_from_obsolete_path_metadata(monkeypat
     monkeypatch.setattr(BuildMatchKpis, '_save_data_artifact', staticmethod(lambda *args: None))
     result = BuildMatchKpis(data).rebuild_for_logic_change('match', 'H')
     assert not result.validation_failed and len(saved) == 1
-    assert saved[0]['kpi'].DTP == 1 and saved[0]['kpi'].TTP == 1
+    assert saved[0]['kpi'].DTP == 1 and saved[0]['kpi'].TTP == 1 and saved[0]['kpi'].DTS == 1
+
+    source.recording.kpi = source.recording.kpi.model_copy(update={'DTS': 2})
+    result = BuildMatchKpis(data).rebuild_for_logic_change('match', 'H')
+    assert result.validation_failed and len(saved) == 1
 
 
 def test_preserved_master_fields_are_allowed_only_when_unchanged_in_baseline():

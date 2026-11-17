@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+from collections import Counter
 from dataclasses import dataclass
 from backend.system.system_schema import PlayerKpi, RecordingKpi, Side
 from backend.system.system_firestore import JpdDidData, PROJECT_ROOT, round_key_for, utc_now
@@ -205,6 +206,20 @@ class BuildMatchKpis:
             # Some legacy imports have no trustworthy playerStats baseline.
             # Team KPI remains the acceptance baseline in that case.
             player_differences = _player_differences(expected_players, player_kpis) if expected_players else {}
+            if all(record.legacy_flags is not None for record in before_review):
+                old_dts_records = [record for record in before_review if (record.legacy_flags or {}).get("dts")]
+                old_player_dts = Counter(record.player_id for record in old_dts_records if record.player_id != "OWN")
+                team_dts = team_differences.get("DTS")
+                if team_dts and _same_number(team_dts["expected"], len(old_dts_records)):
+                    del team_differences["DTS"]
+                    accepted.append("legacy-dts:team")
+                for player_id, differences in list(player_differences.items()):
+                    player_dts = differences.get("DTS")
+                    if player_dts and _same_number(player_dts["expected"], old_player_dts[player_id]):
+                        del differences["DTS"]
+                        accepted.append(f"legacy-dts:{player_id}")
+                        if not differences:
+                            del player_differences[player_id]
             legacy_drift_accepted = _is_legacy_baseline_drift(team_differences, player_differences)
             validation = KpiValidation(
                 passed=not team_differences and not player_differences,
