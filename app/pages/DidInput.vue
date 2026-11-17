@@ -1269,10 +1269,12 @@ const pendingShot = ref<PendingShot | null>(null)
 // (rows 가 pendingPos/pendingShot 을 참조하므로, 이 둘이 선언된 뒤에 watch 를 걸어야 한다.)
 watch(() => rows.value.length, async (len, prevLen) => {
   if (historyPinned.value || editingId.value || playerPickFor.value) return
+  // 삭제 등으로 줄어들 때는 스크롤을 그대로 둔다 — 중간 기록(예: 417번)을 지웠는데
+  // 맨 아래(마지막 기록)로 튀어 내려가지 않고 지운 자리를 계속 보여주도록.
+  if (len < prevLen) return
   // 수정 화면에서는 기록을 중간에 끼워 넣으므로 맨 아래로 내리지 않고, 지금 입력 중인
-  // 가안 행이나 방금 넣은 기록이 있는 자리를 보여준다. 삭제 등으로 줄어들 때는 그대로 둔다.
+  // 가안 행이나 방금 넣은 기록이 있는 자리를 보여준다.
   if (isEditMode) {
-    if (len < prevLen) return
     if (!editingId.value && pendingPos.value) void scrollRowIntoView('__draft__')
     else if (lastInsertedId.value) void scrollRowIntoView(lastInsertedId.value)
     return
@@ -3841,7 +3843,12 @@ button {
 .halfLabel {
   font-size: 11px;
   color: rgba(255, 255, 255, .35);
-  font-weight: 800
+  font-weight: 800;
+  /* 전/반 을 세로로 한 글자씩 쌓는다 */
+  writing-mode: vertical-rl;
+  text-orientation: upright;
+  letter-spacing: 1px;
+  line-height: 1
 }
 
 .halfLabel.on {
@@ -3860,7 +3867,7 @@ button {
 
 .clock {
   font-family: monospace;
-  font-size: 20px;
+  font-size: 24px;
   color: #f0b429;
   font-weight: 800
 }
