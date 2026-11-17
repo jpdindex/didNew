@@ -729,6 +729,8 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
                 raise ValueError('Legacy numbering formula is only verified for EPL')
             own, other = ('home', 'away') if side == 'H' else ('away', 'home')
             dmst['Point'] = 3 if match['score'][own] > match['score'][other] else 1 if match['score'][own] == match['score'][other] else 0
+            if len(existing_dmst) == 1 and 'WDL' in existing_dmst[0]['data']:
+                dmst['WDL'] = {3: 'W', 1: 'D', 0: 'L'}[dmst['Point']]
             team = evidence.get('teams', {}).get(team_id, {})
             dmst['t_Nm'] = team_delivery_name(evidence['ai_samples']['code'], season, team_id, team)
             emit('dMST', dmst)
@@ -1101,7 +1103,7 @@ def aggregate_key(collection: str, data: dict[str, Any]) -> tuple:
 def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions: dict,
                      *, prediction_inputs: dict | None = None,
                      prediction_index_baselines: dict | None = None,
-                     calculation_mode: str = 'current', round_only: bool = False) -> dict:
+                     calculation_mode: str = 'current', round_only: bool = False, fixture_numbers=None) -> dict:
     if calculation_mode not in ('current', 'legacy-audit'):
         raise ValueError('Unknown calculation mode')
     legacy = calculation_mode == 'legacy-audit'
@@ -1222,7 +1224,8 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
     for round_no, round_rows in sorted(rows_by_round.items()):
         mids = sorted({row['item']['match_id'] for row in round_rows})
         for row in round_rows:
-            fixture_no = mids.index(row['item']['match_id']) + 1
+            mid = row['item']['match_id']
+            fixture_no = fixture_numbers[mid] if fixture_numbers is not None else mids.index(mid) + 1
             row['fixture_no'] = fixture_no
             row['match_position'] = (fixture_no - 1) * 2 + (1 if row['side'] == 'H' else 2)
     for mid, pair in sorted(grouped.items()):
@@ -1262,6 +1265,8 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
             pmst['ASR'] = rounded(pmst['ASR'], 3)
             pmst['SSR'] = rounded(pmst['SSR'], 3)
             pmst['SSR2'] = rounded(pmst['SSR2'], 3)
+            if fixture_numbers is not None:
+                pmst.update(gm_id=mid, Point=row['point'], WDL=row['wdl'])
             if row['jmx'] is not None:
                 pmst['gi_score'] = row['jmx']
             else:
@@ -1481,7 +1486,7 @@ def bind_existing_documents(generated: dict, existing: dict) -> None:
 
 
 def validate_sql_facts(generated: dict, items: list[dict], codes: list[dict], slots: dict,
-                       *, round_only: bool = False) -> dict:
+                       *, round_only: bool = False, fixture_numbers=None) -> dict:
     """Validate output against SQL facts, not against existing Firestore values.
 
     Ratings are explicitly skipped: SQL gi_score is not current JPD-RATING JMX.
@@ -1609,6 +1614,8 @@ def validate_sql_facts(generated: dict, items: list[dict], codes: list[dict], sl
         ravg = {'PlSeason': season, 'Round': number}
         mids = sorted(mid for mid, pair in fixtures.items() if next(iter(pair.values()))['match']['round'] == number)
         for n, mid in enumerate(mids, 1):
+            if fixture_numbers is not None:
+                n = fixture_numbers[mid]
             for side, item in fixtures[mid].items():
                 match, team = item['match'], item['recording']['teamId']
                 own, other = ('home', 'away') if side == 'H' else ('away', 'home')
@@ -1668,11 +1675,12 @@ def match_target_scope(existing, match):
     return result
 
 
-def validate_aggregate_links(generated, items, codes, slots, *, round_only=False):
+def validate_aggregate_links(generated, items, codes, slots, *, round_only=False, fixture_numbers=None):
     """Independent source-fact checks plus the saved-rating links SQL cannot check."""
 
     try:
-        facts = validate_sql_facts(generated, items, codes, slots, round_only=round_only)
+        facts = validate_sql_facts(generated, items, codes, slots, round_only=round_only,
+                                   fixture_numbers=fixture_numbers)
     except (StopIteration, ValueError, KeyError, TypeError) as exc:
         facts = {'passed': False, 'checked': 0, 'status': 'blocked',
                  'failures': [f'Source fact validation requires valid fixture/code/season POSITION context: {type(exc).__name__}: {exc}']}
@@ -1711,7 +1719,8 @@ def validate_aggregate_links(generated, items, codes, slots, *, round_only=False
                 continue
             current.append(jmx)
             ratings.append(jmx)
-            n = mids.index(item['match_id']) + 1
+            mid = item['match_id']
+            n = fixture_numbers[mid] if fixture_numbers is not None else mids.index(mid) + 1
             team = item['recording']['teamId']
             match = item['match']
             check('mMST', (season, number, match['homeTeamId'], match['awayTeamId']), item['side'] + '-FX', truncate_rating(jmx, 2))
@@ -1783,16 +1792,40 @@ MATCH_TARGETS = ('TACTIC', 'multiSheet_ALL', 'multiSheet_BAP', 'multiSheet_DAP',
 IDENTITY_COLLECTIONS = frozenset(('Player', 'playerDB', 'Manager', 'code'))
 MASTER_COLLECTIONS = IDENTITY_COLLECTIONS | frozenset(AGGREGATES)
 MATCH_COLLECTIONS = frozenset(('dMST', *MATCH_TARGETS))
+DEFAULT_COLLECTIONS = frozenset(('dMST', 'pMST', 'cAVG', 'rAVG',
+                                 *(col for col in MATCH_TARGETS if col.startswith('multiSheet_'))))
 
 
 def delivery_mode(scope):
     mode = scope.get('mode', 'matches')
     # Keep old stored job scopes readable; only the three new modes have HTTP routes.
-    if mode not in ('matches', 'masters', 'aggregates', 'all', 'latest'):
+    if mode not in ('matches', 'masters', 'aggregates', 'all', 'latest', 'default'):
         fail('Unknown delivery mode')
     if (mode in ('masters', 'latest') or (mode == 'all' and not scope.get('unified'))) and any(scope.get(k) is not None for k in ('roundFrom', 'roundTo', 'matchId')):
         fail('Masters accept a season only; round and match filters are not allowed')
     return mode
+
+
+def unready_fixture(fixture, recordings):
+    match, mid = fixture['data'], fixture['id']
+    for reason, blocked in (
+        ('recording_not_final', lambda rec: rec.get('status') != 'final'),
+        ('kpi_not_ready', lambda rec: not rec.get('kpi') or not rec.get('kpiVersion')),
+        ('rating_not_ready', lambda rec: not rec.get('teamRating') or rec.get('ratingBasedOn') != rec.get('kpiVersion')),
+    ):
+        sides = [side for side in ('H', 'A') if blocked(recordings[side])]
+        if sides:
+            return {'gmId': mid, 'round': match['round'], 'reason': reason,
+                    'incompleteSides': sides,
+                    'incompleteTeamIds': [match['homeTeamId' if side == 'H' else 'awayTeamId'] for side in sides]}
+    return None
+
+
+def round_fixture_numbers(fixtures):
+    by_round = defaultdict(list)
+    for fixture in fixtures:
+        by_round[fixture['data']['round']].append(fixture['id'])
+    return {mid: number for ids in by_round.values() for number, mid in enumerate(sorted(ids), 1)}
 
 
 def fail(message, code='aifootballx_validation_failed'):
@@ -2044,6 +2077,8 @@ class SourceCapture:
         return [{**scope, 'roundFrom': n, 'roundTo': n} for n in rounds]
 
     def capture(self, scope, slot_path):
+        if delivery_mode(scope) == 'default':
+            return self.capture_defaults(scope, slot_path)
         if delivery_mode(scope) == 'aggregates':
             return self.capture_aggregates(scope, slot_path)
         if delivery_mode(scope) != 'matches':
@@ -2069,13 +2104,11 @@ class SourceCapture:
             completed = []
             for fixture in selected:
                 mid = fixture['id']
-                incomplete = [side for side in ('H', 'A')
-                              if recording_by_path[f'matches/{mid}/recordings/{side}'].get('status') != 'final']
-                if incomplete:
-                    skipped.append({'gmId': mid, 'round': fixture['data']['round'],
-                                    'reason': 'recording_not_final', 'incompleteSides': incomplete,
-                                    'incompleteTeamIds': [fixture['data']['homeTeamId' if side == 'H' else 'awayTeamId']
-                                                          for side in incomplete]})
+                issue = unready_fixture(fixture, {
+                    side: recording_by_path[f'matches/{mid}/recordings/{side}'] for side in ('H', 'A')
+                })
+                if issue:
+                    skipped.append(issue)
                 else:
                     completed.append(fixture)
             selected = completed
@@ -2185,7 +2218,8 @@ class SourceCapture:
             target[col] = self.rows(self.target, col, [(field, '==', value)], bound=20000)
         # Earlier edits must propagate through already published cumulative rounds.
         existing_end = max((r['data'].get('gm_round' if col == 'pMST' else 'Round', 0) or 0
-                            for col in AGGREGATES if col != 'sAVG' for r in target[col]), default=0)
+                            for col in AGGREGATES if col != 'sAVG' for r in target[col]
+                            if not r['data'].get('didUnplayed')), default=0)
         cutoff = max(existing_end, max(r['data']['round'] for r in selected))
         context = [r for r in fixtures if r['data']['round'] <= cutoff]
         target['dMST'] = [r for r in target['dMST'] if (r['data'].get('gm_round') or 0) <= cutoff]
@@ -2215,31 +2249,41 @@ class SourceCapture:
                  for r in context for side in ('H', 'A')]
         skipped = []
         round_only = False
-        if not scope.get('unified') and not scope.get('matchId'):
+        fixture_numbers = None
+        requested_rounds = {r['data']['round'] for r in selected}
+        seeded_rounds = {r['data']['Round'] for r in target['rAVG'] if r['data'].get('didRoundDefaults')}
+        seeded_request = bool(requested_rounds & seeded_rounds)
+        if not scope.get('unified') and (not scope.get('matchId') or seeded_request):
             final_sides = defaultdict(set)
             for item in items:
                 if item['recording'].get('status') == 'final':
                     final_sides[item['match_id']].add(item['side'])
-            requested_rounds = {r['data']['round'] for r in selected}
-            for fixture in selected:
-                mid, match = fixture['id'], fixture['data']
-                incomplete = [side for side in ('H', 'A') if side not in final_sides[mid]]
-                if incomplete:
-                    skipped.append({'gmId': mid, 'round': match['round'],
-                                    'reason': 'recording_not_final', 'incompleteSides': incomplete,
-                                    'incompleteTeamIds': [match['homeTeamId' if side == 'H' else 'awayTeamId']
-                                                          for side in incomplete]})
-            selected = [r for r in selected if final_sides[r['id']] == {'H', 'A'}]
-            items = [i for i in items if final_sides[i['match_id']] == {'H', 'A'}]
+            requested_ids = {r['id'] for r in selected}
+            unready = set()
+            for fixture in context:
+                mid = fixture['id']
+                if mid not in requested_ids and fixture['data']['round'] not in requested_rounds & seeded_rounds:
+                    continue
+                issue = unready_fixture(fixture, {
+                    side: heads[f'matches/{mid}/recordings/{side}'] for side in ('H', 'A')
+                })
+                if issue:
+                    unready.add(mid)
+                    if mid in requested_ids:
+                        skipped.append(issue)
+            selected = [r for r in selected if r['id'] not in unready]
+            items = [i for i in items if i['match_id'] not in unready and final_sides[i['match_id']] == {'H', 'A'}]
+            if seeded_request:
+                fixture_numbers = round_fixture_numbers(context)
 
-            if (scope.get('roundFrom') == scope.get('roundTo') == cutoff
-                    and requested_rounds == {cutoff}):
+            if requested_rounds == {cutoff} and (scope.get('roundFrom') == scope.get('roundTo') == cutoff
+                                                  or (scope.get('matchId') and seeded_request)):
                 supplied = {(i['match']['round'], i['recording'].get('teamId')) for i in items}
                 earlier_detail = {(r['data']['gm_round'], r['data'].get('t_code')) for r in target['dMST']
-                                  if 0 < (r['data'].get('gm_round') or 0) < cutoff}
+                                  if not r['data'].get('didUnplayed') and 0 < (r['data'].get('gm_round') or 0) < cutoff}
                 # Publish this round's confirmed match facts without replacing
                 # cumulative documents whose historical RAW is incomplete.
-                round_only = len(selected) < 10 or bool(earlier_detail - supplied)
+                round_only = sum(i['match']['round'] == cutoff for i in items) < 20 or bool(earlier_detail - supplied)
             if round_only:
                 items = [i for i in items if i['match']['round'] == cutoff]
                 target = {col: [r for r in rows if r['data'].get(
@@ -2259,7 +2303,7 @@ class SourceCapture:
             report = generate_masters(
                 evidence, context, items, setup['slots'], setup, 'aggregates',
                 latest=scope.get('latest', False), selected_fixtures=selected, job_id=job_id,
-                round_only=round_only,
+                round_only=round_only, fixture_numbers=fixture_numbers,
             )
         else:
             report = finish_delivery([], [], [], target, 'aggregates')
@@ -2272,6 +2316,41 @@ class SourceCapture:
                   'reference_code': code_reference(codes),
                   'new_code': {d['document_id']: d['data'] for d in setup['documents']}}
         if slot_path and not setup.get('errors'):
+            guards['slot_file'] = {'path': str(slot_path.resolve()), 'sha256': sha256(slot_path.read_bytes()).hexdigest()}
+        self.report_progress(100)
+        return report, guards
+
+    def capture_defaults(self, scope, slot_path):
+        season = season_label(scope['seasonId'])
+        number = scope['roundFrom']
+        fixtures = self.rows(self.did, 'matches', [('seasonId', '==', scope['seasonId']),
+                             ('leagueId', '==', 'EPL'), ('round', '==', number)], source=True, bound=40)
+        self.report_progress(15)
+        teams = {r['data'][k] for r in fixtures for k in ('homeTeamId', 'awayTeamId')}
+        if len(fixtures) != 10 or len(teams) != 20:
+            fail('Round defaults require 10 registered fixtures and 20 distinct teams')
+        codes = self.rows(self.target, 'code', bound=500)
+        existing = {}
+        ids = sorted(r['id'] for r in fixtures)
+        for col in sorted(DEFAULT_COLLECTIONS):
+            if col.startswith('multiSheet_'):
+                filters = [('gm_id', 'in', ids)]
+            else:
+                filters = [('PlSeason', '==', season), ('gm_round' if col in ('dMST', 'pMST') else 'Round', '==', number)]
+            existing[col] = self.rows(self.target, col, filters, bound=40)
+        self.report_progress(55)
+        try:
+            slots = json.loads(slot_path.read_text(encoding='utf-8')) if slot_path else {'seasonSlotMappings': {}}
+            setup = plan_new_season(season, fixtures, codes, existing, slots)
+            slot_map = setup['slots'].get('seasonSlotMappings', {}).get(season, {}).get('cavgSlotToCodeTeamCodeMapping', {})
+            documents = round_default_documents(fixtures, codes, slot_map, existing, force=scope.get('force', False))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            fail(f'Round defaults configuration: {exc}')
+        self.report_progress(90)
+        report = finish_delivery(documents, [], [], existing, 'default', len(fixtures), latest=True)
+        guards = {'documents': self.documents, 'queries': self.queries,
+                  'reference_code': code_reference(codes), 'new_code': {}, 'code_scope': None}
+        if slot_path:
             guards['slot_file'] = {'path': str(slot_path.resolve()), 'sha256': sha256(slot_path.read_bytes()).hexdigest()}
         self.report_progress(100)
         return report, guards
@@ -2666,8 +2745,9 @@ def delivery_payload(collection, generated, old=None):
     else:
         fields = ()
     for field in fields:
-        if data.get(field) is not None:
-            data[field] = rating_two_decimals(data[field])
+        value = data.get(field)
+        if value is not None and not (data.get('didUnplayed') and value == NULL):
+            data[field] = rating_two_decimals(value)
     precision = ({'ASR': 3, 'SSR': 3, 'SHOTScore': 2, 'GOALScore': 2, 'SSRScore': 2,
                   'DAP(AiAttack)': 1, 'DTP(AiTactic)': 1, 'SHOT(AiShot)': 1,
                   'GOAL(AiGoal)': 1, 'SSR(AiSSR)': 1} if collection == 'dMST' else
@@ -2713,6 +2793,8 @@ def retired_calculation_field(collection, field):
 
 def generated_calculation_field(collection, field):
     """Dynamic calculation families belong to the generator, including removals."""
+    if collection in DEFAULT_COLLECTIONS and field == 'didUnplayed':
+        return True
     if collection in ('cAVG', 'rAVG', 'rank') and field == 'didAggregationScope':
         return True
     if collection.startswith('multiSheet_'):
@@ -2758,7 +2840,8 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
     errors = list(errors)
     by_id = {col:{r['id']:r['data'] for r in rows} for col,rows in existing.items()}
     unique = {}
-    allowed = (MATCH_COLLECTIONS if mode == 'matches' else IDENTITY_COLLECTIONS if mode == 'masters'
+    allowed = (DEFAULT_COLLECTIONS if mode == 'default' else
+               MATCH_COLLECTIONS if mode == 'matches' else IDENTITY_COLLECTIONS if mode == 'masters'
                else frozenset(AGGREGATES) if mode == 'aggregates' else MASTER_COLLECTIONS)
     for original in documents:
         doc = deepcopy(original)
@@ -2788,8 +2871,82 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
                        'errors':len(errors),'failed_checks':sum(not c['passed'] for c in checks)}}
 
 
+def round_default_documents(fixtures, codes, slots, existing, *, force=False):
+    season = season_label(fixtures[0]['data']['seasonId'])
+    number = fixtures[0]['data']['round']
+    team_ids = {f['data'][k] for f in fixtures for k in ('homeTeamId', 'awayTeamId')}
+    references = {team: resolve_team_code(codes, season, team) for team in team_ids}
+    if (set(slots) != {str(n) for n in range(1, 21)} or
+            {row['codeTeamCode'] for row in slots.values()} != {row['team_code_number'] for row in references.values()} or
+            len({row['IDX_CODE'] for row in references.values()}) != 20):
+        fail(f'{season}: configure the verified cAVG 20-team slot mapping')
+
+    documents = []
+    index = defaultdict(list)
+    for col, rows in existing.items():
+        for row in rows:
+            key = aggregate_key(col, row['data']) if col in AGGREGATES else natural_key(col, row['data'])
+            index[(col, key)].append(row)
+
+    def emit(col, value):
+        key = aggregate_key(col, value) if col in AGGREGATES else natural_key(col, value)
+        rows = index.pop((col, key), [])
+        if len(rows) > 1:
+            fail(f'{col}: ambiguous existing default identity {key}')
+        if rows:
+            current = rows[0]['data']
+            if value.get('gm_id') and current.get('gm_id') not in (None, '', value['gm_id']):
+                fail(f'{col}: fixture identity conflicts with existing document {rows[0]["id"]}')
+            if col in ('cAVG', 'rAVG') and current.get('didAggregationScope') == 'round':
+                if col == 'rAVG' and any(k.endswith('_NM') and k in current and current[k] != v
+                                         for k, v in value.items()):
+                    fail('Round fixture slots conflict with the published round')
+                value = {**value, **current, 'didRoundDefaults': True}
+                if not current.get('didUnplayed'):
+                    value.pop('didUnplayed', None)
+            elif not force or current.get('didUnplayed') is not True:
+                return
+        ident = rows[0]['id'] if rows else stable_id(col, key)
+        value['uid'] = (rows[0]['data'].get('uid') or ident) if rows else ident
+        documents.append({'collection': col, 'document_id': ident, 'data': value})
+
+    ravg = {'PlSeason': season, 'Round': number, 'didAggregationScope': 'round',
+            'didRoundDefaults': True, 'didUnplayed': True}
+    cavg = {**ravg, **{f'C{n}-AVG': 62.5 for n in range(1, 21)}}
+    fields = ('BAP', 'DAP', 'DTP', 'SHOT', 'GOAL', 'JMX')
+    for n, fixture in enumerate(sorted(fixtures, key=lambda f: f['id']), 1):
+        match = fixture['data']
+        common = {'gm_id': fixture['id'], 'PlSeason': season, 'gm_round': number,
+                  'gm_date': dotted_date(match['date']), 'didUnplayed': True}
+        for side, match_field, team_type in (('H', 'homeTeamId', 'HOME'), ('A', 'awayTeamId', 'AWAY')):
+            team = match[match_field]
+            code = references[team]
+            idx = code['IDX_CODE']
+            pos = (n - 1) * 2 + (1 if side == 'H' else 2)
+            name = team_delivery_name(codes, season, team, {})
+            team_data = {**common, 't_code': team, 'IDX_CODE': idx, 't_Nm': name, 'Match': pos,
+                         'Point': 1, 'WDL': 'D', **dict.fromkeys(KPI_ALIASES, 0)}
+            emit('dMST', {**team_data, 'H-A': side, 'JMX': 40, 'JMX2': 40, 'gi_score2': 40})
+            emit('pMST', {**team_data, 'gi_score': 40, 'Goal': 0})
+            sheet = {**common, 't_code': idx, 'team_type': team_type}
+            wide = dict(sheet)
+            for metric in fields:
+                bins = {f'{metric}-{interval_name(i)}': NULL for i in range(20)}
+                emit('multiSheet_' + metric, {**sheet, **bins})
+                wide.update(bins)
+            wide.update({f'SSR-{interval_name(i)}': 0 for i in range(20)})
+            emit('multiSheet_ALL', wide)
+            emit('multiSheet_GOAL-시간', {**sheet, **{f'GOAL{i}': NULL for i in range(1, 11)}})
+            ravg.update({f'M{side}{n}_NM': idx, f'M{side}{n}-IDX': 40, f'M{side}{n}-WDL': 'D'})
+    emit('rAVG', ravg)
+    emit('cAVG', cavg)
+    if any(rows for rows in index.values()):
+        fail('Existing round documents do not match the registered fixtures')
+    return documents
+
+
 def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *, latest=False,
-                     selected_fixtures=None, job_id=None, round_only=False):
+                     selected_fixtures=None, job_id=None, round_only=False, fixture_numbers=None):
     evidence = with_registration_references(evidence)
     errors, documents = [], ([] if mode == 'aggregates' else list(setup['documents']))
     context = evidence['did_matches']
@@ -2885,7 +3042,8 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
             errors.append(str(exc))
             aggregate_items = []
         final = [i for i in aggregate_items if i['recording'].get('status')=='final']
-        known = {(r['data'].get('gm_round'),r['data'].get('t_code')) for r in target.get('dMST',[])}
+        known = {(r['data'].get('gm_round'),r['data'].get('t_code')) for r in target.get('dMST',[])
+                 if not r['data'].get('didUnplayed')}
         supplied = {(i['match']['round'],i['recording'].get('teamId')) for i in final}
         validation = None
         aggregate_errors = list(setup.get('errors',[]))
@@ -2895,15 +3053,29 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
         elif final and not aggregate_errors:
             try:
                 aggregate=build_aggregates(aggregate_items,evidence['ai_samples']['code'],slots,
-                                           round_only=round_only)
+                                           round_only=round_only, fixture_numbers=fixture_numbers)
+                for doc in aggregate['documents']:
+                    col, data = doc['collection'], doc['data']
+                    if col not in ('cAVG', 'rAVG'):
+                        continue
+                    old = next((r['data'] for r in target.get(col, [])
+                                if r['data'].get('didRoundDefaults') and
+                                aggregate_key(col, r['data']) == aggregate_key(col, data)), None)
+                    if old is not None:
+                        if col == 'rAVG' and any(key.endswith('_NM') and old.get(key) != value
+                                                 for key, value in data.items()):
+                            fail('Round fixture slots conflict with the published defaults')
+                        doc['data'] = {**{k: v for k, v in old.items()
+                                          if col == 'rAVG' and re.fullmatch(r'M[HA]\d+-IDX', k)}, **data}
                 bind_existing_documents(aggregate,target)
                 validation=validate_aggregate_links(aggregate,aggregate_items,evidence['ai_samples']['code'],slots,
-                                                    round_only=round_only)
+                                                    round_only=round_only, fixture_numbers=fixture_numbers)
                 aggregate_errors.extend(aggregate['errors'])
                 if not aggregate['complete'] or not validation['passed']:
                     aggregate_errors.append('Season aggregate source/rating validation failed')
                 generated = {(doc['collection'],aggregate_key(doc['collection'],doc['data'])) for doc in aggregate['documents']}
-                if any((col,aggregate_key(col,row['data'])) not in generated for col in AGGREGATES for row in target.get(col,[])):
+                if any((col,aggregate_key(col,row['data'])) not in generated for col in AGGREGATES
+                       for row in target.get(col,[]) if not row['data'].get('didUnplayed')):
                     aggregate_errors.append('Season aggregate coverage incomplete: existing destination aggregate rows are missing from DID')
                 if not aggregate_errors:
                     aggregate_docs=aggregate['documents']
@@ -2931,7 +3103,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
     return report
 
 
-VALIDATION_POLICY = 'imported-raw-team-player-authority-v26'
+VALIDATION_POLICY = 'imported-raw-team-player-authority-v27'
 
 
 def dump(value):

@@ -3,7 +3,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form
 
-from backend.system.system_firestore import RequiredUser, BackendError
+from backend.system.system_firestore import RequiredUser, BackendError, utc_now
 from backend.system.system_aifootballx import delivery_service
 from backend.system.system_aifootballx import season_label
 from backend.system.system_player_requests import is_manager
@@ -38,6 +38,21 @@ def input_scope(season, round_from, round_to, gm_id):
             description='최근 전송 요청의 진행률·검증 결과·컬렉션별 전송 결과를 조회합니다.')
 def send_status(user: Operator):
     return delivery_service().public_status(user.uid)
+
+
+@router.post('/send/default', status_code=202, summary='라운드 미경기 기본값 비동기 생성')
+def send_default(user: Operator,
+                 round_no: int = Form(..., alias='round', ge=1, le=38),
+                 season: str | None = Form(None, description='생략 시 현재 EPL 시즌'),
+                 force: bool = Form(False, description='이미 생성된 미경기 기본값도 다시 계산')):
+    if not season:
+        now = utc_now()
+        start = now.year if now.month >= 7 else now.year - 1
+        season = f'{start}{start + 1}'
+    service = delivery_service()
+    service.send_scope({**input_scope(season, round_no, round_no, None),
+                        'mode': 'default', 'force': force}, user.uid)
+    return service.public_status(user.uid)
 
 
 @router.post('/send/matches', status_code=202, summary='경기 상세 비동기 전송',

@@ -659,10 +659,10 @@ def test_swagger_routes_validate_scope_and_require_operator(service, monkeypatch
     response=client.get('/api/v1/aifootballx/send/status').json()
     assert response['validationPassed'] and response['status']=='complete'
     paths=app.openapi()['paths']
-    assert list(paths)==['/api/v1/aifootballx/send/status', '/api/v1/aifootballx/send/matches',
+    assert list(paths)==['/api/v1/aifootballx/send/status', '/api/v1/aifootballx/send/default', '/api/v1/aifootballx/send/matches',
                          '/api/v1/aifootballx/send/masters', '/api/v1/aifootballx/send/aggregates', '/api/v1/aifootballx/send/all']
     assert not paths['/api/v1/aifootballx/send/status']['get'].get('parameters')
-    for path in ('matches','masters','aggregates','all'):
+    for path in ('default','matches','masters','aggregates','all'):
         endpoint=paths['/api/v1/aifootballx/send/'+path]['post']
         assert 'application/x-www-form-urlencoded' in endpoint['requestBody']['content']
         assert not endpoint.get('parameters')
@@ -3084,6 +3084,81 @@ def test_latest_round_aggregates_publish_complete_matches_and_keep_published_his
     conflict, _ = source.capture(scope, slot_path)
     assert not conflict['validation_passed']
     assert not conflict['documents']
+
+
+def test_round_defaults_use_published_identities_and_force_only_pending_documents():
+    items, codes, slots = aggregate_fixture()
+    fixtures = [{'id': item['match_id'], 'data': item['match']} for item in items if item['side'] == 'H']
+    for fixture in fixtures:
+        fixture['data']['round'] = 13
+    mapping = slots['seasonSlotMappings']['2024-2025']['cavgSlotToCodeTeamCodeMapping']
+    seeded = delivery.round_default_documents(fixtures, codes, mapping, {})
+    assert len(seeded) == 202
+    assert {doc['collection'] for doc in seeded} == delivery.DEFAULT_COLLECTIONS
+    finished = delivery.finish_delivery(seeded, [], [], {}, 'default', len(fixtures), latest=True)
+    assert docs(finished, 'multiSheet_JMX')[0]['JMX-H1-0-5'] == '\\N'
+    r_avg = next(doc['data'] for doc in seeded if doc['collection'] == 'rAVG')
+    assert r_avg['MH3_NM'] == 'IDX5' and r_avg['MA10-IDX'] == 40
+    c_avg = next(doc['data'] for doc in seeded if doc['collection'] == 'cAVG')
+    assert all(c_avg[f'C{n}-AVG'] == 62.5 for n in range(1, 21))
+    existing = {}
+    for doc in seeded:
+        existing.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': dict(doc['data'])})
+    actual = existing['dMST'][0]['data']
+    actual.pop('didUnplayed')
+    actual.update(JMX=75, WDL='W')
+    assert delivery.round_default_documents(fixtures, codes, mapping, existing)[-1]['collection'] == 'cAVG'
+    forced = delivery.round_default_documents(fixtures, codes, mapping, existing, force=True)
+    assert not any(doc['document_id'] == existing['dMST'][0]['id'] for doc in forced)
+    assert actual['JMX'] == 75
+    actual['gm_id'] = 'different-fixture'
+    with pytest.raises(BackendError, match='fixture identity conflicts'):
+        delivery.round_default_documents(fixtures, codes, mapping, existing, force=True)
+
+
+def test_seeded_round_aggregates_update_original_slots_and_keep_unplayed_documents():
+    items, codes, slots = aggregate_fixture()
+    for item in items:
+        item['match']['round'] = 13
+    fixtures = [{'id': item['match_id'], 'data': item['match']} for item in items if item['side'] == 'H']
+    season_slots = slots['seasonSlotMappings']['2024-2025']['cavgSlotToCodeTeamCodeMapping']
+    existing = {}
+    for doc in delivery.round_default_documents(fixtures, codes, season_slots, {}):
+        existing.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': doc['data']})
+    ready = items[:2] + items[4:6]
+    ready_fixtures = [fixtures[0], fixtures[2]]
+    report = delivery.generate_masters(
+        {'did_matches': fixtures, 'source_recordings': [], 'target_existing': existing, 'ai_samples': {'code': codes}},
+        fixtures, ready, slots, {'new_season': False, 'documents': []}, 'aggregates',
+        selected_fixtures=ready_fixtures, round_only=True, fixture_numbers=delivery.round_fixture_numbers(fixtures),
+    )
+    assert report['validation_passed'], report['errors']
+    ravg = docs(report, 'rAVG')[0]
+    assert (ravg['MH1-IDX'], ravg['MH2-IDX'], ravg['MH3-IDX']) == (51, 40, 55)
+    assert ravg['MA10_NM'] == 'IDX20'
+    assert sum(ravg[f'M{side}{n}-IDX'] == 40 for side in ('H', 'A') for n in range(1, 11)) == 16
+    cavg = docs(report, 'cAVG')[0]
+    assert sum(cavg[f'C{n}-AVG'] == 62.5 for n in range(1, 21)) == 16
+    assert {r['Match'] for r in docs(report, 'pMST')} == {1, 2, 5, 6}
+    assert not any(r.get('didUnplayed') for r in docs(report, 'pMST') + [ravg, cavg])
+
+
+def test_default_route_queues_round_form_and_exposes_mode_in_status(service, monkeypatch):
+    svc, *_ = service
+    submitted = []
+    svc.pool = SimpleNamespace(submit=lambda *args: submitted.append(args))
+    monkeypatch.setattr(api_aifootballx, 'delivery_service', lambda: svc)
+    app = FastAPI()
+    app.include_router(api_aifootballx.router)
+    app.dependency_overrides[api_aifootballx.delivery_operator] = lambda: CurrentUser(uid='operator', claims={})
+    client = TestClient(app)
+    response = client.post('/aifootballx/send/default', data={'season': '20262027', 'round': '13', 'force': 'true'})
+    assert response.status_code == 202
+    assert response.json()['scope'] == {'seasonId': '20262027', 'roundFrom': 13, 'roundTo': 13,
+                                       'matchId': None, 'mode': 'default', 'force': True}
+    assert client.get('/aifootballx/send/status').json()['mode'] == 'default'
+    assert client.post('/aifootballx/send/default', data={'season': '20262027'}).status_code == 422
+    assert len(submitted) == 1
 
 
 def test_unified_all_expands_to_all_three_scopes_with_shared_latest_and_filters():
