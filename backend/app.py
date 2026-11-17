@@ -11,6 +11,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response
 
 from backend.api.api_health import router as health_router
+from backend.api.api_login import router as login_router
 from backend.api.api_player_requests import router as player_requests_router
 from backend.api.api_player_drafts import router as player_drafts_router
 from backend.api.api_aifootballx import router as aifootballx_router
@@ -98,6 +99,7 @@ async def unhandled_error_handler(_: Request, exc: Exception) -> JSONResponse:
 
 
 app.include_router(health_router)
+app.include_router(login_router, prefix=settings.api_prefix)
 app.include_router(player_requests_router, prefix=settings.api_prefix)
 app.include_router(player_drafts_router, prefix=settings.api_prefix)
 app.include_router(aifootballx_router, prefix=settings.api_prefix)

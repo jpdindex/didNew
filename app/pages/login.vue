@@ -4,6 +4,7 @@ import {
   browserLocalPersistence,
   browserSessionPersistence,
   setPersistence,
+  signInWithCustomToken,
   signInWithEmailAndPassword
 } from 'firebase/auth'
 
@@ -27,10 +28,6 @@ onMounted(() => {
     saveId.value = true
   }
 })
-
-// Firebase Auth는 이메일 형식만 받는다. "@"가 포함된 값은 실제 이메일로 그대로 쓰고,
-// 짧은 ID만 입력한 경우엔 내부용 가짜 이메일로 변환한다.
-const toInternalEmail = (id: string) => (id.includes('@') ? id : `${id}@jpd-did.internal`)
 
 // 로그인 실패 원인에 맞는 안내 문구. 아이디/비밀번호 문제가 아닌데도 "일치하지 않습니다"라고
 // 보여주면 서버·네트워크 장애를 계정 문제로 오해하게 된다.
@@ -56,13 +53,17 @@ function loginErrorMessage(error: unknown) {
   }
 
   // 인증은 통과했지만 이후 서버 단계에서 실패한 경우.
+  if (code === 'invalid_login' || code === 'login_requires_email' || code === 'login_throttled') {
+    return (error as Error).message
+  }
   if (status === 401 || status === 403) return '로그인 권한을 확인하지 못했습니다. 관리자에게 문의해 주세요.'
   return '서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 }
 
 async function login() {
   if (loading.value) return
-  if (!uId.value || !uPw.value) {
+  const id = uId.value.trim()
+  if (!id || !uPw.value) {
     message.value = 'ID / PASSWORD 를 입력해줘.'
     return
   }
@@ -73,15 +74,25 @@ async function login() {
   try {
     // 자동로그인 체크: 브라우저를 닫아도 세션 유지. 해제 시: 탭 닫으면 로그아웃.
     await setPersistence($auth, autoLogin.value ? browserLocalPersistence : browserSessionPersistence)
-    const credential = await signInWithEmailAndPassword($auth, toInternalEmail(uId.value), uPw.value)
+    let name = id
+    if (id.includes('@')) {
+      await signInWithEmailAndPassword($auth, id, uPw.value)
+    } else {
+      const { token } = await request<{ token: string }>('/api/v1/auth/short-login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ loginId: id, password: uPw.value, apiKey: $auth.config.apiKey }),
+      })
+      const { user } = await signInWithCustomToken($auth, token)
+      if (user.email && !user.email.endsWith('@jpd-did.internal')) name = user.email
+    }
     // Firestore profile creation is backend-owned; the browser holds Auth only.
     await request('/api/v1/match-input/recorder-profile', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: uId.value.trim() }),
+      body: JSON.stringify({ name }),
     })
 
     if (saveId.value) {
-      localStorage.setItem(SAVED_ID_KEY, uId.value)
+      localStorage.setItem(SAVED_ID_KEY, id)
     } else {
       localStorage.removeItem(SAVED_ID_KEY)
     }

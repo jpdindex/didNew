@@ -5,10 +5,68 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.responses import Response
 from fastapi.testclient import TestClient
 
 from backend.api.api_aifootballx import Operator
 from backend.system import system_firestore as firestore
+
+
+def test_short_login_resolves_new_accounts_and_rejects_duplicate_ids(monkeypatch):
+    from backend.api import api_login
+
+    accounts = [SimpleNamespace(email='local@jpd-did.internal', uid='local')]
+    clock = [100]
+    monkeypatch.setattr(api_login, '_directory_expires', 0)
+    monkeypatch.setattr(api_login, '_accounts_by_id', {})
+    monkeypatch.setattr(api_login, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(api_login.auth, 'list_users', lambda **_: SimpleNamespace(iterate_all=lambda: iter(accounts)))
+
+    assert api_login._find_account('Local', object()) == ('local', 'local@jpd-did.internal')
+    accounts.append(SimpleNamespace(email='new@company.example', uid='new'))
+    clock[0] += 16
+    assert api_login._find_account('new', object()) == ('new', 'new@company.example')
+    accounts.append(SimpleNamespace(email='new@gmail.com', uid='duplicate'))
+    clock[0] += 16
+    assert api_login._find_account('new', object()) is None
+
+
+@pytest.mark.parametrize('result,claims,accepted', [
+    ({'idToken': 'firebase-id-token'}, {'uid': 'account', 'email': 'account@company.example'}, True),
+    ({'error': {'message': 'INVALID_PASSWORD'}}, {}, False),
+    ({'mfaPendingCredential': 'challenge'}, {}, False),
+    ({'idToken': 'firebase-id-token'}, {'uid': 'other', 'email': 'account@company.example'}, False),
+])
+def test_short_login_issues_token_only_for_verified_account(monkeypatch, result, claims, accepted):
+    from backend.api import api_login
+
+    monkeypatch.setattr(api_login, 'ensure_firebase_app', lambda: 'firebase-app')
+    monkeypatch.setattr(api_login, '_find_account', lambda *_: ('account', 'account@company.example'))
+
+    def verify_password(url, *, params, json, timeout):
+        assert json == {'email': 'account@company.example', 'password': 'test-password', 'returnSecureToken': True}
+        return httpx.Response(400 if 'error' in result else 200, json=result)
+
+    def verify_token(token, *, app, check_revoked):
+        assert (token, app, check_revoked) == ('firebase-id-token', 'firebase-app', True)
+        return claims
+
+    def create_token(uid, *, app):
+        assert accepted and uid == 'account' and app == 'firebase-app'
+        return b'custom-token'
+
+    monkeypatch.setattr(api_login.httpx, 'post', verify_password)
+    monkeypatch.setattr(api_login.auth, 'verify_id_token', verify_token)
+    monkeypatch.setattr(api_login.auth, 'create_custom_token', create_token)
+    request = api_login.ShortLoginRequest(loginId='account', password='test-password', apiKey='test-key')
+    response = Response()
+    if accepted:
+        assert api_login.short_login(request, response) == {'token': 'custom-token'}
+        assert response.headers['cache-control'] == 'no-store'
+    else:
+        with pytest.raises(firestore.BackendError) as failure:
+            api_login.short_login(request, response)
+        assert failure.value.status_code == 401
 
 
 @pytest.mark.parametrize('environment', ['local', 'production'])
