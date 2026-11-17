@@ -322,6 +322,7 @@ function lobbyRefreshEnvironment() {
     lobbyKpiRefreshTimer: undefined, lobbySetupRevisions: { H: 0, A: 0 },
     lastLobbyVersions: JSON.stringify([[1, 0, false], [1, 0, false]]),
     dashboardKpiLoaded: { all: true, H1: true, H2: true },
+    dashboardKpiLoading: new Set(),
     game: ref({ formationKey: '4-3-3', halfStatus: 'ready' }),
     lobbyScore: ref({ home: 0, away: 0 }),
     inputStatus: ref({ H: { rawStatus: null }, A: { rawStatus: null } }), kpiHalf: ref('all'),
@@ -361,6 +362,20 @@ test('unchanged lobby checks read only compact versions, with no KPI or setup re
   assert.equal(env.kpiLoads.length, 0)
   assert.equal(env.timers.length, 0)
   assert.equal(env.applied.length, 0)
+})
+
+test('lobby refresh retains a newer version while the current KPI request is in flight', async () => {
+  const env = lobbyRefreshEnvironment()
+  env.context.dashboardKpiLoading.add('all')
+  env.setSides({ H: env.state(2), A: env.state() })
+  await env.context.refreshLobbyState()
+  env.timers[0].callback()
+  assert.deepEqual(env.kpiLoads, [])
+  assert.equal(env.timers.length, 2)
+
+  env.context.dashboardKpiLoading.delete('all')
+  env.timers[1].callback()
+  assert.deepEqual(env.kpiLoads, ['all'])
 })
 
 test('peer ACT revisions coalesce KPI refresh while only setup revisions fetch a setup', async () => {

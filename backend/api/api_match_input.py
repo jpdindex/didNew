@@ -7,15 +7,17 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date
+from functools import lru_cache
 from threading import Lock
 from typing import Any, Literal
 from uuid import uuid4
 from time import monotonic
 
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
 from firebase_admin import auth
 from google.api_core.exceptions import FailedPrecondition
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 from starlette.websockets import WebSocketState
 
 from backend.api.api_player_requests import ManagerUser, manager_user
@@ -1164,20 +1166,43 @@ def list_approvals() -> dict:
 
 
 @router.post("/match-input/preview", include_in_schema=False)
-def calculate_input_preview(request: InputPreviewRequest, _: RequiredUser = None) -> dict:
+def calculate_input_preview(request: InputPreviewRequest, _: RequiredUser = None) -> Response:
     """Calculate preview KPI and per-record eligibility without Firestore I/O."""
-    source = [
-        KpiRecord(
-            id=item.id or f"record-{index}", half=item.half, seconds=item.halfSeconds, seq=item.seq,
-            act=item.act, res=item.res, area=item.area, player_id=item.playerId,
-            shoot_pos_x=item.shootPosX, shoot_pos_y=item.shootPosY,
-            shoot_dsp_range=item.shootDspRange, is_shot=item.isShot,
+    # Use the actual calculation inputs as the version, including unsaved edits.
+    source = tuple(
+        (
+            item.id or f"record-{index}", item.half, item.halfSeconds, item.seq,
+            item.act, item.res, item.area, item.playerId,
+            item.shootPosX, item.shootPosY, item.shootDspRange, item.isShot,
         )
         for index, item in enumerate(request.records)
         if request.half is None or item.half == request.half
+    )
+    if len(source) <= 2_000:
+        # Concurrent requests with this version share the first calculation.
+        with _preview_locks[hash(source) % len(_preview_locks)]:
+            body = _cached_preview_body(source)
+    else:
+        body = _preview_body(source)
+    return Response(content=body, media_type="application/json")
+
+
+_preview_locks = tuple(Lock() for _ in range(16))
+_preview_json = TypeAdapter(dict)
+
+
+def _preview_body(source: tuple[tuple, ...]) -> bytes:
+    records = [
+        KpiRecord(
+            id=record_id, half=half, seconds=seconds, seq=seq, act=act, res=res, area=area,
+            player_id=player_id, shoot_pos_x=shoot_x, shoot_pos_y=shoot_y,
+            shoot_dsp_range=shoot_dsp_range, is_shot=is_shot,
+        )
+        for (record_id, half, seconds, seq, act, res, area, player_id,
+             shoot_x, shoot_y, shoot_dsp_range, is_shot) in source
     ]
-    result = calculate_kpis(source)
-    return {
+    result = calculate_kpis(records)
+    return _preview_json.dump_json({
         "status": "ok",
         "kpis": result.team_kpi,
         "flags": {
@@ -1191,7 +1216,10 @@ def calculate_input_preview(request: InputPreviewRequest, _: RequiredUser = None
             {"id": path.id, "recordIds": list(path.record_ids), "type": path.path_type, "ttp": path.ttp}
             for path in result.paths
         ],
-    }
+    })
+
+
+_cached_preview_body = lru_cache(maxsize=32)(_preview_body)
 
 
 @router.get("/match-input/recorder-profile", include_in_schema=False)

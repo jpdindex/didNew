@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+import json
+
 from backend.api import api_match_input
 from backend.api.api_match_input import DraftResponse, DraftSocketHub, DraftWriteRequest, InputPreviewRequest, MatchInputCommit, ParticipantJoinRequest, calculate_input_preview, enter_draft, router
 from backend.system.system_firestore import CurrentUser, NotFoundError
@@ -615,11 +618,35 @@ def test_input_preview_returns_kpi_and_per_record_flags() -> None:
         "half": "H1",
         "records": [{"id": "r1", "half": "H1", "halfSeconds": 5, "seq": 0, "act": "P", "res": "O", "area": 5}],
     })
-    result = calculate_input_preview(request)
+    response = calculate_input_preview(request)
+    assert response.media_type == "application/json"
+    result = json.loads(response.body)
 
     assert result["status"] == "ok"
     assert "TAP" in result["kpis"]
     assert "r1" in result["flags"]
+
+
+def test_input_preview_concurrent_requests_share_result_until_records_change(monkeypatch):
+    calculate = api_match_input.calculate_kpis
+    calls = []
+
+    def tracked(records):
+        calls.append(records)
+        return calculate(records)
+
+    monkeypatch.setattr(api_match_input, "calculate_kpis", tracked)
+    request = InputPreviewRequest.model_validate({"half": "H1", "records": [
+        {"id": "shared", "half": "H1", "halfSeconds": 1, "seq": 1, "act": "S", "res": "X", "area": 5},
+    ]})
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(lambda _: calculate_input_preview(request).body, range(5)))
+    assert len(set(results)) == 1
+    assert len(calls) == 1
+
+    request.records[0].res = "GOAL"
+    assert json.loads(calculate_input_preview(request).body)["kpis"]["GOAL"] == 1
+    assert len(calls) == 2
 
 
 def test_internal_bootstrap_route_requires_selected_side_and_is_hidden_from_openapi() -> None:

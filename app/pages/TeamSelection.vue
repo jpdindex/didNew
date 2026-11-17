@@ -431,6 +431,10 @@ function queueLobbyKpiRefresh() {
     lobbyKpiRefreshTimer = undefined
     if (!isCurrentLobby()) return
     if (typeof document !== 'undefined' && document.hidden) { lastLobbyVersions = ''; return }
+    if (dashboardKpiLoading.has(kpiHalf.value)) {
+      queueLobbyKpiRefresh()
+      return
+    }
     void loadDashboardKpis(kpiHalf.value).catch(() => { lastLobbyVersions = '' })
   }, 1200)
 }

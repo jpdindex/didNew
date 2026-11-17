@@ -31,8 +31,10 @@ type ServerPreview = {
 }
 
 type CachedPreview = { fingerprint: string; result: InputPreviewResult }
+type PreviewTarget = { key: string; fingerprint: string }
 
 const PREVIEW_DEBOUNCE_MS = 120
+const PREVIEW_TIMEOUT_MS = 10_000
 
 function scopeKey(half: Half | undefined, scope = '') {
   return `${scope || 'default'}:${half ?? 'all'}`
@@ -42,19 +44,8 @@ function scopedRecords(records: DidRecord[], half: Half | undefined) {
   return half ? records.filter(record => (record.half ?? 'H1') === half) : records
 }
 
-function fingerprint(records: DidRecord[], half: Half | undefined, scope = '') {
-  return JSON.stringify({
-    scope,
-    half: half ?? 'all',
-    records: scopedRecords(records, half).map(record => ({
-      id: record.id, half: record.half ?? 'H1', seconds: record.seconds, seq: record.seq ?? 0,
-      act: record.act, res: record.res, area: record.area,
-      posX: record.posX ?? null, posY: record.posY ?? null,
-      shootPosX: record.shootPosX ?? null, shootPosY: record.shootPosY ?? null,
-      shootDspRange: record.shootDspRange ?? null, isShot: record.isShot ?? null,
-      playerId: record.playerId ?? null,
-    })),
-  })
+function fingerprint(records: DidRecord[], half: Half | undefined) {
+  return JSON.stringify({ records: requestRecords(records), ...(half ? { half } : {}) })
 }
 
 function fallbackPreview(records: DidRecord[], half: Half | undefined): InputPreviewResult {
@@ -139,8 +130,6 @@ function requestRecords(records: DidRecord[]) {
     act: record.act,
     res: record.res,
     area: record.area,
-    posX: record.posX ?? null,
-    posY: record.posY ?? null,
     shootPosX: record.shootPosX ?? null,
     shootPosY: record.shootPosY ?? null,
     shootDspRange: record.shootDspRange ?? null,
@@ -157,59 +146,69 @@ function requestRecords(records: DidRecord[]) {
 export function useInputPreview() {
   const { request } = useBackendApi()
   const cached = reactive<Record<string, CachedPreview | undefined>>({})
-  const timers = new Map<string, ReturnType<typeof setTimeout>>()
-  const requestVersions = new Map<string, number>()
-  const pendingFingerprints = new Map<string, string>()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let inFlight: AbortController | undefined
+  let latest: PreviewTarget | undefined
 
   function preview(records: DidRecord[], half?: Half, scope = ''): InputPreviewResult {
     const key = scopeKey(half, scope)
-    const currentFingerprint = fingerprint(records, half, scope)
+    const currentFingerprint = fingerprint(scopedRecords(records, half), half)
     const server = cached[key]
     return server?.fingerprint === currentFingerprint ? server.result : fallbackPreview(records, half)
+  }
+
+  function queue() {
+    if (timer || inFlight || !latest || cached[latest.key]?.fingerprint === latest.fingerprint) return
+    timer = setTimeout(() => {
+      timer = undefined
+      void refresh()
+    }, PREVIEW_DEBOUNCE_MS)
+  }
+
+  async function refresh() {
+    const target = latest
+    if (!target || cached[target.key]?.fingerprint === target.fingerprint) return
+    const controller = new AbortController()
+    inFlight = controller
+    const timeout = setTimeout(() => controller.abort(), PREVIEW_TIMEOUT_MS)
+    try {
+      const response = await request<ServerPreview>('/api/v1/match-input/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: target.fingerprint,
+        signal: controller.signal,
+      })
+      if (latest?.key !== target.key || latest.fingerprint !== target.fingerprint) return
+      cached[target.key] = {
+        fingerprint: target.fingerprint,
+        result: {
+          source: 'server',
+          kpis: response.kpis,
+          flags: new Map(Object.entries(response.flags)),
+          paths: response.paths,
+        },
+      }
+    } catch {
+      // Keep the local preview available and let the next refresh retry.
+    } finally {
+      clearTimeout(timeout)
+      inFlight = undefined
+      if (latest?.key !== target.key || latest.fingerprint !== target.fingerprint) queue()
+    }
   }
 
   function schedule(records: DidRecord[], half?: Half, scope = '') {
     const key = scopeKey(half, scope)
     const currentRecords = scopedRecords(records, half)
-    const currentFingerprint = fingerprint(records, half, scope)
-    if (cached[key]?.fingerprint === currentFingerprint || pendingFingerprints.get(key) === currentFingerprint) return
-    const nextVersion = (requestVersions.get(key) ?? 0) + 1
-    requestVersions.set(key, nextVersion)
-    const timer = timers.get(key)
-    if (timer) clearTimeout(timer)
-    if (!currentRecords.length) {
-      cached[key] = undefined
-      pendingFingerprints.delete(key)
-      return
-    }
-    pendingFingerprints.set(key, currentFingerprint)
-    timers.set(key, setTimeout(() => {
-      void request<ServerPreview>('/api/v1/match-input/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ records: requestRecords(currentRecords), ...(half ? { half } : {}) }),
-      }).then(response => {
-        // A late response must not replace a newer preview for the same half.
-        if (requestVersions.get(key) !== nextVersion) return
-        cached[key] = {
-          fingerprint: currentFingerprint,
-          result: {
-            source: 'server',
-            kpis: response.kpis,
-            flags: new Map(Object.entries(response.flags)),
-            paths: response.paths,
-          },
-        }
-        if (pendingFingerprints.get(key) === currentFingerprint) pendingFingerprints.delete(key)
-      }).catch(() => {
-        // IndexedDB and the local calculation remain available offline.
-        if (pendingFingerprints.get(key) === currentFingerprint) pendingFingerprints.delete(key)
-      })
-    }, PREVIEW_DEBOUNCE_MS))
+    latest = currentRecords.length ? { key, fingerprint: fingerprint(currentRecords, half) } : undefined
+    if (!latest) cached[key] = undefined
+    queue()
   }
 
   onScopeDispose(() => {
-    for (const timer of timers.values()) clearTimeout(timer)
+    latest = undefined
+    clearTimeout(timer)
+    inFlight?.abort()
   })
 
   return { preview, schedule }

@@ -106,6 +106,51 @@ function environment(transport, indexedDB = fakeIndexedDB(), nativeBatch = false
 
 async function settle() { for (let i = 0; i < 40; i++) await Promise.resolve() }
 
+test('input preview waits for its current request and only follows up with the latest records', async () => {
+  const timers = new Map()
+  const requests = []
+  let nextTimer = 0
+  function runPreviewTimer() {
+    const [id, callback] = [...timers.entries()].find(([, fn]) => fn.delay === 120)
+    timers.delete(id)
+    callback()
+  }
+  const { useInputPreview } = load('composables/useInputPreview.ts', {
+    AbortController,
+    reactive: value => value,
+    onScopeDispose: () => {},
+    setTimeout: (callback, delay) => { timers.set(++nextTimer, Object.assign(callback, { delay })); return nextTimer },
+    clearTimeout: id => timers.delete(id),
+    useBackendApi: () => ({ request: (_, options) => {
+      const response = deferred()
+      requests.push({ seconds: JSON.parse(options.body).records[0].halfSeconds, response })
+      return response.promise
+    } }),
+  }, { '~/utils/didLogic': {
+    computeAttackPaths: () => ({ paths: [], flags: new Map() }),
+    computeBap: () => [],
+  } })
+  const { schedule, preview } = useInputPreview()
+  const records = [{ id: 'r', act: 'P', res: 'O', area: 1, seconds: 1 }]
+  schedule(records, 'H1')
+  runPreviewTimer()
+  for (const seconds of [2, 3]) {
+    records[0].seconds = seconds
+    schedule(records, 'H1')
+  }
+  assert.deepEqual(requests.map(item => item.seconds), [1])
+  requests[0].response.resolve({ kpis: { TAP: 1 }, flags: {}, paths: [] })
+  await settle()
+  assert.equal(preview([{ ...records[0], seconds: 1 }], 'H1').source, 'fallback')
+  runPreviewTimer()
+  assert.deepEqual(requests.map(item => item.seconds), [1, 3])
+  requests[1].response.resolve({ kpis: { TAP: 3 }, flags: {}, paths: [] })
+  await settle()
+  schedule(records, 'H1')
+  assert.equal(preview(records, 'H1').kpis.TAP, 3)
+  assert.equal(timers.size, 0)
+})
+
 test('RAW restore accepts the root receipt when the response also contains lineup setup', async () => {
   let confirmed
   const env = environment(async (url, options = {}) => {
