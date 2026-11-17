@@ -3022,6 +3022,70 @@ def test_aggregate_capture_scopes_rounds_and_carries_existing_later_totals(tmp_p
     assert prepared == [len(report['documents'])] * 2
 
 
+def test_latest_round_aggregates_publish_complete_matches_and_keep_published_history(tmp_path):
+    items, codes, slots = aggregate_fixture()
+    earlier = build_aggregates(items, codes, slots)
+    existing = {}
+    for doc in earlier['documents']:
+        existing.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': doc['data']})
+    existing['dMST'] = [{'id': 'historical-detail', 'data': {'gm_round': 1, 't_code': 'T20'}}]
+    selected = deepcopy(items[:6])
+    for item in selected:
+        item['match_id'] += '-r2'
+        item['match']['round'] = 2
+    selected[-1]['recording'] = {}
+    # Historical aggregate documents exist but their DID RAW is not complete.
+    source_items = items[:2] + selected
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in source_items if i['side'] == 'H']
+    heads = {f'matches/{i["match_id"]}/recordings/{i["side"]}': i['recording'] for i in source_items}
+    source = object.__new__(delivery.SourceCapture)
+    source.documents = {}; source.queries = []
+    source.did = SimpleNamespace(
+        document=lambda path: SimpleNamespace(path=path),
+        get_all=lambda refs, **opts: [
+            SimpleNamespace(reference=ref, exists=bool(heads[ref.path]),
+                            update_time=SimpleNamespace(isoformat=lambda: 'v1'),
+                            to_dict=lambda path=ref.path: heads[path]) for ref in refs
+        ],
+    )
+    source.target = object()
+    source.rows = lambda client, path, *args, **kwargs: (
+        fixtures if client is source.did else
+        [{'id': str(n), **r} for n, r in enumerate(codes)] if path == 'code' else
+        existing.get(path, [])
+    )
+    source.get_many = lambda paths: {}
+    slot_path = tmp_path / 'slots.json'
+    slot_path.write_text(json.dumps(slots), encoding='utf-8')
+    scope = {'seasonId': '20242025', 'mode': 'aggregates', 'roundFrom': 2, 'roundTo': 2, 'latest': True}
+    report, _ = source.capture(scope, slot_path)
+    assert report['validation_passed'], report['errors']
+    assert report['aggregate_status'] == 'ready'
+    assert report['summary']['matches'] == 2
+    assert report['summary']['aggregationScope'] == 'round_only'
+    assert report['skippedMatches'] == [{
+        'gmId': selected[-1]['match_id'], 'round': 2, 'reason': 'recording_not_final',
+        'incompleteSides': ['A'], 'incompleteTeamIds': ['T06'],
+    }]
+    assert {d['t_code'] for d in docs(report, 'pMST')} == {'T01', 'T02', 'T03', 'T04'}
+    assert len(docs(report, 'mMST')) == 2
+    assert not docs(report, 'sAVG')
+    assert all(d['data'].get('Round', d['data'].get('gm_round')) == 2 for d in report['documents'])
+    assert 'M-AVG' not in docs(report, 'rAVG')[0]
+    assert 'R-AVG' not in docs(report, 'cAVG')[0]
+    assert not any(key.startswith(('WTT', 'WRK', 'RRK')) for key in docs(report, 'rank')[0])
+
+    for doc in report['documents']:
+        existing[doc['collection']].append({'id': doc['document_id'], 'data': deepcopy(doc['data'])})
+    repeated, _ = source.capture(scope, slot_path)
+    assert repeated['validation_passed'], repeated['errors']
+    assert not repeated['documents']
+    existing['rAVG'][-1]['data'].pop('didAggregationScope')
+    conflict, _ = source.capture(scope, slot_path)
+    assert not conflict['validation_passed']
+    assert not conflict['documents']
+
+
 def test_unified_all_expands_to_all_three_scopes_with_shared_latest_and_filters():
     source = object.__new__(delivery.SourceCapture)
     source.did = object()

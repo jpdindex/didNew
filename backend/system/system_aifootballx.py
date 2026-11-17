@@ -1101,7 +1101,7 @@ def aggregate_key(collection: str, data: dict[str, Any]) -> tuple:
 def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions: dict,
                      *, prediction_inputs: dict | None = None,
                      prediction_index_baselines: dict | None = None,
-                     calculation_mode: str = 'current') -> dict:
+                     calculation_mode: str = 'current', round_only: bool = False) -> dict:
     if calculation_mode not in ('current', 'legacy-audit'):
         raise ValueError('Unknown calculation mode')
     legacy = calculation_mode == 'legacy-audit'
@@ -1306,15 +1306,15 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
     previous_round_no = None
     for round_no, round_rows in sorted(rows_by_round.items()):
         scope = f'{season}/R{round_no}'
-        history_available = all(previous in rows_by_round for previous in range(1, round_no + 1))
-        if not history_available:
+        history_available = not round_only and all(previous in rows_by_round for previous in range(1, round_no + 1))
+        if not history_available and not round_only:
             blocked['rank'].add(f'R{round_no}: earlier round context missing; cumulative points/rank omitted')
             blocked['rAVG'].add(f'R{round_no}: earlier round context missing; S_AVG omitted')
         by_number = {r['team_number']: r for r in round_rows}
         if len(by_number) != len(round_rows):
             result['errors'].append(f'Duplicate team in round {round_no}; explicit double-fixture rule required')
         complete = len(round_rows) == 20
-        if not complete:
+        if not complete and not round_only:
             blocked['cAVG'].add(f'R{round_no}: incomplete round ({len(round_rows)}/20 teams)')
             blocked['rank'].add(f'R{round_no}: incomplete round')
         cavg = {'PlSeason': season, 'Round': round_no}
@@ -1323,7 +1323,8 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
         for slot, slot_info in slots.items():
             row = by_number.get(slot_info['codeTeamCode'])
             if not row:
-                blocked['cAVG'].add(f'C{slot}: team missing in R{round_no}')
+                if not round_only:
+                    blocked['cAVG'].add(f'C{slot}: team missing in R{round_no}')
                 continue
             cavg.update({f'C{slot}-WDL': row['point'], f'C{slot}-S': row['goals'], f'C{slot}-C': row['against']})
             if row['jmx'] is not None:
@@ -1335,7 +1336,8 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
         if complete:
             cavg['RS-AVG'] = rounded(mean(r['goals'] for r in round_rows))
             cavg['RC-AVG'] = rounded(mean(r['against'] for r in round_rows))
-        round_avg = avg_known([r['jmx'] for r in round_rows] if complete else [], 'cAVG', 'R-AVG', scope)
+        round_avg = (avg_known([r['jmx'] for r in round_rows] if complete else [], 'cAVG', 'R-AVG', scope)
+                     if complete or not round_only else None)
         if round_avg is not None:
             cavg['R-AVG'] = rating_precision(round_avg)
         emit('cAVG', cavg)
@@ -1361,7 +1363,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
         round_means.append(round_avg)
         if history_available and all(v is not None for v in round_means):
             ravg['S_AVG'] = rating_precision(precise_mean(round_means))
-        else:
+        elif not round_only:
             blocked['rAVG'].add('S_AVG: missing prior round ratings')
         emit('rAVG', ravg)
         ranks = {'PlSeason': season, 'Round': round_no}
@@ -1406,7 +1408,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                 ranks[f'RAV{number}'] = rating_precision(row['jmx'])
                 if complete and all(v is not None for v in ratings) and (legacy or (history_available and rating_history_complete)):
                     ranks[f'RRK{number}'] = rank_competition(row['jmx'], ratings) if legacy else rrk_map[row['team']]
-                elif not legacy:
+                elif not legacy and not round_only:
                     blocked['rank'].add(f'RRK{number}: complete rating/previous round context required')
             else:
                 blocked['rank'].add(f'RAV{number}/RRK{number}: missing stored JMX')
@@ -1422,7 +1424,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                 ranks['R_Gap'] = 0
                 if legacy:
                     ranks['R_Rate'] = 0
-            elif not legacy:
+            elif not legacy and not round_only:
                 blocked['rank'].add(f'R{round_no} R_Gap: previous round mean absent')
         # Missing intervening ratings must not silently select an older rating as
         # the previous played round. A missing previous value blocks RRK above.
@@ -1430,19 +1432,20 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
         previous_mean = round_avg
         previous_round_no = round_no
         emit('rank', ranks)
-    savg = {'SEASON': season[2:4] + '/' + season[7:9]}
-    for dest, source in KPI_ALIASES.items():
-        dest = 'TAP' if dest == 'gi_tmp' else dest
-        digits = 3 if dest in ('ASR', 'SSR') else 2 if dest == 'GOAL' else 1
-        savg[dest] = rounded(mean(r['kpi'][source] for r in all_rows), digits)
-    rating_avg = avg_known([r['jmx'] for r in all_rows], 'sAVG', 'AI Rating', season)
-    if rating_avg is not None:
-        savg['AI Rating'] = rating_precision(rating_avg)
-        if not legacy:
-            savg['AVG'] = savg['AI Rating']
-    if legacy:
-        blocked['sAVG'].add('AVG: historical multi-season/override definition is diagnostic only')
-    emit('sAVG', savg)
+    if not round_only:
+        savg = {'SEASON': season[2:4] + '/' + season[7:9]}
+        for dest, source in KPI_ALIASES.items():
+            dest = 'TAP' if dest == 'gi_tmp' else dest
+            digits = 3 if dest in ('ASR', 'SSR') else 2 if dest == 'GOAL' else 1
+            savg[dest] = rounded(mean(r['kpi'][source] for r in all_rows), digits)
+        rating_avg = avg_known([r['jmx'] for r in all_rows], 'sAVG', 'AI Rating', season)
+        if rating_avg is not None:
+            savg['AI Rating'] = rating_precision(rating_avg)
+            if not legacy:
+                savg['AVG'] = savg['AI Rating']
+        if legacy:
+            blocked['sAVG'].add('AVG: historical multi-season/override definition is diagnostic only')
+        emit('sAVG', savg)
     result['blocked'] = [{'collection': c, 'fields_or_scopes': sorted(fields)} for c, fields in sorted(blocked.items())]
     result['summary'] = {'season': season, 'final_recordings': len(all_rows),
                          'documents': len(result['documents']),
@@ -1477,7 +1480,8 @@ def bind_existing_documents(generated: dict, existing: dict) -> None:
     generated['summary']['errors'] = len(generated['errors'])
 
 
-def validate_sql_facts(generated: dict, items: list[dict], codes: list[dict], slots: dict) -> dict:
+def validate_sql_facts(generated: dict, items: list[dict], codes: list[dict], slots: dict,
+                       *, round_only: bool = False) -> dict:
     """Validate output against SQL facts, not against existing Firestore values.
 
     Ratings are explicitly skipped: SQL gi_score is not current JPD-RATING JMX.
@@ -1583,7 +1587,8 @@ def validate_sql_facts(generated: dict, items: list[dict], codes: list[dict], sl
             position = positions[team]
             if position is not None:
                 ranks[f'WDL{position}'] = point
-                ranks[f'WTT{position}'] = points[team]
+                if not round_only:
+                    ranks[f'WTT{position}'] = points[team]
             for slot, info in season_slots.items():
                 if info['codeTeamCode'] == code['team_code_number']:
                     cavg.update({f'C{slot}-WDL': point, f'C{slot}-S': score, f'C{slot}-C': against})
@@ -1594,7 +1599,7 @@ def validate_sql_facts(generated: dict, items: list[dict], codes: list[dict], sl
             cavg.update({'RS-AVG': rounded(mean(scores)), 'RC-AVG': rounded(mean(conceded))})
             teams = sorted((i['recording']['teamId'] for i in values),
                            key=lambda team: (-points[team], -(gf[team]-ga[team]), -gf[team], references[team]['IDX_CODE']))
-            if generated.get('calculation_mode') == 'current':
+            if generated.get('calculation_mode') == 'current' and not round_only:
                 for rank_no, team in enumerate(teams, 1):
                     position = positions[team]
                     if position is not None:
@@ -1616,9 +1621,10 @@ def validate_sql_facts(generated: dict, items: list[dict], codes: list[dict], sl
         dest = 'TAP' if dest == 'gi_tmp' else dest
         digits = 3 if dest in ('ASR', 'SSR') else 2 if dest == 'GOAL' else 1
         savg[dest] = rounded(mean(i['recording']['kpi'][source] for i in final), digits)
-    expect('sAVG', savg)
+    if not round_only:
+        expect('sAVG', savg)
     expected_counts = {'mMST': len(fixtures), 'pMST': len(final),
-                       'cAVG': len(rounds), 'rAVG': len(rounds), 'rank': len(rounds), 'sAVG': 1}
+                       'cAVG': len(rounds), 'rAVG': len(rounds), 'rank': len(rounds), 'sAVG': 0 if round_only else 1}
     for col, count in expected_counts.items():
         check(col, season, '__document_count__', sum(d['collection'] == col for d in generated['documents']), count)
     checked = sum(t['checked'] for t in tallies.values())
@@ -1662,11 +1668,11 @@ def match_target_scope(existing, match):
     return result
 
 
-def validate_aggregate_links(generated, items, codes, slots):
+def validate_aggregate_links(generated, items, codes, slots, *, round_only=False):
     """Independent source-fact checks plus the saved-rating links SQL cannot check."""
 
     try:
-        facts = validate_sql_facts(generated, items, codes, slots)
+        facts = validate_sql_facts(generated, items, codes, slots, round_only=round_only)
     except (StopIteration, ValueError, KeyError, TypeError) as exc:
         facts = {'passed': False, 'checked': 0, 'status': 'blocked',
                  'failures': [f'Source fact validation requires valid fixture/code/season POSITION context: {type(exc).__name__}: {exc}']}
@@ -1737,9 +1743,10 @@ def validate_aggregate_links(generated, items, codes, slots):
             growth = round((current_rating - previous[team]) / previous[team] * 100, 1) if previous.get(team) else 0.0
             idx = resolve_team_code(codes, season, team)['IDX_CODE']
             rank_values.append((team, position, current_rating, growth, idx))
-        for rank_no, (_, position, _, _, _) in enumerate(sorted(rank_values, key=lambda r: (
-                -int(round(r[2] * 1000)), -int(round(r[3] * 1000)), r[4])), 1):
-            check('rank', (season, number), f'RRK{position}', rank_no)
+        if not round_only:
+            for rank_no, (_, position, _, _, _) in enumerate(sorted(rank_values, key=lambda r: (
+                    -int(round(r[2] * 1000)), -int(round(r[3] * 1000)), r[4])), 1):
+                check('rank', (season, number), f'RRK{position}', rank_no)
         previous.update({team: rating for team, _, rating, _, _ in rank_values})
         pairs = defaultdict(list)
         for item in values:
@@ -1750,12 +1757,13 @@ def validate_aggregate_links(generated, items, codes, slots):
             if len(pair) == 2:
                 match = next(i['match'] for i in values if i['match_id'] == mid)
                 check('mMST', (season, number, match['homeTeamId'], match['awayTeamId']), 'HA-avg', truncate_rating(precise_mean(pair), 2))
-        if len(current) == len(values):
+        if len(current) == len(values) and (not round_only or len(values) == 20):
             cumulative.append(precise_mean(current))
             check('cAVG', (season, number), 'R-AVG', truncate_rating(precise_mean(current)))
             check('rAVG', (season, number), 'M-AVG', truncate_rating(precise_mean(current)))
-            check('rAVG', (season, number), 'S_AVG', truncate_rating(precise_mean(cumulative)))
-    if len(ratings) == len(final):
+            if not round_only:
+                check('rAVG', (season, number), 'S_AVG', truncate_rating(precise_mean(cumulative)))
+    if not round_only and len(ratings) == len(final):
         for field in ('AI Rating', 'AVG'):
             check('sAVG', (season[2:4] + '/' + season[7:9],), field, truncate_rating(precise_mean(ratings)))
     return {'passed': facts['passed'] and all(c['passed'] for c in checks), 'source_facts': facts,
@@ -2205,16 +2213,61 @@ class SourceCapture:
                   'recording': heads[f'matches/{r["id"]}/recordings/{side}'],
                   'team_name': (teams.get('teams/' + r['data']['homeTeamId' if side == 'H' else 'awayTeamId'], {}).get('nameKr'))}
                  for r in context for side in ('H', 'A')]
+        skipped = []
+        round_only = False
+        if not scope.get('unified') and not scope.get('matchId'):
+            final_sides = defaultdict(set)
+            for item in items:
+                if item['recording'].get('status') == 'final':
+                    final_sides[item['match_id']].add(item['side'])
+            requested_rounds = {r['data']['round'] for r in selected}
+            for fixture in selected:
+                mid, match = fixture['id'], fixture['data']
+                incomplete = [side for side in ('H', 'A') if side not in final_sides[mid]]
+                if incomplete:
+                    skipped.append({'gmId': mid, 'round': match['round'],
+                                    'reason': 'recording_not_final', 'incompleteSides': incomplete,
+                                    'incompleteTeamIds': [match['homeTeamId' if side == 'H' else 'awayTeamId']
+                                                          for side in incomplete]})
+            selected = [r for r in selected if final_sides[r['id']] == {'H', 'A'}]
+            items = [i for i in items if final_sides[i['match_id']] == {'H', 'A'}]
+
+            if (scope.get('roundFrom') == scope.get('roundTo') == cutoff
+                    and requested_rounds == {cutoff}):
+                supplied = {(i['match']['round'], i['recording'].get('teamId')) for i in items}
+                earlier_detail = {(r['data']['gm_round'], r['data'].get('t_code')) for r in target['dMST']
+                                  if 0 < (r['data'].get('gm_round') or 0) < cutoff}
+                # Publish this round's confirmed match facts without replacing
+                # cumulative documents whose historical RAW is incomplete.
+                round_only = len(selected) < 10 or bool(earlier_detail - supplied)
+            if round_only:
+                items = [i for i in items if i['match']['round'] == cutoff]
+                target = {col: [r for r in rows if r['data'].get(
+                    'gm_round' if col in ('dMST', 'pMST') else 'Round') == cutoff]
+                    for col, rows in target.items() if col != 'sAVG'}
+                if any(r['data'].get('didAggregationScope') != 'round'
+                       for col in ('cAVG', 'rAVG', 'rank') for r in target[col]):
+                    setup['errors'] = [*setup.get('errors', []),
+                                       'Round-only aggregates cannot replace an existing cumulative round']
         evidence = {'did_matches': context, 'source_recordings': [], 'player_profiles': {},
                     'target_existing': target, 'ai_samples': {'code': codes + setup['code_rows']}}
         self.capture_aggregate_review_sources(evidence, items)
         raw_count = sum(len(recording['children']['records']) for recording in evidence['source_recordings'])
         log_delivery_stage(job_id, 'aggregate_read', started, documents=len(heads) + raw_count, scope=scope)
         self.report_progress(95)
-        report = generate_masters(
-            evidence, context, items, setup['slots'], setup, 'aggregates',
-            latest=scope.get('latest', False), selected_fixtures=selected, job_id=job_id,
-        )
+        if selected:
+            report = generate_masters(
+                evidence, context, items, setup['slots'], setup, 'aggregates',
+                latest=scope.get('latest', False), selected_fixtures=selected, job_id=job_id,
+                round_only=round_only,
+            )
+        else:
+            report = finish_delivery([], [], [], target, 'aggregates')
+            report['aggregate_status'] = 'empty'
+        report['skippedMatches'] = skipped
+        report['summary']['skippedMatches'] = len(skipped)
+        if round_only:
+            report['summary']['aggregationScope'] = 'round_only'
         guards = {'documents': self.documents, 'queries': self.queries, 'code_scope': None,
                   'reference_code': code_reference(codes),
                   'new_code': {d['document_id']: d['data'] for d in setup['documents']}}
@@ -2660,6 +2713,8 @@ def retired_calculation_field(collection, field):
 
 def generated_calculation_field(collection, field):
     """Dynamic calculation families belong to the generator, including removals."""
+    if collection in ('cAVG', 'rAVG', 'rank') and field == 'didAggregationScope':
+        return True
     if collection.startswith('multiSheet_'):
         return bool(re.fullmatch(r'(?:BAP|DAP|DTP|SHOT|GOAL|SSR|JMX)-H[1-4]-.+', field))
     if collection == 'rank':
@@ -2734,7 +2789,7 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
 
 
 def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *, latest=False,
-                     selected_fixtures=None, job_id=None):
+                     selected_fixtures=None, job_id=None, round_only=False):
     evidence = with_registration_references(evidence)
     errors, documents = [], ([] if mode == 'aggregates' else list(setup['documents']))
     context = evidence['did_matches']
@@ -2839,9 +2894,11 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
             aggregate_errors.append('Season aggregate coverage incomplete: DID lacks existing destination team/match rows')
         elif final and not aggregate_errors:
             try:
-                aggregate=build_aggregates(aggregate_items,evidence['ai_samples']['code'],slots)
+                aggregate=build_aggregates(aggregate_items,evidence['ai_samples']['code'],slots,
+                                           round_only=round_only)
                 bind_existing_documents(aggregate,target)
-                validation=validate_aggregate_links(aggregate,aggregate_items,evidence['ai_samples']['code'],slots)
+                validation=validate_aggregate_links(aggregate,aggregate_items,evidence['ai_samples']['code'],slots,
+                                                    round_only=round_only)
                 aggregate_errors.extend(aggregate['errors'])
                 if not aggregate['complete'] or not validation['passed']:
                     aggregate_errors.append('Season aggregate source/rating validation failed')
@@ -2850,7 +2907,10 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
                     aggregate_errors.append('Season aggregate coverage incomplete: existing destination aggregate rows are missing from DID')
                 if not aggregate_errors:
                     aggregate_docs=aggregate['documents']
-                    for doc in aggregate_docs: doc['data'].setdefault('uid',doc['document_id'])
+                    for doc in aggregate_docs:
+                        doc['data'].setdefault('uid',doc['document_id'])
+                        if round_only and doc['collection'] in ('cAVG', 'rAVG', 'rank'):
+                            doc['data']['didAggregationScope'] = 'round'
                     documents.extend(aggregate_docs)
             except (BackendError,KeyError,TypeError,ValueError) as exc:
                 aggregate_errors.append(exc.message if isinstance(exc,BackendError) else f'Aggregate validation failed ({type(exc).__name__})')
@@ -2871,7 +2931,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
     return report
 
 
-VALIDATION_POLICY = 'imported-raw-team-player-authority-v25'
+VALIDATION_POLICY = 'imported-raw-team-player-authority-v26'
 
 
 def dump(value):
