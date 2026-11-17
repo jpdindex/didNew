@@ -1377,7 +1377,9 @@ def run_self_tests() -> int:
             self.assertEqual(result['p_id'], '571')
             self.assertEqual(result['gr_res_code'], 'G')
             self.assertEqual(result['gr_pos_x'], 0)
-            self.assertEqual(result['gr_shoot_pos_x'], '\\N')
+            self.assertEqual(result['gr_shoot_pos_x'], 0)
+            item['recording']['legacyGiId'] = 'legacy'
+            self.assertEqual(tactic_projection(item,row,'path')['gr_shoot_pos_x'], '\\N')
 
         def test_missing_half_duration(self):
             item,row = fixture()
@@ -1718,6 +1720,9 @@ def test_match_new_season_can_send_without_nonmatch_setup():
 
 def test_match_capture_does_not_require_season_code_or_slot_setup(monkeypatch,tmp_path):
     evidence,_=preview_fixture()
+    incomplete = deepcopy(evidence['did_matches'][0])
+    incomplete['id'] = 'unfinished-match'
+    evidence['did_matches'].append(incomplete)
     existing_targets = {}
     source=object.__new__(delivery.SourceCapture)
     source.did=object();source.target=SimpleNamespace(collection=lambda col:SimpleNamespace(
@@ -1727,7 +1732,7 @@ def test_match_capture_does_not_require_season_code_or_slot_setup(monkeypatch,tm
     class Did:
         def document(self,path): return SimpleNamespace(path=path)
         def get_all(self,refs,**kwargs):
-            return [SimpleNamespace(reference=ref,exists=True,
+            return [SimpleNamespace(reference=ref,exists=ref.path in recordings,
                     update_time=SimpleNamespace(isoformat=lambda:'version'),
                     to_dict=lambda p=ref.path:recordings[p]['recording']) for ref in refs]
     source.did=Did()
@@ -1748,6 +1753,11 @@ def test_match_capture_does_not_require_season_code_or_slot_setup(monkeypatch,tm
     report,guards=source.capture({'seasonId':'20232024','mode':'matches','roundFrom':1,'roundTo':1},
                                 tmp_path/'missing-aggregate-slots.json')
     assert report['validation_passed'],report['errors']
+    assert report['skippedMatches'] == [
+        {'gmId': 'unfinished-match', 'round': 1, 'reason': 'recording_not_final', 'incompleteSides': ['H', 'A'],
+         'incompleteTeamIds': [incomplete['data']['homeTeamId'], incomplete['data']['awayTeamId']]},
+    ]
+    assert report['summary']['matches'] == 1
     assert 'slot_file' not in guards and guards['new_code']=={}
     for doc in report['documents']:
         existing_targets.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': doc['data']})

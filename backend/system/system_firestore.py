@@ -1039,7 +1039,8 @@ class JpdDidData:
             in_half, in_seconds = item.get("inHalf"), item.get("inSeconds")
             if out_half in {"H1", "H2"} and isinstance(out_seconds, int):
                 outgoing.setdefault((out_half, out_seconds), []).append(player_id)
-            if in_half in {"H1", "H2"} and isinstance(in_seconds, int) and in_seconds > 0:
+            if (in_half in {"H1", "H2"} and isinstance(in_seconds, int) and in_seconds >= 0
+                    and (in_seconds > 0 or in_half == "H2" or item.get("type") == "BENCH")):
                 incoming.setdefault((in_half, in_seconds), []).append(player_id)
         result: list[dict[str, Any]] = []
         for key in sorted(set(outgoing) | set(incoming)):

@@ -240,14 +240,15 @@ def tactic_projection(item: dict[str, Any], row: dict[str, Any], path_id: str | 
     if any(h not in timings or timings[h].get('seconds') is None for h in previous):
         raise ValueError('Previous half duration is missing; no fixed offset fallback')
     player = value.get('playerId')
+    missing_shot_coordinate = '\\N' if recording.get('legacyGiId') else 0
     return {'gm_id': item['match_id'], 'gm_round': match['round'], 'PlSeason': season_label(match['seasonId']),
             'gr_half': half, 'gr_half_seconds': value['halfSeconds'],
             'gr_seconds': value['halfSeconds'] + sum(timings[h]['seconds'] for h in previous),
             'gr_act_code': value['act'] or None, 'gr_res_code': 'G' if value['res'] == 'GOAL' else value['res'],
             'gr_area_code': value['area'], 'gr_pos_x': pitch_coordinate(value.get('posX'), 971),
             'gr_pos_y': pitch_coordinate(value.get('posY'), 634),
-            'gr_shoot_pos_x': value.get('shootPosX') if value.get('shootPosX') is not None else '\\N',
-            'gr_shoot_pos_y': value.get('shootPosY') if value.get('shootPosY') is not None else '\\N',
+            'gr_shoot_pos_x': value.get('shootPosX') if value.get('shootPosX') is not None else missing_shot_coordinate,
+            'gr_shoot_pos_y': value.get('shootPosY') if value.get('shootPosY') is not None else missing_shot_coordinate,
             'p_id': ('OWN' if player == 'OWN' else
                      str(item.get('player_identities', {}).get(player, player_identity(player))) if player else '\\N'),
             'gt_id': str(path_id) if path_id else '\\N'}
@@ -2049,6 +2050,28 @@ class SourceCapture:
         if not selected:
             fail('No DID matches in this scope')
         self.report_progress(5)
+        refs = [self.did.document(f'matches/{r["id"]}/recordings/{side}') for r in selected for side in ('H', 'A')]
+        recording_by_path = {}
+        for start in range(0, len(refs), 100):
+            for snap in self.did.get_all(refs[start:start + 100], timeout=60, retry=None):
+                self.documents[snap.reference.path] = self.version(snap)
+                recording_by_path[snap.reference.path] = encode(snap.to_dict()) if snap.exists else {}
+        skipped = []
+        if not scope.get('matchId') and not scope.get('unified'):
+            completed = []
+            for fixture in selected:
+                mid = fixture['id']
+                incomplete = [side for side in ('H', 'A')
+                              if recording_by_path[f'matches/{mid}/recordings/{side}'].get('status') != 'final']
+                if incomplete:
+                    skipped.append({'gmId': mid, 'round': fixture['data']['round'],
+                                    'reason': 'recording_not_final', 'incompleteSides': incomplete,
+                                    'incompleteTeamIds': [fixture['data']['homeTeamId' if side == 'H' else 'awayTeamId']
+                                                          for side in incomplete]})
+                else:
+                    completed.append(fixture)
+            selected = completed
+
         evidence = {'did_matches': all_matches, 'match_scan_truncated': False, 'source_recordings': [],
                     'captured_at': datetime.now(timezone.utc).isoformat(), 'player_profiles': {}, 'player_contracts': {},
                     'teams': {}, 'stadiums': {}, 'target_existing': {}, 'projects': {},
@@ -2062,13 +2085,7 @@ class SourceCapture:
         # Season code creation and aggregate slots belong to ALL/LATEST.
         slots = {}
         setup = {'documents': [], 'code_rows': [], 'slots': slots, 'new_season': False}
-        # Match delivery never reads unrelated recordings or sends season masters.
-        refs = [self.did.document(f'matches/{r["id"]}/recordings/{side}') for r in selected for side in ('H', 'A')]
-        recording_by_path = {}
-        for start in range(0, len(refs), 100):
-            for snap in self.did.get_all(refs[start:start + 100], timeout=60, retry=None):
-                self.documents[snap.reference.path] = self.version(snap)
-                recording_by_path[snap.reference.path] = encode(snap.to_dict()) if snap.exists else {}
+        # Read detailed records only for the fixtures selected for delivery.
         aggregate_items = []
         for row in selected:
             match = row['data']
@@ -2131,7 +2148,10 @@ class SourceCapture:
                   'reference_code': {},
                   'new_code': {d['document_id']: d['data'] for d in setup['documents']}}
         guards['reference_code'] = code_reference(evidence['ai_samples']['code'],guards['code_scope'])
-        report = generate_delivery(evidence, selected, aggregate_items, slots, setup, match_only=True)
+        report = (generate_delivery(evidence, selected, aggregate_items, slots, setup, match_only=True)
+                  if selected else finish_delivery([], [], [], target, 'matches'))
+        report['skippedMatches'] = skipped
+        report['summary']['skippedMatches'] = len(skipped)
         if scope.get('latest'):
             retain_changed_documents(report, target)
         self.report_progress(100)
@@ -2851,7 +2871,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
     return report
 
 
-VALIDATION_POLICY = 'imported-raw-team-player-authority-v24'
+VALIDATION_POLICY = 'imported-raw-team-player-authority-v25'
 
 
 def dump(value):
@@ -3085,6 +3105,9 @@ class JobStore:
                 for key in ('candidateDocuments','changedDocuments','unchangedDocuments'):
                     if key in report['summary']:
                         report['summary'][key] += previous['report']['summary'].get(key,0)
+                if 'skippedMatches' in report or 'skippedMatches' in previous['report']:
+                    report['skippedMatches'] = previous['report'].get('skippedMatches', []) + report.get('skippedMatches', [])
+                    report['summary']['skippedMatches'] = len(report['skippedMatches'])
                 report['summary']['errors'] = len(report['errors'])
                 report['summary']['failed_checks'] = sum(not c['passed'] for c in report['checks'])
                 guards = merge_guards(previous['guards'], guards)
@@ -3516,6 +3539,7 @@ class DeliveryService:
                 'phase':latest['meta'].get('phase', 'preview'),'percent':percent,'writeEnabled':enabled,'scope':latest['scope'],
                 'validationPassed':report.get('validation_passed'),'summary':report.get('summary'),
                 'aggregateStatus':report.get('aggregate_status'),'blockedGroups':report.get('blocked_groups',[]),
+                'skippedMatches':report.get('skippedMatches',[]),
                 'warnings':report.get('warnings',[]),
                 'counts':counts,
                 'reason':'; '.join(dict.fromkeys(reasons)) if reasons else (failure_reason(latest['error']) if latest['error'] else None),

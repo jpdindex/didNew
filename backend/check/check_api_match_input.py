@@ -8,6 +8,30 @@ from pydantic_core import PydanticUndefined
 import pytest
 
 
+@pytest.mark.parametrize("baseline_source", ["starting", "swapped", None])
+def test_final_lineup_keeps_starting_roles_and_recorded_substitution_times(baseline_source):
+    lineup = {
+        "starter": {"slot": "b1", "order": 12, "type": "BENCH"},
+        "sub": {"slot": "o1", "order": 2, "type": "START"},
+    }
+    baseline = {"starter": lineup["sub"], "sub": lineup["starter"]} if baseline_source == "starting" else lineup
+    setup = {
+        "lineupIsBaseline": baseline_source is not None,
+        "lineup": [{"playerId": pid, **row} for pid, row in baseline.items()],
+        "subs": [{"outPlayer": "starter", "inPlayer": "sub", "half": "H2", "seconds": 0}],
+    }
+    result = api_match_input.final_recording_lineup(lineup, setup)
+    assert result == {
+        "starter": {"slot": "o1", "order": 2, "type": "START", "inHalf": "H1", "inSeconds": 0,
+                    "outHalf": "H2", "outSeconds": 0},
+        "sub": {"slot": "b1", "order": 12, "type": "BENCH", "inHalf": "H2", "inSeconds": 0},
+    }
+    rebuilt = api_match_input.JpdDidData._subs_from_input_lineup([
+        {"playerId": pid, **row} for pid, row in result.items()
+    ])
+    assert [{k: v for k, v in sub.items() if k != "id"} for sub in rebuilt] == setup["subs"]
+
+
 def test_draft_snapshot_busy_is_503_and_never_a_missing_draft(monkeypatch):
     from backend.system.system_firestore import BackendError
     class Data:

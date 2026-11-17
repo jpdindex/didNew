@@ -824,6 +824,48 @@ def _draft_recorders(
     return recorders, recorder_ids
 
 
+def final_recording_lineup(lineup: dict[str, dict], setup: dict | None) -> dict[str, dict]:
+    """Keep initial positions and apply the durable substitutions to final RAW."""
+    if not setup:
+        return lineup
+    substitutions = setup.get("subs") or []
+    baseline = {
+        row["playerId"]: row for row in (setup.get("lineup") or [])
+        if row.get("playerId") in lineup
+    } if setup.get("lineupIsBaseline") else {}
+    if not substitutions and not baseline:
+        return lineup
+    positions = {
+        pid: {key: baseline.get(pid, {}).get(key, row[key]) for key in ("slot", "order", "type")}
+        for pid, row in lineup.items()
+    }
+    # Some older setup snapshots saved post-substitution assignments as the
+    # baseline. Undo swaps where an outgoing player occupies the bench slot.
+    for sub in reversed(substitutions):
+        out_player, in_player = sub["outPlayer"], sub["inPlayer"]
+        out_slot, in_slot = positions.get(out_player), positions.get(in_player)
+        if out_slot and in_slot and out_slot["type"] == "BENCH" and in_slot["type"] == "START":
+            positions[out_player], positions[in_player] = in_slot, out_slot
+    incoming = {sub["inPlayer"]: sub for sub in reversed(substitutions)}
+    outgoing = {sub["outPlayer"]: sub for sub in reversed(substitutions)}
+    result = {}
+    for pid, row in lineup.items():
+        player = {**row, **positions[pid]}
+        if pid in incoming:
+            player["type"] = "BENCH"
+        elif pid in outgoing:
+            player["type"] = "START"
+        entering, leaving = incoming.get(pid), outgoing.get(pid)
+        if entering:
+            player.update(inHalf=entering["half"], inSeconds=entering["seconds"])
+        elif player["type"] == "START":
+            player.update(inHalf="H1", inSeconds=0)
+        if leaving:
+            player.update(outHalf=leaving["half"], outSeconds=leaving["seconds"])
+        result[pid] = player
+    return result
+
+
 _RANK_ROLES = {"main": "primary", "sub": "assistant", "manager": "manager"}
 
 
@@ -847,6 +889,8 @@ def _promote(
     ):
         raise BackendError("Draft match snapshot no longer matches the selected match", status_code=409, code="draft_match_mismatch")
     recording, records, cards = _raw_values(payload, status=status, halves=halves)
+    if status == "final":
+        recording["lineup"] = final_recording_lineup(recording["lineup"], draft.get("_liveSetup"))
     existing_recorders = data.get_recording_heads_many([payload.gmId])[payload.gmId][payload.side].get("recorders")
     recording["recorders"], recording["recorderIds"] = _draft_recorders(draft, existing_recorders)
     recording["teamId"], recording["opponentTeamId"] = (
@@ -859,9 +903,11 @@ def _promote(
     if status == "final":
         # The completed-match lobby reads this compact display snapshot instead
         # of reopening RAW merely to reconstruct formation and player order.
-        data.save_final_input_lobby_snapshot(
-            payload.gmId, payload.side, match, payload.model_dump(mode="python"),
-        )
+        final_payload = payload.model_dump(mode="python")
+        final_payload["lineup"] = [
+            {"playerId": pid, **entry} for pid, entry in recording["lineup"].items()
+        ]
+        data.save_final_input_lobby_snapshot(payload.gmId, payload.side, match, final_payload)
     if delete_draft:
         data.delete_input_draft(payload.gmId, payload.side)
     data.sync_input_summary_from_recording(
