@@ -1374,7 +1374,6 @@ const subPickPlayers = computed(() => {
 })
 // 교체 IN 보기: 경기장 배치와 아래 줄을 뒤집는다. 기록 시각 전에 교체가 있었던 자리에는
 // 원래(나간) 선수를 Out 표시·비활성으로 두고, 들어온 선수는 아래 "교체 IN" 줄에서 고른다.
-// 열 때마다 기본(교체 OUT 보기)으로 돌아간다.
 const pickSwapView = ref(false)
 const pickSubApplied = (s: SubRecord) => pickRecordKey.value === null || subKey(s) < pickRecordKey.value
 const pickDisplayLineup = computed(() => {
@@ -2458,10 +2457,15 @@ function openPlayerPick(recordId: string) {
   pinHistory(recordId)
   playerPickFor.value = recordId
   pickedPlayerId.value = records.value.find(r => r.id === recordId)?.playerId ?? null
-  pickSwapView.value = false
 }
+// 교체 선수창 IN/OUT 보기도 Submit ON/OFF 처럼 창을 닫아도 유지하고 기기별로 기억한다.
+const PICK_SWAP_VIEW_KEY = 'did:pickSwapView'
+onMounted(() => {
+  try { pickSwapView.value = localStorage.getItem(PICK_SWAP_VIEW_KEY) === '1' } catch { }
+})
 function togglePickSwapView() {
   pickSwapView.value = !pickSwapView.value
+  try { localStorage.setItem(PICK_SWAP_VIEW_KEY, pickSwapView.value ? '1' : '0') } catch { }
 }
 function cancelPlayerPick() {
   playerPickFor.value = null
@@ -3091,7 +3095,7 @@ async function finishHalf() {
                     Submit<br>{{ pickSubmitOn ? 'ON' : 'OFF' }}
                   </button>
                   <button class="pickLineBtn pickSwapToggle" :class="{ on: pickSwapView }"
-                    :disabled="!game.subs.length" @click="togglePickSwapView">
+                    @click="togglePickSwapView">
                     <span class="swapSub">교체 선수창</span><br>{{ pickSwapView ? 'OUT' : 'IN' }} 선수 보기
                   </button>
                 </div>
@@ -4546,11 +4550,6 @@ button {
   border-color: #4cc38a;
   background: #4cc38a;
   color: #191919
-}
-
-.pickSwapToggle:disabled {
-  opacity: .3;
-  pointer-events: none
 }
 
 .shirtTag.outTag {

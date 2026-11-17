@@ -1604,8 +1604,9 @@ const displayedKpis = computed(() => {
 // ---- 입력 오류 감지 ----
 // E-Time: 같은 half 안에서 같은 초(seconds)에 두 번 이상 입력된 레코드.
 // E-Player: DAP 로 판정됐는데(=DidInput 표에서 선수 선택 버튼이 뜨는데) 선수를 아직 안 고른 레코드.
-function fmtErrTime(sec: number) {
-  return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
+function fmtErrTime(sec: number, half: Parameters<typeof formatMatchClock>[1]) {
+  // 후반은 45분부터 이어서(H2 46:00) 보여준다. 경기 시간 표시와 같은 기준.
+  return formatMatchClock(sec, half)
 }
 const kpiErrors = computed(() => {
   // DidInput 표의 No. 열과 같은 기준(그 half 레코드만 추린 순서)으로 번호를 매겨,
@@ -1630,7 +1631,7 @@ const kpiErrors = computed(() => {
       .filter(([, ids]) => ids.length > 1)
       .map(([seconds, ids]) => ({
         half: halfKey,
-        time: fmtErrTime(seconds),
+        time: fmtErrTime(seconds, halfKey),
         nos: ids.map(id => numberByHalf[halfKey].get(id) ?? 0).sort((a, b) => a - b),
       }))
   })
@@ -1639,7 +1640,7 @@ const kpiErrors = computed(() => {
     const flags = currentPreview.value.flags
     return records
       .filter(record => flags.get(record.id)?.isDap && !record.playerId)
-      .map(record => ({ half: halfKey, no: numberByHalf[halfKey].get(record.id) ?? 0, time: fmtErrTime(record.seconds) }))
+      .map(record => ({ half: halfKey, no: numberByHalf[halfKey].get(record.id) ?? 0, time: fmtErrTime(record.seconds, halfKey) }))
   })
   timeList.sort((a, b) => (a.half === b.half ? 0 : a.half === 'H1' ? -1 : 1) || a.time.localeCompare(b.time))
   playerList.sort((a, b) => (a.half === b.half ? 0 : a.half === 'H1' ? -1 : 1) || a.no - b.no)
@@ -1662,7 +1663,7 @@ const kpiDetailTimes = computed(() => {
       .map(path => byId.get(path.recordIds[path.recordIds.length - 1] ?? ''))
       .filter((record): record is NonNullable<typeof record> => !!record)
       .sort((a, b) => ((a.half ?? 'H1') === (b.half ?? 'H1') ? a.seconds - b.seconds : (a.half ?? 'H1') === 'H1' ? -1 : 1))
-      .map(record => ({ half: record.half ?? 'H1', time: fmtErrTime(record.seconds) }))
+      .map(record => ({ half: record.half ?? 'H1', time: fmtErrTime(record.seconds, record.half ?? 'H1') }))
   }
   const halves = kpiHalf.value === 'all' ? (['H1', 'H2'] as const) : [kpiHalf.value]
   return halves.flatMap(halfKey => game.value.records
@@ -1670,7 +1671,7 @@ const kpiDetailTimes = computed(() => {
       ? record.res === 'GOAL'
       : record.act === 'S' || record.act === 'H' || record.act === 'R'))
     .sort((a, b) => a.seconds - b.seconds)
-    .map(record => ({ half: halfKey, time: fmtErrTime(record.seconds) })))
+    .map(record => ({ half: halfKey, time: fmtErrTime(record.seconds, halfKey) })))
 })
 function isKpiDetailKey(key: string): key is KpiDetailKey {
   return (KPI_DETAIL_KEYS as readonly string[]).includes(key)
