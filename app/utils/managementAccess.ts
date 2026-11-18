@@ -7,9 +7,11 @@ export function canAccessManagement(email?: string | null): boolean {
 export function isRestrictedManagementPath(path: string): boolean {
   const normalizedPath = path.toLowerCase().replace(/\/+$/, '')
   // New management pages are restricted by default. Analysts can access the
-  // dashboard, GoalX and player requests.
+  // dashboard, GoalX, match reports and player requests.
   return normalizedPath.startsWith('/manage/')
     && normalizedPath !== '/manage/analyst-dashboard'
     && normalizedPath !== '/manage/player-requests'
     && normalizedPath !== '/manage/goalx'
+    && normalizedPath !== '/manage/match-reports'
+    && !normalizedPath.startsWith('/manage/match-reports/')
 }

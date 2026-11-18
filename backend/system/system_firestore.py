@@ -808,6 +808,8 @@ class JpdDidData:
                 heads[match_ref.id][snapshot.id] = {
                     "status": str(value) if value is not None else None,
                     "recorders": recorders if isinstance(recorders, dict) else {},
+                    # Legacy imports have no recorders map, only the SQL recorder IDs.
+                    "recorderIds": [str(uid) for uid in document.get("recorderIds") or [] if uid],
                 }
         return heads
 
