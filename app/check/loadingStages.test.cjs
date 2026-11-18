@@ -170,6 +170,98 @@ function functions(file, names, globals) {
   return context
 }
 
+function finalKpiDetailEnvironment({ side = 'H', final = true, request } = {}) {
+  const requests = []
+  const game = ref({ team: side === 'H' ? 'home' : 'away', records: [{ id: 'stale-device-record' }] })
+  const context = functions('TeamSelection.vue', ['loadFinalKpiDetailRecords'], {
+    game, inputStatus: ref({ H: { rawStatus: final ? 'final' : null }, A: { rawStatus: final ? 'final' : null } }),
+    lobbyMatchId: 'completed-match', isCurrentLobby: () => true,
+    finalKpiDetailRecords: ref(null), kpiDetailLoading: ref(false), kpiDetailError: ref(''),
+    request: async url => {
+      requests.push(url)
+      return request ? request(url) : { payload: { gmId: 'completed-match', side, records: [
+        { id: 'shot', half: 'H1', halfSeconds: 72, seq: 1, act: 'S', res: 'GOAL', area: 2 },
+        { id: 'header', half: 'H2', halfSeconds: 36, seq: 2, act: 'H', res: 'GB', area: 2 },
+      ] } }
+    },
+  })
+  context.computed = getter => ({ get value() { return getter() } })
+  const page = source('TeamSelection.vue')
+  for (const name of ['kpiDetailRecords', 'kpiDetailTimes']) {
+    const expression = page.match(new RegExp(`const ${name} = computed\\([\\s\\S]*?\\n}\\)`))[0]
+    vm.runInContext(transformSync(expression + `\nglobalThis.${name} = ${name}`, { loader: 'ts', format: 'cjs' }).code, context)
+  }
+  context.kpiDetailOpen = ref('Shoot')
+  context.kpiHalf = ref('all')
+  context.kpiDetailPreview = ref({ paths: [{ type: 'DTP', recordIds: ['shot'] }, { type: 'DTP', recordIds: ['header'] }] })
+  context.fmtErrTime = (seconds, half) => `${half}:${seconds}`
+  return { context, game, requests }
+}
+
+test('completed KPI details read selected RAW once without changing the input draft', async () => {
+  for (const side of ['H', 'A']) {
+    const { context, game, requests } = finalKpiDetailEnvironment({ side })
+    assert.equal(requests.length, 0)
+    assert.equal(context.kpiDetailTimes.value.length, 0)
+    await context.loadFinalKpiDetailRecords()
+    assert.match(requests[0], new RegExp(`/recordings/${side}/input-state$`))
+    assert.equal(context.kpiDetailLoading.value, false)
+    assert.deepEqual(JSON.parse(JSON.stringify(context.kpiDetailTimes.value)), [
+      { half: 'H1', time: 'H1:72' }, { half: 'H2', time: 'H2:36' },
+    ])
+    context.kpiDetailOpen.value = 'Goal'
+    assert.equal(context.kpiDetailTimes.value.length, 1)
+    assert.equal(context.kpiDetailTimes.value[0].time, 'H1:72')
+    context.kpiDetailOpen.value = 'DTP'
+    assert.equal(context.kpiDetailTimes.value.length, 2)
+    await context.loadFinalKpiDetailRecords()
+    assert.equal(requests.length, 1)
+    assert.deepEqual(game.value.records, [{ id: 'stale-device-record' }])
+    context.kpiDetailOpen.value = 'Shoot'
+    context.kpiHalf.value = 'H2'
+    assert.equal(context.kpiDetailTimes.value[0].time, 'H2:36')
+    assert.equal(context.kpiDetailTimes.value.length, 1)
+  }
+})
+
+test('live KPI details keep using current records without fetching completed RAW', async () => {
+  const { context, game, requests } = finalKpiDetailEnvironment({ final: false })
+  await context.loadFinalKpiDetailRecords()
+  assert.equal(requests.length, 0)
+  assert.equal(context.kpiDetailRecords.value, game.value.records)
+})
+
+test('completed KPI detail fetch deduplicates pending reads and ignores a departed lobby', async () => {
+  const gate = deferred()
+  const { context, requests } = finalKpiDetailEnvironment({ request: () => gate.promise })
+  const loading = context.loadFinalKpiDetailRecords()
+  await context.loadFinalKpiDetailRecords()
+  assert.equal(requests.length, 1)
+  assert.equal(context.kpiDetailLoading.value, true)
+  context.isCurrentLobby = () => false
+  gate.resolve({ payload: { gmId: 'completed-match', side: 'H', records: [] } })
+  await loading
+  assert.equal(context.finalKpiDetailRecords.value, null)
+})
+
+test('failed or mismatched completed KPI reads remain retryable instead of showing no records', async () => {
+  let attempt = 0
+  const { context, requests } = finalKpiDetailEnvironment({ request: async () => {
+    if (++attempt === 1) throw new Error('offline')
+    return { payload: { gmId: attempt === 2 ? 'wrong-match' : 'completed-match', side: 'H', records: [] } }
+  } })
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await context.loadFinalKpiDetailRecords()
+    assert.ok(context.kpiDetailError.value)
+    assert.equal(context.finalKpiDetailRecords.value, null)
+    assert.equal(context.kpiDetailLoading.value, false)
+  }
+  await context.loadFinalKpiDetailRecords()
+  assert.equal(requests.length, 3)
+  assert.equal(context.kpiDetailError.value, '')
+  assert.equal(context.finalKpiDetailRecords.value.length, 0)
+})
+
 test('saved setup paints without waiting for profile, then only the current half precedes full KPI', async () => {
   const half = deferred(), profile = deferred(), events = [], intervals = []
   const context = functions('TeamSelection.vue', ['loadInitialKpis'], {

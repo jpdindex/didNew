@@ -6,6 +6,7 @@ import type { InputPayload } from '~/composables/useMatchDraft'
 import type { DraftRestoreResponse } from '~/composables/useMatchCollaboration'
 import { cloneState, payloadFromState } from '~/composables/useMatchDraft'
 import { formatMatchClock, formatMatchMinute } from '~/utils/matchClock'
+import type { DidRecord } from '~/utils/didLogic'
 import {
   BENCH_COUNT,
   BENCH_IDS,
@@ -1648,17 +1649,67 @@ const kpiErrors = computed(() => {
   return { eTime: timeList.length, ePlayer: playerList.length, timeList, playerList }
 })
 // KPI 표의 DTP/Shoot/Goal 행을 누르면 DTP 루트·슈팅(S/H/R)·골(결과 GOAL) 기록 시간을 펼쳐 보여준다.
-// 이 기기에서 입력 중인 팀 기록 기준이다.
+// 종료 경기는 초기 로비에서 RAW를 생략하므로, 목록을 펼칠 때 읽기 전용으로 불러온다.
 const KPI_DETAIL_KEYS = ['DTP', 'Shoot', 'Goal'] as const
 type KpiDetailKey = (typeof KPI_DETAIL_KEYS)[number]
 const kpiDetailOpen = ref<KpiDetailKey | null>(null)
+const finalKpiDetailRecords = ref<DidRecord[] | null>(null)
+const kpiDetailLoading = ref(false)
+const kpiDetailError = ref('')
+const kpiDetailRecords = computed(() => {
+  const side = game.value.team === 'away' ? 'A' : 'H'
+  return inputStatus.value[side].rawStatus === 'final'
+    ? finalKpiDetailRecords.value ?? []
+    : game.value.records
+})
+const kpiDetailPreview = computed(() => previewInput(
+  kpiDetailRecords.value,
+  kpiHalf.value === 'all' ? undefined : kpiHalf.value,
+  `${matchId.value}:${game.value.team === 'home' ? 'H' : 'A'}:detail`,
+))
+watch([kpiDetailOpen, kpiDetailRecords, kpiHalf], () => {
+  if (!kpiDetailOpen.value) return
+  void loadFinalKpiDetailRecords()
+  scheduleInputPreview(
+    kpiDetailRecords.value,
+    kpiHalf.value === 'all' ? undefined : kpiHalf.value,
+    `${matchId.value}:${game.value.team === 'home' ? 'H' : 'A'}:detail`,
+  )
+}, { deep: true })
+async function loadFinalKpiDetailRecords() {
+  const side = game.value.team === 'away' ? 'A' : 'H'
+  if (inputStatus.value[side].rawStatus !== 'final' || finalKpiDetailRecords.value !== null || kpiDetailLoading.value) return
+  kpiDetailLoading.value = true
+  kpiDetailError.value = ''
+  try {
+    const { payload } = await request<{ payload: InputPayload }>(
+      `/api/v1/match-input/matches/${encodeURIComponent(lobbyMatchId)}/recordings/${side}/input-state`,
+    )
+    if (!isCurrentLobby()) return
+    if (payload.gmId !== lobbyMatchId || payload.side !== side || !Array.isArray(payload.records)) {
+      throw new Error('경기 기록을 확인하지 못했습니다. 목록을 다시 열어주세요.')
+    }
+    finalKpiDetailRecords.value = payload.records.map(record => ({
+      id: String(record.id), half: record.half as DidRecord['half'],
+      seconds: Number(record.halfSeconds), seq: Number(record.seq), area: Number(record.area),
+      act: record.act as DidRecord['act'], res: record.res as DidRecord['res'],
+      isShot: record.isShot as boolean | undefined, playerId: record.playerId as string | undefined,
+      shootPosX: record.shootPosX as number | undefined, shootPosY: record.shootPosY as number | undefined,
+      shootDspRange: record.shootDspRange as boolean | undefined,
+    }))
+  } catch (error) {
+    if (isCurrentLobby()) kpiDetailError.value = error instanceof Error ? error.message : '기록 시간을 불러오지 못했습니다. 목록을 다시 열어주세요.'
+  } finally {
+    kpiDetailLoading.value = false
+  }
+}
 const kpiDetailTimes = computed(() => {
   const kind = kpiDetailOpen.value
   if (!kind) return []
   if (kind === 'DTP') {
     // DTP 는 루트 단위라, 루트가 DTP 로 확정되는 마지막 기록(슈팅)의 시간을 보여준다.
-    const byId = new Map(game.value.records.map(record => [record.id, record]))
-    return currentPreview.value.paths
+    const byId = new Map(kpiDetailRecords.value.map(record => [record.id, record]))
+    return kpiDetailPreview.value.paths
       .filter(path => path.type === 'DTP')
       .map(path => byId.get(path.recordIds[path.recordIds.length - 1] ?? ''))
       .filter((record): record is NonNullable<typeof record> => !!record)
@@ -1666,7 +1717,7 @@ const kpiDetailTimes = computed(() => {
       .map(record => ({ half: record.half ?? 'H1', time: fmtErrTime(record.seconds, record.half ?? 'H1') }))
   }
   const halves = kpiHalf.value === 'all' ? (['H1', 'H2'] as const) : [kpiHalf.value]
-  return halves.flatMap(halfKey => game.value.records
+  return halves.flatMap(halfKey => kpiDetailRecords.value
     .filter(record => (record.half ?? 'H1') === halfKey && (kind === 'Goal'
       ? record.res === 'GOAL'
       : record.act === 'S' || record.act === 'H' || record.act === 'R'))
@@ -2028,7 +2079,9 @@ function undoSub(index: number) {
                 <span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.H[key] : 0 }}{{ isPercentKpi(key) ? '%' : '' }}</span><b>{{ key }}<i v-if="isKpiDetailKey(key)" class="toggleArrow" :class="{ open: kpiDetailOpen === key }">▾</i></b><span>{{ dashboardKpiLoaded[kpiHalf] ? displayedKpis.A[key] : 0 }}{{ isPercentKpi(key) ? '%' : '' }}</span>
               </div>
               <div v-if="kpiDetailOpen === key" class="errDetail shotDetail">
-                <div v-if="kpiDetailTimes.length" class="errDetailGrid">
+                <span v-if="kpiDetailLoading" class="errDetailEmpty">기록 시간 불러오는 중…</span>
+                <span v-else-if="kpiDetailError" class="errDetailEmpty">{{ kpiDetailError }}</span>
+                <div v-else-if="kpiDetailTimes.length" class="errDetailGrid">
                   <span v-for="(g, i) in kpiDetailTimes" :key="i" class="errDetailItem">{{ g.half }} {{ g.time }}{{ i <
                     kpiDetailTimes.length - 1 ? ',' : '' }}</span>
                 </div>
