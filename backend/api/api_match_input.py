@@ -86,6 +86,8 @@ class InputRecord(BaseModel):
     shootDspRange: bool | None = None
     isShot: bool | None = None
     playerId: str | None = None
+    # PK = R taken from the penalty spot. act stays "R"; this flag marks it.
+    isPk: bool | None = None
 
 
 class InputCard(BaseModel):

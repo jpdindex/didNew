@@ -153,6 +153,8 @@ class RecordDoc(SchemaModel):
     shootDspRange: bool | None = None
     isShot: bool | None = None
     playerId: str | None = None
+    # PK = R taken from the penalty spot (act stays "R").
+    isPk: bool | None = None
     # New RAW intentionally does not retain the operator UID.
     createdBy: str = ""
     playerIdBy: str | None = None

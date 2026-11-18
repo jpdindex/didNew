@@ -6,6 +6,8 @@ import {
   computeAttackPaths,
   createActRecord,
   createResultRecord,
+  isPkRecord,
+  pkSpotNear,
   type ActCode,
   type DidRecord,
   type ResCode,
@@ -767,6 +769,7 @@ const rows = computed(() => {
       // 한 번이라도 수정된 기록은 No 옆에 점으로 계속 표시한다(이 브라우저에 남긴 id 기준).
       edited: editedIds.value.has(r.id),
       draft: false,
+      pk: isPkRecord(r),
     }))
   // 위치만 찍고 아직 액트를 안 고른 상태 — 확정 레코드가 아니라 표시 전용 "가안" 행이다.
   // records.value 에는 안 들어가므로 채점 로직(computeAttackPaths 등)에는 전혀 영향이 없다.
@@ -782,12 +785,44 @@ const rows = computed(() => {
     list.splice(at, 0, {
       id: '__draft__', no: at + 1, time: formatMatchClock(draftSeconds.value, halfCode.value),
       act: '', result: '', area: areaFromPos(pendingPos.value),
-      isDap: false, playerName: '', edited: false, draft: true,
+      isDap: false, playerName: '', edited: false, draft: true, pk: false,
     })
     for (let i = at + 1; i < list.length; i++) list[i]!.no = i + 1
   }
   return list
 })
+
+// 수정 화면 전용: 이 팀·이 하프의 슈팅(S/H/R) 기록 목록. 고르면 기록표를 그 행으로 옮긴다.
+const SHOOT_KEYS = new Set(['S', 'H', 'R'])
+// DTP 루트(C/P/K/F 뒤에 이어진 슛)에 속한 슈팅은 목록에 (DTP)로 표시한다. 단독슛(STP)은 제외.
+const dtpRecordIds = computed(() => new Set(analysis.value.paths.filter(p => p.type === 'DTP').flatMap(p => p.recordIds)))
+const shootRows = computed(() => rows.value
+  .filter(r => !r.draft && SHOOT_KEYS.has(r.act))
+  .map(r => ({ ...r, isDtp: dtpRecordIds.value.has(r.id) })))
+const shootMenuOpen = ref(false)
+const shootMenuEl = ref<HTMLElement | null>(null)
+const jumpedRowId = ref<string | null>(null)
+let jumpedTimer: ReturnType<typeof setTimeout> | undefined
+// 목록 바깥을 누르면 닫는다.
+function closeShootMenuOnOutside(e: PointerEvent) {
+  if (shootMenuEl.value?.contains(e.target as Node)) return
+  shootMenuOpen.value = false
+}
+watch(shootMenuOpen, open => {
+  if (open) document.addEventListener('pointerdown', closeShootMenuOnOutside, true)
+  else document.removeEventListener('pointerdown', closeShootMenuOnOutside, true)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', closeShootMenuOnOutside, true)
+  clearTimeout(jumpedTimer)
+})
+function jumpToShoot(id: string) {
+  shootMenuOpen.value = false
+  scrollRowIntoView(id)
+  jumpedRowId.value = id
+  clearTimeout(jumpedTimer)
+  jumpedTimer = setTimeout(() => { jumpedRowId.value = null }, 1600)
+}
 
 // 최신 기록이 맨 아래에 쌓이므로, 기록이 늘면 표를 아래로 붙여준다.
 const tableEl = ref<HTMLElement | null>(null)
@@ -1086,6 +1121,19 @@ function applyEdit() {
       rec.posX = editPos.value.x
       rec.posY = editPos.value.y
       rec.area = Number(areaFromPos(editPos.value))
+    }
+    // 수정에서도 R 이 PK 점 근처면 PK(11m 위치로 맞춤), 아니면 PK 해제.
+    // (액트만 R 로 바꾸거나 R 에서 다른 액트로 바꾼 경우도 여기서 함께 정리된다.)
+    const spot = rec.act === 'R' && rec.posX != null && rec.posY != null
+      ? pkSpotNear({ x: rec.posX, y: rec.posY })
+      : null
+    if (spot) {
+      rec.posX = spot.x
+      rec.posY = spot.y
+      rec.area = Number(areaFromPos(spot))
+      rec.isPk = true
+    } else if (rec.isPk) {
+      rec.isPk = undefined
     }
     // P|B 처럼 액트가 있는 X/B 레코드의 결과를 지웠으면 'O' 로 되돌린다.
     // 그 결과만 나타내던 짝 레코드(act 없음)는 건드리지 않는다 — 필요하면 직접 보고 삭제한다.
@@ -2018,6 +2066,45 @@ const recentTapKey = computed(() => {
   return records.value.some(r => r.id === tap.id) ? tap.key : null
 })
 
+// Kick/Shooting 버튼은 누르는 동안엔 눌림 표시만 하고, 버튼 안에서 손을 떼야 입력한다.
+// 누른 채 버튼 밖으로 밀어서 떼면 취소된다(포인터 캡처로 밖에서 떼도 pointerup 을 받는다).
+const pressing = ref<{ key: string; pointerId: number; inside: boolean } | null>(null)
+const pressingKey = computed(() => (pressing.value?.inside ? pressing.value.key : null))
+
+function isInsideEl(e: PointerEvent) {
+  const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  return e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom
+}
+
+function pressStart(key: string, e: PointerEvent) {
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  pressing.value = { key, pointerId: e.pointerId, inside: true }
+  try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* noop */ }
+}
+
+function pressMove(e: PointerEvent) {
+  const p = pressing.value
+  if (!p || p.pointerId !== e.pointerId) return
+  const inside = isInsideEl(e)
+  if (p.inside !== inside) p.inside = inside
+}
+
+function pressEnd(key: string, e: PointerEvent, commit: () => void) {
+  const p = pressing.value
+  if (!p || p.key !== key || p.pointerId !== e.pointerId) return
+  pressing.value = null
+  if (isInsideEl(e)) commit()
+}
+
+function pressCancel(e: PointerEvent) {
+  if (pressing.value?.pointerId === e.pointerId) pressing.value = null
+}
+
+function commitShootAct(actKey: string) {
+  sizeGoalDismissed.value = false
+  clickAct(actKey, true)
+}
+
 // 위 레코드의 결과가 X/B 면 그 결과 버튼도 "선택됨"으로 보여준다.
 // 하나의 레코드에 act 와 res(X/B) 가 함께 있는 경우(예: 표에서 "P|B" 한 줄로 보이는
 // 레코드를 직접 클릭해서 보는 중) 는 activeAct 와 동시에 채워진다 — 의도된 동작이다.
@@ -2206,11 +2293,14 @@ function clickAct(actKey: string, isShot: boolean) {
     return
   }
   if (!pendingPos.value) return
+  // PK 점 근처를 찍고 R 을 누르면 PK — 위치를 정확히 11m 인 PK 점에 맞추고 isPk 를 저장한다.
+  const pkSpot = actKey === 'R' ? pkSpotNear(pendingPos.value) : null
+  const pos = pkSpot ?? pendingPos.value
   const rec = createActRecord(
     actKey as Exclude<ActCode, ''>,
     draftSeconds.value,
-    Number(areaFromPos(pendingPos.value)),
-    { posX: pendingPos.value.x, posY: pendingPos.value.y, half: halfCode.value }
+    Number(areaFromPos(pos)),
+    { posX: pos.x, posY: pos.y, half: halfCode.value, ...(pkSpot ? { isPk: true } : {}) }
   )
   records.value.push(rec)
   markRecordDirty(rec.id)
@@ -2749,7 +2839,7 @@ async function finishHalf() {
             </div>
             <div class="tbody">
               <div v-for="r in rows" :key="r.id" class="trow" :data-row-id="r.id"
-                :class="{ pending: r.isDap, editing: editingId === r.id, peeking: peekId === r.id, rangeSel: rangeMode && rangeSelectedIds.has(r.id), rangeAnchor: rangeMode && r.id === rangeStartId && !rangeEndId, draft: r.draft }"
+                :class="{ pending: r.isDap, editing: editingId === r.id, peeking: peekId === r.id, rangeSel: rangeMode && rangeSelectedIds.has(r.id), rangeAnchor: rangeMode && r.id === rangeStartId && !rangeEndId, draft: r.draft, jumped: jumpedRowId === r.id }"
                 @pointerdown="!r.draft && startPress(r.id, $event)" @pointerup="!r.draft && endPress(r.id, $event)"
                 @pointermove="movePress" @pointercancel="cancelPress" @lostpointercapture="cancelPress" @contextmenu.prevent>
                 <template v-if="editingId === r.id">
@@ -2782,7 +2872,7 @@ async function finishHalf() {
                   </div>
                 </template>
                 <template v-else>
-                  <span class="noCell"><i v-if="r.edited" class="editedDot" />{{ r.no }}</span><span>{{ r.time }}</span><span>{{ r.act }}</span><span>{{ r.result
+                  <span class="noCell"><i v-if="r.edited" class="editedDot" />{{ r.no }}</span><span>{{ r.time }}</span><span>{{ r.act }}<small v-if="r.pk" class="pkTag">(PK)</small></span><span>{{ r.result
                   }}</span><span>{{ r.area }}</span>
                   <span>
                     <button v-if="r.isDap" class="playerBtn" :class="{ assigned: !!r.playerName }" @pointerdown.stop
@@ -3004,16 +3094,22 @@ async function finishHalf() {
               <div v-if="!sizeUp" class="groupTitle">CID-INPUT(Kick)</div>
               <div class="kickGrid">
                 <button v-for="a in kickActs" :key="a.k" class="actBtn kickPrimary"
-                  :class="[`kick-${a.k.toLowerCase()}`, { on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k }]"
-                  @pointerdown="clickAct(a.k, false)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
+                  :class="[`kick-${a.k.toLowerCase()}`, { on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k, pressing: pressingKey === a.k }]"
+                  @pointerdown="pressStart(a.k, $event)" @pointermove="pressMove"
+                  @pointerup="pressEnd(a.k, $event, () => clickAct(a.k, false))" @pointercancel="pressCancel"
+                  @contextmenu.prevent><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
                 <div class="stacked">
                   <button v-for="a in kickActs2" :key="a.k" class="actBtn small"
-                    :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k }"
-                    @pointerdown="clickAct(a.k, false)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
+                    :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k, pressing: pressingKey === a.k }"
+                    @pointerdown="pressStart(a.k, $event)" @pointermove="pressMove"
+                    @pointerup="pressEnd(a.k, $event, () => clickAct(a.k, false))" @pointercancel="pressCancel"
+                    @contextmenu.prevent><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
                 </div>
                 <button v-for="a in kickResultActs" :key="a.k" class="actBtn kickResult"
-                  :class="[`kick-${a.k.toLowerCase()}`, { on: activeResult === a.k, recent: recentTapKey === a.k }]"
-                  @pointerdown="clickResult(a.k as 'X' | 'B')"><b>{{ a.k }}</b><span class="divider">|</span><span>{{ a.label
+                  :class="[`kick-${a.k.toLowerCase()}`, { on: activeResult === a.k, recent: recentTapKey === a.k, pressing: pressingKey === a.k }]"
+                  @pointerdown="pressStart(a.k, $event)" @pointermove="pressMove"
+                  @pointerup="pressEnd(a.k, $event, () => clickResult(a.k as 'X' | 'B'))" @pointercancel="pressCancel"
+                  @contextmenu.prevent><b>{{ a.k }}</b><span class="divider">|</span><span>{{ a.label
                   }}</span></button>
               </div>
             </div>
@@ -3022,11 +3118,29 @@ async function finishHalf() {
               <div v-if="!sizeUp" class="groupTitle">CID-INPUT(Shooting)</div>
               <div class="shootGrid">
                 <button v-for="a in shootActs" :key="a.k" class="actBtn"
-                  :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k }"
-                  @pointerdown="sizeGoalDismissed = false; clickAct(a.k, true)"><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
+                  :class="{ on: activeAct === a.k, available: !!pendingPos && activeAct !== a.k, recent: recentTapKey === a.k, pressing: pressingKey === a.k }"
+                  @pointerdown="pressStart(a.k, $event)" @pointermove="pressMove"
+                  @pointerup="pressEnd(a.k, $event, () => commitShootAct(a.k))" @pointercancel="pressCancel"
+                  @contextmenu.prevent><b>{{ a.k }}</b><span>{{ a.label }}</span></button>
               </div>
 
-              <div v-if="!sizeUp || isEditMode || editingId || pendingOuterResult || cardPlayerEditTarget || editingSubIndex !== null" class="liveRoomGap">
+              <div v-if="!sizeUp || isEditMode || editingId || pendingOuterResult || cardPlayerEditTarget || editingSubIndex !== null" class="liveRoomGap" :class="{ menuOpen: shootMenuOpen }">
+                <!-- 슈팅 기록 바로가기(왼쪽 끝): 고르면 기록표가 그 행으로 스크롤된다 -->
+                <div v-if="isEditMode" ref="shootMenuEl" class="shootJump">
+                    <button class="scoreTool shootJumpBtn" :class="{ on: shootMenuOpen }" :disabled="!shootRows.length"
+                      @click="shootMenuOpen = !shootMenuOpen">
+                      {{ shootRows.length ? `슈팅 기록 ${shootRows.length}` : '슈팅 기록 없음' }}<i class="caret">▾</i>
+                    </button>
+                    <div v-if="shootMenuOpen" class="shootMenu">
+                      <button v-for="(s, i) in shootRows" :key="s.id" class="shootItem" :class="{ isGoal: s.result === 'GOAL' }"
+                        @click="jumpToShoot(s.id)">
+                        <span class="shootNo">{{ i + 1 }}</span>
+                        <span class="shootTime">{{ s.time }}<small v-if="s.isDtp" class="shootDtp">(DTP)</small></span>
+                        <span class="shootAct" :class="{ pk: s.pk }">{{ s.pk ? 'PK' : s.act }}</span>
+                        <span class="shootRes">{{ s.result === 'GOAL' ? 'G' : s.result }}</span>
+                      </button>
+                    </div>
+                </div>
                 <LiveRoomStatus v-if="editingId || pendingOuterResult || cardPlayerEditTarget || editingSubIndex !== null" compact :status="roomStatus" @accept-server="acceptServer" @keep-local="keepLocal" />
                 <!-- 수정 화면의 기록 더보기·구간 수정은 골대 위에 둔다 (스코어바에 두면 팀 이름이 밀려나고, 경기장 아래에 두면 코너 위치 입력과 겹친다) -->
                 <div v-if="isEditMode" class="editTools">
@@ -4007,15 +4121,14 @@ button {
   pointer-events: none
 }
 
-/* 실제 규격 비율: 골라인에서 11m / 박스 깊이 16.5m → 박스 폭(15.5%)의 2/3 */
+/* 골라인에서 11m (경기장 105m 기준) — utils/didLogic.ts PK_SPOT_X 와 같은 값이어야 한다 */
 .pkSpotL {
-  left: calc(15.5% * 2 / 3)
+  left: calc(100% * 11 / 105)
 }
 
 .pkSpotR {
-  right: calc(15.5% * 2 / 3)
+  right: calc(100% * 11 / 105)
 }
-
 .goalNetL,
 .goalNetR {
   position: absolute;
@@ -4222,6 +4335,20 @@ button {
 .trow.peeking {
   background: rgba(45, 212, 191, .14);
   box-shadow: inset 3px 0 rgba(45, 212, 191, .8)
+}
+
+/* 기록표 Act 칸의 PK 표시 — R(PK) */
+.pkTag {
+  margin-left: 3px;
+  color: #c4c8ce;
+  font-size: 11px;
+  font-weight: 700
+}
+
+/* 슈팅 기록 드롭다운으로 이동한 행 — 잠깐 청록색으로 표시 */
+.trow.jumped {
+  background: rgba(45, 212, 191, .24);
+  box-shadow: inset 3px 0 #2dd4bf
 }
 
 /* 태블릿(터치) 전용 — hover 가 없으니 가만히 있을 때부터 "누를 수 있는 칸"으로 보여야 하고,
@@ -5220,6 +5347,18 @@ section.right h1 {
   }
 }
 
+/* 누르고 있는 중(아직 입력 전) — 떼면 입력된다. 위 모든 상태보다 우선 보이도록 맨 뒤에 둔다. */
+.actBtn.actBtn.pressing:not(:disabled) {
+  background: rgba(240, 180, 41, .35);
+  border-color: #f0b429;
+  color: #fff;
+  box-shadow: inset 0 3px 6px rgba(0, 0, 0, .35)
+}
+
+.actBtn.pressing .divider {
+  color: rgba(255, 255, 255, .35)
+}
+
 .shootGrid {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
@@ -5255,6 +5394,134 @@ section.right h1 {
   gap: 8px;
   margin-left: auto;
   flex: 0 0 auto
+}
+
+/* 수정 화면에서는 슈팅 기록 목록이 골대 위로 펼쳐지도록 잘라내지 않는다 */
+.liveRoomGap.menuOpen {
+  overflow: visible;
+  position: relative;
+  z-index: 30
+}
+
+.shootJump {
+  position: relative;
+  flex: 0 0 auto;
+  margin-right: 8px
+}
+
+.shootJumpBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px
+}
+
+.shootJumpBtn:disabled {
+  opacity: .4;
+  cursor: default
+}
+
+.shootJumpBtn .caret {
+  font-style: normal;
+  font-size: 10px;
+  transition: transform .15s
+}
+
+.shootJumpBtn.on .caret {
+  transform: rotate(180deg)
+}
+
+.shootMenu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  width: 240px;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid rgba(240, 180, 41, .45);
+  border-radius: 6px;
+  background: #1a1d22;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .55);
+  display: flex;
+  flex-direction: column;
+  gap: 2px
+}
+
+.shootItem {
+  display: grid;
+  grid-template-columns: 20px 1fr 28px 52px;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 40px;
+  height: 40px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #e6e6e6;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer
+}
+
+.shootItem:active {
+  background: rgba(240, 180, 41, .18)
+}
+
+.shootTime {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap
+}
+
+.shootNo {
+  color: #7d838c;
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums
+}
+
+.shootDtp {
+  margin-left: 4px;
+  color: #c4c8ce;
+  font-size: 10px;
+  font-weight: 700
+}
+
+.shootAct {
+  justify-self: center;
+  width: 24px;
+  height: 22px;
+  line-height: 22px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .08);
+  color: #cfd3da;
+  font-size: 12px;
+  font-weight: 800;
+  text-align: center
+}
+
+.shootAct.pk {
+  width: 28px;
+  font-size: 11px
+}
+
+.shootRes {
+  justify-self: end;
+  color: #9aa0a8;
+  font-size: 12px;
+  font-weight: 700
+}
+
+.shootItem.isGoal .shootTime {
+  color: #f0b429
+}
+
+.shootItem.isGoal .shootRes {
+  color: #111;
+  background: #f0b429;
+  padding: 2px 6px;
+  border-radius: 3px
 }
 
 .goal.active {

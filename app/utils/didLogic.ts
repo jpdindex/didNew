@@ -96,11 +96,42 @@ export interface DidRecord {
   /** 어느 half 의 레코드인지. 전반/후반 기록이 한 배열에 섞이는 걸 막는 구분자.
    *  없으면(과거 데이터) 전반으로 취급한다 — resolvedOnly() 참고. */
   half?: 'H1' | 'H2'
+  /** PK 여부. act 는 'R' 그대로 두고 이 필드로 구분한다(Firestore 에 isPk:true 로 저장). */
+  isPk?: boolean
   edited?: boolean
 }
 
 function isShotAct(act: ActCode) {
   return act === 'S' || act === 'H' || act === 'R'
+}
+
+// ---- PK ----
+// PK 는 별도 액트가 아니다. "PK 점에 찍은 R" 을 PK 로 보고 isPk:true 를 함께 저장한다.
+// 사람이 찍는 위치는 조금씩 어긋나므로, PK 면 위치를 골라인에서 정확히 11m 인 PK 점 좌표로
+// 맞춰 저장한다(거리 보정). 좌표는 경기장 화면 기준 %(0~100), 경기장 길이 105m 기준.
+// CSS .pkSpotL/.pkSpotR 도 같은 위치(11/105)에 그린다.
+export const PITCH_LENGTH_M = 105
+export const PK_DISTANCE_M = 11
+export const PK_SPOT_X = PK_DISTANCE_M / PITCH_LENGTH_M * 100
+export const PK_SPOT_Y = 50
+const PK_SPOTS_X = [PK_SPOT_X, 100 - PK_SPOT_X]
+// 손가락으로 눌러도 들어가게 잡은 판정 범위(경기장 대비 %). 가로·세로 비율이 달라 따로 둔다.
+const PK_HIT_RX = 2.6
+const PK_HIT_RY = 4.2
+
+/** 이 위치가 PK 점 판정 범위 안이면 그 PK 점 좌표를, 아니면 null 을 돌려준다. */
+export function pkSpotNear(pos: { x: number; y: number }): { x: number; y: number } | null {
+  for (const x of PK_SPOTS_X) {
+    const dx = (pos.x - x) / PK_HIT_RX
+    const dy = (pos.y - PK_SPOT_Y) / PK_HIT_RY
+    if (dx * dx + dy * dy <= 1) return { x, y: PK_SPOT_Y }
+  }
+  return null
+}
+
+/** PK 기록 = isPk 가 켜진 R */
+export function isPkRecord(r: Pick<DidRecord, 'act' | 'isPk'>) {
+  return r.act === 'R' && r.isPk === true
 }
 
 /** 'GOAL' 을 레거시 res_code 'G' 와 동일하게 취급한다. */
@@ -148,7 +179,7 @@ export function createActRecord(
   act: Exclude<ActCode, ''>,
   seconds: number,
   area: number,
-  extra: Partial<Pick<DidRecord, 'playerId' | 'shootPosX' | 'shootPosY' | 'posX' | 'posY' | 'half'>> = {}
+  extra: Partial<Pick<DidRecord, 'playerId' | 'shootPosX' | 'shootPosY' | 'posX' | 'posY' | 'half' | 'isPk'>> = {}
 ): DidRecord {
   return { id: nextRecordId(), seconds, act, res: 'O', area, seq: ++recSeq, isShot: isShotAct(act), ...extra }
 }
@@ -357,6 +388,13 @@ function splitIntoChains(records: DidRecord[], closeTrailing: boolean): DidRecor
     // 4초 초과 공백 → 강제 마감 후 새 루트 시작
     // (레거시도 진행중($g_path_mking)일 때만 검사하므로 current 가 비어있으면 건너뛴다)
     if (last && r.seconds - last.seconds > 4) {
+      chains.push(current)
+      current = []
+    }
+
+    // R(프리킥·PK)은 세트피스라 앞의 C/P/K/F 와 이어지지 않는다 — 항상 새 루트(단독슛 STP)로 시작한다.
+    // (F 뒤에 S/H 가 오는 건 그대로 같은 루트라 DTP 다.) 서버 system_kpi_rules._split_chains 와 같은 규칙.
+    if (r.act === 'R' && current.length > 0) {
       chains.push(current)
       current = []
     }

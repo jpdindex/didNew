@@ -150,6 +150,7 @@ export function payloadFromState(game: MatchState): InputPayload {
       act: record.act, res: record.res, area: record.area, posX: record.posX ?? null, posY: record.posY ?? null,
       shootPosX: record.shootPosX ?? null, shootPosY: record.shootPosY ?? null,
       shootDspRange: record.shootDspRange ?? null, isShot: record.isShot ?? null, playerId: record.playerId ?? null,
+      isPk: record.isPk ?? null,
     })),
     cards: game.cards.map(card => ({
       id: card.id, playerId: card.player,
@@ -257,7 +258,7 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
       posX: record.posX as number | undefined, posY: record.posY as number | undefined,
       shootPosX: record.shootPosX as number | undefined, shootPosY: record.shootPosY as number | undefined,
       shootDspRange: record.shootDspRange as boolean | undefined, isShot: record.isShot as boolean | undefined,
-      playerId: record.playerId as string | undefined,
+      playerId: record.playerId as string | undefined, isPk: record.isPk === true ? true : undefined,
     }))
     // Cards are server-owned Draft data, not a browser-only UI scratchpad.
     // Without this assignment a lobby re-entry restored an older clientState
@@ -287,7 +288,7 @@ function hydrateFromPayload(game: MatchState, payload: InputPayload, clientState
     posX: record.posX as number | undefined, posY: record.posY as number | undefined,
     shootPosX: record.shootPosX as number | undefined, shootPosY: record.shootPosY as number | undefined,
     shootDspRange: record.shootDspRange as boolean | undefined, isShot: record.isShot as boolean | undefined,
-    playerId: record.playerId as string | undefined,
+    playerId: record.playerId as string | undefined, isPk: record.isPk === true ? true : undefined,
   }))
   game.cards = cardsFromPayload(payload.cards)
   game.halfStatus = payload.status

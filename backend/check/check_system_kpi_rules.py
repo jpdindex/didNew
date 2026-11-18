@@ -25,6 +25,22 @@ def test_kpi_engine_builds_team_player_and_twenty_rating_snapshots() -> None:
     assert snapshots[-1]["GOAL"] == result.team_kpi["GOAL"]
 
 
+def test_free_kick_r_never_links_to_preceding_actions() -> None:
+    # R (free kick / PK) is a set piece: C/P/K/F before it do not make it DTP.
+    paths, _ = compute_attack_paths([
+        KpiRecord("p", "H1", 10, 1, "P", "O", 5, "p1"),
+        KpiRecord("r", "H1", 11, 2, "R", "GOAL", 4, "p2", is_shot=True),
+    ])
+    assert [(path.record_ids, path.path_type) for path in paths] == [(("p",), "UPP"), (("r",), "STP")]
+
+    # F followed by S (or H) is still one linked path → DTP.
+    paths, _ = compute_attack_paths([
+        KpiRecord("f", "H1", 10, 1, "F", "O", 8, "p1"),
+        KpiRecord("s", "H1", 11, 2, "S", "GOAL", 4, "p2", is_shot=True),
+    ])
+    assert [path.path_type for path in paths] == ["DTP"]
+
+
 def test_kpi_engine_does_not_join_attack_paths_across_halves() -> None:
     result = calculate_kpis([
         KpiRecord("h1", "H1", 100, 1, "P", "O", 5, "p1"),

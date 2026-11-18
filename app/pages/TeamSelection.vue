@@ -1714,15 +1714,17 @@ const kpiDetailTimes = computed(() => {
       .map(path => byId.get(path.recordIds[path.recordIds.length - 1] ?? ''))
       .filter((record): record is NonNullable<typeof record> => !!record)
       .sort((a, b) => ((a.half ?? 'H1') === (b.half ?? 'H1') ? a.seconds - b.seconds : (a.half ?? 'H1') === 'H1' ? -1 : 1))
-      .map(record => ({ half: record.half ?? 'H1', time: fmtErrTime(record.seconds, record.half ?? 'H1') }))
+      .map(record => ({ half: record.half ?? 'H1', time: fmtErrTime(record.seconds, record.half ?? 'H1'), dtp: true }))
   }
+  // Shoot 목록에서는 DTP 루트에 속한 슈팅을 다른 색으로 구분한다(어느 슈팅이 DTP 인지 보이게).
+  const dtpIds = new Set(kpiDetailPreview.value.paths.filter(path => path.type === 'DTP').flatMap(path => path.recordIds))
   const halves = kpiHalf.value === 'all' ? (['H1', 'H2'] as const) : [kpiHalf.value]
   return halves.flatMap(halfKey => kpiDetailRecords.value
     .filter(record => (record.half ?? 'H1') === halfKey && (kind === 'Goal'
       ? record.res === 'GOAL'
       : record.act === 'S' || record.act === 'H' || record.act === 'R'))
     .sort((a, b) => a.seconds - b.seconds)
-    .map(record => ({ half: halfKey, time: fmtErrTime(record.seconds, halfKey) })))
+    .map(record => ({ half: halfKey, time: fmtErrTime(record.seconds, halfKey), dtp: kind === 'Shoot' && dtpIds.has(record.id) })))
 })
 function isKpiDetailKey(key: string): key is KpiDetailKey {
   return (KPI_DETAIL_KEYS as readonly string[]).includes(key)
@@ -2082,10 +2084,11 @@ function undoSub(index: number) {
                 <span v-if="kpiDetailLoading" class="errDetailEmpty">기록 시간 불러오는 중…</span>
                 <span v-else-if="kpiDetailError" class="errDetailEmpty">{{ kpiDetailError }}</span>
                 <div v-else-if="kpiDetailTimes.length" class="errDetailGrid">
-                  <span v-for="(g, i) in kpiDetailTimes" :key="i" class="errDetailItem">{{ g.half }} {{ g.time }}{{ i <
+                  <span v-for="(g, i) in kpiDetailTimes" :key="i" class="errDetailItem" :class="{ dtpItem: g.dtp }">{{ g.half }} {{ g.time }}{{ i <
                     kpiDetailTimes.length - 1 ? ',' : '' }}</span>
                 </div>
-                <span v-else class="errDetailEmpty">{{ key === 'Goal' ? '골 기록 없음' : key === 'DTP' ? 'DTP 기록 없음' : '슈팅 기록 없음' }}</span>
+                <div v-if="key === 'Shoot' && kpiDetailTimes.some(g => g.dtp)" class="dtpLegend"><i />DTP 슈팅</div>
+                <span v-else-if="!kpiDetailLoading && !kpiDetailError && !kpiDetailTimes.length" class="errDetailEmpty">{{ key === 'Goal' ? '골 기록 없음' : key === 'DTP' ? 'DTP 기록 없음' : '슈팅 기록 없음' }}</span>
               </div>
             </template>
           </div>
@@ -2888,6 +2891,28 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis
+}
+
+/* DTP 에 속한 슈팅 — Shoot 목록에서 일반 슈팅과 구분 (DTP 목록도 같은 색) */
+.errDetailItem.dtpItem {
+  color: rgba(45, 212, 191, .88);
+  font-weight: 600
+}
+
+.dtpLegend {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, .5)
+}
+
+.dtpLegend i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(45, 212, 191, .88)
 }
 
 .errDetailEmpty {

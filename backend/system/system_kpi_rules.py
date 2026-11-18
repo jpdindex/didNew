@@ -130,6 +130,14 @@ def _split_chains(records: list[KpiRecord]) -> list[list[KpiRecord]]:
             current = []
             making = False
 
+        # R (free kick / PK) is a set piece: it never links to a preceding
+        # C/P/K/F, so it always starts its own path and classifies as STP.
+        # Mirrors splitIntoChains in app/utils/didLogic.ts.
+        if record.act == "R" and current:
+            chains.append(current)
+            current = []
+            making = False
+
         if not making:
             making = True
         current.append(record)

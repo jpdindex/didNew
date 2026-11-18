@@ -2783,7 +2783,7 @@ class JpdDidData:
 
         record_fields = {
             "half", "halfSeconds", "seq", "act", "res", "area", "posX", "posY",
-            "shootPosX", "shootPosY", "shootDspRange", "isShot", "playerId",
+            "shootPosX", "shootPosY", "shootDspRange", "isShot", "playerId", "isPk",
         }
         payload = {
             "gmId": gm_id,

@@ -75,7 +75,7 @@ function commandInputs(command: LiveCommand) {
   return values
 }
 const fingerprint = (record: Record<string, unknown>) => JSON.stringify(Object.fromEntries(Object.entries({
-  posX: null, posY: null, shootPosX: null, shootPosY: null, shootDspRange: null, isShot: null, playerId: null, ...record,
+  posX: null, posY: null, shootPosX: null, shootPosY: null, shootDspRange: null, isShot: null, playerId: null, isPk: null, ...record,
 }).sort(([a], [b]) => a.localeCompare(b))))
 
 function notifyRoom(room: Room, response: any) {

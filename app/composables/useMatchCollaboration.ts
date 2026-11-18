@@ -36,6 +36,7 @@ function recordFromPayload(record: Record<string, unknown>): DidRecord {
     shootPosX: numberOrUndefined(record.shootPosX), shootPosY: numberOrUndefined(record.shootPosY),
     shootDspRange: booleanOrUndefined(record.shootDspRange), isShot: booleanOrUndefined(record.isShot),
     playerId: typeof record.playerId === 'string' ? record.playerId : undefined,
+    isPk: record.isPk === true ? true : undefined,
   }
 }
 
@@ -48,7 +49,7 @@ function recordFingerprint(record: DidRecord): string {
     posX: record.posX, posY: record.posY,
     shootPosX: record.shootPosX, shootPosY: record.shootPosY,
     shootDspRange: record.shootDspRange, isShot: record.isShot,
-    playerId: record.playerId,
+    playerId: record.playerId, isPk: record.isPk === true ? true : undefined,
   })
 }
 
@@ -58,6 +59,7 @@ function recordsToPayload(records: DidRecord[]) {
     act: record.act, res: record.res, area: record.area, posX: record.posX ?? null, posY: record.posY ?? null,
     shootPosX: record.shootPosX ?? null, shootPosY: record.shootPosY ?? null,
     shootDspRange: record.shootDspRange ?? null, isShot: record.isShot ?? null, playerId: record.playerId ?? null,
+    isPk: record.isPk ?? null,
   }))
 }
 
