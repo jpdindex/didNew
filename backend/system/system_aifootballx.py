@@ -2516,7 +2516,7 @@ def player_db_reference_values(rows, season):
 
 
 def plan_new_season(season, matches, code_rows, target, slots):
-    """Match rows alone do not imply that season code/aggregate slots exist."""
+    """Reuse season references and create only missing team codes."""
     slots = deepcopy(slots)
     result = {'code_rows': [], 'documents': [], 'slots': slots, 'new_season': False}
     exact = [r for r in code_rows if r['data'].get('PlSeason') == season]
@@ -2525,26 +2525,34 @@ def plan_new_season(season, matches, code_rows, target, slots):
         if set(saved) == set(range(1, 21)) and len(set(saved.values())) == 20:
             slots.setdefault('seasonSlotMappings', {})[season] = {'cavgSlotToCodeTeamCodeMapping': {
                 str(n): {'codeTeamCode': number, 'cavgSlot': n} for n, number in saved.items()}}
-    established = any(target.get(col) for col in ('mMST', 'pMST', 'cAVG', 'rAVG', 'rank'))
-    if exact or established:
-        return result
     teams = {r['data'][field] for r in matches for field in ('homeTeamId', 'awayTeamId')}
     if len(teams) != 20:
         return result
     references = []
+    season_positions = []
     for team in sorted(teams):
         code = resolve_team_code(code_rows, season, team)
-        positions = {r['data'].get('POSITION') for r in code_rows
-                     if not r['data'].get('PlSeason') and (r['data'].get('TCODE') or r['data'].get('Code')) == team}
-        if len(positions) != 1 or None in positions:
-            fail(f'New season requires an unambiguous global POSITION: {team}')
+        saved = [r for r in exact if (r['data'].get('TCODE') or r['data'].get('Code')) == team]
+        if len(saved) > 1:
+            fail(f'Ambiguous season team code: {team}')
+        source = saved or [r for r in code_rows if not r['data'].get('PlSeason')
+                          and (r['data'].get('TCODE') or r['data'].get('Code')) == team]
+        positions = {r['data'].get('POSITION') for r in source}
+        if len(positions) != 1 or any(type(p) is not int or p <= 0 for p in positions):
+            fail(f'Season requires an unambiguous POSITION: {team}')
+        position = next(iter(positions))
+        references.append(code['team_code_number'])
+        season_positions.append(position)
+        if saved:
+            continue
         data = {'PlSeason': season, 'TCODE': team, 'Code': team, 'IDX_NAME': code['IDX_CODE'],
-                'No': code['No'], 'Team Code': code['team_code_number'], 'POSITION': next(iter(positions))}
+                'No': code['No'], 'Team Code': code['team_code_number'], 'POSITION': position}
         ident = stable_id('code', (season, team))
+        if any(r.get('id') == ident for r in code_rows):
+            fail(f'Season team code destination already exists: {team}')
         result['code_rows'].append({'id': ident, 'data': data})
         result['documents'].append({'collection': 'code', 'document_id': ident, 'data': dict(data, uid=ident), 'action': 'create-candidate'})
-        references.append(code['team_code_number'])
-    if len(set(references)) != 20 or len({r['data']['POSITION'] for r in result['code_rows']}) != 20:
+    if len(set(references)) != 20 or len(set(season_positions)) != 20:
         fail('New season team numbers/positions must be unique')
     slots.setdefault('seasonSlotMappings', {}).setdefault(season, {'cavgSlotToCodeTeamCodeMapping': {
         str(n): {'codeTeamCode': number, 'cavgSlot': n} for n, number in enumerate(sorted(references), 1)}})
@@ -2552,10 +2560,14 @@ def plan_new_season(season, matches, code_rows, target, slots):
     if set(mapping)!={str(n) for n in range(1,21)} or {v.get('codeTeamCode') for v in mapping.values()}!=set(references):
         fail('Season slot mapping must cover the same 20 team numbers')
     assigned = {value['codeTeamCode']:int(key) for key,value in mapping.items()}
+    for row in exact:
+        saved_slot = row['data'].get('DID_CAVG_SLOT')
+        if saved_slot is not None and saved_slot != assigned.get(row['data'].get('Team Code')):
+            fail('Season slot mapping conflicts with the published team code')
     for row, doc in zip(result['code_rows'], result['documents'], strict=True):
         row['data']['DID_CAVG_SLOT'] = assigned[row['data']['Team Code']]
         doc['data']['DID_CAVG_SLOT'] = assigned[row['data']['Team Code']]
-    result['new_season'] = True
+    result['new_season'] = bool(result['code_rows'])
     return result
 
 
@@ -2827,6 +2839,8 @@ def select_aggregate_documents(documents, selected):
                  for r in selected for side in ('homeTeamId', 'awayTeamId')}
     def selected_document(doc):
         col, data = doc['collection'], doc['data']
+        if col == 'code':
+            return data.get('PlSeason') == season
         if col == 'pMST':
             return aggregate_key(col, data) in team_keys
         if col == 'mMST':
@@ -2842,7 +2856,7 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
     unique = {}
     allowed = (DEFAULT_COLLECTIONS if mode == 'default' else
                MATCH_COLLECTIONS if mode == 'matches' else IDENTITY_COLLECTIONS if mode == 'masters'
-               else frozenset(AGGREGATES) if mode == 'aggregates' else MASTER_COLLECTIONS)
+               else frozenset((*AGGREGATES, 'code')) if mode == 'aggregates' else MASTER_COLLECTIONS)
     for original in documents:
         doc = deepcopy(original)
         if doc['collection'] not in allowed:
@@ -2864,7 +2878,7 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
             'documents':result,'checks':checks,'errors':errors,
             'scope_note':('Selected match documents only' if mode == 'matches' else
                           'Player, playerDB, Manager, code only' if mode == 'masters' else
-                          'pMST, mMST, cAVG, rAVG, rank, sAVG only' if mode == 'aggregates' else
+                          'pMST, mMST, cAVG, rAVG, rank, sAVG and missing season code' if mode == 'aggregates' else
                           'Legacy combined master/aggregate scope'),
             'summary':{'matches':matches,'documents':len(result),'candidateDocuments':len(unique),
                        'changedDocuments':len(changed),'unchangedDocuments':len(unique)-len(changed),
@@ -3087,6 +3101,8 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
                        for row in target.get(col,[]) if not row['data'].get('didUnplayed')):
                     aggregate_errors.append('Season aggregate coverage incomplete: existing destination aggregate rows are missing from DID')
                 if not aggregate_errors:
+                    if mode == 'aggregates' and setup.get('new_season'):
+                        documents.extend(d for d in setup['documents'] if d['collection'] == 'code')
                     aggregate_docs=aggregate['documents']
                     for doc in aggregate_docs:
                         doc['data'].setdefault('uid',doc['document_id'])

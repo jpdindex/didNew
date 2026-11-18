@@ -492,7 +492,7 @@ def test_atomic_receipt_prevents_duplicate_merge_after_lost_ack(monkeypatch):
     assert data['Manager/one']['m_id'] == 12
 
 
-def test_new_season_setup_is_deterministic_and_never_changes_established_season():
+def test_new_season_setup_is_deterministic_and_reuses_saved_codes():
     items, codes, _ = aggregate_fixture()
     matches = {i['match_id']: {'id': i['match_id'], 'data': i['match']} for i in items}
     for row in codes: row['data']['PlSeason'] = None
@@ -501,11 +501,80 @@ def test_new_season_setup_is_deterministic_and_never_changes_established_season(
     assert len(plan['documents']) == 20
     assert plan == plan_new_season('2024-2025', list(reversed(matches.values())), codes, {}, {'seasonSlotMappings': {}})
     old = plan_new_season('2024-2025', list(matches.values()), codes, {'rank': [{'id': 'old'}]}, {'seasonSlotMappings': {}})
-    assert not old['new_season']
+    assert old == plan
     # The new season's slot choices survive a backend restart/new preview.
     saved = plan_new_season('2024-2025', list(matches.values()), codes + plan['code_rows'],
                             {'rank': [{'id': 'created'}]}, {'seasonSlotMappings': {}})
     assert saved['slots'] == plan['slots']
+    assert not saved['documents'] and not saved['new_season']
+
+
+def test_season_setup_repairs_only_missing_codes_and_blocks_conflicts():
+    items, codes, slots = aggregate_fixture()
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    for row in codes:
+        row['data']['PlSeason'] = None
+    original = plan_new_season('2024-2025', fixtures, codes, {}, slots)
+    saved = original['code_rows'][:19]
+    before = deepcopy(saved)
+    repaired = plan_new_season('2024-2025', fixtures, codes + saved,
+                               {'rank': [{'id': 'round1'}]}, original['slots'])
+    assert repaired['code_rows'] == original['code_rows'][19:]
+    assert len(repaired['documents']) == 1 and saved == before
+    conflicting = deepcopy(saved)
+    conflicting[0]['data']['POSITION'] = original['code_rows'][19]['data']['POSITION']
+    with pytest.raises(BackendError, match='numbers/positions must be unique'):
+        plan_new_season('2024-2025', fixtures, codes + conflicting, {}, original['slots'])
+    conflicting = deepcopy(saved)
+    conflicting[0]['data']['DID_CAVG_SLOT'] = 99
+    with pytest.raises(BackendError, match='conflicts with the published team code'):
+        plan_new_season('2024-2025', fixtures, codes + conflicting, {}, original['slots'])
+    with pytest.raises(BackendError, match='Ambiguous season team code'):
+        plan_new_season('2024-2025', fixtures, codes + saved + saved[:1], {}, original['slots'])
+    collision = {'id': original['code_rows'][19]['id'], 'data': {'PlSeason': 'other-season'}}
+    with pytest.raises(BackendError, match='destination already exists'):
+        plan_new_season('2024-2025', fixtures, codes + saved + [collision], {}, original['slots'])
+
+
+def test_aggregate_round_two_reuses_persisted_codes_and_repairs_legacy_missing_codes():
+    items, codes, slots = aggregate_fixture()
+    for row in codes:
+        row['data']['PlSeason'] = None
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    setup = plan_new_season('2024-2025', fixtures, codes, {}, slots)
+    evidence = {'did_matches': fixtures, 'ai_samples': {'code': codes + setup['code_rows']},
+                'target_existing': {}}
+    first = delivery.generate_masters(evidence, fixtures, items, setup['slots'], setup,
+                                      'aggregates', selected_fixtures=fixtures)
+    assert first['validation_passed'], first['errors']
+    assert len(docs(first, 'code')) == 20
+    stale = deepcopy(items)
+    stale[0]['recording']['ratingBasedOn'] = 0
+    blocked = delivery.generate_masters(evidence, fixtures, stale, setup['slots'], setup,
+                                        'aggregates', selected_fixtures=fixtures)
+    assert not blocked['validation_passed'] and not blocked['documents']
+    target = {}
+    for doc in first['documents']:
+        target.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': doc['data']})
+    later = deepcopy(items)
+    for item in later:
+        item['match_id'] += '-r2'
+        item['match']['round'] = 2
+        item['match']['date'] = '2024.08.19'
+    later_fixtures = [{'id': i['match_id'], 'data': i['match']} for i in later if i['side'] == 'H']
+    all_fixtures = fixtures + later_fixtures
+    for persisted in (True, False):
+        available_codes = codes + (target['code'] if persisted else [])
+        next_setup = plan_new_season('2024-2025', all_fixtures, available_codes, target, setup['slots'])
+        evidence = {'did_matches': all_fixtures,
+                    'ai_samples': {'code': available_codes + next_setup['code_rows']},
+                    'target_existing': {col: rows for col, rows in target.items() if persisted or col != 'code'}}
+        second = delivery.generate_masters(evidence, all_fixtures, items + later, next_setup['slots'],
+                                           next_setup, 'aggregates', selected_fixtures=later_fixtures)
+        assert second['validation_passed'], second['errors']
+        assert len(docs(second, 'code')) == (0 if persisted else 20)
+        assert {row['gm_round'] for row in docs(second, 'pMST')} == {2}
+        assert {row['Round'] for row in docs(second, 'rank')} == {2}
 
 
 def test_season_player_master_uses_latest_season_contract_for_every_scope():
