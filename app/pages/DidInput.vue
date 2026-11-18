@@ -659,12 +659,22 @@ function queueDraftSave(shared = true) {
   }, 80)
 }
 
+// 최종 RAW 갱신 요청 중에는 버튼을 잠그고 스피너를 보여 중복 클릭을 막는다.
+const finalCorrectionBusy = ref(false)
+
 async function completeFinalCorrection() {
+  if (finalCorrectionBusy.value) return
   if (!isPrimary.value || game.value.recorderLevel !== 'advanced') {
     alert('ADVANCED 주 분석관만 최종 RAW를 갱신할 수 있습니다.')
     return
   }
-  if (!confirm('수정한 내용을 최종 RAW에 반영하시겠습니까?')) return
+  const confirmed = await askConfirm(
+    '수정을 완료하시겠습니까?',
+    '수정한 내용을 최종 RAW에 반영합니다.',
+    '수정 완료',
+  )
+  if (!confirmed || finalCorrectionBusy.value) return
+  finalCorrectionBusy.value = true
   saveToStore()
   game.value.halfStatus = 'final'
   try {
@@ -672,12 +682,18 @@ async function completeFinalCorrection() {
     goTeamSelection()
   } catch (error) {
     game.value.halfStatus = 'H2_done'
+    finalCorrectionBusy.value = false
     alert(error instanceof Error ? error.message : '최종 RAW 갱신에 실패했습니다.')
   }
 }
 
-function exitFinalCorrection() {
-  if (!confirm('수정한 내용은 저장하지 않고 나가시겠습니까?')) return
+async function exitFinalCorrection() {
+  const confirmed = await askConfirm(
+    '수정 화면에서 나가시겠습니까?',
+    '수정한 내용은 최종 RAW에 반영되지 않습니다.',
+    '나가기',
+  )
+  if (!confirmed) return
   game.value.halfStatus = 'final'
   game.value.clockStartedAt = null
   goTeamSelection()
@@ -2911,8 +2927,12 @@ async function finishHalf() {
           <div v-if="!editingId && !pendingOuterResult && !cardPlayerEditTarget && editingSubIndex === null" class="finishControls">
             <!-- 최종 RAW 수정은 같은 자리에서 바로 반영하고 final 상태로 되돌린다. -->
             <template v-if="isFinalCorrection">
-              <button class="lobbyExitBtn" @click="exitFinalCorrection">퇴장하기</button>
-              <button class="finishBtn" @click="completeFinalCorrection">수정 완료</button>
+              <button class="lobbyExitBtn" :disabled="finalCorrectionBusy" @click="exitFinalCorrection">퇴장하기</button>
+              <button class="finishBtn" :class="{ isBusy: finalCorrectionBusy }" :disabled="finalCorrectionBusy"
+                :aria-busy="finalCorrectionBusy" @click="completeFinalCorrection">
+                <span v-if="finalCorrectionBusy" class="btnSpinner" aria-hidden="true"></span>
+                {{ finalCorrectionBusy ? '저장 중...' : '수정 완료' }}
+              </button>
             </template>
             <!-- 기존 half 수정 화면에서는 종료 상태를 바꾸지 않고 대기방으로만 복귀한다. -->
             <button v-else-if="isEditMode" class="finishBtn" @click="exitToLobby">대기방으로 나가기</button>
@@ -4855,6 +4875,31 @@ button {
 .lobbyExitBtn {
   color: rgba(255, 255, 255, .72);
   background: rgba(255, 255, 255, .035)
+}
+
+.finishBtn.isBusy {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: progress;
+  opacity: 1;
+  border-color: #f0b429;
+  color: #f0b429
+}
+
+.btnSpinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(240, 180, 41, .3);
+  border-top-color: #f0b429;
+  border-radius: 50%;
+  animation: btnSpin .7s linear infinite
+}
+
+@keyframes btnSpin {
+  to {
+    transform: rotate(360deg)
+  }
 }
 
 .titleRow {

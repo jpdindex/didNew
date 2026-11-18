@@ -1358,13 +1358,29 @@ async function cancelMatchInfoEdit() {
 // editReturn 에 "끝난 상태"(H1_done/H2_done)를 넘겨서, 수정 후 "대기방으로 나가기"를
 // 누르면 다시 그 끝난 상태(= 후반전 시작 화면)로 돌아오게 한다. halfStatus 를 여기서
 // 미리 H1/H2 로 바꾸는 건 DidInput 진입 화면(정지 상태 표시)을 위한 것일 뿐이다.
-function editHalf() {
-  // 갱신으로 잠긴 half 는 관리자가 풀어주기 전까지 수정할 수 없다.
-  if (game.value.halfStatus === 'H1_done' && game.value.h1Locked) return
-  if (game.value.halfStatus === 'H2_done' && game.value.h2Locked) return
+// target: 후반 종료 뒤에는 전반/후반 수정 버튼이 따로 있어 들어갈 half 를 고른다.
+// 전반 종료 상태에서는 전반만 있으므로 target 없이 전반으로 들어간다.
+// 수정 화면으로 들어가는 중인 half. 진입(최종 RAW 복원·입력 화면 로딩)이 오래 걸려
+// 누른 버튼에 "불러오는 중" 표시를 띄우고 다른 수정 버튼은 막는다.
+const enteringEditHalf = ref<'전반' | '후반' | null>(null)
+async function navigateToEdit(query: ReturnType<typeof didInputQuery>) {
+  try {
+    await navigateTo({ path: '/DidInput', query })
+  } finally {
+    if (isCurrentLobby()) enteringEditHalf.value = null
+  }
+}
+
+async function editHalf(target?: '전반' | '후반') {
+  if (enteringEditHalf.value) return
   const prevStatus = game.value.halfStatus // 'H1_done' | 'H2_done'
-  game.value.halfStatus = prevStatus === 'H2_done' ? 'H2' : 'H1'
-  navigateTo({ path: '/DidInput', query: didInputQuery(game.value.halfStatus === 'H2' ? '후반' : '전반', true, prevStatus) })
+  const half = target ?? (prevStatus === 'H2_done' ? '후반' : '전반')
+  // 갱신으로 잠긴 half 는 관리자가 풀어주기 전까지 수정할 수 없다.
+  if (half === '전반' && game.value.h1Locked) return
+  if (half === '후반' && game.value.h2Locked) return
+  enteringEditHalf.value = half
+  game.value.halfStatus = half === '후반' ? 'H2' : 'H1'
+  await navigateToEdit(didInputQuery(half, true, prevStatus))
 }
 async function startSecondHalf() {
   if (!setupSaved.value) return saveEntrySetup()
@@ -1470,7 +1486,10 @@ onUnmounted(() => {
 
 async function finishMatch() {
   const isBasicPrimary = game.value.participantRole === 'primary' && game.value.recorderLevel === 'basic'
-  if (!confirm(isBasicPrimary ? '기록을 제출하시겠습니까? 관리자 승인 전까지 RAW로 반영되지 않습니다.' : '최종 갱신하시겠습니까?')) return
+  const confirmed = isBasicPrimary
+    ? await askConfirm('기록을 제출하시겠습니까?', '관리자 승인 전까지 RAW로 반영되지 않습니다.', '제출')
+    : await askConfirm('최종 갱신하시겠습니까?', '기록이 최종 RAW에 반영됩니다.', '최종 갱신')
+  if (!confirmed || lifecycleBusy.value) return
   lifecycleBusy.value = true
   lifecycleError.value = ''
   try {
@@ -1490,8 +1509,8 @@ async function finishMatch() {
   }
 }
 
-async function editFinal() {
-  if (lifecycleBusy.value || !lobbyParticipantReady.value) return
+async function editFinal(half: '전반' | '후반' = '후반') {
+  if (lifecycleBusy.value || enteringEditHalf.value || !lobbyParticipantReady.value) return
   const side = game.value.team === 'away' ? 'A' : 'H'
   // A final RAW must always enter through confirmed restoration. In
   // particular, a still-unconfirmed manager must never take the assistant
@@ -1503,18 +1522,15 @@ async function editFinal() {
   }
   // 부 분석관은 최종 RAW를 직접 교체하지 않는다. 마지막 half의 Draft 편집으로
   // 들어가면 입력 화면에서 전반/후반을 모두 선택해 수정할 수 있다.
-  if (!game.value.lifecycleControl) {
+  enteringEditHalf.value = half
+  if (!game.value.lifecycleControl || game.value.recorderLevel === 'basic') {
     game.value.halfStatus = 'H2_done'
-    navigateTo({ path: '/DidInput', query: didInputQuery('후반', true, 'H2_done') })
-    return
-  }
-  if (game.value.recorderLevel === 'basic') {
-    game.value.halfStatus = 'H2_done'
-    navigateTo({ path: '/DidInput', query: didInputQuery('후반', true, 'H2_done') })
+    await navigateToEdit(didInputQuery(half, true, 'H2_done'))
     return
   }
   lifecycleBusy.value = true
   lifecycleError.value = ''
+  let navigating = false
   try {
     void preloadRouteComponents('/DidInput').catch(() => undefined)
     const restored = await restoreFinalRaw(game.value)
@@ -1530,11 +1546,14 @@ async function editFinal() {
         inputSetup: { H: side === 'H' ? restored.inputSetup : null, A: side === 'A' ? restored.inputSetup : null },
       }
     }
-    navigateTo({ path: '/DidInput', query: didInputQuery('후반', true, 'H2_done', true) })
+    navigating = true
+    lifecycleBusy.value = false
+    await navigateToEdit(didInputQuery(half, true, 'H2_done', true))
   } catch (error) {
-    lifecycleError.value = error instanceof Error ? error.message : '최종 RAW를 수정용 Draft로 복원하지 못했습니다.'
+    if (!navigating) lifecycleError.value = error instanceof Error ? error.message : '최종 RAW를 수정용 Draft로 복원하지 못했습니다.'
   } finally {
     lifecycleBusy.value = false
+    if (!navigating && isCurrentLobby()) enteringEditHalf.value = null
   }
 }
 
@@ -2356,7 +2375,7 @@ function undoSub(index: number) {
                   <button v-if="canToggleMatchInfoEdit" :class="matchInfoEditMode ? 'startBtn' : 'editBtn'" :disabled="lifecycleBusy"
                     @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? (lifecycleBusy ? '저장 중…' : '변경 완료') : '경기 정보 변경' }}</button>
                   <button v-if="matchInfoEditMode" class="editBtn cancelEditBtn" :disabled="lifecycleBusy" @click="cancelMatchInfoEdit">변경 취소</button>
-                  <button v-if="!matchInfoEditMode" class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
+                  <button v-if="!matchInfoEditMode" class="editBtn" :disabled="lifecycleBusy" @click="editHalf()">수정</button>
                   <button v-if="game.lifecycleControl && !matchInfoEditMode" class="startBtn" :disabled="!bootstrapApplied || !canStart || lifecycleBusy" @click="startSecondHalf">{{ lifecycleBusy ? '처리 중…' : setupSaved ? '후반전 입장' : '세팅 저장' }}</button>
                 </div>
               </template>
@@ -2364,11 +2383,16 @@ function undoSub(index: number) {
                 <p>후반 기록을 확인하세요<br><b>{{ game.lifecycleControl ? '기록을 수정하거나 처리할 수 있습니다.' : '전반 또는 후반 기록을 수정할 수 있습니다.' }}</b></p>
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">제출하면 관리자 승인 대기 Draft로 유지됩니다.</p>
                 <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
-                <div class="halfActions">
+                <div class="halfActions" :class="{ pairRow: !matchInfoEditMode }">
                   <button v-if="canToggleMatchInfoEdit" :class="matchInfoEditMode ? 'startBtn' : 'editBtn'" :disabled="lifecycleBusy"
                     @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? (lifecycleBusy ? '저장 중…' : '변경 완료') : '경기 정보 변경' }}</button>
                   <button v-if="matchInfoEditMode" class="editBtn cancelEditBtn" :disabled="lifecycleBusy" @click="cancelMatchInfoEdit">변경 취소</button>
-                  <button v-if="!matchInfoEditMode" class="editBtn" :disabled="lifecycleBusy" @click="editHalf">수정</button>
+                  <div v-if="!matchInfoEditMode" class="halfEditPair">
+                    <button class="editBtn" :class="{ entering: enteringEditHalf === '전반' }" :disabled="lifecycleBusy || !!enteringEditHalf || game.h1Locked"
+                      @click="editHalf('전반')"><span v-if="enteringEditHalf === '전반'" class="enterSpinner" />{{ enteringEditHalf === '전반' ? '전반 불러오는 중…' : '전반 수정' }}</button>
+                    <button class="editBtn" :class="{ entering: enteringEditHalf === '후반' }" :disabled="lifecycleBusy || !!enteringEditHalf || game.h2Locked"
+                      @click="editHalf('후반')"><span v-if="enteringEditHalf === '후반'" class="enterSpinner" />{{ enteringEditHalf === '후반' ? '후반 불러오는 중…' : '후반 수정' }}</button>
+                  </div>
                   <button v-if="game.lifecycleControl && !matchInfoEditMode" class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">{{ game.recorderLevel ===
                     'basic' ? '제출' : '최종 갱신' }}</button>
                 </div>
@@ -2388,11 +2412,16 @@ function undoSub(index: number) {
                 <p v-else-if="lobbyParticipantReady">{{ !game.lifecycleControl ? '분석 협업 종료' : (game.recorderLevel === 'basic' ? '관리자 승인 대기' : statusLabel) }}</p>
                 <p v-if="game.recorderLevel === 'basic' && game.participantRole === 'primary'" class="draftNotice">관리자 페이지에서 RAW 승격 전까지 Draft만 유지됩니다.</p>
                 <p v-if="matchInfoEditMode" class="draftNotice">라인업 · 포메이션 · 진영 선택 변경 중입니다.</p>
-                <div v-if="lobbyParticipantReady" class="halfActions">
+                <div v-if="lobbyParticipantReady" class="halfActions" :class="{ pairRow: !matchInfoEditMode }">
                   <button v-if="canToggleMatchInfoEdit" :class="matchInfoEditMode ? 'startBtn' : 'editBtn'" :disabled="lifecycleBusy"
                     @click="toggleMatchInfoEdit">{{ matchInfoEditMode ? (lifecycleBusy ? '저장 중…' : '변경 완료') : '경기 정보 변경' }}</button>
                   <button v-if="matchInfoEditMode" class="editBtn cancelEditBtn" :disabled="lifecycleBusy" @click="cancelMatchInfoEdit">변경 취소</button>
-                  <button v-if="!matchInfoEditMode" class="editBtn" :disabled="lifecycleBusy" @click="editFinal">수정</button>
+                  <div v-if="!matchInfoEditMode" class="halfEditPair">
+                    <button class="editBtn" :class="{ entering: enteringEditHalf === '전반' }" :disabled="lifecycleBusy || !!enteringEditHalf"
+                      @click="editFinal('전반')"><span v-if="enteringEditHalf === '전반'" class="enterSpinner" />{{ enteringEditHalf === '전반' ? '전반 불러오는 중…' : '전반 수정' }}</button>
+                    <button class="editBtn" :class="{ entering: enteringEditHalf === '후반' }" :disabled="lifecycleBusy || !!enteringEditHalf"
+                      @click="editFinal('후반')"><span v-if="enteringEditHalf === '후반'" class="enterSpinner" />{{ enteringEditHalf === '후반' ? '후반 불러오는 중…' : '후반 수정' }}</button>
+                  </div>
                   <button v-if="!matchInfoEditMode && game.lifecycleControl && game.recorderLevel === 'advanced' && roomStatus?.finalizationPending"
                     class="startBtn" :disabled="lifecycleBusy" @click="finishMatch">최종 갱신 재시도</button>
                 </div>
@@ -4262,6 +4291,124 @@ button {
   gap: 8px
 }
 
+/* 경기 정보 변경 옆 한 칸 안에 전반 수정(위) / 후반 수정(아래)을 세로로 쌓는다. */
+.halfEditPair {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px
+}
+
+/* 옆 칸이 두 줄(전반/후반 수정)이어도 경기 정보 변경은 늘어나지 않고 세로 가운데에 둔다. */
+.halfActions > .editBtn {
+  align-self: center
+}
+
+/* 패널이 좁아도 버튼 글자가 칸 밖으로 넘치지 않게: 칸은 글자 폭보다 줄어들 수 있고,
+   글자는 단어 단위로 줄바꿈하며 높이는 최소 43px 에서 필요한 만큼 늘어난다. */
+.halfActions .editBtn,
+.halfActions .startBtn {
+  min-width: 0;
+  height: auto;
+  min-height: 43px;
+  padding: 6px 8px;
+  line-height: 1.25;
+  white-space: normal;
+  word-break: keep-all;
+  overflow-wrap: anywhere
+}
+
+.halfActions > *,
+.halfEditPair > * {
+  min-width: 0
+}
+
+/* 전반/후반 수정이 있는 줄은 2×2 로 둔다.
+     [경기 정보 변경][후반 수정]
+     [전반 수정    ][최종 갱신]
+   halfEditPair 는 display: contents 로 풀어 두 수정 버튼을 바깥 그리드 칸에 직접 놓는다. */
+.halfActions.pairRow {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: stretch
+}
+
+.halfActions.pairRow > .halfEditPair {
+  display: contents
+}
+
+.halfActions.pairRow > .editBtn {
+  align-self: stretch
+}
+
+.halfActions.pairRow .halfEditPair > .editBtn,
+.halfActions.pairRow > .editBtn,
+.halfActions.pairRow > .startBtn {
+  min-height: 40px
+}
+
+/* 네 버튼이 모두 있을 때만 후반 수정을 윗줄, 전반 수정을 아랫줄로 바꿔 놓는다. */
+.halfActions.pairRow:has(> .editBtn):has(> .startBtn) .halfEditPair > :last-child {
+  order: 1
+}
+
+.halfActions.pairRow:has(> .editBtn):has(> .startBtn) .halfEditPair > :first-child {
+  order: 2
+}
+
+.halfActions.pairRow:has(> .editBtn):has(> .startBtn) > .startBtn {
+  order: 3
+}
+
+/* 최종 갱신이 없으면 경기 정보 변경이 윗줄 전체, 아랫줄에 전반 | 후반 수정. */
+.halfActions.pairRow > .editBtn:nth-last-child(2) {
+  grid-column: 1 / -1;
+  align-self: stretch
+}
+
+/* 수정 버튼만 있으면(매니저 등) 전처럼 전체 폭으로 위아래에 쌓는다. */
+.halfActions.pairRow > .halfEditPair:only-child {
+  display: grid;
+  grid-column: 1 / -1
+}
+
+/* 경기 정보 변경 권한이 없으면 윗줄 전반 | 후반 수정, 아랫줄 최종 갱신 전체. */
+.halfActions.pairRow > .halfEditPair:first-child ~ .startBtn {
+  grid-column: 1 / -1
+}
+
+/* 내용이 패널보다 높아져도 위쪽 안내 문구가 잘리지 않게 한다. */
+.startPanel {
+  justify-content: safe center;
+  overflow-y: auto
+}
+
+/* 수정 화면 진입 중인 버튼: 비활성이어도 흐려지지 않고 노란 테두리 + 회전 표시. */
+.halfEditPair > .editBtn.entering:disabled {
+  opacity: 1;
+  border-color: #f0b429;
+  color: #f0b429;
+  cursor: progress
+}
+
+.enterSpinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  margin-right: 8px;
+  vertical-align: -2px;
+  border: 2px solid rgba(240, 180, 41, .3);
+  border-top-color: #f0b429;
+  border-radius: 50%;
+  animation: enterSpin .7s linear infinite
+}
+
+@keyframes enterSpin {
+  to { transform: rotate(360deg) }
+}
+
+.halfActions > .halfEditPair:only-child {
+  grid-column: 1 / -1
+}
+
 .halfActions3 {
   grid-template-columns: 1fr 1fr 1.3fr
 }
@@ -4293,7 +4440,7 @@ button {
 }
 
 /* 버튼이 3개라 아랫줄로 내려간 시작 버튼은 윗줄 두 버튼 폭에 맞춰 가로로 꽉 채운다. */
-.halfActions > .startBtn:nth-child(3) {
+.halfActions:not(.pairRow) > .startBtn:nth-child(3) {
   grid-column: 1 / -1
 }
 
