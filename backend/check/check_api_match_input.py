@@ -32,6 +32,52 @@ def test_final_lineup_keeps_starting_roles_and_recorded_substitution_times(basel
     assert [{k: v for k, v in sub.items() if k != "id"} for sub in rebuilt] == setup["subs"]
 
 
+def test_final_lineup_recovers_old_checkpoint_with_halftime_substitution():
+    lineup = {
+        "starter": {"slot": "b0", "order": 1, "type": "BENCH", "inHalf": None,
+                    "inSeconds": None, "outHalf": "H2", "outSeconds": 0},
+        "sub": {"slot": "o1", "order": 2, "type": "START", "inHalf": "H2", "inSeconds": 0},
+    }
+    result = api_match_input.final_recording_lineup(lineup, None)
+    assert result["starter"]["type"] == "START"
+    assert (result["starter"]["inHalf"], result["starter"]["inSeconds"]) == ("H1", 0)
+    assert result["sub"]["type"] == "BENCH"
+    assert (result["sub"]["inHalf"], result["sub"]["inSeconds"]) == ("H2", 0)
+    # An explicitly empty live history must not resurrect a deleted event.
+    assert api_match_input.final_recording_lineup(lineup, {"subs": []}) == lineup
+
+
+def test_final_lineup_rejects_unexplained_activity_before_any_raw_write():
+    from types import SimpleNamespace
+    from backend.system.system_firestore import BackendError
+    payload = api_match_input.MatchInputPayload.model_validate({
+        "gmId": "sample-match", "side": "H", "inputMode": "분석", "fieldSide": "left",
+        "formationKey": "4-3-3", "status": "final", "lineup": [], "cards": [],
+        "homeScore": 0, "awayScore": 0, "halves": {},
+        "records": [{"id": "r1", "half": "H1", "halfSeconds": 12, "seq": 1,
+                     "act": "P", "res": "O", "area": 7, "playerId": "player-1"}],
+    })
+    class Data:
+        def get_match(self, gm_id):
+            return SimpleNamespace()
+        def replace_recording_raw(self, *args, **kwargs):
+            pytest.fail("Invalid lineup must not replace RAW")
+    with pytest.raises(BackendError) as caught:
+        api_match_input._promote(Data(), payload, {}, "user", status="final",
+                                halves={"H1", "H2"}, delete_draft=False)
+    assert caught.value.code == "finalize_invalid_lineup"
+    assert "player-1" in caught.value.message
+
+
+def test_final_lineup_allows_unused_bench_and_zero_second_substitute():
+    records = [("r1", {"half": "H2", "halfSeconds": 12, "seq": 1,
+                       "act": "P", "res": "O", "area": 7, "playerId": "sub"})]
+    api_match_input.validate_final_lineup({
+        "sub": {"type": "BENCH", "inHalf": "H2", "inSeconds": 0},
+        "unused": {"type": "BENCH", "inHalf": None, "inSeconds": None},
+    }, records)
+
+
 def test_draft_snapshot_busy_is_503_and_never_a_missing_draft(monkeypatch):
     from backend.system.system_firestore import BackendError
     class Data:

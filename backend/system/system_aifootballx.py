@@ -498,7 +498,7 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
         'Destination-only fields are preserved; generated fields and nested calculation maps are replaced from the reviewed payload.',
     ]
     report['excluded'] = {'unused': ['pMST.I-*/PH-*/PA-*/PI-*', 'prediction', 'aiPHR', 'yPHR',
-                                    'rank.WGR*/Season/S_Avg/R_Rate'],
+                                    'rank.Season/S_Avg/R_Rate'],
                           'manual_upload': ['Manager.Coach/Captain', 'playerMST residual score fields']}
     report['excluded']['collections'] = sorted(EXCLUDED_COLLECTIONS)
     report['excluded']['halves'] = ['H3', 'H4']
@@ -1082,6 +1082,23 @@ LEGACY_2025_PREDICTION_BASELINES = {'DAP': 450, 'BAP': 60, 'DTP': 18, 'SHOT': 20
 LEGACY_RANK_SLOT_OVERRIDES = {'2025-2026': {'E-BU': 27, 'E-LU': 12, 'E-SU': 21}}
 
 
+def normalize_rank_team_codes(data, season, codes, teams):
+    """Read already-published legacy standings through their current team identities."""
+    result = dict(data)
+    for team, old_number in LEGACY_RANK_SLOT_OVERRIDES.get(season, {}).items():
+        if team not in teams:
+            continue
+        number = resolve_team_code(codes, season, team)['team_code_number']
+        if f'WDL{number}' not in result:
+            for family in ('WDL', 'WTT', 'WRK', 'WGR', 'RAV', 'RRK'):
+                if f'{family}{old_number}' in data:
+                    result[f'{family}{number}'] = data[f'{family}{old_number}']
+    for field, value in list(result.items()):
+        if re.fullmatch(r'WRK\d+', field) and type(value) in (int, float):
+            result.setdefault('WGR' + field[3:], int(value) // 4 + 1)
+    return result
+
+
 def rounded(value: float, digits: int = 1) -> float:
     return float(Decimal(str(value)).quantize(Decimal(10) ** -digits, rounding=ROUND_HALF_UP))
 
@@ -1115,7 +1132,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
     result = {'mode': 'aggregate-preview-only', 'write_enabled': False, 'documents': [],
               'calculation_mode': calculation_mode,
               'excluded': {'unused': ['pMST.I-*', 'pMST.PH-*', 'pMST.PA-*', 'pMST.PI-*',
-                                      'prediction', 'aiPHR', 'yPHR', 'rank.WGR*',
+                                      'prediction', 'aiPHR', 'yPHR',
                                       'rank.Season', 'rank.S_Avg', 'rank.R_Rate'],
                            'manual_upload': ['Manager.Coach/Captain', 'playerMST residual score fields']},
               'errors': [], 'blocked': [], 'policies': {
@@ -1124,7 +1141,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                   'rank': ('Historical Excel competition RANK; WGR=floor(WRK/4)+1' if legacy else
                            'AIfootballX ai_chart/build_ranking.py: points/GD/GF/team; JMX/growth/team; unique ranks'),
                   'legacy_fields': ('diagnostic only; not approved for delivery' if legacy else
-                                    'I-*, WGR*, Season, S_Avg, R_Rate unused by user decision; omitted'),
+                                    'I-*, Season, S_Avg, R_Rate unused; WGR follows WRK'),
                   'season_reference_average': 'current: AVG equals same-season AI Rating; never a multi-season average',
                   'unplayed': 'non-final recordings excluded, never padded with a fabricated rating',
               }}
@@ -1199,16 +1216,18 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                'point': 3 if score > against else 1 if score == against else 0,
                'wdl': 'W' if score > against else 'D' if score == against else 'L',
                'name': team_delivery_name(code_rows, season, team, {'name': item.get('team_name')})}
-        matching_codes = [r['data'] for r in code_rows
-                          if (r['data'].get('TCODE') or r['data'].get('Code')) == team
-                          and r['data'].get('PlSeason') == season]
-        positions = {r.get('POSITION') for r in matching_codes}
-        if len(positions) != 1 or None in positions:
-            result['errors'].append(f'Missing/ambiguous season rank POSITION for {team}')
-            blocked['rank'].add(f'{team}: season rank POSITION missing/ambiguous')
-            row['rank_slot'] = None
-        else:
-            row['rank_slot'] = LEGACY_RANK_SLOT_OVERRIDES.get(season, {}).get(team, int(next(iter(positions))))
+        row['rank_slot'] = code['team_code_number']
+        if legacy:
+            matching_codes = [r['data'] for r in code_rows
+                              if (r['data'].get('TCODE') or r['data'].get('Code')) == team
+                              and r['data'].get('PlSeason') == season]
+            positions = {r.get('POSITION') for r in matching_codes}
+            if len(positions) != 1 or None in positions:
+                result['errors'].append(f'Missing/ambiguous season rank POSITION for {team}')
+                blocked['rank'].add(f'{team}: season rank POSITION missing/ambiguous')
+                row['rank_slot'] = None
+            else:
+                row['rank_slot'] = LEGACY_RANK_SLOT_OVERRIDES.get(season, {}).get(team, int(next(iter(positions))))
         grouped[key][side] = row
         rows_by_round[match['round']].append(row)
         all_rows.append(row)
@@ -1218,7 +1237,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
         result['summary']['errors'] = len(result['errors'])
         result['complete'] = False
         return result
-    result['policies']['rank_slot_overrides'] = LEGACY_RANK_SLOT_OVERRIDES.get(season, {})
+    result['policies']['rank_slot_overrides'] = LEGACY_RANK_SLOT_OVERRIDES.get(season, {}) if legacy else {}
 
     # Allocation is independent of dates. Rescheduled matches keep their gm_id order.
     for round_no, round_rows in sorted(rows_by_round.items()):
@@ -1407,8 +1426,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                 ranks[f'WTT{number}'] = total
             if complete and history_available:
                 ranks[f'WRK{number}'] = wrk if legacy else wrk_map[row['team']]
-                if legacy:
-                    ranks[f'WGR{number}'] = wrk // 4 + 1
+                ranks[f'WGR{number}'] = ranks[f'WRK{number}'] // 4 + 1
             if row['jmx'] is not None:
                 ranks[f'RAV{number}'] = rating_precision(row['jmx'])
                 if complete and all(v is not None for v in ratings) and (legacy or (history_available and rating_history_complete)):
@@ -1540,6 +1558,8 @@ def validate_sql_facts(generated: dict, items: list[dict], codes: list[dict], sl
         position = next(iter(candidates)) if len(candidates) == 1 else None
         positions[team] = (LEGACY_RANK_SLOT_OVERRIDES.get(season, {}).get(team, int(position))
                            if position is not None else None)
+        if generated.get('calculation_mode') == 'current':
+            positions[team] = references[team]['team_code_number']
         if positions[team] is None:
             check('rank', team, '__season_rank_position_available__', False, True)
         rounds[match['round']].append(item)
@@ -1740,13 +1760,7 @@ def validate_aggregate_links(generated, items, codes, slots, *, round_only=False
             jmx = (item['recording'].get('teamRating') or {}).get('jmx')
             if type(jmx) not in (int, float) or not math.isfinite(jmx):
                 continue
-            positions = {r['data'].get('POSITION') for r in codes if r['data'].get('PlSeason') == season
-                         and (r['data'].get('TCODE') or r['data'].get('Code')) == team}
-            if len(positions) != 1 or None in positions:
-                checks.append({'passed': False, 'collection': 'rank', 'team': team, 'round': number,
-                               'field': 'season-POSITION'})
-                continue
-            position = LEGACY_RANK_SLOT_OVERRIDES.get(season, {}).get(team, int(next(iter(positions))))
+            position = resolve_team_code(codes, season, team)['team_code_number']
             check('rank', (season, number), f'RAV{position}', truncate_rating(jmx))
             current_rating = min(truncate_rating(jmx), 99.9)
             growth = round((current_rating - previous[team]) / previous[team] * 100, 1) if previous.get(team) else 0.0
@@ -1792,7 +1806,7 @@ MATCH_TARGETS = ('TACTIC', 'multiSheet_ALL', 'multiSheet_BAP', 'multiSheet_DAP',
 IDENTITY_COLLECTIONS = frozenset(('Player', 'playerDB', 'Manager', 'code'))
 MASTER_COLLECTIONS = IDENTITY_COLLECTIONS | frozenset(AGGREGATES)
 MATCH_COLLECTIONS = frozenset(('dMST', *MATCH_TARGETS))
-DEFAULT_COLLECTIONS = frozenset(('dMST', 'pMST', 'cAVG', 'rAVG',
+DEFAULT_COLLECTIONS = frozenset(('dMST', 'pMST', 'mMST', 'cAVG', 'rAVG', 'rank',
                                  *(col for col in MATCH_TARGETS if col.startswith('multiSheet_'))))
 
 
@@ -2211,6 +2225,7 @@ class SourceCapture:
                     and (scope.get('roundTo') is None or r['data']['round'] <= scope['roundTo'])]
         if not selected:
             fail('No DID matches in this scope')
+        requested_fixtures = list(selected)
         codes = self.rows(self.target, 'code', bound=500)
         target = {}
         for col in ('dMST', *AGGREGATES):
@@ -2218,11 +2233,11 @@ class SourceCapture:
             target[col] = self.rows(self.target, col, [(field, '==', value)], bound=20000)
         # Earlier edits must propagate through already published cumulative rounds.
         existing_end = max((r['data'].get('gm_round' if col == 'pMST' else 'Round', 0) or 0
-                            for col in AGGREGATES if col != 'sAVG' for r in target[col]
-                            if not r['data'].get('didUnplayed')), default=0)
+                            for col in AGGREGATES if col != 'sAVG' for r in target[col]), default=0)
         cutoff = max(existing_end, max(r['data']['round'] for r in selected))
         context = [r for r in fixtures if r['data']['round'] <= cutoff]
         target['dMST'] = [r for r in target['dMST'] if (r['data'].get('gm_round') or 0) <= cutoff]
+        aggregate_history = target
         slots = {'seasonSlotMappings': {}}
         try:
             if slot_path:
@@ -2273,8 +2288,7 @@ class SourceCapture:
                         skipped.append(issue)
             selected = [r for r in selected if r['id'] not in unready]
             items = [i for i in items if i['match_id'] not in unready and final_sides[i['match_id']] == {'H', 'A'}]
-            if seeded_request:
-                fixture_numbers = round_fixture_numbers(context)
+            fixture_numbers = round_fixture_numbers(context)
 
             if requested_rounds == {cutoff} and (scope.get('roundFrom') == scope.get('roundTo') == cutoff
                                                   or (scope.get('matchId') and seeded_request)):
@@ -2284,25 +2298,30 @@ class SourceCapture:
                 # Publish this round's confirmed match facts without replacing
                 # cumulative documents whose historical RAW is incomplete.
                 round_only = sum(i['match']['round'] == cutoff for i in items) < 20 or bool(earlier_detail - supplied)
+            if any(sum(i['match']['round'] == number for i in items) < 20 for number in requested_rounds):
+                round_only = True
             if round_only:
-                items = [i for i in items if i['match']['round'] == cutoff]
+                items = [i for i in items if i['match']['round'] in requested_rounds]
                 target = {col: [r for r in rows if r['data'].get(
-                    'gm_round' if col in ('dMST', 'pMST') else 'Round') == cutoff]
+                    'gm_round' if col in ('dMST', 'pMST') else 'Round') in requested_rounds]
                     for col, rows in target.items() if col != 'sAVG'}
                 if any(r['data'].get('didAggregationScope') != 'round'
-                       for col in ('cAVG', 'rAVG', 'rank') for r in target[col]):
+                       for col in ('cAVG', 'rAVG', 'rank') for r in target[col]) and len({
+                           r['data'][key] for r in requested_fixtures for key in ('homeTeamId', 'awayTeamId')}) != 20:
                     setup['errors'] = [*setup.get('errors', []),
                                        'Round-only aggregates cannot replace an existing cumulative round']
         evidence = {'did_matches': context, 'source_recordings': [], 'player_profiles': {},
-                    'target_existing': target, 'ai_samples': {'code': codes + setup['code_rows']}}
+                    'target_existing': target, 'aggregate_history': aggregate_history,
+                    'ai_samples': {'code': codes + setup['code_rows']}}
         self.capture_aggregate_review_sources(evidence, items)
         raw_count = sum(len(recording['children']['records']) for recording in evidence['source_recordings'])
         log_delivery_stage(job_id, 'aggregate_read', started, documents=len(heads) + raw_count, scope=scope)
         self.report_progress(95)
-        if selected:
+        complete_schedule = all(sum(r['data']['round'] == n for r in context) == 10 for n in requested_rounds)
+        if selected or complete_schedule:
             report = generate_masters(
                 evidence, context, items, setup['slots'], setup, 'aggregates',
-                latest=scope.get('latest', False), selected_fixtures=selected, job_id=job_id,
+                latest=scope.get('latest', False), selected_fixtures=requested_fixtures if complete_schedule else selected, job_id=job_id,
                 round_only=round_only, fixture_numbers=fixture_numbers,
             )
         else:
@@ -2338,12 +2357,40 @@ class SourceCapture:
             else:
                 filters = [('PlSeason', '==', season), ('gm_round' if col in ('dMST', 'pMST') else 'Round', '==', number)]
             existing[col] = self.rows(self.target, col, filters, bound=40)
+        earlier_ranks = self.rows(self.target, 'rank', [('PlSeason', '==', season), ('Round', '<', number)], bound=40)
+        team_numbers = {team: resolve_team_code(codes, season, team)['team_code_number'] for team in teams}
+        history = [normalize_rank_team_codes(row['data'], season, codes, teams) for row in earlier_ranks
+                   if row['data'].get('Round', number) < number]
+        previous_rank = max((row for row in history if all(f'WTT{n}' in row for n in team_numbers.values())),
+                            key=lambda row: row['Round'], default={})
+        first_missing_round = previous_rank.get('Round', 0) + 1
+        if first_missing_round < number:
+            prior_rows = self.rows(self.target, 'pMST', [('PlSeason', '==', season)], bound=2000)
+            prior = {}
+            for row in prior_rows:
+                data = row['data']
+                if first_missing_round <= data.get('gm_round', 0) < number and not data.get('didUnplayed'):
+                    key = data['gm_round'], data['t_code']
+                    if key in prior:
+                        fail(f'pMST: ambiguous previous standing source {key}')
+                    prior[key] = data
+            for team, n in team_numbers.items():
+                total = previous_rank.get(f'WTT{n}', first_missing_round - 1)
+                for prior_round in range(first_missing_round, number):
+                    data = prior.get((prior_round, team))
+                    if data is None:
+                        total += 1
+                    else:
+                        own, other = data['GOAL'], data['Goal']
+                        total += 3 if own > other else 1 if own == other else 0
+                previous_rank[f'WTT{n}'] = total
         self.report_progress(55)
         try:
             slots = json.loads(slot_path.read_text(encoding='utf-8')) if slot_path else {'seasonSlotMappings': {}}
             setup = plan_new_season(season, fixtures, codes, existing, slots)
             slot_map = setup['slots'].get('seasonSlotMappings', {}).get(season, {}).get('cavgSlotToCodeTeamCodeMapping', {})
-            documents = round_default_documents(fixtures, codes, slot_map, existing, force=scope.get('force', False))
+            documents = round_default_documents(fixtures, codes + setup['code_rows'], slot_map, existing,
+                force=scope.get('force', False), previous_rank=previous_rank)
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             fail(f'Round defaults configuration: {exc}')
         self.report_progress(90)
@@ -2800,7 +2847,7 @@ def delivery_payload(collection, generated, old=None):
 
 def retired_calculation_field(collection, field):
     return ((collection == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-')))
-            or (collection == 'rank' and (field.startswith('WGR') or field in ('Season', 'S_Avg', 'R_Rate'))))
+            or (collection == 'rank' and field in ('Season', 'S_Avg', 'R_Rate')))
 
 
 def generated_calculation_field(collection, field):
@@ -2812,7 +2859,7 @@ def generated_calculation_field(collection, field):
     if collection.startswith('multiSheet_'):
         return bool(re.fullmatch(r'(?:BAP|DAP|DTP|SHOT|GOAL|SSR|JMX)-H[1-4]-.+', field))
     if collection == 'rank':
-        return bool(re.fullmatch(r'(?:WRK|RRK|RAV)\d+', field))
+        return bool(re.fullmatch(r'(?:WDL|WTT|WRK|WGR|RRK|RAV)\d+', field))
     if collection == 'rAVG':
         return bool(re.fullmatch(r'M[HA]\d+-IDX', field))
     return False
@@ -2885,7 +2932,8 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
                        'errors':len(errors),'failed_checks':sum(not c['passed'] for c in checks)}}
 
 
-def round_default_documents(fixtures, codes, slots, existing, *, force=False):
+def round_default_documents(fixtures, codes, slots, existing, *, force=False, previous_rank=None,
+                            collections=DEFAULT_COLLECTIONS):
     season = season_label(fixtures[0]['data']['seasonId'])
     short_season = int(season[2:4] + season[7:9])
     number = fixtures[0]['data']['round']
@@ -2904,6 +2952,8 @@ def round_default_documents(fixtures, codes, slots, existing, *, force=False):
             index[(col, key)].append(row)
 
     def emit(col, value):
+        if col not in collections:
+            return
         key = aggregate_key(col, value) if col in AGGREGATES else natural_key(col, value)
         rows = index.pop((col, key), [])
         if len(rows) > 1:
@@ -2912,27 +2962,46 @@ def round_default_documents(fixtures, codes, slots, existing, *, force=False):
             current = rows[0]['data']
             if value.get('gm_id') and current.get('gm_id') not in (None, '', value['gm_id']):
                 fail(f'{col}: fixture identity conflicts with existing document {rows[0]["id"]}')
-            if col in ('cAVG', 'rAVG') and current.get('didAggregationScope') == 'round':
+            if col in ('cAVG', 'rAVG', 'rank'):
                 if col == 'rAVG' and any(k.endswith('_NM') and k in current and current[k] != v
                                          for k, v in value.items()):
                     fail('Round fixture slots conflict with the published round')
-                value = {**value, **current, 'didRoundDefaults': True}
+                value = ({**current, **value} if force and current.get('didUnplayed') else
+                         {**value, **current, 'didRoundDefaults': True})
                 if not current.get('didUnplayed'):
                     value.pop('didUnplayed', None)
-            elif not force or current.get('didUnplayed') is not True:
+            elif current.get('didUnplayed') is not True:
                 return
+            elif not force:
+                value = {**value, **current}
         ident = rows[0]['id'] if rows else stable_id(col, key)
+        value = {field: item for field, item in value.items() if not retired_calculation_field(col, field)}
         value['uid'] = (rows[0]['data'].get('uid') or ident) if rows else ident
         documents.append({'collection': col, 'document_id': ident, 'data': value})
 
     ravg = {'PlSeason': season, 'Round': number, 'didAggregationScope': 'round',
             'didRoundDefaults': True, 'didUnplayed': True}
-    cavg = {**ravg, **{f'C{n}-AVG': 62.5 for n in range(1, 21)}}
+    cavg = {**ravg, 'C-W': 0, 'C-D': 20, 'C-L': 0, 'RS-AVG': 0, 'RC-AVG': 0, 'R-AVG': 40.0}
+    for n in range(1, 21):
+        cavg.update({f'C{n}-AVG': 40.0, f'C{n}-WDL': 1, f'C{n}-S': 0, f'C{n}-C': 0})
+    ranks = {**ravg, 'R_Avg': 40.0, 'R_Gap': 0, 'Max': 40.0, 'Min': 40.0}
+    previous_rank = previous_rank or {}
+    for code in references.values():
+        n = code['team_code_number']
+        ranks.update({f'WDL{n}': 1, f'WTT{n}': previous_rank.get(f'WTT{n}', number - 1) + 1,
+                      f'WRK{n}': previous_rank.get(f'WRK{n}', 1),
+                      f'WGR{n}': previous_rank.get(f'WGR{n}', 1), f'RAV{n}': 40.0, f'RRK{n}': 1})
+    ravg.update({'M-AVG': 40.0, 'S_AVG': 40.0})
     fields = ('BAP', 'DAP', 'DTP', 'SHOT', 'GOAL', 'JMX')
     for n, fixture in enumerate(sorted(fixtures, key=lambda f: f['id']), 1):
         match = fixture['data']
         common = {'gm_id': fixture['id'], 'PlSeason': season, 'gm_round': number,
                   'gm_date': dotted_date(match['date']), 'didUnplayed': True}
+        mmst = {'gm_id': fixture['id'], 'PlSeason': season, 'Round': number,
+                'Match-No': n, 'RM-NO': number * 1000 + n,
+                'M-Home': n * 2 - 1, 'M-Away': n * 2,
+                'M-No1': number * 100 + n * 2 - 1, 'M-No2': number * 100 + n * 2,
+                'M_date': dotted_date(match['date']), 'HA-avg': 40.0, 'didUnplayed': True}
         for side, match_field, team_type in (('H', 'homeTeamId', 'HOME'), ('A', 'awayTeamId', 'AWAY')):
             team = match[match_field]
             code = references[team]
@@ -2950,7 +3019,11 @@ def round_default_documents(fixtures, codes, slots, existing, *, force=False):
             emit('dMST', {**team_data, 'H-A': side, 'T-code2': code['No'] + number,
                           'T-code3': 0, 'JMX': 40, 'JMX2': 40, 'gi_score2': 40})
             emit('pMST', {**team_data, 'ROUND2': number, 'M_No3': number * 100 + pos,
-                          'gi_score': 40, 'Goal': 0})
+                          'gi_score': 40.0, 'Goal': 0, **{m + '2': 0 for m in METRICS}})
+            mmst.update({f'{side}-Code': team, f'{side}-IDX': idx, f'{side}-Name': name,
+                         f'{side}-DWL': 'D', f'{side}-FX': 40.0,
+                         **{f'{side}-{"TAP" if m == "gi_tmp" else m}': 0 for m in KPI_ALIASES},
+                         **{f'6{side}-{m}': 0 for m in METRICS}})
             sheet = {**common, 't_code': idx, 'team_type': team_type}
             wide = dict(sheet)
             for metric in fields:
@@ -2961,11 +3034,160 @@ def round_default_documents(fixtures, codes, slots, existing, *, force=False):
             emit('multiSheet_ALL', wide)
             emit('multiSheet_GOAL-시간', {**sheet, **{f'GOAL{i}': NULL for i in range(1, 11)}})
             ravg.update({f'M{side}{n}_NM': idx, f'M{side}{n}-IDX': 40, f'M{side}{n}-WDL': 'D'})
+        ravg[f'M{n}-AVG'] = 40.0
+        emit('mMST', mmst)
     emit('rAVG', ravg)
     emit('cAVG', cavg)
+    emit('rank', ranks)
     if any(rows for rows in index.values()):
         fail('Existing round documents do not match the registered fixtures')
     return documents
+
+
+def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, items):
+    """Complete scheduled rounds from defaults and confirmed team rows, then roll standings forward."""
+    season = season_label(fixtures[0]['data']['seasonId'])
+    slot_map = slots.get('seasonSlotMappings', {}).get(season, {}).get('cavgSlotToCodeTeamCodeMapping', {})
+    by_round = defaultdict(list)
+    for fixture in fixtures:
+        by_round[fixture['data']['round']].append(fixture)
+    published = {}
+    for col, rows in existing.items():
+        if col not in AGGREGATES:
+            continue
+        for row in rows:
+            key = col, aggregate_key(col, row['data'])
+            if key in published:
+                fail(f'{col}: ambiguous scheduled aggregate identity {key[1]}')
+            published[key] = row
+    generated = {(doc['collection'], aggregate_key(doc['collection'], doc['data'])): doc
+                 for doc in aggregate['documents']}
+    updated = dict(generated)
+    source_items = {(i['match']['round'], i['recording'].get('teamId')): i for i in items}
+    previous_rank = {}
+    previous_ratings = {}
+    goals, conceded = Counter(), Counter()
+    round_means = []
+    first_generated = min((doc['data'].get('Round', doc['data'].get('gm_round', 1000))
+                           for doc in aggregate['documents']), default=min(by_round))
+    for number, round_fixtures in sorted(by_round.items()):
+        teams = {f['data'][key] for f in round_fixtures for key in ('homeTeamId', 'awayTeamId')}
+        if len(round_fixtures) != 10 or len(teams) != 20:
+            previous_rank = published.get(('rank', (season, number)), {}).get('data', {})
+            continue
+        stored_rank = normalize_rank_team_codes(
+            published.get(('rank', (season, number)), {}).get('data', {}), season, codes, teams)
+        defaults = round_default_documents(round_fixtures, codes, slot_map, {},
+            previous_rank=previous_rank, collections={'pMST', 'mMST', 'cAVG', 'rAVG', 'rank'})
+        values = {(d['collection'], aggregate_key(d['collection'], d['data'])): d for d in defaults}
+        for key, doc in values.items():
+            old = published.get(key)
+            if old and not old['data'].get('didUnplayed'):
+                doc['data'].update(old['data'])
+                doc['data'].pop('didUnplayed', None)
+            if key in generated:
+                doc['data'].update(generated[key]['data'])
+                doc['data'].pop('didUnplayed', None)
+            if old:
+                doc['document_id'] = old['id']
+                doc['data']['uid'] = old['data'].get('uid', old['id'])
+            doc['data'] = {field: value for field, value in doc['data'].items()
+                           if not retired_calculation_field(key[0], field)}
+            if key[0] == 'rank':
+                valid_numbers = {resolve_team_code(codes, season, team)['team_code_number'] for team in teams}
+                doc['data'] = {field: value for field, value in doc['data'].items()
+                               if not (match := re.fullmatch(r'(?:WDL|WTT|WRK|WGR|RAV|RRK)(\d+)', field))
+                               or int(match[1]) in valid_numbers}
+        cavg = values[('cAVG', (season, number))]['data']
+        ravg = values[('rAVG', (season, number))]['data']
+        ranks = values[('rank', (season, number))]['data']
+        rows = []
+        fixture_ratings = []
+        for fixture_no, fixture in enumerate(sorted(round_fixtures, key=lambda f: f['id']), 1):
+            match = fixture['data']
+            pair = []
+            for side, team in (('H', match['homeTeamId']), ('A', match['awayTeamId'])):
+                code = resolve_team_code(codes, season, team)
+                pmst = values[('pMST', (season, number, team))]['data']
+                played = not pmst.get('didUnplayed')
+                source = source_items.get((number, team))
+                own, other = ('home', 'away') if side == 'H' else ('away', 'home')
+                score, against = (pmst['GOAL'], pmst['Goal']) if played else (0, 0)
+                if played and source:
+                    score, against = source['match']['score'][own], source['match']['score'][other]
+                point = 3 if score > against else 1 if score == against else 0
+                raw_jmx = source['recording']['teamRating']['jmx'] if played and source else pmst['gi_score']
+                jmx = truncate_rating(raw_jmx) if played else 40.0
+                team_number = code['team_code_number']
+                official_score, official_against = match['score'][own], match['score'][other]
+                official_point = 3 if official_score > official_against else 1 if official_score == official_against else 0
+                historical_score = (number < first_generated and not played and not stored_rank.get('didUnplayed')
+                                    and stored_rank.get(f'WDL{team_number}') == official_point)
+                goals[team] += official_score if historical_score else score
+                conceded[team] += official_against if historical_score else against
+                total = previous_rank.get(f'WTT{team_number}', number - 1) + point
+                row = {'team': team, 'number': team_number, 'idx': code['IDX_CODE'], 'played': played,
+                       'point': point, 'total': total, 'score': score, 'against': against,
+                       'jmx': jmx, 'raw_jmx': raw_jmx}
+                rows.append(row)
+                pair.append(row)
+                for slot, info in slot_map.items():
+                    if info['codeTeamCode'] == team_number:
+                        cavg.update({f'C{slot}-AVG': jmx, f'C{slot}-WDL': point,
+                                     f'C{slot}-S': score, f'C{slot}-C': against})
+                ravg.update({f'M{side}{fixture_no}_NM': code['IDX_CODE'],
+                             f'M{side}{fixture_no}-IDX': jmx,
+                             f'M{side}{fixture_no}-WDL': 'W' if point == 3 else 'D' if point == 1 else 'L'})
+                ranks.update({f'WDL{team_number}': point, f'WTT{team_number}': total,
+                              f'RAV{team_number}': jmx, f'RRK{team_number}': 1,
+                              f'WRK{team_number}': previous_rank.get(f'WRK{team_number}', 1),
+                              f'WGR{team_number}': previous_rank.get(f'WGR{team_number}', 1)})
+            ravg[f'M{fixture_no}-AVG'] = truncate_rating(precise_mean([r['raw_jmx'] for r in pair]))
+            if all(r['played'] for r in pair):
+                fixture_ratings.extend(r['raw_jmx'] for r in pair)
+        played = [r for r in rows if r['played']]
+        wrk = {r['team']: rank for rank, r in enumerate(sorted(rows, key=lambda r: (
+            -r['total'], -(goals[r['team']] - conceded[r['team']]), -goals[r['team']], r['idx'])), 1)}
+        def rating_order(row):
+            current = min(row['jmx'], 99.9)
+            previous = previous_ratings.get(row['team'])
+            growth = round((current - previous) / previous * 100, 1) if previous else 0.0
+            return -int(round(current * 1000)), -int(round(growth * 1000)), row['idx']
+        rrk = {r['team']: rank for rank, r in enumerate(sorted(played, key=rating_order), 1)}
+        for row in played:
+            n = row['number']
+            ranks.update({f'WRK{n}': wrk[row['team']], f'WGR{n}': wrk[row['team']] // 4 + 1,
+                          f'RRK{n}': rrk[row['team']]})
+            previous_ratings[row['team']] = min(row['jmx'], 99.9)
+        round_avg = truncate_rating(precise_mean(fixture_ratings)) if fixture_ratings else 40.0
+        if fixture_ratings:
+            round_means.append(precise_mean(fixture_ratings))
+        cavg.update({'C-W': sum(r['point'] == 3 for r in rows), 'C-D': sum(r['point'] == 1 for r in rows),
+                     'C-L': sum(r['point'] == 0 for r in rows), 'R-AVG': round_avg,
+                     'RS-AVG': rounded(precise_mean([r['score'] for r in rows])),
+                     'RC-AVG': rounded(precise_mean([r['against'] for r in rows]))})
+        ravg.update({'M-AVG': round_avg, 'S_AVG': truncate_rating(precise_mean(round_means)) if round_means else 40.0})
+        rating_values = [r['raw_jmx'] for r in played] or [40.0]
+        ranks.update({'R_Avg': round_avg, 'Max': truncate_rating(max(rating_values)), 'Min': truncate_rating(min(rating_values)),
+                      'R_Gap': truncate_rating(round_avg - previous_rank.get('R_Avg', round_avg), 2)})
+        for col in ('cAVG', 'rAVG', 'rank'):
+            data = values[(col, (season, number))]['data']
+            data['didAggregationScope'] = 'round'
+            if played:
+                data.pop('didUnplayed', None)
+        previous_rank = ranks
+        if number < first_generated:
+            if not any(round_no == number for round_no, _ in source_items) and all(
+                    f'WTT{r["number"]}' in stored_rank for r in rows):
+                previous_rank = stored_rank
+                for row in rows:
+                    if not stored_rank.get('didRoundDefaults') and f'RAV{row["number"]}' in stored_rank:
+                        previous_ratings[row['team']] = stored_rank[f'RAV{row["number"]}']
+            continue
+        for key, doc in values.items():
+            # A skipped fixture retains its published facts or its complete defaults.
+            updated[key] = doc
+    aggregate['documents'] = list(updated.values())
 
 
 def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *, latest=False,
@@ -3073,10 +3295,11 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
         aggregate_docs = []
         if known-supplied:
             aggregate_errors.append('Season aggregate coverage incomplete: DID lacks existing destination team/match rows')
-        elif final and not aggregate_errors:
+        elif not aggregate_errors:
             try:
-                aggregate=build_aggregates(aggregate_items,evidence['ai_samples']['code'],slots,
-                                           round_only=round_only, fixture_numbers=fixture_numbers)
+                aggregate = (build_aggregates(aggregate_items, evidence['ai_samples']['code'], slots,
+                             round_only=round_only, fixture_numbers=fixture_numbers) if final else
+                             {'documents': [], 'errors': [], 'complete': True})
                 for doc in aggregate['documents']:
                     col, data = doc['collection'], doc['data']
                     if col not in ('cAVG', 'rAVG'):
@@ -3091,11 +3314,14 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
                         doc['data'] = {**{k: v for k, v in old.items()
                                           if col == 'rAVG' and re.fullmatch(r'M[HA]\d+-IDX', k)}, **data}
                 bind_existing_documents(aggregate,target)
-                validation=validate_aggregate_links(aggregate,aggregate_items,evidence['ai_samples']['code'],slots,
-                                                    round_only=round_only, fixture_numbers=fixture_numbers)
+                validation = (validate_aggregate_links(aggregate, aggregate_items, evidence['ai_samples']['code'], slots,
+                              round_only=round_only, fixture_numbers=fixture_numbers) if final else {'passed': True})
                 aggregate_errors.extend(aggregate['errors'])
                 if not aggregate['complete'] or not validation['passed']:
                     aggregate_errors.append('Season aggregate source/rating validation failed')
+                if not aggregate_errors:
+                    complete_scheduled_aggregates(aggregate, context, evidence['ai_samples']['code'], slots,
+                        evidence.get('aggregate_history', target), aggregate_items)
                 generated = {(doc['collection'],aggregate_key(doc['collection'],doc['data'])) for doc in aggregate['documents']}
                 if any((col,aggregate_key(col,row['data'])) not in generated for col in AGGREGATES
                        for row in target.get(col,[]) if not row['data'].get('didUnplayed')):
@@ -3120,7 +3346,8 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
         documents = select_aggregate_documents(documents, selected_fixtures)
     started = log_delivery_stage(job_id, 'aggregate_prepare', documents=len(documents))
     matches = len(selected_fixtures) if selected_fixtures is not None else 0
-    report = finish_delivery(documents, errors, [], target, mode, matches, latest=latest)
+    delivery_existing = evidence.get('aggregate_history', target) if mode == 'aggregates' else target
+    report = finish_delivery(documents, errors, [], delivery_existing, mode, matches, latest=latest)
     log_delivery_stage(job_id, 'aggregate_prepare', started, documents=len(report['documents']))
     report.update(aggregate_validation=validation,new_season=setup['new_season'],slot_definitions=slots,
                   aggregate_status=None if mode == 'masters' else ('blocked' if aggregate_errors else ('ready' if aggregate_docs else 'empty')),
@@ -3128,7 +3355,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
     return report
 
 
-VALIDATION_POLICY = 'imported-raw-team-player-authority-v27'
+VALIDATION_POLICY = 'scheduled-aggregate-defaults-team-code-v28'
 
 
 def dump(value):
@@ -3199,7 +3426,7 @@ def validate_document(doc):
             fail('Payload fields must be literal top-level names')
         if col == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-')):
             fail('Unused prediction field in delivery')
-        if col == 'rank' and (field.startswith('WGR') or field in ('Season', 'S_Avg', 'R_Rate')):
+        if col == 'rank' and field in ('Season', 'S_Avg', 'R_Rate'):
             fail('Unused rank field in delivery')
     dump(data)
     def finite(value):

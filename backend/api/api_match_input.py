@@ -829,7 +829,11 @@ def _draft_recorders(
 def final_recording_lineup(lineup: dict[str, dict], setup: dict | None) -> dict[str, dict]:
     """Keep initial positions and apply the durable substitutions to final RAW."""
     if not setup:
-        return lineup
+        # Older RAW/checkpoints can retain IN/OUT times without a live setup.
+        # Recover only paired events; never infer an appearance from activity.
+        setup = {"subs": JpdDidData._subs_from_input_lineup([
+            {"playerId": pid, **row} for pid, row in lineup.items()
+        ])}
     substitutions = setup.get("subs") or []
     baseline = {
         row["playerId"]: row for row in (setup.get("lineup") or [])
@@ -868,6 +872,31 @@ def final_recording_lineup(lineup: dict[str, dict], setup: dict | None) -> dict[
     return result
 
 
+def validate_final_lineup(lineup: dict[str, dict], records: list[tuple[str, dict]]) -> None:
+    """Reject unexplained appearances before replacing the existing RAW tree."""
+    computed = calculate_kpis([
+        KpiRecord(id=rid, half=row["half"], seconds=row["halfSeconds"], seq=row["seq"],
+                  act=row["act"], res=row["res"], area=row["area"], player_id=row.get("playerId"),
+                  is_shot=row.get("isShot"))
+        for rid, row in records
+    ])
+    invalid = []
+    for pid, kpis in computed.player_kpis.items():
+        if not any(kpis.get(key, 0) for key in ("TAP", "SHOT", "GOAL")):
+            continue
+        entry = lineup.get(pid, {})
+        if entry.get("type") == "START":
+            continue
+        if (entry.get("type") == "BENCH" and entry.get("inHalf")
+                and entry.get("inSeconds") is not None):
+            continue
+        invalid.append(f'{entry.get("name") or pid} ({pid})')
+    if invalid:
+        raise BackendError(
+            '활동 기록이 있는 선수의 선발·교체 정보가 누락되었습니다. 라인업과 교체 이력을 확인하세요: '
+            + ', '.join(invalid), status_code=422, code='finalize_invalid_lineup')
+
+
 _RANK_ROLES = {"main": "primary", "sub": "assistant", "manager": "manager"}
 
 
@@ -893,6 +922,7 @@ def _promote(
     recording, records, cards = _raw_values(payload, status=status, halves=halves)
     if status == "final":
         recording["lineup"] = final_recording_lineup(recording["lineup"], draft.get("_liveSetup"))
+        validate_final_lineup(recording["lineup"], records)
     existing_recorders = data.get_recording_heads_many([payload.gmId])[payload.gmId][payload.side].get("recorders")
     recording["recorders"], recording["recorderIds"] = _draft_recorders(draft, existing_recorders)
     recording["teamId"], recording["opponentTeamId"] = (

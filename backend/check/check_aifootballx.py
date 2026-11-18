@@ -136,8 +136,9 @@ class AggregateTests(unittest.TestCase):
         result = build_aggregates(*aggregate_fixture())
         rank = docs(result, 'rank')[0]
         self.assertEqual(result['calculation_mode'], 'current')
-        for field in ('WGR20', 'Season', 'S_Avg', 'R_Rate'):
+        for field in ('Season', 'S_Avg', 'R_Rate'):
             self.assertNotIn(field, rank)
+        self.assertEqual(rank['WGR20'], rank['WRK20'] // 4 + 1)
         with self.assertRaisesRegex(ValueError, 'legacy-audit'):
             build_aggregates(*aggregate_fixture(), prediction_index_baselines=LEGACY_PREDICTION_BASELINES)
 
@@ -149,8 +150,8 @@ class AggregateTests(unittest.TestCase):
         for item in items[2:4]:
             item['match']['score'] = {'home': 3, 'away': 1}
         rank = docs(build_aggregates(items, codes, slots), 'rank')[0]
-        self.assertEqual(rank['WRK18'], 1)  # T03
-        self.assertEqual(rank['WRK20'], 2)  # T01
+        self.assertEqual(rank['WRK3'], 1)  # T03
+        self.assertEqual(rank['WRK1'], 2)  # T01
         self.assertEqual(len({rank[f'WRK{n}'] for n in range(1, 21)}), 20)
 
     def test_current_jmx_tie_uses_previous_played_round_growth(self):
@@ -164,8 +165,8 @@ class AggregateTests(unittest.TestCase):
         items[0]['recording']['teamRating']['jmx'] = 60
         items[1]['recording']['teamRating']['jmx'] = 40
         ranks = docs(build_aggregates(items + second, codes, slots), 'rank')
-        self.assertEqual(ranks[1]['RRK19'], 1)
-        self.assertGreater(ranks[1]['RRK20'], ranks[1]['RRK19'])
+        self.assertEqual(ranks[1]['RRK2'], 1)
+        self.assertGreater(ranks[1]['RRK1'], ranks[1]['RRK2'])
         self.assertEqual(len({ranks[1][f'RRK{n}'] for n in range(1, 21)}), 20)
 
     def test_missing_previous_rating_blocks_current_jmx_rank(self):
@@ -194,11 +195,11 @@ class AggregateTests(unittest.TestCase):
         self.assertFalse(result['complete'])  # Forecast inputs/AVG definition remain absent.
         self.assertEqual(result['errors'], [])
 
-    def test_rank_position_is_not_cavg_slot_or_team_code(self):
+    def test_rank_fields_use_team_code_independently_of_position(self):
         result = build_aggregates(*aggregate_fixture())
-        self.assertEqual(docs(result, 'rank')[0]['RAV20'], 51)
+        self.assertEqual(docs(result, 'rank')[0]['RAV1'], 51)
         self.assertEqual(docs(result, 'cAVG')[0]['C1-AVG'], 51)
-        self.assertEqual(docs(result, 'rank')[0]['WTT20'], 3)
+        self.assertEqual(docs(result, 'rank')[0]['WTT1'], 3)
 
     def test_competition_ties_and_grade(self):
         result = build_aggregates(*aggregate_fixture(), calculation_mode='legacy-audit')
@@ -258,7 +259,7 @@ class AggregateTests(unittest.TestCase):
         result = build_aggregates(*aggregate_fixture())
         self.assertFalse(any(b['collection'] == 'pMST' for b in result['blocked']))
         self.assertIn('prediction', result['excluded']['unused'])
-        self.assertIn('rank.WGR*', result['excluded']['unused'])
+        self.assertNotIn('rank.WGR*', result['excluded']['unused'])
         with self.assertRaisesRegex(ValueError, 'disabled'):
             build_aggregates(*aggregate_fixture(), prediction_inputs={})
 
@@ -1013,17 +1014,17 @@ class SeasonAcceptanceTests(unittest.TestCase):
                 self.assertTrue(result['source_facts']['passed'])
                 self.assertEqual(result['rating_checks_failed'], 1)
 
-    def test_missing_season_positions_reports_blocker_without_crashing(self):
+    def test_current_rank_uses_global_team_code_without_season_position(self):
         items, codes, slots = aggregate_fixture()
         for row in codes:
             row['data']['PlSeason'] = None
         generated = build_aggregates(items, codes, slots)
         result = validate_aggregate_links(generated, items, codes, slots)
-        self.assertFalse(result['passed'])
-        self.assertFalse(result['source_facts']['passed'])
+        self.assertTrue(result['passed'])
+        self.assertTrue(result['source_facts']['passed'])
         self.assertEqual({d['collection'] for d in generated['documents']}, {'mMST', 'pMST', 'cAVG', 'rAVG', 'sAVG', 'rank'})
-        self.assertFalse(generated['complete'])
-        self.assertTrue(generated['blocked'])
+        self.assertTrue(generated['complete'])
+        self.assertFalse(generated['blocked'])
 
     def test_invalid_numeric_source_stays_visible_in_strict_json(self):
         encoded = encode({'metric': float('nan')})
@@ -1496,8 +1497,9 @@ def run_self_tests() -> int:
                 self.assertEqual(field_rule('playerMST', field)[0], 'manual')
             for field in ('I-DAP', 'PH-DAP', 'PA-SHOT', 'PI-GOAL'):
                 self.assertEqual(field_rule('pMST', field)[0], 'excluded')
-            for field in ('WGR1', 'Season', 'S_Avg', 'R_Rate'):
+            for field in ('Season', 'S_Avg', 'R_Rate'):
                 self.assertEqual(field_rule('rank', field)[0], 'excluded')
+            self.assertEqual(field_rule('rank', 'WGR1')[0], 'derived')
             self.assertEqual(field_rule('sAVG', 'AVG')[1], '동일 시즌 sAVG.AI Rating')
 
         def test_x_fields_are_excluded(self):
@@ -3162,7 +3164,7 @@ def test_round_defaults_use_published_identities_and_force_only_pending_document
         fixture['data']['round'] = 13
     mapping = slots['seasonSlotMappings']['2024-2025']['cavgSlotToCodeTeamCodeMapping']
     seeded = delivery.round_default_documents(fixtures, codes, mapping, {})
-    assert len(seeded) == 202
+    assert len(seeded) == 213
     assert {doc['collection'] for doc in seeded} == delivery.DEFAULT_COLLECTIONS
     for collection in ('dMST', 'pMST'):
         rows = [doc['data'] for doc in seeded if doc['collection'] == collection]
@@ -3186,14 +3188,14 @@ def test_round_defaults_use_published_identities_and_force_only_pending_document
     r_avg = next(doc['data'] for doc in seeded if doc['collection'] == 'rAVG')
     assert r_avg['MH3_NM'] == 'IDX5' and r_avg['MA10-IDX'] == 40
     c_avg = next(doc['data'] for doc in seeded if doc['collection'] == 'cAVG')
-    assert all(c_avg[f'C{n}-AVG'] == 62.5 for n in range(1, 21))
+    assert all(c_avg[f'C{n}-AVG'] == 40.0 for n in range(1, 21))
     existing = {}
     for doc in seeded:
         existing.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': dict(doc['data'])})
     actual = existing['dMST'][0]['data']
     actual.pop('didUnplayed')
     actual.update(JMX=75, WDL='W')
-    assert delivery.round_default_documents(fixtures, codes, mapping, existing)[-1]['collection'] == 'cAVG'
+    assert delivery.round_default_documents(fixtures, codes, mapping, existing)[-1]['collection'] == 'rank'
     forced = delivery.round_default_documents(fixtures, codes, mapping, existing, force=True)
     assert not any(doc['document_id'] == existing['dMST'][0]['id'] for doc in forced)
     assert actual['JMX'] == 75
@@ -3231,9 +3233,156 @@ def test_seeded_round_aggregates_update_original_slots_and_keep_unplayed_documen
     assert ravg['MA10_NM'] == 'IDX20'
     assert sum(ravg[f'M{side}{n}-IDX'] == 40 for side in ('H', 'A') for n in range(1, 11)) == 16
     cavg = docs(report, 'cAVG')[0]
-    assert sum(cavg[f'C{n}-AVG'] == 62.5 for n in range(1, 21)) == 16
+    assert sum(cavg[f'C{n}-AVG'] == 40.0 for n in range(1, 21)) == 16
     assert {r['Match'] for r in docs(report, 'pMST')} == {1, 2, 5, 6}
     assert not any(r.get('didUnplayed') for r in docs(report, 'pMST') + [ravg, cavg])
+
+
+def test_workbook_defaults_cover_all_five_collections_and_previous_standings():
+    items, codes, slots = aggregate_fixture()
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    mapping = slots['seasonSlotMappings']['2024-2025']['cavgSlotToCodeTeamCodeMapping']
+    first = {'documents': delivery.round_default_documents(fixtures, codes, mapping, {})}
+    ranks = docs(first, 'rank')[0]
+    assert all(ranks[f'WRK{n}'] == ranks[f'WGR{n}'] == ranks[f'RRK{n}'] == 1 for n in range(1, 21))
+    assert all(ranks[f'WDL{n}'] == ranks[f'WTT{n}'] == 1 and ranks[f'RAV{n}'] == 40 for n in range(1, 21))
+    for row in docs(first, 'mMST'):
+        assert row['H-FX'] == row['A-FX'] == row['HA-avg'] == 40
+        assert row['H-DWL'] == row['A-DWL'] == 'D'
+        assert row['H-TAP'] == row['A-DAP'] == row['6H-GOAL'] == 0
+    for row in docs(first, 'pMST'):
+        assert row['gi_score'] == 40 and row['DAP2'] == row['GOAL2'] == row['Goal'] == 0
+    cavg, ravg = docs(first, 'cAVG')[0], docs(first, 'rAVG')[0]
+    assert cavg['C-D'] == 20 and cavg['C-W'] == cavg['C-L'] == 0
+    assert all(cavg[f'C{n}-AVG'] == 40 and cavg[f'C{n}-WDL'] == 1 and
+               cavg[f'C{n}-S'] == cavg[f'C{n}-C'] == 0 for n in range(1, 21))
+    assert all(ravg[f'M{n}-AVG'] == 40 for n in range(1, 11))
+    for f in fixtures:
+        f['data']['round'] = 2
+    previous = {**ranks, 'WTT1': 3, 'WRK1': 2, 'WGR1': 1}
+    second = {'documents': delivery.round_default_documents(fixtures, codes, mapping, {}, previous_rank=previous)}
+    ranks = docs(second, 'rank')[0]
+    assert ranks['WTT1'] == 4 and ranks['WRK1'] == 2 and ranks['WGR1'] == 1
+
+
+def test_partial_aggregates_keep_all_team_defaults_and_update_later_round_points():
+    items, codes, slots = aggregate_fixture()
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    second = deepcopy(fixtures)
+    for f in second:
+        f['id'] += '-r2'
+        f['data']['round'] = 2
+    mapping = slots['seasonSlotMappings']['2024-2025']['cavgSlotToCodeTeamCodeMapping']
+    existing = {}
+    for group in (fixtures, second):
+        for doc in delivery.round_default_documents(group, codes, mapping, {}):
+            existing.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': doc['data']})
+    existing['rank'][0]['data'].pop('didUnplayed')
+    existing['rank'][0]['data'].update(Season=99, S_Avg=99, R_Rate=99)
+    all_fixtures = fixtures + second
+    evidence = {'did_matches': all_fixtures, 'source_recordings': [], 'target_existing': existing,
+                'ai_samples': {'code': codes}}
+    evidence['aggregate_history'] = existing
+    evidence['target_existing'] = {
+        col: [row for row in rows if row['data'].get('Round', row['data'].get('gm_round')) == 1]
+        for col, rows in existing.items()
+    }
+    report = delivery.generate_masters(evidence, all_fixtures, items[:2], slots,
+        {'new_season': False, 'documents': []}, 'aggregates', selected_fixtures=fixtures,
+        round_only=True, fixture_numbers=delivery.round_fixture_numbers(all_fixtures))
+    assert report['validation_passed'], report['errors']
+    ranks = {r['Round']: r for r in docs(report, 'rank')}
+    assert not {'Season', 'S_Avg', 'R_Rate'} & ranks[1].keys()
+    assert ranks[1]['WDL1'] == 3 and ranks[1]['WDL2'] == 0
+    assert ranks[1]['WDL3'] == 1 and ranks[1]['RAV3'] == 40
+    assert all(f'{field}{n}' in ranks[1] for field in ('WDL', 'WTT', 'WRK', 'WGR', 'RAV', 'RRK') for n in range(1, 21))
+    assert ranks[2]['WTT1'] == 4 and ranks[2]['WTT2'] == 1 and ranks[2]['WTT3'] == 2
+    assert ranks[2]['WRK1'] == ranks[1]['WRK1'] and ranks[2]['RRK1'] == 1
+    later_rank = next(d for d in report['documents'] if d['collection'] == 'rank' and d['data']['Round'] == 2)
+    assert later_rank['existed']
+    assert later_rank['baseline']['Round']['exists']
+    assert len(docs(report, 'mMST')) == 10 and len(docs(report, 'pMST')) == 20
+    assert sum(r.get('didUnplayed', False) for r in docs(report, 'pMST')) == 18
+    assert docs(report, 'rAVG')[0]['M-AVG'] == 51.5
+    for doc in report['documents']:
+        rows = existing.setdefault(doc['collection'], [])
+        rows[:] = [row for row in rows if row['id'] != doc['document_id']]
+        rows.append({'id': doc['document_id'], 'data': deepcopy(doc['data'])})
+    repeated = delivery.generate_masters(evidence, all_fixtures, items[:2], slots,
+        {'new_season': False, 'documents': []}, 'aggregates', selected_fixtures=fixtures,
+        round_only=True, fixture_numbers=delivery.round_fixture_numbers(all_fixtures), latest=True)
+    assert repeated['validation_passed'], repeated['errors']
+    assert not repeated['documents']
+    next_report = delivery.generate_masters(evidence, all_fixtures, items[2:4], slots,
+        {'new_season': False, 'documents': []}, 'aggregates', selected_fixtures=fixtures,
+        round_only=True, fixture_numbers=delivery.round_fixture_numbers(all_fixtures))
+    assert next_report['validation_passed'], next_report['errors']
+    first_rank = next(r for r in docs(next_report, 'rank') if r['Round'] == 1)
+    assert first_rank['RAV1'] == 51 and first_rank['RAV3'] == 53 and first_rank['RAV5'] == 40
+
+
+def test_aggregates_use_published_previous_points_when_older_team_rows_are_missing():
+    items, codes, slots = aggregate_fixture()
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    second = deepcopy(items)
+    for item in second:
+        item['match_id'] += '-r2'
+        item['match']['round'] = 2
+    later = [{'id': i['match_id'], 'data': i['match']} for i in second if i['side'] == 'H']
+    existing = {'rank': [{'id': 'published-first', 'data': {
+        'PlSeason': '2024-2025', 'Round': 1,
+        **{f'WTT{n}': n + 10 for n in range(1, 21)},
+        **{f'RAV{n}': 50 + n for n in range(1, 21)},
+    }}]}
+    aggregate = build_aggregates(second[:2], codes, slots, round_only=True,
+                                 fixture_numbers=delivery.round_fixture_numbers(later))
+    delivery.complete_scheduled_aggregates(aggregate, fixtures + later, codes, slots, existing, second[:2])
+    rank = next(r for r in docs(aggregate, 'rank') if r['Round'] == 2)
+    assert rank['WTT1'] == 14 and rank['WTT2'] == 12 and rank['WTT3'] == 14
+
+
+def test_published_legacy_rank_aliases_are_read_as_current_team_codes():
+    codes = [{'data': {'TCODE': team, 'PlSeason': '2025-2026', 'Team Code': number,
+                       'No': number * 100, 'IDX_NAME': team}}
+             for team, number in [('E-BU', 5), ('E-LU', 14), ('E-SU', 28)]]
+    normalized = delivery.normalize_rank_team_codes(
+        {'WDL27': 3, 'WTT27': 15, 'WRK27': 8, 'WDL12': 1, 'WTT12': 10, 'WDL21': 0, 'WTT21': 5},
+        '2025-2026', codes, {'E-BU', 'E-LU', 'E-SU'})
+    assert normalized['WDL5'] == 3 and normalized['WTT5'] == 15 and normalized['WGR5'] == 3
+    assert normalized['WDL14'] == 1 and normalized['WTT14'] == 10
+    assert normalized['WDL28'] == 0 and normalized['WTT28'] == 5
+
+
+def test_default_capture_fills_missing_history_from_confirmed_team_points(tmp_path):
+    items, codes, slots = aggregate_fixture()
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    for fixture in fixtures:
+        fixture['data']['round'] = 13
+    previous = {'id': 'round10', 'data': {'Round': 10, 'PlSeason': '2024-2025',
+                **{f'WTT{n}': 20 for n in range(1, 21)}, 'WRK1': 8}}
+    prior_rows = [{'id': 'win', 'data': {'gm_round': 11, 't_code': 'T01', 'GOAL': 3, 'Goal': 0}},
+                  {'id': 'loss', 'data': {'gm_round': 12, 't_code': 'T01', 'GOAL': 0, 'Goal': 1}}]
+    source = object.__new__(delivery.SourceCapture)
+    source.did, source.target = object(), object()
+    source.documents, source.queries = {}, []
+    def rows(client, path, filters=(), **kwargs):
+        if client is source.did:
+            return fixtures
+        if path == 'code':
+            return [{'id': str(n), **row} for n, row in enumerate(codes)]
+        if path == 'rank' and ('Round', '<', 13) in filters:
+            return [previous]
+        if path == 'pMST' and len(filters) == 1:
+            return prior_rows
+        return []
+    source.rows = rows
+    slot_path = tmp_path / 'slots.json'
+    slot_path.write_text(json.dumps(slots), encoding='utf-8')
+    report, _ = source.capture_defaults({'seasonId': '20242025', 'roundFrom': 13}, slot_path)
+    assert report['validation_passed'], report['errors']
+    rank = docs(report, 'rank')[0]
+    assert rank['WTT1'] == 24 and rank['WTT2'] == 23
+    assert rank['WRK1'] == 8 and rank['WGR1'] == 3
 
 
 def test_default_route_queues_round_form_and_exposes_mode_in_status(service, monkeypatch):

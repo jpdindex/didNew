@@ -206,7 +206,7 @@ def type_compatible(value: Any, types: list[str]) -> bool:
 
 
 def field_rule(collection: str, field: str, label: str = '') -> tuple[str, str, str]:
-    if collection == 'rank' and (field.startswith('WGR') or field in {'Season', 'S_Avg', 'R_Rate'}):
+    if collection == 'rank' and field in {'Season', 'S_Avg', 'R_Rate'}:
         return 'excluded', '', '사용자 확정: 미사용. 기존 값 삭제 없이 신규 생성 제외'
     if collection == 'sAVG' and field == 'AVG':
         return 'derived', '동일 시즌 sAVG.AI Rating', '사용자 확정: 여러 시즌 평균이 아닌 해당 시즌 평점과 동일'
@@ -384,7 +384,7 @@ def field_rule(collection: str, field: str, label: str = '') -> tuple[str, str, 
             sources = {'WDL': 'matches.score → 3/1/0', 'WTT': '해당 라운드까지 WDL 누적',
                        'WRK': '누적 승점 내림차순 RANK', 'WGR': 'floor(WRK/4)+1',
                        'RAV': 'teamRating.jmx', 'RRK': '라운드 JMX 내림차순 RANK'}
-            return 'derived', sources[match[1]], '집계 미리보기 구현; 기본 code.POSITION, 2025–26 승격 3팀은 기존 rank와 38R 대조한 호환 슬롯 사용. WGR은 floor(WRK/4)+1'
+            return 'derived', sources[match[1]], '시즌별 팀 자리 유지, 필드 번호는 code.Team Code. WGR은 floor(WRK/4)+1; 미경기 기본값은 이전 라운드 등급'
     if collection in MAPPING_AGGREGATES:
         return 'decision', '기존 SQL/엑셀의 경기 결합·누적·예측 산출물', '기존 공식/조회 소비 규칙 필요; 이름만으로 계산·복사 금지'
     return 'decision', '', '기존 SQL/엑셀 산출식 또는 업무 의미 확인 필요' + (f' (화면 제목: {label})' if label else '')

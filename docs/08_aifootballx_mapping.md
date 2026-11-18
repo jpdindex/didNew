@@ -229,14 +229,14 @@ AIfootballX의 API·파이프라인·화면은 유지하고, 기존 SQL 추출·
 | cAVG | 팀·라운드 JMX, 승점, 득점, 상대 득점 | `C{slot}-AVG/WDL/S/C`, `R-AVG/RS-AVG/RC-AVG`, `C-W/D/L` | 구현; 기존 시즌 슬롯표 필수 |
 | rAVG | gm_id 순서의 홈·원정 IDX/JMX/승무패 | `MHn_NM/MAn_NM`, `MHn-IDX/MAn-IDX`, `MHn-WDL/MAn-WDL`, `Mn-AVG` | 구현; 날짜가 아닌 gm_id 순번 |
 | sAVG | 완료 경기의 KPI·평점 모음 | `TAP/DAP/.../GOAL`, `B/M/A/S`, `AI Rating/AVG/SEASON` | 구현; 해당 시즌 AI Rating=AVG. 여러 시즌 평균 사용 안 함 |
-| rank | 경기 스코어→승점·누적 승점, JMX | `WDLn/WTTn/WRKn/RAVn/RRKn` | 구현; 현행 승점·JMX 정렬. WGR*/Season/S_Avg/R_Rate 미사용 제외 |
+| rank | 경기 스코어→승점·누적 승점, JMX | `WDLn/WTTn/WRKn/WGRn/RAVn/RRKn` | 필드 번호는 시즌 팀의 Team Code. 현행 승점·JMX 정렬, WGR=floor(WRK/4)+1 |
 | code | `teams` + 기존 목적지 시즌별 코드·슬롯 | `TCODE/Code/IDX_NAME/Full Name/Team Code/No` | 기존 번호·슬롯 보존; 팀 명칭 연결 |
 
 ## 확정 범위·규칙
 
 | 구분 | 처리 |
 |---|---|
-| 미사용 | pMST I-*/PH-*/PA-*/PI-*, prediction/aiPHR/yPHR, rank WGR*/Season/S_Avg/R_Rate, X-*, BAP(AiBuildup), P-KPI50~68은 신규 생성 제외 |
+| 미사용 | pMST I-*/PH-*/PA-*/PI-*, prediction/aiPHR/yPHR, rank Season/S_Avg/R_Rate, X-*, BAP(AiBuildup), P-KPI50~68은 신규 생성 제외 |
 | 기존 수동 업로드 | Manager.Coach/Captain, P-KPI40/41 등 원천 없는 잔여 선수 점수는 팀원 엑셀 관리·직접 업로드 유지. DID 누락 검증 대상이 아니며 기존 값을 삭제하지 않음 |
 | 시즌 평균 | sAVG.AI Rating은 해당 시즌 완료 팀 기록의 저장 JMX 평균. sAVG.AVG는 같은 값. 이전 시즌 평균을 섞지 않음 |
 | 운영·콘텐츠 | AIAnalysis/analysis_history/aiPodcast/aiShorts/forecastSnapshots/snapshot_history/shot_x 등은 기존 생성 주체 유지 |
@@ -244,7 +244,8 @@ AIfootballX의 API·파이프라인·화면은 유지하고, 기존 SQL 추출·
 - **정답 원천:** 2024–25 경기·KPI는 제공 SQL 덤프. AIfootballX 기존 Firestore는 스키마·문서 ID/UID·팀 코드·슬롯 참조와 차이 진단용이다. 차이를 맞추려고 SQL 값을 변경하지 않는다.
 - **평점:** 실제 연동은 DID 저장 teamRating/playerStats와 jmxSeries를 읽고 ratingBasedOn=kpiVersion을 확인한다. SQL gi_score를 새 JMX로 대체하지 않는다. SQL 덤프에 현재 JPD-RATING 값이 없어 이번 SQL 평점 검사는 건너뛴다. 24/25 시즌 81.2는 확인된 값이며 73.8을 정답으로 쓰지 않는다.
 - **순위:** WRK는 누적 승점↓·득실차↓·득점↓·IDX↑, RRK는 rAVG 표시 JMX↓·직전 출전 라운드 대비 상승률↓·IDX↑로 순번을 정한다. 상승률은 (현재−직전)/직전×100의 소수 첫째 자리, 첫 출전·직전 0은 0이다. 근거는 현재 AIfootballX ai_chart/build_ranking.py이며 관리자만 표시하는 미사용 필드와 분리한다.
-- **ID·계약:** 선수 숫자 ID는 DID에서 수동 발급한다. 기존 이력 보존·중복 제거와 DID의 경기일·리그/컵/국가대표별 계약 선택 기준을 재사용한다. gm_id 순번·대상 UID·시즌 슬롯을 유지하며 연기 시 gm_date만 변경한다. 2025–26 rank 슬롯 호환은 번리27/리즈12/선덜랜드21이다. EPL 외 번호식은 별도 확인이 필요하다.
+- **ID·계약:** 선수 숫자 ID는 DID에서 수동 발급한다. 기존 이력 보존·중복 제거와 DID의 경기일·리그/컵/국가대표별 계약 선택 기준을 재사용한다. gm_id 순번·대상 UID·시즌 슬롯을 유지하며 연기 시 gm_date만 변경한다. 현재 rank는 시즌별 자리 순서를 유지하면서 Team Code를 필드 번호로 사용한다. 과거 2025–26 슬롯 예외는 legacy-audit에만 적용한다. EPL 외 번호식은 별도 확인이 필요하다.
+- **미경기 기본값:** default는 rank/mMST/pMST/rAVG/cAVG를 모두 생성한다. KPI·득실점은 0, JMX는 40, 승무패는 D, 승점은 1이다. rank WTT는 이전 누적승점+1, WRK/WGR는 이전 순위·등급, RRK는 1이며 1라운드 WRK/WGR도 1이다. aggregates는 완료 경기 값을 반영하면서 다른 팀의 기본값을 유지하고 이후 생성 라운드의 누적값을 갱신한다. 라운드 평점 평균은 완료된 경기에서 계산하며 완료 경기가 없으면 40이다.
 - **구간·골:** 정확히 5:00은 5–10. 분석 골은 자책골 제외, 공식 경기 스코어는 유지. 구간 SSR은 반별 누적 골/슛이며 분모 0은 0이다. DTP는 구간 합과 총계를 맞추며 과거 SQL 추출·업로드 원인은 추가 조사하지 않는다.
 - **점수·등급:** NEW 고정 기준 DAP400/DTP12/SHOT15/SSR0.18/GOAL3. 원본 DAP·DTP 점수와 상한 99.9 평점을 구분한다. FPX는 보정 SHOT·GOAL 평균, Power3X는 APX·TPX·FPX 평균. 등급은 F<50, D≥50, C≥60, B≥70, A≥80, A+≥90이다.
 - **시간·좌표:** 후반 전체 초는 전반 실제 종료 초+halfSeconds. 경기장 좌표만 백분율에서 971×634로 복원하고 슈팅 좌표 단위는 유지한다.
