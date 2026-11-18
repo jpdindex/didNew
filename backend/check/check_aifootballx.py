@@ -3095,6 +3095,23 @@ def test_round_defaults_use_published_identities_and_force_only_pending_document
     seeded = delivery.round_default_documents(fixtures, codes, mapping, {})
     assert len(seeded) == 202
     assert {doc['collection'] for doc in seeded} == delivery.DEFAULT_COLLECTIONS
+    for collection in ('dMST', 'pMST'):
+        rows = [doc['data'] for doc in seeded if doc['collection'] == collection]
+        assert {row['Match'] for row in rows} == set(range(1, 21))
+        for row in rows:
+            pos = row['Match']
+            assert row['Season'] == 2425
+            assert row['S-Round'] == 24251300 + pos
+            assert row['M_No1'] == 24250240 + pos
+            assert row['M_No2'] == 1300 + pos
+            code = delivery.resolve_team_code(codes, '2024-2025', row['t_code'])
+            assert row['T-code'] == code['No']
+            assert row['T-Round'] == code['No'] + 13
+            assert row['M-Code'] == 24250000 + code['No'] + 13
+            if collection == 'dMST':
+                assert row['T-code2'] == row['T-Round'] and row['T-code3'] == 0
+            else:
+                assert row['ROUND2'] == 13 and row['M_No3'] == row['M_No2']
     finished = delivery.finish_delivery(seeded, [], [], {}, 'default', len(fixtures), latest=True)
     assert docs(finished, 'multiSheet_JMX')[0]['JMX-H1-0-5'] == '\\N'
     r_avg = next(doc['data'] for doc in seeded if doc['collection'] == 'rAVG')
@@ -3111,6 +3128,13 @@ def test_round_defaults_use_published_identities_and_force_only_pending_document
     forced = delivery.round_default_documents(fixtures, codes, mapping, existing, force=True)
     assert not any(doc['document_id'] == existing['dMST'][0]['id'] for doc in forced)
     assert actual['JMX'] == 75
+    pending = existing['dMST'][1]
+    for field in ('Season', 'S-Round', 'M-Code', 'M_No1', 'M_No2', 'T-code', 'T-Round'):
+        pending['data'].pop(field)
+    repaired = delivery.round_default_documents(fixtures, codes, mapping, existing, force=True)
+    repaired_row = next(doc['data'] for doc in repaired if doc['collection'] == 'dMST'
+                        and doc['document_id'] == pending['id'])
+    assert repaired_row['Season'] == 2425 and repaired_row['M_No1'] == 24250242
     actual['gm_id'] = 'different-fixture'
     with pytest.raises(BackendError, match='fixture identity conflicts'):
         delivery.round_default_documents(fixtures, codes, mapping, existing, force=True)

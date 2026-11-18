@@ -2873,6 +2873,7 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
 
 def round_default_documents(fixtures, codes, slots, existing, *, force=False):
     season = season_label(fixtures[0]['data']['seasonId'])
+    short_season = int(season[2:4] + season[7:9])
     number = fixtures[0]['data']['round']
     team_ids = {f['data'][k] for f in fixtures for k in ('homeTeamId', 'awayTeamId')}
     references = {team: resolve_team_code(codes, season, team) for team in team_ids}
@@ -2925,9 +2926,17 @@ def round_default_documents(fixtures, codes, slots, existing, *, force=False):
             pos = (n - 1) * 2 + (1 if side == 'H' else 2)
             name = team_delivery_name(codes, season, team, {})
             team_data = {**common, 't_code': team, 'IDX_CODE': idx, 't_Nm': name, 'Match': pos,
+                         'Season': short_season,
+                         'S-Round': short_season * 10000 + number * 100 + pos,
+                         'M-Code': short_season * 10000 + code['No'] + number,
+                         'M_No1': short_season * 10000 + (number - 1) * 20 + pos,
+                         'M_No2': number * 100 + pos,
+                         'T-code': code['No'], 'T-Round': code['No'] + number,
                          'Point': 1, 'WDL': 'D', **dict.fromkeys(KPI_ALIASES, 0)}
-            emit('dMST', {**team_data, 'H-A': side, 'JMX': 40, 'JMX2': 40, 'gi_score2': 40})
-            emit('pMST', {**team_data, 'gi_score': 40, 'Goal': 0})
+            emit('dMST', {**team_data, 'H-A': side, 'T-code2': code['No'] + number,
+                          'T-code3': 0, 'JMX': 40, 'JMX2': 40, 'gi_score2': 40})
+            emit('pMST', {**team_data, 'ROUND2': number, 'M_No3': number * 100 + pos,
+                          'gi_score': 40, 'Goal': 0})
             sheet = {**common, 't_code': idx, 'team_type': team_type}
             wide = dict(sheet)
             for metric in fields:
