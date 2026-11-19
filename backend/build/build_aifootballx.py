@@ -207,7 +207,8 @@ def type_compatible(value: Any, types: list[str]) -> bool:
 
 def field_rule(collection: str, field: str, label: str = '') -> tuple[str, str, str]:
     if collection == 'rank' and field in {'Season', 'S_Avg', 'R_Rate'}:
-        return 'excluded', '', '사용자 확정: 미사용. 기존 값 삭제 없이 신규 생성 제외'
+        return 'derived', {'Season': '라운드 평균 / Round', 'S_Avg': '라운드 평균 / Round²',
+                           'R_Rate': '(현재 평균 - 이전 평균) / 현재 평균'}[field], 'RANK.csv 요약 항목; R_Rate는 비율로 저장'
     if collection == 'sAVG' and field == 'AVG':
         return 'derived', '동일 시즌 sAVG.AI Rating', '사용자 확정: 여러 시즌 평균이 아닌 해당 시즌 평점과 동일'
     if collection in {'prediction', 'aiPHR', 'yPHR'} or (collection == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-'))):
@@ -786,8 +787,7 @@ def compare(generated: dict, existing: dict, *, replay: bool = False) -> dict:
                     if len(examples) < 25:
                         examples.append({'key': key, 'field': field, 'generated': value, 'target': expected})
             for field in target.keys() - doc['data'].keys() - {'uid', 'id', 'createAt', 'updatedAt', '_round', '_season', '_isFuture'}:
-                if (col == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-'))) or (col == 'rank' and
-                        (field.startswith('WGR') or field in {'Season', 'S_Avg', 'R_Rate'})):
+                if col == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-')):
                     excluded[field] += 1
                 else:
                     omitted[field] += 1

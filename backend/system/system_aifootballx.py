@@ -497,8 +497,7 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
         'Some target fields have no confirmed definition; these are omitted, not zero-filled.',
         'Destination-only fields are preserved; generated fields and nested calculation maps are replaced from the reviewed payload.',
     ]
-    report['excluded'] = {'unused': ['pMST.I-*/PH-*/PA-*/PI-*', 'prediction', 'aiPHR', 'yPHR',
-                                    'rank.Season/S_Avg/R_Rate'],
+    report['excluded'] = {'unused': ['pMST.I-*/PH-*/PA-*/PI-*', 'prediction', 'aiPHR', 'yPHR'],
                           'manual_upload': ['Manager.Coach/Captain', 'playerMST residual score fields']}
     report['excluded']['collections'] = sorted(EXCLUDED_COLLECTIONS)
     report['excluded']['halves'] = ['H3', 'H4']
@@ -1147,6 +1146,17 @@ def aggregate_key(collection: str, data: dict[str, Any]) -> tuple:
     return data.get('PlSeason'), data.get('Round')
 
 
+def rank_excel_summary(number, average, previous_average=None):
+    """RANK.csv summary; percentage is stored as a ratio (e.g. -0.014)."""
+    result = {'Season': rounded(average / number),
+              'S_Avg': rounded(average / number ** 2)}
+    if number == 1:
+        result['R_Rate'] = 0.0
+    elif previous_average is not None:
+        result['R_Rate'] = rounded((average - previous_average) / average, 3) if average else 0.0
+    return result
+
+
 def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions: dict,
                      *, prediction_inputs: dict | None = None,
                      prediction_index_baselines: dict | None = None,
@@ -1162,8 +1172,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
     result = {'mode': 'aggregate-preview-only', 'write_enabled': False, 'documents': [],
               'calculation_mode': calculation_mode,
               'excluded': {'unused': ['pMST.I-*', 'pMST.PH-*', 'pMST.PA-*', 'pMST.PI-*',
-                                      'prediction', 'aiPHR', 'yPHR',
-                                      'rank.Season', 'rank.S_Avg', 'rank.R_Rate'],
+                                      'prediction', 'aiPHR', 'yPHR'],
                            'manual_upload': ['Manager.Coach/Captain', 'playerMST residual score fields']},
               'errors': [], 'blocked': [], 'policies': {
                   'rating': 'DID stored teamRating only; no fallback to SQL gi_score',
@@ -1171,7 +1180,7 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                   'rank': ('Historical Excel competition RANK; WGR=floor(WRK/4)+1' if legacy else
                            'AIfootballX ai_chart/build_ranking.py: points/GD/GF/team; JMX/growth/team; unique ranks'),
                   'legacy_fields': ('diagnostic only; not approved for delivery' if legacy else
-                                    'I-*, Season, S_Avg, R_Rate unused; WGR follows WRK'),
+                                    'I-* unused; rank summary follows RANK.csv; WGR follows WRK'),
                   'season_reference_average': 'current: AVG equals same-season AI Rating; never a multi-season average',
                   'unplayed': 'non-final recordings excluded, never padded with a fabricated rating',
               }}
@@ -1475,8 +1484,8 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                 blocked['rank'].add(f'RAV{number}/RRK{number}: missing stored JMX')
         if round_avg is not None:
             ranks.update({'R_Avg': rating_precision(round_avg), 'Max': rating_precision(max(ratings)), 'Min': rating_precision(min(ratings))})
-            if legacy:
-                ranks.update(Season=rating_precision(round_avg / round_no), S_Avg=rating_precision(round_avg / round_no ** 2))
+            ranks.update(rank_excel_summary(round_no, round_avg,
+                previous_mean if legacy or previous_round_no == round_no - 1 else None))
             if previous_mean is not None and (legacy or previous_round_no == round_no - 1):
                 ranks['R_Gap'] = rating_precision(round_avg - previous_mean, 2)
                 if legacy:
@@ -2886,8 +2895,7 @@ def delivery_payload(collection, generated, old=None):
 
 
 def retired_calculation_field(collection, field):
-    return ((collection == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-')))
-            or (collection == 'rank' and field in ('Season', 'S_Avg', 'R_Rate')))
+    return collection == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-'))
 
 
 def generated_calculation_field(collection, field):
@@ -2899,7 +2907,7 @@ def generated_calculation_field(collection, field):
     if collection.startswith('multiSheet_'):
         return bool(re.fullmatch(r'(?:BAP|DAP|DTP|SHOT|GOAL|SSR|JMX)-H[1-4]-.+', field))
     if collection == 'rank':
-        return bool(re.fullmatch(r'(?:WDL|WTT|WRK|WGR|RRK|RAV)\d+', field))
+        return field in ('Season', 'S_Avg', 'R_Rate') or bool(re.fullmatch(r'(?:WDL|WTT|WRK|WGR|RRK|RAV)\d+', field))
     if collection == 'rAVG':
         return bool(re.fullmatch(r'M[HA]\d+-IDX', field))
     return False
@@ -3030,6 +3038,9 @@ def round_default_documents(fixtures, codes, slots, existing, *, force=False, pr
     ranks = {**ravg, 'R_Avg': 40.0, 'R_Gap': 0, 'Max': 40.0, 'Min': 40.0,
              'didRankFieldScheme': 'rank-slots-v1'}
     previous_rank = previous_rank or {}
+    ranks.update(rank_excel_summary(number, 40.0, previous_rank.get('R_Avg', 40.0)))
+    if number > 1 and 'R_Avg' in previous_rank:
+        ranks['R_Gap'] = truncate_rating(40.0 - previous_rank['R_Avg'], 2)
     rank_numbers = rank_slot_numbers({'seasonSlotMappings': {season: {
         'rankSlotToCodeTeamCodeMapping': rank_slots or {}}}}, season) if 'rank' in collections else {}
     for code in references.values():
@@ -3228,6 +3239,7 @@ def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, i
         rating_values = [r['raw_jmx'] for r in played] or [40.0]
         ranks.update({'R_Avg': round_avg, 'Max': truncate_rating(max(rating_values)), 'Min': truncate_rating(min(rating_values)),
                       'R_Gap': truncate_rating(round_avg - previous_rank.get('R_Avg', round_avg), 2)})
+        ranks.update(rank_excel_summary(number, round_avg, previous_rank.get('R_Avg')))
         for col in ('cAVG', 'rAVG', 'rank'):
             data = values[(col, (season, number))]['data']
             data['didAggregationScope'] = 'round'
@@ -3413,7 +3425,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
     return report
 
 
-VALIDATION_POLICY = 'scheduled-aggregate-rank-slots-v29'
+VALIDATION_POLICY = 'scheduled-aggregate-rank-excel-summary-v30'
 
 
 def dump(value):
@@ -3487,8 +3499,6 @@ def validate_document(doc):
         rank_field = re.fullmatch(r'(?:WDL|WTT|WRK|WGR|RAV|RRK)(\d+)', field) if col == 'rank' else None
         if rank_field and not 1 <= int(rank_field[1]) <= 20:
             fail('rank payload fields must use mapped slots 1..20')
-        if col == 'rank' and field in ('Season', 'S_Avg', 'R_Rate'):
-            fail('Unused rank field in delivery')
     dump(data)
     def finite(value):
         if isinstance(value, float) and not math.isfinite(value):

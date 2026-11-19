@@ -133,12 +133,12 @@ class AggregateTests(unittest.TestCase):
         self.assertFalse(report['passed'])
         self.assertTrue(report['collections']['sAVG']['failed'])
 
-    def test_current_mode_excludes_unconfirmed_historical_fields(self):
+    def test_current_mode_includes_excel_summary_fields(self):
         result = build_aggregates(*aggregate_fixture())
         rank = docs(result, 'rank')[0]
         self.assertEqual(result['calculation_mode'], 'current')
         for field in ('Season', 'S_Avg', 'R_Rate'):
-            self.assertNotIn(field, rank)
+            self.assertIn(field, rank)
         self.assertEqual(rank['WGR20'], rank['WRK20'] // 4 + 1)
         with self.assertRaisesRegex(ValueError, 'legacy-audit'):
             build_aggregates(*aggregate_fixture(), prediction_index_baselines=LEGACY_PREDICTION_BASELINES)
@@ -1499,7 +1499,7 @@ def run_self_tests() -> int:
             for field in ('I-DAP', 'PH-DAP', 'PA-SHOT', 'PI-GOAL'):
                 self.assertEqual(field_rule('pMST', field)[0], 'excluded')
             for field in ('Season', 'S_Avg', 'R_Rate'):
-                self.assertEqual(field_rule('rank', field)[0], 'excluded')
+                self.assertEqual(field_rule('rank', field)[0], 'derived')
             self.assertEqual(field_rule('rank', 'WGR1')[0], 'derived')
             self.assertEqual(field_rule('sAVG', 'AVG')[1], '동일 시즌 sAVG.AI Rating')
 
@@ -3295,7 +3295,10 @@ def test_partial_aggregates_keep_all_team_defaults_and_update_later_round_points
         round_only=True, fixture_numbers=delivery.round_fixture_numbers(all_fixtures))
     assert report['validation_passed'], report['errors']
     ranks = {r['Round']: r for r in docs(report, 'rank')}
-    assert not {'Season', 'S_Avg', 'R_Rate'} & ranks[1].keys()
+    assert ranks[1]['Season'] == 51.5 and ranks[1]['S_Avg'] == 51.5
+    assert ranks[1]['R_Rate'] == 0
+    assert ranks[2]['Season'] == 20 and ranks[2]['S_Avg'] == 10
+    assert ranks[2]['R_Rate'] == -0.288
     assert ranks[1]['WDL1'] == 3 and ranks[1]['WDL2'] == 0
     assert ranks[1]['WDL3'] == 1 and ranks[1]['RAV3'] == 40
     assert all(f'{field}{n}' in ranks[1] for field in ('WDL', 'WTT', 'WRK', 'WGR', 'RAV', 'RRK') for n in range(1, 21))
@@ -3874,3 +3877,51 @@ def test_current_rank_mapping_missing_participant_is_reported_instead_of_using_t
     generated = build_aggregates(items, codes, slots)
     assert any('no slot for team code 101' in error for error in generated['errors'])
     assert not generated['complete']
+
+
+def test_rank_excel_summaries_are_delivered_in_current_mode():
+    items, codes, slots = aggregate_fixture()
+    second = deepcopy(items)
+    for item in second:
+        item['match_id'] += '-r2'
+        item['match']['round'] = 2
+        item['recording']['teamRating']['jmx'] += 10
+    aggregate = build_aggregates(items + second, codes, slots)
+    ranks = docs(aggregate, 'rank')
+    assert ranks[0]['Season'] == 60.5 and ranks[0]['S_Avg'] == 60.5
+    assert ranks[0]['R_Rate'] == 0
+    assert ranks[1]['Season'] == 35.3 and ranks[1]['S_Avg'] == 17.6
+    assert ranks[1]['R_Gap'] == 10 and ranks[1]['R_Rate'] == .142
+    for doc in aggregate['documents']:
+        if doc['collection'] == 'rank':
+            validate_document(doc)
+    merged = delivery.delivery_payload('rank', ranks[1], {'Season': 999, 'S_Avg': 999, 'R_Rate': 999, 'note': 'keep'})
+    assert merged['Season'] == 35.3 and merged['R_Rate'] == .142 and merged['note'] == 'keep'
+
+
+def test_rank_excel_summary_defaults_and_missing_history():
+    items, codes, slots = aggregate_fixture()
+    fixtures = [{'id': i['match_id'], 'data': deepcopy(i['match'])} for i in items if i['side'] == 'H']
+    for fixture in fixtures:
+        fixture['data']['round'] = 13
+    block = slots['seasonSlotMappings']['2024-2025']
+    documents = delivery.round_default_documents(fixtures, codes,
+        block['cavgSlotToCodeTeamCodeMapping'], {}, rank_slots=block['rankSlotToCodeTeamCodeMapping'])
+    rank_doc = next(d for d in documents if d['collection'] == 'rank')
+    assert rank_doc['data']['Season'] == 3.1
+    assert rank_doc['data']['S_Avg'] == .2
+    assert rank_doc['data']['R_Rate'] == 0
+    validate_document(rank_doc)
+    previous = delivery.round_default_documents(fixtures, codes,
+        block['cavgSlotToCodeTeamCodeMapping'], {}, rank_slots=block['rankSlotToCodeTeamCodeMapping'],
+        previous_rank={'R_Avg': 80})
+    pending = next(d['data'] for d in previous if d['collection'] == 'rank')
+    assert pending['R_Gap'] == -40 and pending['R_Rate'] == -1
+    assert delivery.rank_excel_summary(2, 0, 40)['R_Rate'] == 0
+    third = deepcopy(items)
+    for item in third:
+        item['match_id'] += '-r3'
+        item['match']['round'] = 3
+    rank = docs(build_aggregates(items + third, codes, slots), 'rank')[1]
+    assert 'R_Gap' not in rank and 'R_Rate' not in rank
+    assert rank['Season'] == 20.2 and rank['S_Avg'] == 6.7

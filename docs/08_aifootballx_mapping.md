@@ -477,3 +477,20 @@ FPX 검증과 dMST의 GOAL 점수 성분은 자책골을 포함한 GOAL 전체�
 ## latest 옵션 변수 충돌 수정 - 2026-10-27
 
 감독 계약 선택에 사용하던 지역 변수 latest를 latest_contract_start로 변경하여 전송의 latest boolean을 덮어쓰지 않도록 수정했다. 감독 계약이 있는 경우에도 latest=false는 전체 후보, latest=true는 신규·변경 후보를 선택한다. 해당 회귀 테스트를 추가했으며 전체 로컬 테스트 398개 통과. 실제 Firestore 쓰기·전송·재시작·커밋·push는 수행하지 않았다.
+
+
+### 2026-11-19 RANK.csv upload / aggregates alignment
+
+The RANK.csv contract is 135 columns: Round, WDL1..20, Round, WTT1..20,
+Round, WRK1..20, blank, WGR1..20, blank, RAV1..20, blank, RRK1..20,
+blank, Season, S_Avg, R_Avg, R_Gap, R_Rate, Max, Min, PlSeason.
+CSV block headers contain only 1..20; footballx resolves them by position.
+Repeated Round columns refer to the same stored Round and must agree.
+DID keeps named payload fields and the season-specific rank slot mapping.
+Season and S_Avg are restored as round average / Round and / Round² (one
+decimal, half-up); R_Rate is (current average - previous average) / current
+average (three decimal places), stored as a ratio. Round 1 uses zero for
+gap/rate; absent consecutive history does not fabricate a rate. Current
+JMX truncation and standings policies remain in effect. Default and partial
+scheduled aggregates also generate these summary fields. These rules supersede
+older notes that excluded Season, S_Avg, and R_Rate from delivery.
