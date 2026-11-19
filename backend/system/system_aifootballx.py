@@ -41,6 +41,73 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
 from uuid import uuid4
 
+CODE_METADATA = frozenset(('uid', 'PlSeason', 'createAt', 'createdAt', 'updatedAt',
+                           'codeSharedUpdatedAt', 'DID_CAVG_SLOT', 'actions'))
+def _code_field_filled(value):
+    return value is not None and (not isinstance(value, str) or value.strip() not in ('', 'null', 'undefined', r'\N'))
+
+
+CODE_REQUIRED = ('Code', 'TCODE', 'POSITION', 'Team Code', 'No', 'IDX_NAME',
+                 '구단(약자)', 'FC Name(한글)', 'Full Name', '구단코드')
+
+
+def code_team(row):
+    return str(row.get('TCODE') or row.get('Code') or '').strip()
+
+
+def common_code_registry(rows, *, require_complete=False):
+    grouped = defaultdict(list)
+    for row in rows:
+        data = row['data']
+        if code_team(data) and type(data.get('Team Code')) is int and data['Team Code'] > 0:
+            grouped[code_team(data)].append(data)
+    registry = {}
+    for team, candidates in sorted(grouped.items()):
+        stamped = [r for r in candidates if r.get('codeSharedUpdatedAt')]
+        if stamped:
+            latest = max(str(r['codeSharedUpdatedAt']) for r in stamped)
+            preferred = [r for r in stamped if str(r['codeSharedUpdatedAt']) == latest]
+        else:
+            preferred = ([r for r in candidates if r.get('PlSeason') == '2026-2027']
+                         or [r for r in candidates if not r.get('PlSeason')]
+                         or [max(candidates, key=lambda r: str(r.get('PlSeason', '')))])
+        fields = set().union(*(set(r) for r in candidates)) - CODE_METADATA
+        common = {}
+        for field in sorted(fields):
+            values = [r[field] for r in preferred if field in r and _code_field_filled(r[field])]
+            if not values and not stamped:
+                values = [r[field] for r in candidates if field in r and _code_field_filled(r[field])]
+            values = [value.strip() if isinstance(value, str) else value for value in values]
+            signatures = {json.dumps(value, sort_keys=True, ensure_ascii=True, default=str) for value in values}
+            if len(signatures) > 1:
+                raise ValueError(f'Common code conflict: {team}.{field}; synchronize the code workbook')
+            if values:
+                value = deepcopy(values[0])
+                common[field] = value.strip() if isinstance(value, str) else value
+        common['Code'] = common['TCODE'] = team
+        if require_complete:
+            missing = [field for field in CODE_REQUIRED if common.get(field) in (None, '')]
+            if missing:
+                raise ValueError(f'Common code fields missing: {team}: {", ".join(missing)}')
+        if require_complete:
+            for field in ('POSITION', 'Team Code', 'No', '구단코드'):
+                if type(common.get(field)) is not int or common[field] <= 0:
+                    raise ValueError(f'Common code field must be a positive integer: {team}.{field}')
+        registry[team] = common
+    for field in ('Team Code', 'No', 'IDX_NAME', 'POSITION', '구단코드'):
+        values = [r.get(field) for r in registry.values() if r.get(field) not in (None, '')]
+        if len(values) != len(set(values)):
+            raise ValueError(f'Common code {field} must be unique across registered teams')
+    return registry
+
+
+def code_seasons(rows, selected, slots):
+    return sorted({selected} | {
+        r['data']['PlSeason'] for r in rows
+        if re.fullmatch(r'\d{4}-\d{4}', str(r['data'].get('PlSeason', '')))
+    } | set(slots.get('seasonSlotMappings', {})))
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -109,14 +176,23 @@ def numeric_player_id(value: Any) -> int:
 
 def resolve_team_code(rows: list[dict[str, Any]], season: str, team_id: str) -> dict[str, Any]:
     candidates = [row['data'] for row in rows if (row['data'].get('TCODE') or row['data'].get('Code')) == team_id]
-    exact = [row for row in candidates if row.get('PlSeason') == season]
-    selected = exact or [row for row in candidates if not row.get('PlSeason')]
+    shared = [row for row in candidates if row.get('codeSharedUpdatedAt')]
+    if shared:
+        latest = max(str(row['codeSharedUpdatedAt']) for row in shared)
+        selected = [row for row in shared if str(row['codeSharedUpdatedAt']) == latest]
+    else:
+        selected = ([row for row in candidates if row.get('PlSeason') == '2026-2027']
+                    or [row for row in candidates if row.get('PlSeason') == max(
+                        (str(r.get('PlSeason')) for r in candidates if r.get('PlSeason')), default='')]
+                    or [row for row in candidates if not row.get('PlSeason')] or candidates)
     signatures = {(row.get('IDX_NAME'), row.get('Team Code'), row.get('No')) for row in selected}
     if not selected or len(signatures) != 1 or not next(iter(signatures))[0]:
-        raise ValueError('Missing or ambiguous season-specific team code')
+        raise ValueError('Missing or ambiguous common team code')
     idx, number, no = next(iter(signatures))
+    if type(number) is not int or number <= 0 or type(no) is not int or no <= 0:
+        raise ValueError('Missing or ambiguous common team code')
     return {'team_id': team_id, 'season': season, 'IDX_CODE': idx, 'team_code_number': number,
-            'No': no, 'basis': 'exact-season' if exact else 'global-fallback'}
+            'No': no, 'basis': 'common-registry'}
 
 
 def registration_team_index(evidence, season, team_id):
@@ -2084,11 +2160,11 @@ class SourceCapture:
             check(value)
             self.report_progress(95)
         if 'reference_code' in guards:
-            code = self.rows(self.target, 'code', bound=500)
+            code = self.rows(self.target, 'code', bound=20000)
             actual = code_reference(code,guards.get('code_scope'))
             expected = guards['reference_code']
             additions = guards.get('new_code', {})
-            if any(actual.get(k) != v for k, v in expected.items()) or any(
+            if any(k not in actual or actual[k] != v and actual[k] != additions.get(k) for k, v in expected.items()) or any(
                     k not in expected and (k not in additions or v != additions[k]) for k, v in actual.items()):
                 fail('Destination team code configuration changed; create a new preview', 'aifootballx_source_changed')
         if 'registration_references' in guards:
@@ -2178,7 +2254,7 @@ class SourceCapture:
                     'captured_at': datetime.now(timezone.utc).isoformat(), 'player_profiles': {}, 'player_contracts': {},
                     'teams': {}, 'stadiums': {}, 'target_existing': {}, 'projects': {},
                     'leagues': {r['id']: r['data'] for r in self.rows(self.did, 'leagues', source=True, bound=100)},
-                    'ai_samples': {'code': self.rows(self.target, 'code', bound=500)}}
+                    'ai_samples': {'code': self.rows(self.target, 'code', bound=20000)}}
         target = evidence['target_existing']
         for col in ('dMST',):
             field, value = ('SEASON', season[2:4] + '/' + season[7:9]) if col == 'sAVG' else ('PlSeason', season)
@@ -2273,7 +2349,7 @@ class SourceCapture:
         if not selected:
             fail('No DID matches in this scope')
         requested_fixtures = list(selected)
-        codes = self.rows(self.target, 'code', bound=500)
+        codes = self.rows(self.target, 'code', bound=20000)
         target = {}
         for col in ('dMST', *AGGREGATES):
             field, value = ('SEASON', season[2:4] + '/' + season[7:9]) if col == 'sAVG' else ('PlSeason', season)
@@ -2284,6 +2360,7 @@ class SourceCapture:
         cutoff = max(existing_end, max(r['data']['round'] for r in selected))
         context = [r for r in fixtures if r['data']['round'] <= cutoff]
         target['dMST'] = [r for r in target['dMST'] if (r['data'].get('gm_round') or 0) <= cutoff]
+        target['code'] = codes
         aggregate_history = target
         slots = {'seasonSlotMappings': {}}
         try:
@@ -2291,7 +2368,7 @@ class SourceCapture:
                 slots = json.loads(slot_path.read_text(encoding='utf-8'))
             if not isinstance(slots, dict) or not isinstance(slots.get('seasonSlotMappings', {}), dict):
                 raise ValueError('Invalid season slot configuration')
-            setup = plan_new_season(season, fixtures, codes, target, slots)
+            setup = plan_new_season(season, fixtures, codes, target, slots, require_complete_code=True, require_slots=True)
         except (BackendError, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             reason = exc.message if isinstance(exc, BackendError) else f'Season slot configuration unavailable ({type(exc).__name__})'
             setup = {'documents': [], 'code_rows': [], 'slots': slots, 'new_season': False, 'errors': [reason]}
@@ -2359,7 +2436,8 @@ class SourceCapture:
                                        'Round-only aggregates cannot replace an existing cumulative round']
         evidence = {'did_matches': context, 'source_recordings': [], 'player_profiles': {},
                     'target_existing': target, 'aggregate_history': aggregate_history,
-                    'ai_samples': {'code': codes + setup['code_rows']}}
+                    'ai_samples': {'code': overlay_code_rows(codes, setup['code_rows'])}}
+        target['code'] = codes
         self.capture_aggregate_review_sources(evidence, items)
         raw_count = sum(len(recording['children']['records']) for recording in evidence['source_recordings'])
         log_delivery_stage(job_id, 'aggregate_read', started, documents=len(heads) + raw_count, scope=scope)
@@ -2395,7 +2473,7 @@ class SourceCapture:
         teams = {r['data'][k] for r in fixtures for k in ('homeTeamId', 'awayTeamId')}
         if len(fixtures) != 10 or len(teams) != 20:
             fail('Round defaults require 10 registered fixtures and 20 distinct teams')
-        codes = self.rows(self.target, 'code', bound=500)
+        codes = self.rows(self.target, 'code', bound=20000)
         existing = {}
         ids = sorted(r['id'] for r in fixtures)
         for col in sorted(DEFAULT_COLLECTIONS):
@@ -2435,17 +2513,20 @@ class SourceCapture:
                 previous_rank[f'WTT{n}'] = total
         self.report_progress(55)
         try:
-            setup = plan_new_season(season, fixtures, codes, existing, slots)
+            setup = plan_new_season(season, fixtures, codes, existing, slots, require_complete_code=True, require_slots=True)
             slot_map = setup['slots'].get('seasonSlotMappings', {}).get(season, {}).get('cavgSlotToCodeTeamCodeMapping', {})
-            documents = round_default_documents(fixtures, codes + setup['code_rows'], slot_map, existing,
+            documents = round_default_documents(fixtures, overlay_code_rows(codes, setup['code_rows']), slot_map, existing,
                 force=scope.get('force', False), previous_rank=previous_rank,
                 rank_slots=setup['slots']['seasonSlotMappings'][season].get('rankSlotToCodeTeamCodeMapping'))
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             fail(f'Round defaults configuration: {exc}')
         self.report_progress(90)
+        documents.extend(setup['documents'])
+        existing['code'] = codes
         report = finish_delivery(documents, [], [], existing, 'default', len(fixtures), latest=True)
         guards = {'documents': self.documents, 'queries': self.queries,
-                  'reference_code': code_reference(codes), 'new_code': {}, 'code_scope': None}
+                  'reference_code': code_reference(codes),
+                  'new_code': {d['document_id']: d['data'] for d in setup['documents']}, 'code_scope': None}
         if slot_path:
             guards['slot_file'] = {'path': str(slot_path.resolve()), 'sha256': sha256(slot_path.read_bytes()).hexdigest()}
         self.report_progress(100)
@@ -2458,7 +2539,7 @@ class SourceCapture:
         season = season_label(scope['seasonId'])
         fixtures = self.rows(self.did, 'matches', [('seasonId','==',scope['seasonId']),('leagueId','==','EPL')], source=True, bound=2000)
         season_doc = self.get('seasons/' + scope['seasonId']) or {}
-        codes = self.rows(self.target,'code',bound=500)
+        codes = self.rows(self.target,'code',bound=20000)
         context = list(fixtures)
         start = season_doc.get('from') or season[:4] + '.07.01'
         end = season_doc.get('to') or season[5:] + '.06.30'
@@ -2499,7 +2580,7 @@ class SourceCapture:
                         'date':date,'homeTeamId':tid,'awayTeamId':tid}}
                        for tid in sorted(team_ids) for n,date in enumerate((start,end)))
         if not context: fail('No teams or registrations for this season')
-        target = {}
+        target = {'code': codes}
         target_collections = ('Manager', 'Player', 'playerDB') if delivery_mode(scope) == 'masters' else ('dMST','Manager',*AGGREGATES,'Player','playerDB')
         for col in target_collections:
             field,value = (FieldPath('P-6').to_api_repr(),int(season[2:4]+season[7:9])) if col=='playerDB' else (
@@ -2518,11 +2599,12 @@ class SourceCapture:
             if slot_path: slots = json.loads(slot_path.read_text(encoding='utf-8'))
             if not isinstance(slots,dict) or not isinstance(slots.get('seasonSlotMappings',{}),dict):
                 raise ValueError('Invalid season slot configuration')
-            setup = plan_new_season(season,context,codes,target,slots)
+            setup = plan_new_season(season,context,codes,target,slots, require_complete_code=True,
+                                    require_slots=delivery_mode(scope) != 'masters')
         except (BackendError,OSError,ValueError,TypeError,KeyError,AttributeError) as exc:
             reason = exc.message if isinstance(exc,BackendError) else f'Season slot configuration unavailable ({type(exc).__name__})'
             setup = {'documents':[],'code_rows':[],'slots':slots,'new_season':False,'errors':[reason]}
-        reference_context = {'target_existing': target, 'ai_samples': {'code': codes + setup['code_rows']}}
+        reference_context = {'target_existing': target, 'ai_samples': {'code': overlay_code_rows(codes, setup['code_rows'])}}
         missing_team_ids = []
         for team_id in sorted(historical_teams):
             try:
@@ -2532,7 +2614,7 @@ class SourceCapture:
         historical_indexes = self.historical_team_indexes(missing_team_ids)
         self.report_progress(75)
         evidence = {'did_matches':context,'source_recordings':[],'player_profiles':profiles,'player_contracts':contracts,
-                    'teams':teams,'player_team_links':links,'target_existing':target,'ai_samples':{'code':codes+setup['code_rows']},
+                    'teams':teams,'player_team_links':links,'target_existing':target,'ai_samples':{'code':overlay_code_rows(codes, setup['code_rows'])},
                     'historical_team_indexes': historical_indexes,
                     'leagues':{r['id']:r['data'] for r in self.rows(self.did,'leagues',source=True,bound=100)},
                     'coach_rounds':[] if fixtures else self.rows(self.did,'coachRounds',[('plSeason','==',season)],source=True,bound=2000),
@@ -2595,9 +2677,7 @@ class SourceCapture:
 
 
 def code_reference(rows, scope=None):
-    return {r['id']:r['data'] for r in rows if scope is None or (
-        r['data'].get('PlSeason') in (None,'',scope['season'])
-        and (r['data'].get('TCODE') or r['data'].get('Code')) in scope['teams'])}
+    return {r['id']:r['data'] for r in rows if scope is None or code_team(r['data']) in scope['teams']}
 
 
 def registration_reference_values(rows, season):
@@ -2611,59 +2691,69 @@ def player_db_reference_values(rows, season):
             for r in rows if r['data'].get('P-6') == int(season[2:4]+season[7:9])}
 
 
-def plan_new_season(season, matches, code_rows, target, slots):
-    """Reuse season references and create only missing team codes."""
+def overlay_code_rows(rows, changes):
+    identity = lambda row: row.get('id') or (row['data'].get('PlSeason'), code_team(row['data']))
+    result = {identity(row): row for row in rows}
+    result.update({identity(row): row for row in changes})
+    return list(result.values())
+
+
+def plan_new_season(season, matches, code_rows, target, slots, *, require_complete_code=False,
+                    require_slots=False):
+    """Synchronize registered clubs across query seasons; slots remain in JSON only."""
     slots = deepcopy(slots)
     result = {'code_rows': [], 'documents': [], 'slots': slots, 'new_season': False}
-    exact = [r for r in code_rows if r['data'].get('PlSeason') == season]
-    if season not in slots.get('seasonSlotMappings', {}) and len(exact) == 20:
-        saved = {r['data'].get('DID_CAVG_SLOT'): r['data'].get('Team Code') for r in exact}
-        if set(saved) == set(range(1, 21)) and len(set(saved.values())) == 20:
-            slots.setdefault('seasonSlotMappings', {})[season] = {'cavgSlotToCodeTeamCodeMapping': {
-                str(n): {'codeTeamCode': number, 'cavgSlot': n} for n, number in saved.items()}}
-    teams = {r['data'][field] for r in matches for field in ('homeTeamId', 'awayTeamId')}
-    if len(teams) != 20:
-        return result
-    references = []
-    season_positions = []
-    for team in sorted(teams):
-        code = resolve_team_code(code_rows, season, team)
-        saved = [r for r in exact if (r['data'].get('TCODE') or r['data'].get('Code')) == team]
-        if len(saved) > 1:
-            fail(f'Ambiguous season team code: {team}')
-        source = saved or [r for r in code_rows if not r['data'].get('PlSeason')
-                          and (r['data'].get('TCODE') or r['data'].get('Code')) == team]
-        positions = {r['data'].get('POSITION') for r in source}
-        if len(positions) != 1 or any(type(p) is not int or p <= 0 for p in positions):
-            fail(f'Season requires an unambiguous POSITION: {team}')
-        position = next(iter(positions))
-        references.append(code['team_code_number'])
-        season_positions.append(position)
-        if saved:
-            continue
-        data = {'PlSeason': season, 'TCODE': team, 'Code': team, 'IDX_NAME': code['IDX_CODE'],
-                'No': code['No'], 'Team Code': code['team_code_number'], 'POSITION': position}
-        ident = stable_id('code', (season, team))
-        if any(r.get('id') == ident for r in code_rows):
-            fail(f'Season team code destination already exists: {team}')
-        result['code_rows'].append({'id': ident, 'data': data})
-        result['documents'].append({'collection': 'code', 'document_id': ident, 'data': dict(data, uid=ident), 'action': 'create-candidate'})
-    if len(set(references)) != 20 or len(set(season_positions)) != 20:
-        fail('New season team numbers/positions must be unique')
-    slots.setdefault('seasonSlotMappings', {}).setdefault(season, {'cavgSlotToCodeTeamCodeMapping': {
-        str(n): {'codeTeamCode': number, 'cavgSlot': n} for n, number in enumerate(sorted(references), 1)}})
-    mapping = slots['seasonSlotMappings'][season].get('cavgSlotToCodeTeamCodeMapping',{})
-    if set(mapping)!={str(n) for n in range(1,21)} or {v.get('codeTeamCode') for v in mapping.values()}!=set(references):
-        fail('Season slot mapping must cover the same 20 team numbers')
-    assigned = {value['codeTeamCode']:int(key) for key,value in mapping.items()}
-    for row in exact:
-        saved_slot = row['data'].get('DID_CAVG_SLOT')
-        if saved_slot is not None and saved_slot != assigned.get(row['data'].get('Team Code')):
-            fail('Season slot mapping conflicts with the published team code')
-    for row, doc in zip(result['code_rows'], result['documents'], strict=True):
-        row['data']['DID_CAVG_SLOT'] = assigned[row['data']['Team Code']]
-        doc['data']['DID_CAVG_SLOT'] = assigned[row['data']['Team Code']]
-    result['new_season'] = bool(result['code_rows'])
+    try:
+        registry = common_code_registry(code_rows, require_complete=require_complete_code)
+    except ValueError as exc:
+        fail(str(exc))
+    seasons = code_seasons(code_rows, season, slots)
+    active = {r['data'][key] for r in matches for key in ('homeTeamId', 'awayTeamId')}
+    block = slots.get('seasonSlotMappings', {}).get(season, {})
+    mapping = block.get('cavgSlotToCodeTeamCodeMapping', {})
+    if require_slots and not mapping:
+        fail(f'{season}: configure the verified cAVG 20-team slot mapping')
+    if mapping:
+        if (set(mapping) != {str(n) for n in range(1, 21)}
+                or len({v.get('codeTeamCode') for v in mapping.values()}) != 20):
+            fail('Season slot mapping must cover 20 unique team numbers')
+        available = {v['Team Code'] for v in registry.values()}
+        if {v.get('codeTeamCode') for v in mapping.values()} - available:
+            fail('Season slot mapping references an unregistered common team code')
+        # Full schedule identity must agree with the explicitly configured clubs.
+        if len(active) == 20 and {resolve_team_code(code_rows, season, team)['team_code_number']
+                                  for team in active} != {v['codeTeamCode'] for v in mapping.values()}:
+            fail('Season slot mapping must cover the same 20 scheduled team numbers')
+    indexed = defaultdict(list)
+    for row in code_rows:
+        indexed[(row['data'].get('PlSeason') or None, code_team(row['data']))].append(row)
+    for team, common in registry.items():
+        destinations = [(query_season, indexed.get((query_season, team), [])) for query_season in seasons]
+        # Existing seasonless references remain references, and receive the same information.
+        destinations.extend((None, [row]) for row in indexed.get((None, team), []) if row.get('id'))
+        for query_season, existing in destinations:
+            if len(existing) > 1:
+                fail(f'Ambiguous common team code: {query_season}/{team}')
+            old = existing[0] if existing else None
+            # Pure in-memory references without document IDs are not write destinations.
+            if old and not old.get('id'):
+                continue
+            ident = old['id'] if old else stable_id('code', (query_season, team))
+            if not old and any(row.get('id') == ident for row in code_rows):
+                fail(f'Common code destination already exists: {query_season}/{team}')
+            values = {**({k: v for k, v in old['data'].items() if k in CODE_METADATA} if old else {}),
+                      **common, 'uid':
+                      (old['data'].get('uid') or ident) if old else ident}
+            values.pop('DID_CAVG_SLOT', None)
+            values.pop('actions', None)
+            if query_season:
+                values['PlSeason'] = query_season
+            if old and values == old['data']:
+                continue
+            result['code_rows'].append({'id': ident, 'data': values})
+            result['documents'].append({'collection': 'code', 'document_id': ident, 'data': values,
+                'shared_fields': sorted(common), 'action': 'replace-existing' if old else 'create-candidate'})
+            result['new_season'] |= old is None
     return result
 
 
@@ -2895,11 +2985,14 @@ def delivery_payload(collection, generated, old=None):
 
 
 def retired_calculation_field(collection, field):
-    return collection == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-'))
+    return ((collection == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-')))
+            or (collection == 'code' and field in ('DID_CAVG_SLOT', 'actions')))
 
 
 def generated_calculation_field(collection, field):
     """Dynamic calculation families belong to the generator, including removals."""
+    if collection == 'code':
+        return field not in CODE_METADATA
     if collection in DEFAULT_COLLECTIONS and field == 'didUnplayed':
         return True
     if collection in ('cAVG', 'rAVG', 'rank') and field == 'didAggregationScope':
@@ -2935,7 +3028,7 @@ def select_aggregate_documents(documents, selected):
     def selected_document(doc):
         col, data = doc['collection'], doc['data']
         if col == 'code':
-            return data.get('PlSeason') == season
+            return True  # Common code projections are synchronized across every query season.
         if col == 'pMST':
             return aggregate_key(col, data) in team_keys
         if col == 'mMST':
@@ -2949,7 +3042,7 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
     errors = list(errors)
     by_id = {col:{r['id']:r['data'] for r in rows} for col,rows in existing.items()}
     unique = {}
-    allowed = (DEFAULT_COLLECTIONS if mode == 'default' else
+    allowed = (DEFAULT_COLLECTIONS | {'code'} if mode == 'default' else
                MATCH_COLLECTIONS if mode == 'matches' else IDENTITY_COLLECTIONS if mode == 'masters'
                else frozenset((*AGGREGATES, 'code')) if mode == 'aggregates' else MASTER_COLLECTIONS)
     for original in documents:
@@ -3260,6 +3353,43 @@ def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, i
     aggregate['documents'] = list(updated.values())
 
 
+def validate_aggregate_completeness(aggregate, fixtures):
+    """Full scheduled rounds must contain every owned non-prediction field."""
+    by_round = defaultdict(list)
+    for fixture in fixtures:
+        by_round[fixture['data'].get('round')].append(fixture)
+    required = {
+        'rank': {f'{family}{n}' for family in ('WDL', 'WTT', 'WRK', 'WGR', 'RAV', 'RRK') for n in range(1, 21)}
+                | {'PlSeason', 'Round', 'R_Avg', 'R_Gap', 'Min', 'Max', 'Season', 'S_Avg', 'R_Rate'},
+        'cAVG': {f'C{n}-{metric}' for n in range(1, 21) for metric in ('AVG', 'WDL', 'S', 'C')}
+                | {'PlSeason', 'Round', 'C-W', 'C-D', 'C-L', 'R-AVG', 'RS-AVG', 'RC-AVG'},
+        'rAVG': {f'M{side}{n}{suffix}' for side in ('H', 'A') for n in range(1, 11)
+                 for suffix in ('_NM', '-IDX', '-WDL')} | {f'M{n}-AVG' for n in range(1, 11)}
+                | {'PlSeason', 'Round', 'M-AVG', 'S_AVG'},
+        'pMST': set(KPI_ALIASES) | {f'{m}2' for m in METRICS}
+                | {'PlSeason', 'gm_id', 'gm_round', 't_code', 'IDX_CODE', 'Goal', 'Point', 'WDL', 'gi_score'},
+        'mMST': {f'{side}-{m}' for side in ('H', 'A') for m in ('Code', 'IDX', 'Name', 'DWL', 'FX', 'GOAL', 'SHOT', 'DAP', 'DTP', 'BAP', 'TAP')}
+                | {f'6{side}-{m}' for side in ('H', 'A') for m in METRICS}
+                | {'PlSeason', 'Round', 'gm_id', 'HA-avg'},
+    }
+    counts = Counter()
+    for doc in aggregate['documents']:
+        col, data = doc['collection'], doc['data']
+        number = data.get('gm_round') if col == 'pMST' else data.get('Round')
+        schedule = by_round.get(number, [])
+        complete = len(schedule) == 10 and len({f['data'][side] for f in schedule for side in ('homeTeamId', 'awayTeamId')}) == 20
+        if not complete or col not in required:
+            continue
+        missing = sorted(field for field in required[col] if field not in data or data[field] is None)
+        if missing:
+            fail(f'{col} R{number}: required aggregate fields missing: {", ".join(missing)}')
+        counts[(number, col)] += 1
+    for number in {number for number, _ in counts}:
+        for col, expected in [('pMST', 20), ('mMST', 10), ('cAVG', 1), ('rAVG', 1), ('rank', 1)]:
+            if counts[(number, col)] != expected:
+                fail(f'{col} R{number}: required aggregate documents missing ({counts[(number, col)]}/{expected})')
+
+
 def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *, latest=False,
                      selected_fixtures=None, job_id=None, round_only=False, fixture_numbers=None):
     evidence = with_registration_references(evidence)
@@ -3392,12 +3522,13 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
                 if not aggregate_errors:
                     complete_scheduled_aggregates(aggregate, context, evidence['ai_samples']['code'], slots,
                         evidence.get('aggregate_history', target), aggregate_items)
+                    validate_aggregate_completeness(aggregate, context)
                 generated = {(doc['collection'],aggregate_key(doc['collection'],doc['data'])) for doc in aggregate['documents']}
                 if any((col,aggregate_key(col,row['data'])) not in generated for col in AGGREGATES
                        for row in target.get(col,[]) if not row['data'].get('didUnplayed')):
                     aggregate_errors.append('Season aggregate coverage incomplete: existing destination aggregate rows are missing from DID')
                 if not aggregate_errors:
-                    if mode == 'aggregates' and setup.get('new_season'):
+                    if mode == 'aggregates':
                         documents.extend(d for d in setup['documents'] if d['collection'] == 'code')
                     aggregate_docs=aggregate['documents']
                     for doc in aggregate_docs:
@@ -3489,7 +3620,8 @@ def validate_document(doc):
         fail('Invalid delivery collection/document')
     preserved = {field for field, expected in doc.get('baseline', {}).items()
                  if expected['exists'] and field in data and data[field] == expected['value']}
-    if col in MASTER_FIELDS and set(data) - MASTER_FIELDS[col] - preserved:
+    shared_fields = set(doc.get('shared_fields', [])) if col == 'code' else set()
+    if col in MASTER_FIELDS and set(data) - MASTER_FIELDS[col] - shared_fields - preserved:
         fail(f'Unowned fields in {col}')
     for field in data:
         if ('.' in field or field.startswith('`')) and field not in preserved:

@@ -99,7 +99,7 @@
   약자를 우선하고, 없으면 code의 `구단(약자)` 또는 DID 팀 nameShort를 사용한다.
   Player/PlayerDB 참조는 신원·코드 연결에 사용한다. 운영 전용 필드 보존은 아래 V15 기준을 따른다.
   열린 시작·종료일도 명시적으로 출력한다.
-- 시즌별 운영 code에 한글 팀명이 있으면 dMST·Manager·집계의 표시 이름에 사용한다.
+- 공통 code에 한글 팀명이 있으면 dMST·Manager·집계의 표시 이름에 사용한다.
   새 역사적 코드·별칭 참조가 바뀌면 전송 전에 재검증하도록 guard를 추가했다.
 - 계약 전체 조회용 `contracts.leagueId` 컬렉션 그룹 인덱스를 `firestore.indexes.json`에 추가했다.
   인덱스가 아직 없으면 leagueId 필드만 최대 50,001문서까지 읽고 50,000 초과 시 차단한다.
@@ -230,7 +230,7 @@ AIfootballX의 API·파이프라인·화면은 유지하고, 기존 SQL 추출·
 | rAVG | gm_id 순서의 홈·원정 IDX/JMX/승무패 | `MHn_NM/MAn_NM`, `MHn-IDX/MAn-IDX`, `MHn-WDL/MAn-WDL`, `Mn-AVG` | 구현; 날짜가 아닌 gm_id 순번 |
 | sAVG | 완료 경기의 KPI·평점 모음 | `TAP/DAP/.../GOAL`, `B/M/A/S`, `AI Rating/AVG/SEASON` | 구현; 해당 시즌 AI Rating=AVG. 여러 시즌 평균 사용 안 함 |
 | rank | 경기 스코어→승점·누적 승점, JMX | `WDLn/WTTn/WRKn/WGRn/RAVn/RRKn` | 필드 번호는 `rankSlotToCodeTeamCodeMapping`의 자리 번호 1~20. 현행 승점·JMX 정렬, WGR=floor(WRK/4)+1 |
-| code | `teams` + 기존 목적지 시즌별 코드·슬롯 | `TCODE/Code/IDX_NAME/Full Name/Team Code/No` | 기존 번호·슬롯 보존; 팀 명칭 연결 |
+| code | AIfootballX 공통 팀 정보 | 구단 약자·한글/전체 이름·구단코드·`TCODE/Code/IDX_NAME/Team Code/No/POSITION` 및 추가 필드 | `PlSeason`은 조회용 복제값. 모든 시즌의 공통 필드는 동일하며, 시즌 참가·자리는 별도 JSON 매핑 |
 
 ## 확정 범위·규칙
 
@@ -368,7 +368,7 @@ GET 응답의 `status`는 idle/queued/running/ready/complete/fail/error이며, `
 
 원천 버전·자식 구성·코드·슬롯과 대상 소유 필드의 동시 수정을 확인한다. 긴 전송은 원천을 5분 간격으로 재확인한다. 두 Firestore 사이의 단일 분산 트랜잭션은 아니다. 이미 성공한 문서는 결과에 남기고 후속 실패 사유를 표시한다.
 
-선수 식별 마스터 Player/playerDB는 경기 KPI·출전 여부와 별도로 생성한다. 시즌 내 EPL 계약이 있으면 해당 소속을 사용하고, 없으면 DID의 현재 등록 팀·스쿼드 연결·기존 팀 계약 정보로 식별 소속을 확인한다. 경기일 계약을 임의로 늘리거나 만들지 않는다. 계약 날짜·등번호·포지션이 불명확하면 해당 선택 필드는 생략한다. 경기별 실제 출전 소속 검증은 별도로 유지한다. 신규 이전 시즌은 기존 전역 Team Code/No/POSITION을 유지한 시즌 code 후보와 Team Code 오름차순 cAVG 슬롯을 만든다. 슬롯은 `code.DID_CAVG_SLOT`로 보관해 후속 미리보기에서 재사용한다. 기존 시즌의 슬롯은 재배정하지 않는다. 실제 신규 시즌 생성은 아직 실행하지 않았다.
+선수 식별 마스터 Player/playerDB는 경기 KPI·출전 여부와 별도로 생성한다. 시즌 내 EPL 계약이 있으면 해당 소속을 사용하고, 없으면 DID의 현재 등록 팀·스쿼드 연결·기존 팀 계약 정보로 식별 소속을 확인한다. 경기일 계약을 임의로 늘리거나 만들지 않는다. 계약 날짜·등번호·포지션이 불명확하면 해당 선택 필드는 생략한다. 경기별 실제 출전 소속 검증은 별도로 유지한다. code는 모든 등록 팀의 공통 정보이며 새 조회 시즌에도 전체 팀을 복제한다. 강등팀을 삭제하지 않는다. `DID_CAVG_SLOT`은 더 이상 code에 저장하거나 검증하지 않으며, cAVG와 rank의 시즌별 JSON 매핑만 사용한다. 필수 구단 표시 정보가 없으면 누락 필드를 명시하고 전송을 차단한다.
 
 ## 현재 JPD·선수·감독 검증 상태
 
@@ -494,3 +494,12 @@ gap/rate; absent consecutive history does not fabricate a rate. Current
 JMX truncation and standings policies remain in effect. Default and partial
 scheduled aggregates also generate these summary fields. These rules supersede
 older notes that excluded Season, S_Avg, and R_Rate from delivery.
+
+
+## 공통 code 및 집계 필드 완전성 (2026-11-19)
+
+- 기준 공통 정보는 `codeSharedUpdatedAt`의 최신 수정이며, 초기 정리 기준은 2026–2027의 등록 30팀이다. 팀 정보와 고정 번호는 모든 조회 시즌에 동일하고 `PlSeason`, 문서 ID·생성일 등 문서 메타데이터만 다를 수 있다.
+- footballx Code 화면의 수정·엑셀 업로드는 전체 시즌으로 전파된다. 새 `PlSeason`을 업로드하면 기존 전체 팀을 새 시즌에 생성하고, 새 팀은 다른 시즌에도 추가한다. 파일에 없는 팀은 유지한다. 필수값 누락·고정 번호 중복은 쓰기 전에 차단하며 빈 행·중복 행·시즌 없는 문서는 정리한다.
+- 엑셀/CSV는 열 이름으로 읽는다. UTF-8 및 EUC-KR CSV를 지원하고 문자열 앞뒤 공백·빈값을 정리한다. 명시적인 팀 삭제는 모든 조회 시즌에 적용한다.
+- DID의 masters·aggregates·default는 공통 code를 보충하고 기존 문서 ID를 유지한다. code 조회 시즌은 참가팀 판정에 사용하지 않는다. 집계 팀·칸은 cAVG/rank의 각 시즌 매핑을 사용한다.
+- 완전한 10경기 일정의 집계는 pMST 20개·mMST 10개·cAVG/rAVG/rank 각 1개와 각 필수 필드를 확인한다. 누락이 있으면 구체적인 컬렉션·라운드·필드 오류로 차단하며, 허용된 예측 필드 제외 규칙은 유지한다.

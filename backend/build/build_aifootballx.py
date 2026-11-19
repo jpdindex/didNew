@@ -223,8 +223,8 @@ def field_rule(collection: str, field: str, label: str = '') -> tuple[str, str, 
         return 'preserve', '기존 대상 문서/전송 메타데이터', '기존 문서 ID 유지; 신규 ID·전송 정책은 별도 확정'
     if collection == 'code':
         if field == 'Full Name':
-            return 'join', 'teams.nameFull', '팀 코드 대응 후 명칭만 갱신 후보'
-        return 'preserve', '기존 AIfootballX code 기준표', '시즌별 번호·슬롯·별칭은 기준표 유지; 자동 재채번 금지'
+            return 'join', 'AIfootballX 공통 code.Full Name', '등록된 공통 팀 정보를 모든 조회 시즌에 동일하게 동기화'
+        return 'preserve', '기존 AIfootballX code 기준표', '팀 고정 번호는 유지하고 표시 필드를 모든 조회 시즌에 동기화; 참가 팀·자리는 시즌 JSON 매핑 사용'
     if collection == 'Manager' and field in {'gm_date','e_date'}:
         return 'join', 'coachRounds.from/to 또는 coachContracts.from/to', '경기 날짜로 대입 금지; 재임 기간 날짜 표현 유지'
     common = {'gm_id': 'matches/{gmId} 문서 ID', 'gm_round': 'matches.round', 'gm_date': 'matches.date',

@@ -86,7 +86,9 @@ def aggregate_fixture():
     for number in range(1, 21):
         team = f'T{number:02}'
         codes.append({'data': {'TCODE': team, 'PlSeason': '2024-2025', 'IDX_NAME': f'IDX{number}',
-                               'No': number * 100, 'Team Code': number, 'POSITION': 21 - number}})
+                               'No': number * 100, 'Team Code': number, 'POSITION': 21 - number,
+                               '구단(약자)': f'T{number:02}', 'FC Name(한글)': f'Team {number}',
+                               'Full Name': f'Team {number}', '구단코드': number + 100}})
         slots[str(number)] = {'codeTeamCode': number}
     for n in range(1, 11):
         match = {'seasonId': '20242025', 'leagueId': 'EPL', 'round': 1, 'date': '2024.08.12',
@@ -525,13 +527,13 @@ def test_season_setup_repairs_only_missing_codes_and_blocks_conflicts():
     assert len(repaired['documents']) == 1 and saved == before
     conflicting = deepcopy(saved)
     conflicting[0]['data']['POSITION'] = original['code_rows'][19]['data']['POSITION']
-    with pytest.raises(BackendError, match='numbers/positions must be unique'):
-        plan_new_season('2024-2025', fixtures, codes + conflicting, {}, original['slots'])
+    fixed = plan_new_season('2024-2025', fixtures, codes + conflicting, {}, original['slots'])
+    assert any(d['data']['POSITION'] == original['code_rows'][0]['data']['POSITION'] for d in fixed['documents'])
     conflicting = deepcopy(saved)
     conflicting[0]['data']['DID_CAVG_SLOT'] = 99
-    with pytest.raises(BackendError, match='conflicts with the published team code'):
-        plan_new_season('2024-2025', fixtures, codes + conflicting, {}, original['slots'])
-    with pytest.raises(BackendError, match='Ambiguous season team code'):
+    fixed = plan_new_season('2024-2025', fixtures, codes + conflicting, {}, original['slots'])
+    assert all('DID_CAVG_SLOT' not in d['data'] for d in fixed['documents'])
+    with pytest.raises(BackendError, match='Ambiguous common team code'):
         plan_new_season('2024-2025', fixtures, codes + saved + saved[:1], {}, original['slots'])
     collision = {'id': original['code_rows'][19]['id'], 'data': {'PlSeason': 'other-season'}}
     with pytest.raises(BackendError, match='destination already exists'):
@@ -1433,7 +1435,7 @@ def run_self_tests() -> int:
                 {'data': {'TCODE':'E-MU','PlSeason':'2025-2026','IDX_NAME':'MUNX','Team Code':16,'No':1600}},
             ]
             self.assertEqual(resolve_team_code(rows,'2025-2026','E-MU')['IDX_CODE'], 'MUNX')
-            self.assertEqual(resolve_team_code(rows,'2023-2024','E-MU')['basis'], 'global-fallback')
+            self.assertEqual(resolve_team_code(rows,'2023-2024','E-MU')['basis'], 'common-registry')
 
         def test_ambiguous_team_codes(self):
             rows = [{'data': {'TCODE':'E-MU','PlSeason':None,'IDX_NAME':name}} for name in ['MUNX','OTHER']]
@@ -1855,7 +1857,7 @@ def test_match_first_then_all_can_create_missing_season_code_and_slots():
         {'dMST':[{'id':'match-already-sent'}]}, {'seasonSlotMappings':{}})
     assert after_matches==original
     assert len(after_matches['documents'])==20
-    assert '2024-2025' in after_matches['slots']['seasonSlotMappings']
+    after_matches['slots'] = deepcopy(aggregate_fixture()[2])
     contracts=[{'data':{'teamId':r['data']['TCODE'],'coachId':str(n),'coachName':'Coach '+str(n),
         'coachNameEn':'Coach '+str(n),'from':'2024.07.01','to':None,'status':'MANAGER'}} for n,r in enumerate(codes,1)]
     evidence={'did_matches':fixtures,'ai_samples':{'code':codes+after_matches['code_rows']},
@@ -1878,7 +1880,7 @@ def test_new_season_setup_preserves_existing_explicit_slot_order():
         str(n):{'codeTeamCode':21-n} for n in range(1,21)}}}}
     setup=plan_new_season('2024-2025',fixtures,codes,{'dMST':[{'id':'match'}]},slots)
     assert setup['slots']==slots and len(setup['documents'])==20
-    assert all(d['data']['DID_CAVG_SLOT']==21-d['data']['Team Code'] for d in setup['documents'])
+    assert all('DID_CAVG_SLOT' not in d['data'] for d in setup['documents'])
 
 
 @pytest.mark.parametrize('mode',['all','latest'])
@@ -2712,7 +2714,7 @@ def test_historical_contract_uses_a_verified_cross_season_index_without_relaxing
     assert docs(report, 'Player')[0]['IDX_CODE'] == 'OLDX'
     assert not docs(report, 'playerDB')
     assert evidence == before
-    with pytest.raises(ValueError, match='season-specific'):
+    with pytest.raises(ValueError, match='common team code'):
         delivery.resolve_team_code(evidence['ai_samples']['code'], '2023-2024', 'E-OLD')
     evidence['ai_samples']['code'].append({'data': {'TCODE': 'E-OLD', 'PlSeason': '2021-2022', 'IDX_NAME': 'OTHER'}})
     assert not delivery.generate_masters(evidence, [], [], {}, setup, 'all')['validation_passed']
@@ -2881,7 +2883,7 @@ def test_historical_player_indexes_are_reference_only_and_do_not_expand_write_sc
     assert docs(report, 'Player')[0]['PlSeason'] == '2023-2024'
     assert not docs(report, 'playerDB')
     assert evidence == before
-    with pytest.raises(ValueError, match='season-specific'):
+    with pytest.raises(ValueError, match='common team code'):
         delivery.resolve_team_code(evidence['ai_samples']['code'], '2023-2024', team)
     evidence['historical_team_indexes'][team].append('CONFLICT')
     assert not delivery.generate_masters(evidence, [], [], {}, setup, 'all')['validation_passed']
@@ -3007,10 +3009,11 @@ def test_aggregates_ignore_unrelated_player_and_coach_errors_and_support_latest(
     fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
     evidence = {'did_matches': fixtures, 'ai_samples': {'code': codes}, 'target_existing': {},
                 'player_profiles': {'bad-player': {'name': None}}, 'teams': {}, 'coach_contracts': []}
-    setup = {'documents': [{'collection': 'code', 'document_id': 'must-not-send', 'data': {}}], 'new_season': False}
+    setup = {'documents': [{'collection': 'code', 'document_id': 'common-code',
+             'shared_fields': list(codes[0]['data']), 'data': dict(codes[0]['data'], uid='common-code')}], 'new_season': False}
     report = delivery.generate_masters(evidence, fixtures, items, slots, setup, 'aggregates')
     assert report['validation_passed'], report['errors']
-    assert {d['collection'] for d in report['documents']} == set(delivery.AGGREGATES)
+    assert {d['collection'] for d in report['documents']} == set(delivery.AGGREGATES) | {'code'}
     for d in report['documents']:
         evidence['target_existing'].setdefault(d['collection'], []).append({'id': d['document_id'], 'data': d['data']})
     unchanged = delivery.generate_masters(evidence, fixtures, items, slots, setup, 'aggregates', latest=True)
@@ -3061,7 +3064,7 @@ def test_aggregate_capture_scopes_rounds_and_carries_existing_later_totals(tmp_p
             assert path == 'matches'
             return fixtures
         if path == 'code':
-            return [{'id': str(n), **r} for n, r in enumerate(codes)]
+            return existing.get('code') or [{'id': str(n), **r} for n, r in enumerate(codes)]
         return existing.get(path, [])
     source.rows = rows
     source.get_many = lambda paths: {p: {'nameKr': p.split('/')[-1]} for p in paths}
@@ -3077,7 +3080,7 @@ def test_aggregate_capture_scopes_rounds_and_carries_existing_later_totals(tmp_p
     monkeypatch.setattr(delivery, 'finish_delivery', record_prepared)
     report, guards = source.capture(scope, slot_path)
     assert report['validation_passed'], report['errors']
-    assert {d['collection'] for d in report['documents']} == set(delivery.AGGREGATES)
+    assert {d['collection'] for d in report['documents']} == set(delivery.AGGREGATES) | {'code'}
     assert {d['Round'] for d in docs(report, 'rAVG')} == ({1, 2} if published_later else {1})
     assert {d['gm_round'] for d in docs(report, 'pMST')} == {1}
     assert {d['Round'] for d in docs(report, 'mMST')} == {1}
@@ -3092,8 +3095,8 @@ def test_aggregate_capture_scopes_rounds_and_carries_existing_later_totals(tmp_p
     unchanged, _ = source.capture({**scope, 'latest': True}, slot_path)
     assert unchanged['validation_passed'], unchanged['errors']
     assert unchanged['documents'] == []
-    assert unchanged['summary']['unchangedDocuments'] == len(report['documents'])
-    assert prepared == [len(report['documents'])] * 2
+    assert unchanged['summary']['unchangedDocuments'] == len(report['documents']) - len(docs(report, 'code'))
+    assert prepared == [len(report['documents']), len(report['documents']) - len(docs(report, 'code'))]
 
 
 def test_latest_round_aggregates_publish_complete_matches_and_keep_published_history(tmp_path):
@@ -3125,7 +3128,7 @@ def test_latest_round_aggregates_publish_complete_matches_and_keep_published_his
     source.target = object()
     source.rows = lambda client, path, *args, **kwargs: (
         fixtures if client is source.did else
-        [{'id': str(n), **r} for n, r in enumerate(codes)] if path == 'code' else
+        (existing.get('code') or [{'id': str(n), **r} for n, r in enumerate(codes)]) if path == 'code' else
         existing.get(path, [])
     )
     source.get_many = lambda paths: {}
@@ -3144,13 +3147,13 @@ def test_latest_round_aggregates_publish_complete_matches_and_keep_published_his
     assert {d['t_code'] for d in docs(report, 'pMST')} == {'T01', 'T02', 'T03', 'T04'}
     assert len(docs(report, 'mMST')) == 2
     assert not docs(report, 'sAVG')
-    assert all(d['data'].get('Round', d['data'].get('gm_round')) == 2 for d in report['documents'])
+    assert all(d['data'].get('Round', d['data'].get('gm_round')) == 2 for d in report['documents'] if d['collection'] != 'code')
     assert 'M-AVG' not in docs(report, 'rAVG')[0]
     assert 'R-AVG' not in docs(report, 'cAVG')[0]
     assert not any(key.startswith(('WTT', 'WRK', 'RRK')) for key in docs(report, 'rank')[0])
 
     for doc in report['documents']:
-        existing[doc['collection']].append({'id': doc['document_id'], 'data': deepcopy(doc['data'])})
+        existing.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': deepcopy(doc['data'])})
     repeated, _ = source.capture(scope, slot_path)
     assert repeated['validation_passed'], repeated['errors']
     assert not repeated['documents']
@@ -3925,3 +3928,97 @@ def test_rank_excel_summary_defaults_and_missing_history():
     rank = docs(build_aggregates(items + third, codes, slots), 'rank')[1]
     assert 'R_Gap' not in rank and 'R_Rate' not in rank
     assert rank['Season'] == 20.2 and rank['S_Avg'] == 6.7
+
+
+# Common Code registry and season projection regressions.
+def _common_code_test_team(number=1, name='Arsenal'):
+    return {'Code': f'E-{number}', 'TCODE': f'E-{number}', 'Team Code': number,
+            'No': number * 100, 'POSITION': number, 'IDX_NAME': f'IDX{number}',
+            '구단(약자)': f'T{number}', 'FC Name(한글)': name, 'Full Name': name,
+            '구단코드': 100 + number, '로고': f'https://example.com/{number}.svg'}
+
+
+def test_common_info_uses_2026_baseline_and_fills_every_query_season_without_relegation_deletes():
+    source = [
+        {'id': 'old', 'data': dict(_common_code_test_team(), PlSeason='2021-2022', **{'Full Name': ''})},
+        {'id': 'base', 'data': dict(_common_code_test_team(), PlSeason='2026-2027')},
+        {'id': 'retired', 'data': dict(_common_code_test_team(2, 'Retired'), PlSeason='2026-2027')},
+    ]
+    before = deepcopy(source)
+    plan = delivery.plan_new_season('2027-2028', [], source, {}, {}, require_complete_code=True)
+    generated = {(r['data']['PlSeason'], r['data']['TCODE']): r for r in plan['documents']}
+    assert generated['2021-2022', 'E-1']['document_id'] == 'old'
+    assert generated['2021-2022', 'E-1']['data']['Full Name'] == 'Arsenal'
+    assert generated['2027-2028', 'E-2']['data']['Full Name'] == 'Retired'
+    assert generated['2021-2022', 'E-2']['data']['로고'].endswith('2.svg')
+    assert source == before
+
+
+def test_latest_common_edit_wins_across_seasons_without_changing_fixed_number():
+    rows = [{'data': dict(_common_code_test_team(), PlSeason='2026-2027')},
+            {'data': dict(_common_code_test_team(name='Updated'), PlSeason='2021-2022', codeSharedUpdatedAt='2027-01-01T00:00:00Z')}]
+    common = delivery.common_code_registry(rows, require_complete=True)['E-1']
+    assert common['Full Name'] == 'Updated' and common['Team Code'] == 1 and common['No'] == 100
+
+
+def test_missing_display_fields_are_explicit_errors_and_never_successful_blank_candidates():
+    broken = _common_code_test_team()
+    broken.pop('구단코드')
+    with pytest.raises(BackendError, match='Common code fields missing'):
+        delivery.plan_new_season('2026-2027', [], [{'id': 'one', 'data': broken}], {}, {}, require_complete_code=True)
+
+
+def test_source_conflicts_and_global_team_number_collisions_are_rejected():
+    with pytest.raises(ValueError, match='conflict'):
+        delivery.common_code_registry([{'data': dict(_common_code_test_team(), PlSeason='2026-2027')},
+                              {'data': dict(_common_code_test_team(name='Different'), PlSeason='2026-2027')}])
+    other = _common_code_test_team(2)
+    other['Team Code'] = 1
+    with pytest.raises(ValueError, match='unique'):
+        delivery.common_code_registry([{'data': _common_code_test_team()}, {'data': other}])
+
+
+def test_old_code_slot_does_not_override_season_json_and_is_removed_from_payload():
+    items, codes, slots = aggregate_fixture()
+    rows = [{'id': str(i), 'data': dict(row['data'], DID_CAVG_SLOT=99)} for i, row in enumerate(codes)]
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    plan = delivery.plan_new_season('2024-2025', fixtures, rows, {}, slots, require_complete_code=True, require_slots=True)
+    assert plan['documents'] and all('DID_CAVG_SLOT' not in doc['data'] for doc in plan['documents'])
+    assert plan['slots'] == slots
+    for doc in plan['documents']:
+        delivery.validate_document(doc)
+
+
+def test_global_registry_can_contain_relegated_clubs_outside_the_twenty_mapped_teams():
+    items, codes, slots = aggregate_fixture()
+    extra = dict(_common_code_test_team(77), PlSeason='2024-2025')
+    codes.append({'id': 'retired', 'data': extra})
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    plan = delivery.plan_new_season('2024-2025', fixtures, codes, {}, slots, require_slots=True)
+    generated = delivery.build_aggregates(items, codes, slots)
+    assert generated['complete']
+    assert len(docs(generated, 'pMST')) == 20
+    assert 'WDL77' not in docs(generated, 'rank')[0]
+    assert any(d['data']['TCODE'] == 'E-77' for d in plan['documents'])
+
+
+def test_complete_round_field_audit_blocks_missing_cavg_and_rank_fields():
+    items, codes, slots = aggregate_fixture()
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    aggregate = delivery.build_aggregates(items, codes, slots)
+    delivery.complete_scheduled_aggregates(aggregate, fixtures, codes, slots, {}, items)
+    delivery.validate_aggregate_completeness(aggregate, fixtures)
+    for collection, field in [('cAVG', 'C20-C'), ('rank', 'WGR20'), ('rAVG', 'MA10-WDL')]:
+        broken = deepcopy(aggregate)
+        docs(broken, collection)[0].pop(field)
+        with pytest.raises(BackendError, match='required aggregate fields missing'):
+            delivery.validate_aggregate_completeness(broken, fixtures)
+
+
+def test_common_code_repairs_are_not_filtered_to_selected_season_only():
+    source = [{'id': 'base', 'data': dict(_common_code_test_team(), PlSeason='2026-2027')}]
+    plan = delivery.plan_new_season('2027-2028', [], source, {}, {}, require_complete_code=True)
+    selected = [{'id': 'fixture', 'data': {'seasonId': '20272028', 'round': 1,
+                                         'homeTeamId': 'E-1', 'awayTeamId': 'E-2'}}]
+    retained = delivery.select_aggregate_documents(plan['documents'], selected)
+    assert {d['data']['PlSeason'] for d in retained} == {'2026-2027', '2027-2028'}
