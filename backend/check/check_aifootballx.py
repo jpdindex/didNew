@@ -98,7 +98,8 @@ def aggregate_fixture():
             items.append({'match_id': f'20242024fixture{n:04}', 'match': deepcopy(match), 'side': side,
                           'recording': {'status': 'final', 'teamId': f'T{number:02}', 'kpi': kpi,
                                         'kpiVersion': 1, 'ratingBasedOn': 1, 'teamRating': {'jmx': 50 + number}}})
-    return items, codes, {'seasonSlotMappings': {'2024-2025': {'cavgSlotToCodeTeamCodeMapping': slots}}}
+    return items, codes, {'seasonSlotMappings': {'2024-2025': {'cavgSlotToCodeTeamCodeMapping': slots,
+        'rankSlotToCodeTeamCodeMapping': {str(n): {'rankSlot': n, 'codeTeamCode': n} for n in range(1, 21)}}}}
 
 
 def docs(result, collection):
@@ -1860,6 +1861,8 @@ def test_match_first_then_all_can_create_missing_season_code_and_slots():
     evidence={'did_matches':fixtures,'ai_samples':{'code':codes+after_matches['code_rows']},
         'target_existing':{'dMST':[{'id':'already-sent','data':{'gm_round':1,'t_code':'T01'}}]},
         'player_profiles':{},'teams':{},'coach_contracts':contracts}
+    after_matches['slots']['seasonSlotMappings']['2024-2025']['rankSlotToCodeTeamCodeMapping'] = (
+        aggregate_fixture()[2]['seasonSlotMappings']['2024-2025']['rankSlotToCodeTeamCodeMapping'])
     report=delivery.generate_masters(evidence,fixtures,items,after_matches['slots'],after_matches,'all')
     assert report['validation_passed'],report['errors']
     assert report['aggregate_status']=='ready' and not report['warnings']
@@ -3163,7 +3166,7 @@ def test_round_defaults_use_published_identities_and_force_only_pending_document
     for fixture in fixtures:
         fixture['data']['round'] = 13
     mapping = slots['seasonSlotMappings']['2024-2025']['cavgSlotToCodeTeamCodeMapping']
-    seeded = delivery.round_default_documents(fixtures, codes, mapping, {})
+    seeded = delivery.round_default_documents(fixtures, codes, mapping, {}, rank_slots=mapping)
     assert len(seeded) == 213
     assert {doc['collection'] for doc in seeded} == delivery.DEFAULT_COLLECTIONS
     for collection in ('dMST', 'pMST'):
@@ -3195,20 +3198,20 @@ def test_round_defaults_use_published_identities_and_force_only_pending_document
     actual = existing['dMST'][0]['data']
     actual.pop('didUnplayed')
     actual.update(JMX=75, WDL='W')
-    assert delivery.round_default_documents(fixtures, codes, mapping, existing)[-1]['collection'] == 'rank'
-    forced = delivery.round_default_documents(fixtures, codes, mapping, existing, force=True)
+    assert delivery.round_default_documents(fixtures, codes, mapping, existing, rank_slots=mapping)[-1]['collection'] == 'rank'
+    forced = delivery.round_default_documents(fixtures, codes, mapping, existing, rank_slots=mapping, force=True)
     assert not any(doc['document_id'] == existing['dMST'][0]['id'] for doc in forced)
     assert actual['JMX'] == 75
     pending = existing['dMST'][1]
     for field in ('Season', 'S-Round', 'M-Code', 'M_No1', 'M_No2', 'T-code', 'T-Round'):
         pending['data'].pop(field)
-    repaired = delivery.round_default_documents(fixtures, codes, mapping, existing, force=True)
+    repaired = delivery.round_default_documents(fixtures, codes, mapping, existing, rank_slots=mapping, force=True)
     repaired_row = next(doc['data'] for doc in repaired if doc['collection'] == 'dMST'
                         and doc['document_id'] == pending['id'])
     assert repaired_row['Season'] == 2425 and repaired_row['M_No1'] == 24250242
     actual['gm_id'] = 'different-fixture'
     with pytest.raises(BackendError, match='fixture identity conflicts'):
-        delivery.round_default_documents(fixtures, codes, mapping, existing, force=True)
+        delivery.round_default_documents(fixtures, codes, mapping, existing, rank_slots=mapping, force=True)
 
 
 def test_seeded_round_aggregates_update_original_slots_and_keep_unplayed_documents():
@@ -3218,7 +3221,7 @@ def test_seeded_round_aggregates_update_original_slots_and_keep_unplayed_documen
     fixtures = [{'id': item['match_id'], 'data': item['match']} for item in items if item['side'] == 'H']
     season_slots = slots['seasonSlotMappings']['2024-2025']['cavgSlotToCodeTeamCodeMapping']
     existing = {}
-    for doc in delivery.round_default_documents(fixtures, codes, season_slots, {}):
+    for doc in delivery.round_default_documents(fixtures, codes, season_slots, {}, rank_slots=season_slots):
         existing.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': doc['data']})
     ready = items[:2] + items[4:6]
     ready_fixtures = [fixtures[0], fixtures[2]]
@@ -3242,7 +3245,7 @@ def test_workbook_defaults_cover_all_five_collections_and_previous_standings():
     items, codes, slots = aggregate_fixture()
     fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
     mapping = slots['seasonSlotMappings']['2024-2025']['cavgSlotToCodeTeamCodeMapping']
-    first = {'documents': delivery.round_default_documents(fixtures, codes, mapping, {})}
+    first = {'documents': delivery.round_default_documents(fixtures, codes, mapping, {}, rank_slots=mapping)}
     ranks = docs(first, 'rank')[0]
     assert all(ranks[f'WRK{n}'] == ranks[f'WGR{n}'] == ranks[f'RRK{n}'] == 1 for n in range(1, 21))
     assert all(ranks[f'WDL{n}'] == ranks[f'WTT{n}'] == 1 and ranks[f'RAV{n}'] == 40 for n in range(1, 21))
@@ -3260,7 +3263,7 @@ def test_workbook_defaults_cover_all_five_collections_and_previous_standings():
     for f in fixtures:
         f['data']['round'] = 2
     previous = {**ranks, 'WTT1': 3, 'WRK1': 2, 'WGR1': 1}
-    second = {'documents': delivery.round_default_documents(fixtures, codes, mapping, {}, previous_rank=previous)}
+    second = {'documents': delivery.round_default_documents(fixtures, codes, mapping, {}, rank_slots=mapping, previous_rank=previous)}
     ranks = docs(second, 'rank')[0]
     assert ranks['WTT1'] == 4 and ranks['WRK1'] == 2 and ranks['WGR1'] == 1
 
@@ -3275,7 +3278,7 @@ def test_partial_aggregates_keep_all_team_defaults_and_update_later_round_points
     mapping = slots['seasonSlotMappings']['2024-2025']['cavgSlotToCodeTeamCodeMapping']
     existing = {}
     for group in (fixtures, second):
-        for doc in delivery.round_default_documents(group, codes, mapping, {}):
+        for doc in delivery.round_default_documents(group, codes, mapping, {}, rank_slots=mapping):
             existing.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': doc['data']})
     existing['rank'][0]['data'].pop('didUnplayed')
     existing['rank'][0]['data'].update(Season=99, S_Avg=99, R_Rate=99)
@@ -3341,16 +3344,19 @@ def test_aggregates_use_published_previous_points_when_older_team_rows_are_missi
     assert rank['WTT1'] == 14 and rank['WTT2'] == 12 and rank['WTT3'] == 14
 
 
-def test_published_legacy_rank_aliases_are_read_as_current_team_codes():
-    codes = [{'data': {'TCODE': team, 'PlSeason': '2025-2026', 'Team Code': number,
-                       'No': number * 100, 'IDX_NAME': team}}
-             for team, number in [('E-BU', 5), ('E-LU', 14), ('E-SU', 28)]]
-    normalized = delivery.normalize_rank_team_codes(
-        {'WDL27': 3, 'WTT27': 15, 'WRK27': 8, 'WDL12': 1, 'WTT12': 10, 'WDL21': 0, 'WTT21': 5},
-        '2025-2026', codes, {'E-BU', 'E-LU', 'E-SU'})
-    assert normalized['WDL5'] == 3 and normalized['WTT5'] == 15 and normalized['WGR5'] == 3
-    assert normalized['WDL14'] == 1 and normalized['WTT14'] == 10
-    assert normalized['WDL28'] == 0 and normalized['WTT28'] == 5
+def test_published_team_code_history_is_read_as_slots_without_mutating_source():
+    slots = {'seasonSlotMappings': {'2025-2026': {'rankSlotToCodeTeamCodeMapping': {
+        str(n): {'rankSlot': n, 'codeTeamCode': code}
+        for n, code in enumerate([15, 1, 2, 3, 4, 6, 8, 7, 9, 10, 27, 12, 11, 16, 17, 18, 21, 22, 24, 23], 1)
+    }}}}
+    original = {'WDL27': 3, 'WTT27': 15, 'WRK27': 8, 'WDL12': 1, 'WTT12': 10, 'WDL21': 0, 'WTT21': 5}
+    before = deepcopy(original)
+    normalized = delivery.normalize_rank_slots(original, slots, '2025-2026')
+    assert normalized['WDL11'] == 3 and normalized['WTT11'] == 15 and normalized['WGR11'] == 3
+    assert normalized['WDL12'] == 1 and normalized['WTT12'] == 10
+    assert normalized['WDL17'] == 0 and normalized['WTT17'] == 5
+    assert 'WTT27' not in normalized and original == before
+    assert delivery.normalize_rank_slots(normalized, slots, '2025-2026') == normalized
 
 
 def test_default_capture_fills_missing_history_from_confirmed_team_points(tmp_path):
@@ -3736,3 +3742,135 @@ def test_aggregate_import_cannot_fall_back_to_stored_totals_without_raw(imported
 
 if __name__ == '__main__':
     raise SystemExit(pytest.main([__file__]))
+
+
+
+def permuted_rank_fixture():
+    items, codes, slots = aggregate_fixture()
+    block = slots['seasonSlotMappings']['2024-2025']
+    for n, code in enumerate(codes, 1):
+        code['data']['Team Code'] = n + 100
+        block['cavgSlotToCodeTeamCodeMapping'][str(n)]['codeTeamCode'] = n + 100
+    block['rankSlotToCodeTeamCodeMapping'] = {
+        str(21 - n): {'rankSlot': 21 - n, 'codeTeamCode': 100 + n} for n in range(1, 21)}
+    return items, codes, slots
+
+
+def test_rank_outputs_use_independent_slots_for_all_six_families_and_keep_cavg():
+    items, codes, slots = permuted_rank_fixture()
+    generated = build_aggregates(items, codes, slots)
+    rank = docs(generated, 'rank')[0]
+    assert rank['RAV20'] == 51 and rank['RAV1'] == 70
+    assert rank['WDL20'] == 3 and rank['WDL19'] == 0
+    assert docs(generated, 'cAVG')[0]['C1-AVG'] == 51
+    assert docs(generated, 'pMST')[0]['t_code'] == 'T01'
+    for family in ('WDL', 'WTT', 'WRK', 'WGR', 'RAV', 'RRK'):
+        assert {int(key[len(family):]) for key in rank if key.startswith(family)} == set(range(1, 21))
+    assert rank['didRankFieldScheme'] == 'rank-slots-v1'
+    checked = validate_aggregate_links(generated, items, codes, slots)
+    assert checked['passed'], checked
+
+
+def test_default_rank_carries_previous_points_by_rank_slot_not_team_or_cavg_slot():
+    items, codes, slots = permuted_rank_fixture()
+    fixtures = [{'id': item['match_id'], 'data': deepcopy(item['match'])} for item in items if item['side'] == 'H']
+    for f in fixtures:
+        f['data']['round'] = 2
+    block = slots['seasonSlotMappings']['2024-2025']
+    result = {'documents': delivery.round_default_documents(fixtures, codes,
+        block['cavgSlotToCodeTeamCodeMapping'], {}, rank_slots=block['rankSlotToCodeTeamCodeMapping'],
+        previous_rank={'WTT20': 30, 'WRK20': 4, 'WGR20': 2})}
+    rank = docs(result, 'rank')[0]
+    assert (rank['WTT20'], rank['WRK20'], rank['WGR20']) == (31, 4, 2)
+    assert rank['WTT1'] == 2 and 'WTT101' not in rank
+
+
+def test_partial_rank_rolls_later_rounds_forward_using_permuted_slots():
+    items, codes, slots = permuted_rank_fixture()
+    first = [{'id': item['match_id'], 'data': deepcopy(item['match'])} for item in items if item['side'] == 'H']
+    second = deepcopy(first)
+    for row in second:
+        row['id'] += '-r2'; row['data']['round'] = 2
+    partial = build_aggregates(items[:2], codes, slots, round_only=True,
+                               fixture_numbers=delivery.round_fixture_numbers(first + second))
+    delivery.complete_scheduled_aggregates(partial, first + second, codes, slots, {}, items[:2])
+    ranks = {row['Round']: row for row in docs(partial, 'rank')}
+    assert ranks[1]['WTT20'] == 3 and ranks[1]['WTT19'] == 0
+    assert ranks[2]['WTT20'] == 4 and ranks[2]['WTT19'] == 1
+    assert ranks[1]['RAV20'] == 51 and ranks[1]['RAV1'] == 40
+    assert all('WTT101' not in row for row in ranks.values())
+
+
+def test_old_team_code_rank_history_is_read_without_touching_source_or_new_slots():
+    _, _, slots = permuted_rank_fixture()
+    old = {'WTT101': 30, 'WDL101': 3, 'RAV101': 71, 'WTT120': 5}
+    before = deepcopy(old)
+    converted = delivery.normalize_rank_slots(old, slots, '2024-2025')
+    assert converted['WTT20'] == 30 and converted['RAV20'] == 71 and converted['WTT1'] == 5
+    assert 'WTT101' not in converted and old == before
+    assert delivery.normalize_rank_slots(converted, slots, '2024-2025') == converted
+    uploaded = {'WTT1': 30, 'WTT20': 5}
+    assert delivery.normalize_rank_slots(uploaded, slots, '2024-2025')['WTT1'] == 30
+
+
+def test_rank_slot_mapping_rejects_missing_duplicate_and_wrong_slot_metadata():
+    items, codes, slots = permuted_rank_fixture()
+    block = slots['seasonSlotMappings']['2024-2025']
+    for mutate in [lambda m: m.pop('20'),
+                   lambda m: m['20'].update(codeTeamCode=m['1']['codeTeamCode']),
+                   lambda m: m['20'].update(rankSlot=19)]:
+        broken = deepcopy(slots)
+        mutate(broken['seasonSlotMappings']['2024-2025']['rankSlotToCodeTeamCodeMapping'])
+        with pytest.raises(BackendError):
+            delivery.rank_slot_numbers(broken, '2024-2025')
+    block.pop('rankSlotToCodeTeamCodeMapping')
+    generated = build_aggregates(items, codes, slots)
+    assert generated['errors'] and not generated['complete']
+
+
+def test_rank_delivery_rejects_team_code_numbered_payloads():
+    with pytest.raises(BackendError, match='rank payload fields'):
+        validate_document({'collection': 'rank', 'document_id': 'rank',
+                           'data': {'PlSeason': '2024-2025', 'Round': 1, 'WDL101': 3}})
+
+
+
+def test_default_capture_reads_old_history_through_rank_slots(tmp_path):
+    items, codes, slots = permuted_rank_fixture()
+    fixtures = [{'id': i['match_id'], 'data': deepcopy(i['match'])} for i in items if i['side'] == 'H']
+    for fixture in fixtures:
+        fixture['data']['round'] = 13
+    previous = {'id': 'round10', 'data': {'Round': 10, 'PlSeason': '2024-2025',
+                **{f'WTT{n + 100}': 20 for n in range(1, 21)}, 'WRK101': 8}}
+    prior_rows = [{'id': 'win', 'data': {'gm_round': 11, 't_code': 'T01', 'GOAL': 3, 'Goal': 0}},
+                  {'id': 'loss', 'data': {'gm_round': 12, 't_code': 'T01', 'GOAL': 0, 'Goal': 1}}]
+    source = object.__new__(delivery.SourceCapture)
+    source.did, source.target = object(), object()
+    source.documents, source.queries = {}, []
+    def rows(client, path, filters=(), **kwargs):
+        if client is source.did:
+            return fixtures
+        if path == 'code':
+            return [{'id': str(n), **row} for n, row in enumerate(codes)]
+        if path == 'rank' and ('Round', '<', 13) in filters:
+            return [previous]
+        if path == 'pMST' and len(filters) == 1:
+            return prior_rows
+        return []
+    source.rows = rows
+    slot_path = tmp_path / 'slots.json'
+    slot_path.write_text(json.dumps(slots), encoding='utf-8')
+    report, _ = source.capture_defaults({'seasonId': '20242025', 'roundFrom': 13}, slot_path)
+    assert report['validation_passed'], report['errors']
+    rank = docs(report, 'rank')[0]
+    assert rank['WTT20'] == 24 and rank['WTT19'] == 23
+    assert rank['WRK20'] == 8 and rank['WGR20'] == 3
+    assert previous['data']['WTT101'] == 20 and 'WTT20' not in previous['data']
+
+
+def test_current_rank_mapping_missing_participant_is_reported_instead_of_using_team_code():
+    items, codes, slots = permuted_rank_fixture()
+    slots['seasonSlotMappings']['2024-2025']['rankSlotToCodeTeamCodeMapping']['20']['codeTeamCode'] = 999
+    generated = build_aggregates(items, codes, slots)
+    assert any('no slot for team code 101' in error for error in generated['errors'])
+    assert not generated['complete']

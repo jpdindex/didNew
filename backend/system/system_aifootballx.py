@@ -1082,19 +1082,49 @@ LEGACY_2025_PREDICTION_BASELINES = {'DAP': 450, 'BAP': 60, 'DTP': 18, 'SHOT': 20
 LEGACY_RANK_SLOT_OVERRIDES = {'2025-2026': {'E-BU': 27, 'E-LU': 12, 'E-SU': 21}}
 
 
-def normalize_rank_team_codes(data, season, codes, teams):
-    """Read already-published legacy standings through their current team identities."""
+def rank_slot_numbers(slot_definitions, season):
+    """Resolve team codes to explicitly configured rank field slots 1..20."""
+    mapping = slot_definitions.get('seasonSlotMappings', {}).get(season, {}).get('rankSlotToCodeTeamCodeMapping', {})
+    if set(mapping) != {str(n) for n in range(1, 21)}:
+        fail(f'{season}: configure rankSlotToCodeTeamCodeMapping slots 1..20')
+    result = {}
+    for key, row in mapping.items():
+        if not isinstance(row, dict):
+            fail(f'{season}: rank slot entries must contain team codes')
+        number = row.get('codeTeamCode')
+        if (type(number) is not int or number < 1 or type(row.get('rankSlot', int(key))) is not int
+                or row.get('rankSlot', int(key)) != int(key)
+                or number in result):
+            fail(f'{season}: rank slots must map to 20 unique team codes')
+        result[number] = int(key)
+    return result
+
+
+def rank_slot_for_team(slot_definitions, season, team_number):
+    mapping = rank_slot_numbers(slot_definitions, season)
+    if team_number not in mapping:
+        fail(f'{season}: rank mapping has no slot for team code {team_number}')
+    return mapping[team_number]
+
+
+def normalize_rank_slots(data, slot_definitions, season):
+    """Read old team-code history in memory; uploaded 1..20 slot values stay in place."""
     result = dict(data)
-    for team, old_number in LEGACY_RANK_SLOT_OVERRIDES.get(season, {}).items():
-        if team not in teams:
-            continue
-        number = resolve_team_code(codes, season, team)['team_code_number']
-        if f'WDL{number}' not in result:
+    numbered = {field: value for field, value in data.items()
+                if re.fullmatch(r'(?:WDL|WTT|WRK|WGR|RAV|RRK)\d+', field)}
+    old_team_codes = data.get('didRankFieldScheme') != 'rank-slots-v1' and any(
+        int(re.search(r'\d+$', field)[0]) > 20 for field in numbered)
+    if old_team_codes:
+        result = {field: value for field, value in data.items() if field not in numbered}
+        for team_number, slot in rank_slot_numbers(slot_definitions, season).items():
             for family in ('WDL', 'WTT', 'WRK', 'WGR', 'RAV', 'RRK'):
-                if f'{family}{old_number}' in data:
-                    result[f'{family}{number}'] = data[f'{family}{old_number}']
+                source = f'{family}{team_number}'
+                if source in data:
+                    result[f'{family}{slot}'] = data[source]
+    if data:
+        result['didRankFieldScheme'] = 'rank-slots-v1'
     for field, value in list(result.items()):
-        if re.fullmatch(r'WRK\d+', field) and type(value) in (int, float):
+        if re.fullmatch(r'WRK(?:[1-9]|1[0-9]|20)', field) and type(value) in (int, float):
             result.setdefault('WGR' + field[3:], int(value) // 4 + 1)
     return result
 
@@ -1216,7 +1246,13 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                'point': 3 if score > against else 1 if score == against else 0,
                'wdl': 'W' if score > against else 'D' if score == against else 'L',
                'name': team_delivery_name(code_rows, season, team, {'name': item.get('team_name')})}
-        row['rank_slot'] = code['team_code_number']
+        row['rank_slot'] = None
+        if not legacy:
+            try:
+                row['rank_slot'] = rank_slot_for_team(slot_definitions, season, code['team_code_number'])
+            except BackendError as exc:
+                result['errors'].append(exc.message)
+                blocked['rank'].add(f'{team}: rank slot mapping missing/invalid')
         if legacy:
             matching_codes = [r['data'] for r in code_rows
                               if (r['data'].get('TCODE') or r['data'].get('Code')) == team
@@ -1421,6 +1457,8 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                 continue
             total = cumulative_points[row['team']]
             wrk = rank_competition(total, points)
+            if not legacy:
+                ranks['didRankFieldScheme'] = 'rank-slots-v1'
             ranks[f'WDL{number}'] = row['point']
             if history_available:
                 ranks[f'WTT{number}'] = total
@@ -1559,7 +1597,7 @@ def validate_sql_facts(generated: dict, items: list[dict], codes: list[dict], sl
         positions[team] = (LEGACY_RANK_SLOT_OVERRIDES.get(season, {}).get(team, int(position))
                            if position is not None else None)
         if generated.get('calculation_mode') == 'current':
-            positions[team] = references[team]['team_code_number']
+            positions[team] = rank_slot_for_team(slots, season, references[team]['team_code_number'])
         if positions[team] is None:
             check('rank', team, '__season_rank_position_available__', False, True)
         rounds[match['round']].append(item)
@@ -1760,7 +1798,7 @@ def validate_aggregate_links(generated, items, codes, slots, *, round_only=False
             jmx = (item['recording'].get('teamRating') or {}).get('jmx')
             if type(jmx) not in (int, float) or not math.isfinite(jmx):
                 continue
-            position = resolve_team_code(codes, season, team)['team_code_number']
+            position = rank_slot_for_team(slots, season, resolve_team_code(codes, season, team)['team_code_number'])
             check('rank', (season, number), f'RAV{position}', truncate_rating(jmx))
             current_rating = min(truncate_rating(jmx), 99.9)
             growth = round((current_rating - previous[team]) / previous[team] * 100, 1) if previous.get(team) else 0.0
@@ -2358,8 +2396,10 @@ class SourceCapture:
                 filters = [('PlSeason', '==', season), ('gm_round' if col in ('dMST', 'pMST') else 'Round', '==', number)]
             existing[col] = self.rows(self.target, col, filters, bound=40)
         earlier_ranks = self.rows(self.target, 'rank', [('PlSeason', '==', season), ('Round', '<', number)], bound=40)
-        team_numbers = {team: resolve_team_code(codes, season, team)['team_code_number'] for team in teams}
-        history = [normalize_rank_team_codes(row['data'], season, codes, teams) for row in earlier_ranks
+        slots = json.loads(slot_path.read_text(encoding='utf-8')) if slot_path else {'seasonSlotMappings': {}}
+        team_numbers = {team: rank_slot_for_team(slots, season,
+                        resolve_team_code(codes, season, team)['team_code_number']) for team in teams}
+        history = [normalize_rank_slots(row['data'], slots, season) for row in earlier_ranks
                    if row['data'].get('Round', number) < number]
         previous_rank = max((row for row in history if all(f'WTT{n}' in row for n in team_numbers.values())),
                             key=lambda row: row['Round'], default={})
@@ -2386,11 +2426,11 @@ class SourceCapture:
                 previous_rank[f'WTT{n}'] = total
         self.report_progress(55)
         try:
-            slots = json.loads(slot_path.read_text(encoding='utf-8')) if slot_path else {'seasonSlotMappings': {}}
             setup = plan_new_season(season, fixtures, codes, existing, slots)
             slot_map = setup['slots'].get('seasonSlotMappings', {}).get(season, {}).get('cavgSlotToCodeTeamCodeMapping', {})
             documents = round_default_documents(fixtures, codes + setup['code_rows'], slot_map, existing,
-                force=scope.get('force', False), previous_rank=previous_rank)
+                force=scope.get('force', False), previous_rank=previous_rank,
+                rank_slots=setup['slots']['seasonSlotMappings'][season].get('rankSlotToCodeTeamCodeMapping'))
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             fail(f'Round defaults configuration: {exc}')
         self.report_progress(90)
@@ -2933,7 +2973,7 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
 
 
 def round_default_documents(fixtures, codes, slots, existing, *, force=False, previous_rank=None,
-                            collections=DEFAULT_COLLECTIONS):
+                            collections=DEFAULT_COLLECTIONS, rank_slots=None):
     season = season_label(fixtures[0]['data']['seasonId'])
     short_season = int(season[2:4] + season[7:9])
     number = fixtures[0]['data']['round']
@@ -2960,6 +3000,9 @@ def round_default_documents(fixtures, codes, slots, existing, *, force=False, pr
             fail(f'{col}: ambiguous existing default identity {key}')
         if rows:
             current = rows[0]['data']
+            if col == 'rank':
+                current = normalize_rank_slots(current, {'seasonSlotMappings': {season: {
+                    'rankSlotToCodeTeamCodeMapping': rank_slots or {}}}}, season)
             if value.get('gm_id') and current.get('gm_id') not in (None, '', value['gm_id']):
                 fail(f'{col}: fixture identity conflicts with existing document {rows[0]["id"]}')
             if col in ('cAVG', 'rAVG', 'rank'):
@@ -2984,10 +3027,17 @@ def round_default_documents(fixtures, codes, slots, existing, *, force=False, pr
     cavg = {**ravg, 'C-W': 0, 'C-D': 20, 'C-L': 0, 'RS-AVG': 0, 'RC-AVG': 0, 'R-AVG': 40.0}
     for n in range(1, 21):
         cavg.update({f'C{n}-AVG': 40.0, f'C{n}-WDL': 1, f'C{n}-S': 0, f'C{n}-C': 0})
-    ranks = {**ravg, 'R_Avg': 40.0, 'R_Gap': 0, 'Max': 40.0, 'Min': 40.0}
+    ranks = {**ravg, 'R_Avg': 40.0, 'R_Gap': 0, 'Max': 40.0, 'Min': 40.0,
+             'didRankFieldScheme': 'rank-slots-v1'}
     previous_rank = previous_rank or {}
+    rank_numbers = rank_slot_numbers({'seasonSlotMappings': {season: {
+        'rankSlotToCodeTeamCodeMapping': rank_slots or {}}}}, season) if 'rank' in collections else {}
     for code in references.values():
-        n = code['team_code_number']
+        if 'rank' not in collections:
+            break
+        if code['team_code_number'] not in rank_numbers:
+            fail(f'{season}: rank mapping has no slot for team code {code["team_code_number"]}')
+        n = rank_numbers[code['team_code_number']]
         ranks.update({f'WDL{n}': 1, f'WTT{n}': previous_rank.get(f'WTT{n}', number - 1) + 1,
                       f'WRK{n}': previous_rank.get(f'WRK{n}', 1),
                       f'WGR{n}': previous_rank.get(f'WGR{n}', 1), f'RAV{n}': 40.0, f'RRK{n}': 1})
@@ -3047,7 +3097,9 @@ def round_default_documents(fixtures, codes, slots, existing, *, force=False, pr
 def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, items):
     """Complete scheduled rounds from defaults and confirmed team rows, then roll standings forward."""
     season = season_label(fixtures[0]['data']['seasonId'])
-    slot_map = slots.get('seasonSlotMappings', {}).get(season, {}).get('cavgSlotToCodeTeamCodeMapping', {})
+    season_slots = slots.get('seasonSlotMappings', {}).get(season, {})
+    slot_map = season_slots.get('cavgSlotToCodeTeamCodeMapping', {})
+    rank_numbers = rank_slot_numbers(slots, season)
     by_round = defaultdict(list)
     for fixture in fixtures:
         by_round[fixture['data']['round']].append(fixture)
@@ -3073,17 +3125,20 @@ def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, i
     for number, round_fixtures in sorted(by_round.items()):
         teams = {f['data'][key] for f in round_fixtures for key in ('homeTeamId', 'awayTeamId')}
         if len(round_fixtures) != 10 or len(teams) != 20:
-            previous_rank = published.get(('rank', (season, number)), {}).get('data', {})
+            previous_rank = normalize_rank_slots(
+                published.get(('rank', (season, number)), {}).get('data', {}), slots, season)
             continue
-        stored_rank = normalize_rank_team_codes(
-            published.get(('rank', (season, number)), {}).get('data', {}), season, codes, teams)
+        stored_rank = normalize_rank_slots(
+            published.get(('rank', (season, number)), {}).get('data', {}), slots, season)
         defaults = round_default_documents(round_fixtures, codes, slot_map, {},
-            previous_rank=previous_rank, collections={'pMST', 'mMST', 'cAVG', 'rAVG', 'rank'})
+            previous_rank=previous_rank, collections={'pMST', 'mMST', 'cAVG', 'rAVG', 'rank'},
+            rank_slots=season_slots.get('rankSlotToCodeTeamCodeMapping'))
         values = {(d['collection'], aggregate_key(d['collection'], d['data'])): d for d in defaults}
         for key, doc in values.items():
             old = published.get(key)
             if old and not old['data'].get('didUnplayed'):
-                doc['data'].update(old['data'])
+                previous_data = normalize_rank_slots(old['data'], slots, season) if key[0] == 'rank' else old['data']
+                doc['data'].update(previous_data)
                 doc['data'].pop('didUnplayed', None)
             if key in generated:
                 doc['data'].update(generated[key]['data'])
@@ -3094,7 +3149,7 @@ def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, i
             doc['data'] = {field: value for field, value in doc['data'].items()
                            if not retired_calculation_field(key[0], field)}
             if key[0] == 'rank':
-                valid_numbers = {resolve_team_code(codes, season, team)['team_code_number'] for team in teams}
+                valid_numbers = set(range(1, 21))
                 doc['data'] = {field: value for field, value in doc['data'].items()
                                if not (match := re.fullmatch(r'(?:WDL|WTT|WRK|WGR|RAV|RRK)(\d+)', field))
                                or int(match[1]) in valid_numbers}
@@ -3119,14 +3174,17 @@ def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, i
                 raw_jmx = source['recording']['teamRating']['jmx'] if played and source else pmst['gi_score']
                 jmx = truncate_rating(raw_jmx) if played else 40.0
                 team_number = code['team_code_number']
+                if team_number not in rank_numbers:
+                    fail(f'{season}: rank mapping has no slot for team code {team_number}')
+                rank_number = rank_numbers[team_number]
                 official_score, official_against = match['score'][own], match['score'][other]
                 official_point = 3 if official_score > official_against else 1 if official_score == official_against else 0
                 historical_score = (number < first_generated and not played and not stored_rank.get('didUnplayed')
-                                    and stored_rank.get(f'WDL{team_number}') == official_point)
+                                    and stored_rank.get(f'WDL{rank_number}') == official_point)
                 goals[team] += official_score if historical_score else score
                 conceded[team] += official_against if historical_score else against
-                total = previous_rank.get(f'WTT{team_number}', number - 1) + point
-                row = {'team': team, 'number': team_number, 'idx': code['IDX_CODE'], 'played': played,
+                total = previous_rank.get(f'WTT{rank_number}', number - 1) + point
+                row = {'team': team, 'number': rank_number, 'idx': code['IDX_CODE'], 'played': played,
                        'point': point, 'total': total, 'score': score, 'against': against,
                        'jmx': jmx, 'raw_jmx': raw_jmx}
                 rows.append(row)
@@ -3138,10 +3196,10 @@ def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, i
                 ravg.update({f'M{side}{fixture_no}_NM': code['IDX_CODE'],
                              f'M{side}{fixture_no}-IDX': jmx,
                              f'M{side}{fixture_no}-WDL': 'W' if point == 3 else 'D' if point == 1 else 'L'})
-                ranks.update({f'WDL{team_number}': point, f'WTT{team_number}': total,
-                              f'RAV{team_number}': jmx, f'RRK{team_number}': 1,
-                              f'WRK{team_number}': previous_rank.get(f'WRK{team_number}', 1),
-                              f'WGR{team_number}': previous_rank.get(f'WGR{team_number}', 1)})
+                ranks.update({f'WDL{rank_number}': point, f'WTT{rank_number}': total,
+                              f'RAV{rank_number}': jmx, f'RRK{rank_number}': 1,
+                              f'WRK{rank_number}': previous_rank.get(f'WRK{rank_number}', 1),
+                              f'WGR{rank_number}': previous_rank.get(f'WGR{rank_number}', 1)})
             ravg[f'M{fixture_no}-AVG'] = truncate_rating(precise_mean([r['raw_jmx'] for r in pair]))
             if all(r['played'] for r in pair):
                 fixture_ratings.extend(r['raw_jmx'] for r in pair)
@@ -3355,7 +3413,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
     return report
 
 
-VALIDATION_POLICY = 'scheduled-aggregate-defaults-team-code-v28'
+VALIDATION_POLICY = 'scheduled-aggregate-rank-slots-v29'
 
 
 def dump(value):
@@ -3426,6 +3484,9 @@ def validate_document(doc):
             fail('Payload fields must be literal top-level names')
         if col == 'pMST' and field.startswith(('I-', 'PH-', 'PA-', 'PI-')):
             fail('Unused prediction field in delivery')
+        rank_field = re.fullmatch(r'(?:WDL|WTT|WRK|WGR|RAV|RRK)(\d+)', field) if col == 'rank' else None
+        if rank_field and not 1 <= int(rank_field[1]) <= 20:
+            fail('rank payload fields must use mapped slots 1..20')
         if col == 'rank' and field in ('Season', 'S_Avg', 'R_Rate'):
             fail('Unused rank field in delivery')
     dump(data)
