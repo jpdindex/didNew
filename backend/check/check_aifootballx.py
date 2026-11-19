@@ -2185,6 +2185,103 @@ def test_aggregate_capture_reads_all_imported_raw_with_guards_without_match_allo
     assert len(calls)==1  # Already captured RAW is not read again.
 
 
+def test_streamed_aggregate_review_releases_raw_between_teams_and_matches_eager_results():
+    import weakref
+
+    class RawRows(list):
+        pass
+
+    evidence, _ = preview_fixture()
+    template = evidence['source_recordings'][0]
+    template['recording']['legacyGiId'] = 'imported'
+    items = [{**template, 'match_id': f'imported-{n}', 'children': None} for n in range(80)]
+    eager = [{**item, 'children': deepcopy(template['children'])} for item in items]
+    expected = delivery.reviewed_aggregate_items({'source_recordings': eager}, items)
+    refs, calls = [], []
+
+    def load(item):
+        assert all(ref() is None for ref in refs), 'Previous team RAW is still retained'
+        rows = RawRows(deepcopy(template['children']['records']))
+        refs.append(weakref.ref(rows))
+        calls.append(item['match_id'])
+        return {**item, 'children': {'records': rows}}
+
+    actual = delivery.reviewed_aggregate_items({'source_recordings': []}, items, source_loader=load)
+    assert actual == expected
+    assert len(calls) == 80 and all(ref() is None for ref in refs)
+
+
+@pytest.mark.parametrize('empty', [False, True])
+def test_streamed_aggregate_review_keeps_missing_and_empty_raw_validation(empty):
+    evidence, _ = preview_fixture()
+    item = evidence['source_recordings'][0]
+    item['recording']['legacyGiId'] = 'imported'
+    loader = (lambda item: {**item, 'children': {'records': []}}) if empty else (lambda item: None)
+    with pytest.raises(ValueError, match='empty' if empty else 'missing'):
+        delivery.reviewed_aggregate_items({'source_recordings': []}, [item], source_loader=loader)
+
+
+def test_streamed_aggregate_documents_equal_eager_and_keep_raw_change_guards(tmp_path):
+    items, codes, slots = aggregate_fixture()
+    raw_evidence, _ = preview_fixture()
+    raw = raw_evidence['source_recordings'][0]['children']['records']
+    kpi = calculate_kpis(source_records(raw_evidence['source_recordings'][0])).team_kpi
+    for item in items:
+        item['recording'].update(legacyGiId='imported', kpi=dict(kpi))
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    heads = {f'matches/{i["match_id"]}/recordings/{i["side"]}': i['recording'] for i in items}
+    paths = {f'{path}/records': deepcopy(raw) for path in heads}
+    versions = {path: 'v1' for path in paths}
+
+    def snapshot(path, data, ident=None):
+        return SimpleNamespace(id=ident or path.rsplit('/', 1)[-1], reference=SimpleNamespace(path=path),
+            exists=True, update_time=SimpleNamespace(isoformat=lambda: versions.get(path.rsplit('/', 1)[0], 'v1')),
+            to_dict=lambda: deepcopy(data))
+
+    class Query:
+        def __init__(self, path):
+            self.path = path
+        def limit(self, _):
+            return self
+        def select(self, _):
+            return self
+        def stream(self, **kwargs):
+            return (snapshot(f'{self.path}/{r["id"]}', r['data'], r['id']) for r in paths[self.path])
+
+    source = object.__new__(delivery.SourceCapture)
+    source.documents, source.queries = {}, []
+    source.did = SimpleNamespace(document=lambda path: SimpleNamespace(path=path), collection=Query,
+        get_all=lambda refs, **kwargs: (snapshot(ref.path, heads[ref.path]) for ref in refs))
+    source.target = object()
+    code_rows = [{'id': str(n), **row} for n, row in enumerate(codes)]
+    def rows(client, path, filters=(), **kwargs):
+        if path in paths:
+            return delivery.SourceCapture.rows(source, client, path, filters, **kwargs)
+        return fixtures if client is source.did else code_rows if path == 'code' else []
+    source.rows = rows
+    source.get_many = lambda _: {}
+    source.capture_aggregate_review_sources = lambda *_: pytest.fail('Must not retain all imported RAW')
+    slot_path = tmp_path / 'slots.json'
+    slot_path.write_text(json.dumps(slots), encoding='utf-8')
+    scope = {'seasonId': '20242025', 'mode': 'aggregates', 'roundFrom': 1, 'roundTo': 1}
+    report, guards = source.capture(scope, slot_path)
+    assert report['validation_passed'], report['errors']
+    setup = plan_new_season('2024-2025', fixtures, code_rows, {'code': code_rows}, slots,
+                            require_complete_code=True, require_slots=True)
+    eager_evidence = {'did_matches': fixtures, 'source_recordings': [
+        {**i, 'children': {'records': deepcopy(raw)}} for i in items],
+        'target_existing': {'code': code_rows}, 'ai_samples': {'code': code_rows}}
+    eager = delivery.generate_masters(eager_evidence, fixtures, items, setup['slots'], setup, 'aggregates',
+        selected_fixtures=fixtures, fixture_numbers=delivery.round_fixture_numbers(fixtures))
+    assert report['documents'] == eager['documents']
+    assert len(guards['queries']) == len(items)
+    source.assert_fresh(guards)
+    versions[next(iter(paths))] = 'v2'
+    with pytest.raises(BackendError) as changed:
+        source.assert_fresh(guards)
+    assert changed.value.code == 'aifootballx_source_changed'
+
+
 def test_0087_apx_waiver_requires_exact_fixture_raw_delta_and_saved_rating():
     args = dict(match_id='20242025eplj2rgn13na28rd2b8q0087', side='H',
                 team_id='E-EV', opponent_id='E-FU', metric='APX', imported=True,

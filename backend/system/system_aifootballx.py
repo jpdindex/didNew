@@ -2438,20 +2438,35 @@ class SourceCapture:
                     'target_existing': target, 'aggregate_history': aggregate_history,
                     'ai_samples': {'code': overlay_code_rows(codes, setup['code_rows'])}}
         target['code'] = codes
-        self.capture_aggregate_review_sources(evidence, items)
-        raw_count = sum(len(recording['children']['records']) for recording in evidence['source_recordings'])
-        log_delivery_stage(job_id, 'aggregate_read', started, documents=len(heads) + raw_count, scope=scope)
-        self.report_progress(95)
+        log_delivery_stage(job_id, 'aggregate_read', started, documents=len(heads), scope=scope)
+        raw_count = 0
+        reviewed_count = 0
+        imported_count = sum(bool(i['recording'].get('legacyGiId')) for i in items)
+        raw_started = log_delivery_stage(job_id, 'aggregate_raw_review', scope=scope)
+
+        def load_aggregate_source(item):
+            nonlocal raw_count, reviewed_count
+            mid, side = item['match_id'], item['side']
+            records = self.rows(self.did, f'matches/{mid}/recordings/{side}/records',
+                                source=True, bound=20000)
+            raw_count += len(records)
+            reviewed_count += 1
+            self.report_progress(80 + 14 * reviewed_count / imported_count)
+            return {**item, 'children': {'records': records}}
+
         complete_schedule = all(sum(r['data']['round'] == n for r in context) == 10 for n in requested_rounds)
         if selected or complete_schedule:
             report = generate_masters(
                 evidence, context, items, setup['slots'], setup, 'aggregates',
                 latest=scope.get('latest', False), selected_fixtures=requested_fixtures if complete_schedule else selected, job_id=job_id,
                 round_only=round_only, fixture_numbers=fixture_numbers,
+                aggregate_source_loader=load_aggregate_source,
             )
         else:
             report = finish_delivery([], [], [], target, 'aggregates')
             report['aggregate_status'] = 'empty'
+        log_delivery_stage(job_id, 'aggregate_raw_review', raw_started, documents=raw_count, scope=scope)
+        self.report_progress(95)
         report['skippedMatches'] = skipped
         report['summary']['skippedMatches'] = len(skipped)
         if round_only:
@@ -2797,31 +2812,41 @@ def excluded_existing_own_goals(evidence, selected_ids):
             if natural_key('playerGoal', row['data']) in keys}
 
 
-def reviewed_aggregate_items(evidence, items):
+def reviewed_aggregate_item(item, source):
+    """Review one team's RAW; retain only its computed KPI in the result."""
+    records = source_records(source)
+    if not records:
+        raise ValueError('Reviewed aggregate RAW is empty')
+    calculation = calculate_kpis(records)
+    confirmed_dtp_results(records, calculation)
+    calculated = calculation.team_kpi
+    stored = item['recording'].get('kpi') or {}
+    imported = imported_raw_is_authoritative(records, item['recording'].get('legacyGiId'))
+    for field, value in stored.items():
+        if field not in calculated or abs(value - calculated[field]) < 1e-6:
+            continue
+        if not imported:
+            raise ValueError(f'Unreviewed aggregate KPI difference: {item["match_id"]}/{item["side"]}/{field}')
+    return {**item, 'recording': {**item['recording'], 'kpi': calculated}}
+
+
+def reviewed_aggregate_items(evidence, items, *, source_loader=None):
     """Use imported RAW totals in aggregates without editing historical SQL KPI."""
     sources = {(r['match_id'], r['side']): r for r in evidence.get('source_recordings', [])}
     result = []
     for item in items:
         source = sources.get((item['match_id'], item['side']))
+        if source is None and item['recording'].get('legacyGiId') and source_loader is not None:
+            source = source_loader(item)
         if source is None:
             if item['recording'].get('legacyGiId'):
                 raise ValueError(f'Imported aggregate RAW is missing: {item["match_id"]}/{item["side"]}')
             result.append(item)
             continue
-        records = source_records(source)
-        if not records:
-            raise ValueError('Reviewed aggregate RAW is empty')
-        calculation = calculate_kpis(records)
-        confirmed_dtp_results(records, calculation)
-        calculated = calculation.team_kpi
-        stored = item['recording'].get('kpi') or {}
-        imported = imported_raw_is_authoritative(records, item['recording'].get('legacyGiId'))
-        for field, value in stored.items():
-            if field not in calculated or abs(value - calculated[field]) < 1e-6:
-                continue
-            if not imported:
-                raise ValueError(f'Unreviewed aggregate KPI difference: {item["match_id"]}/{item["side"]}/{field}')
-        result.append({**item, 'recording': {**item['recording'], 'kpi': calculated}})
+        result.append(reviewed_aggregate_item(item, source))
+        # Drop the loaded RAW before the next loader call, including temporary
+        # KpiRecords/flags kept inside reviewed_aggregate_item's stack frame.
+        source = None
     return result
 
 
@@ -3391,7 +3416,8 @@ def validate_aggregate_completeness(aggregate, fixtures):
 
 
 def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *, latest=False,
-                     selected_fixtures=None, job_id=None, round_only=False, fixture_numbers=None):
+                     selected_fixtures=None, job_id=None, round_only=False, fixture_numbers=None,
+                     aggregate_source_loader=None):
     evidence = with_registration_references(evidence)
     errors, documents = [], ([] if mode == 'aggregates' else list(setup['documents']))
     context = evidence['did_matches']
@@ -3482,7 +3508,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
     if mode != 'masters':
         started = log_delivery_stage(job_id, 'aggregate_calculate')
         try:
-            aggregate_items = reviewed_aggregate_items(evidence, aggregate_items)
+            aggregate_items = reviewed_aggregate_items(evidence, aggregate_items, source_loader=aggregate_source_loader)
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(str(exc))
             aggregate_items = []

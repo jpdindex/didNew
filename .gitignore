@@ -32,6 +32,7 @@ backend/data/
 # Local Firestore mapping audit outputs (shared notes live in one Markdown file)
 docs/aifootballx/*.json
 *.xlsx
+*.inspect.ndjson
 outputs/readonly-20242025-audit/
 /outputs/recovery/
 
