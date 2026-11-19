@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { FORMATIONS, GK_SLOT } from '~/utils/formationLayout'
+import { FORMATIONS, GK_SLOT, orderedOutfieldSlotIds } from '~/utils/formationLayout'
 
 type Half = 'H1' | 'H2' | 'H3' | 'H4'
 type EventTime = { half: Half; clock: string } | null
@@ -22,7 +22,7 @@ type Report = {
 }
 
 // ALL = TAP + X + B (standalone X/B records without an act).
-const kpiFields = ['ALL', 'TAP', 'X', 'B', 'DAP', 'DTP', 'BAP', 'SHOT', 'GOAL', 'OG', 'ASR', 'SSR']
+const kpiFields = ['ALL', 'TAP', 'X', 'B', 'DAP', 'DTP', 'BAP', 'SHOT', 'GOAL', 'ASR', 'SSR']
 const ratioFields = new Set(['ASR', 'SSR'])
 const rankLabels = { main: 'Main', sub: 'Sub', manager: 'Manager' }
 const roundLabels: Record<string, string> = { R32: 'Round of 32', R16: 'Round of 16', QF: 'Quarter-final', SF: 'Semi-final', F: 'Final', unassigned: 'Unassigned' }
@@ -69,8 +69,11 @@ const pitchPlayers = computed(() => {
   const data = report.value
   const slots = data ? FORMATIONS[data.formationKey]?.slots : undefined
   if (!data?.startingEleven?.length || !slots) return []
+  const readingOrder = orderedOutfieldSlotIds(data.formationKey)
   return data.startingEleven.flatMap(player => {
-    const point = player.slot === 'gk' ? GK_SLOT : slots[Number(player.slot.slice(1))]
+    // Legacy rows arrive as "order:N" (formation reading order) instead of an "oN" slot.
+    const slotId = player.slot.startsWith('order:') ? readingOrder[Number(player.slot.slice(6))] ?? '' : player.slot
+    const point = slotId === 'gk' ? GK_SLOT : slotId.startsWith('o') ? slots[Number(slotId.slice(1))] : undefined
     // Squeeze the depth a little so the keeper's name stays inside the pitch.
     return point ? [{ ...player, left: point.x, top: 4 + point.y * 0.9 }] : []
   })
@@ -78,6 +81,8 @@ const pitchPlayers = computed(() => {
 
 // Prefer breaking right after an initial ("J.브랜트와이트" → "J." / "브랜트와이트").
 function pitchName(name: string) { return name.replace(/\.(?=\S)/, '.\u200B') }
+
+const teamLabel = computed(() => report.value?.team.nameEn || report.value?.team.name || '')
 
 function formationLabel(key: string) { return FORMATIONS[key]?.label ?? (key || '-') }
 function kpiValue(field: string, value: number | undefined) {
@@ -182,7 +187,7 @@ onBeforeUnmount(() => {
             <div v-if="!pitchPlayers.length"><dt>Formation</dt><dd>{{ formationLabel(report.formationKey) }}</dd></div>
           </dl>
           <section class="block kpiBlock">
-            <h2>Team KPI</h2>
+            <h2>{{ teamLabel }} Team KPI</h2>
             <table class="kpiTable">
               <thead><tr><th scope="col">Metric</th><th v-for="column in columns" :key="column.key" scope="col">{{ column.label }}</th></tr></thead>
               <tbody>
@@ -195,7 +200,7 @@ onBeforeUnmount(() => {
           </section>
         </div>
         <section v-if="pitchPlayers.length" class="formation">
-          <h2>Formation <span>{{ formationLabel(report.formationKey) }}</span></h2>
+          <h2>{{ teamLabel }} Formation <span>{{ formationLabel(report.formationKey) }}</span></h2>
           <div class="pitch" role="img" :aria-label="`${report.team.nameEn || report.team.name} starting XI ${formationLabel(report.formationKey)}`">
             <i class="line half" /><i class="line circle" /><i class="line box top" /><i class="line box bottom" />
             <div v-for="player in pitchPlayers" :key="player.slot" class="pitchPlayer" :style="{ left: `${player.left}%`, top: `${player.top}%` }">
@@ -221,7 +226,7 @@ onBeforeUnmount(() => {
               <tr v-for="(card, index) in report.cards" :key="index">
                 <td>{{ timeLabel(card.time) }}</td>
                 <td>{{ playerLabel(card) }}</td>
-                <td><span class="cardChip" :class="card.card">{{ card.card === 'R' ? 'Red' : 'Yellow' }}</span></td>
+                <td><span class="cardChip" :class="card.card"><i aria-hidden="true" />{{ card.card === 'R' ? 'Red' : 'Yellow' }}</span></td>
               </tr>
             </tbody>
           </table>
@@ -235,8 +240,8 @@ onBeforeUnmount(() => {
             <tbody>
               <tr v-for="(sub, index) in report.substitutions" :key="index">
                 <td>{{ timeLabel(sub.time) }}</td>
-                <td class="out">{{ playerLabel(sub.out) }}</td>
-                <td class="in">{{ playerLabel(sub.in) }}</td>
+                <td class="out"><i aria-hidden="true">▼</i>{{ playerLabel(sub.out) }}</td>
+                <td class="in"><i aria-hidden="true">▲</i>{{ playerLabel(sub.in) }}</td>
               </tr>
             </tbody>
           </table>
@@ -267,12 +272,13 @@ onBeforeUnmount(() => {
 .scoreboard { display: grid; grid-template-columns: minmax(0, 1fr) 210px minmax(0, 1fr); align-items: center; gap: 16px; padding: 18px 0; border-bottom: 1px solid #d7dde4; }
 .club { display: flex; align-items: center; gap: 12px; min-width: 0; color: #5b6878; }
 .club.home { justify-content: flex-end; text-align: right; }
-.club img { width: 48px; height: 48px; flex: none; object-fit: contain; }
+.club img { width: 48px; height: 48px; flex: none; object-fit: contain; filter: grayscale(1); }
 .crestEmpty { width: 44px; height: 44px; flex: none; margin: 2px; box-sizing: border-box; border: 2px solid #c9d1d9; border-radius: 50%; background: #f3f6f8; }
 .clubText { display: grid; gap: 3px; min-width: 0; }
 .clubText b { overflow: hidden; font-size: 17px; text-overflow: ellipsis; white-space: nowrap; }
 .clubText small { color: #8a95a2; font-size: 10px; font-weight: 800; letter-spacing: .08em; }
-.club.mine b { color: #0b6b80; }
+.club b { color: #6b7684; font-weight: 650; }
+.club.mine b { color: #111; font-weight: 850; }
 .result { display: grid; justify-items: center; gap: 3px; text-align: center; }
 .result strong { display: flex; align-items: center; gap: 12px; font-size: 34px; line-height: 1.1; font-variant-numeric: tabular-nums; }
 .result i { color: #9aa5b1; font-size: 26px; font-style: normal; }
@@ -288,20 +294,20 @@ onBeforeUnmount(() => {
 .factList .completedRow { padding-top: 0; }
 .formation h2 { display: flex; align-items: baseline; gap: 6px; margin: 8px 0; color: #5b6878; font-size: 12px; }
 .formation h2 span { color: #1b2430; font-size: 14px; }
-.pitch { position: relative; height: 380px; border: 1.5px solid #9fc3a9; border-radius: 4px; background: #eef6f0; overflow: hidden; }
-.pitch .line { position: absolute; border: 1.5px solid #c3dbc9; }
+.pitch { position: relative; height: 380px; border: 1.5px solid #8a939d; border-radius: 4px; background: #fff; overflow: hidden; }
+.pitch .line { position: absolute; border: 1.5px solid #c8cdd2; }
 .pitch .half { left: 0; right: 0; top: 50%; height: 0; border-width: 1.5px 0 0; }
 .pitch .circle { top: 50%; left: 50%; width: 64px; height: 64px; border-radius: 50%; transform: translate(-50%, -50%); }
 .pitch .box { left: 22%; right: 22%; height: 13%; }
 .pitch .box.top { top: -1.5px; }
 .pitch .box.bottom { bottom: -1.5px; }
 .pitchPlayer { position: absolute; display: grid; justify-items: center; gap: 1px; width: 66px; transform: translate(-50%, -50%); text-align: center; }
-.pitchPlayer b { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: #0b6b80; color: #fff; font-size: 11px; font-variant-numeric: tabular-nums; }
+.pitchPlayer b { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: #1b2430; color: #fff; font-size: 11px; font-variant-numeric: tabular-nums; }
 .bench { margin-top: 8px; }
 .bench h3 { margin: 0 0 4px; color: #5b6878; font-size: 12px; }
 .bench ul { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px 10px; margin: 0; padding: 0; list-style: none; }
 .bench li { display: flex; align-items: baseline; gap: 5px; min-width: 0; overflow: hidden; font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-.bench li b { flex: none; min-width: 16px; color: #0b6b80; font-size: 10.5px; text-align: right; font-variant-numeric: tabular-nums; }
+.bench li b { flex: none; min-width: 16px; color: #1b2430; font-size: 10.5px; text-align: right; font-variant-numeric: tabular-nums; }
 .pitchPlayer span { display: -webkit-box; max-width: 100%; overflow: hidden; color: #1b2430; font-size: 10px; font-weight: 750; line-height: 1.2; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
 .recorderGroup { display: inline-block; margin: 0 16px 4px 0; }
 .recorderGroup em { margin-right: 6px; padding: 1px 6px; border-radius: 3px; background: #e8eef3; color: #3d4a59; font-size: 11px; font-style: normal; font-weight: 800; }
@@ -317,11 +323,14 @@ thead th { border-bottom: 1.5px solid #1b2430; color: #3d4a59; font-size: 12px; 
 .kpiTable th, .kpiTable td { padding: 5px 6px; }
 .eventGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 12px; }
 .eventTable td:first-child { white-space: nowrap; color: #5b6878; }
-.eventTable .out { color: #a33a2b; }
-.eventTable .in { color: #1d7a3c; }
-.cardChip { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 11px; font-weight: 800; }
-.cardChip.Y { background: #f5d23c; color: #3a3000; }
-.cardChip.R { background: #d93a2b; color: #fff; }
+.eventTable .out, .eventTable .in { color: #1b2430; }
+.eventTable .out i, .eventTable .in i { display: inline-block; width: 14px; font-size: 9px; font-style: normal; }
+.eventTable .out i { color: #6b7684; }
+.eventTable .in i { color: #111; }
+/* Card colour is carried by fill, not hue: yellow = outlined card, red = solid black card. */
+.cardChip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 750; }
+.cardChip i { display: inline-block; width: 9px; height: 12px; box-sizing: border-box; border: 1.5px solid #1b2430; border-radius: 1.5px; background: #fff; }
+.cardChip.R i { background: #1b2430; }
 .none { margin: 0; padding: 10px 0; color: #8a95a2; }
 
 @media print {

@@ -2551,6 +2551,9 @@ class JpdDidData:
         date_to: str | None = None,
         level: Literal["basic", "advanced"] | None = None,
         lifecycle: str | None = None,
+        round_from: int | None = None,
+        round_to: int | None = None,
+        league: str | None = None,
     ) -> dict[str, Any]:
         """Aggregate analyst work from collaborative Drafts."""
         def normalized_date(value: Any) -> str:
@@ -2604,11 +2607,32 @@ class JpdDidData:
 
         sessions: list[dict[str, Any]] = []
         record_sources = []
+        # Rounds offered by the round filter: everything that passes the other
+        # filters, collected before the round filter itself is applied.
+        available_rounds: set[int] = set()
+        # League options are collected before the league/round filters so the
+        # menu keeps listing every league while one is selected.
+        league_counts: dict[str, int] = {}
         for reference, gm_id, side, updated_at, payload, shared, status, participant_rows in drafts:
             match = matches.get(gm_id, {})
             match_snapshot = payload.get("matchSnapshot") if isinstance(payload.get("matchSnapshot"), dict) else {}
             match_date = normalized_date(match.get("date") or match_snapshot.get("date"))
             if (from_key and (not match_date or match_date < from_key)) or (to_key and (not match_date or match_date > to_key)):
+                continue
+
+            league_id = str(match.get("leagueId") or match_snapshot.get("leagueId") or "")
+            if league_id:
+                league_counts[league_id] = league_counts.get(league_id, 0) + 1
+            if league and league_id != league:
+                continue
+
+            raw_round = match.get("round") if match.get("round") is not None else match_snapshot.get("round")
+            round_no = as_int(raw_round, 0) or None
+            if round_no:
+                available_rounds.add(round_no)
+            if (round_from or round_to) and (
+                not round_no or (round_from and round_no < round_from) or (round_to and round_no > round_to)
+            ):
                 continue
 
             home_id = str(match.get("homeTeamId") or "")
@@ -2623,8 +2647,8 @@ class JpdDidData:
                 "status": status,
                 "teamId": team_id,
                 "opponentId": opponent_id,
-                "leagueId": str(match.get("leagueId") or match_snapshot.get("leagueId") or "-"),
-                "round": match.get("round") if match.get("round") is not None else match_snapshot.get("round"),
+                "leagueId": league_id or "-",
+                "round": raw_round,
                 "score": {"home": as_int(score_source.get("homeScore", match_score.get("home", 0))), "away": as_int(score_source.get("awayScore", match_score.get("away", 0)))},
                 "updatedAt": timestamp_value(updated_at),
                 "participants": participant_rows,
@@ -2698,10 +2722,11 @@ class JpdDidData:
                     "uid": uid,
                     "name": str(profile.get("name") or profile.get("displayName") or participant["name"]),
                     "level": "basic" if profile.get("level") == "basic" else participant["level"],
-                    "matchIds": set(), "teamInputs": 0, "primaryCount": 0, "assistantCount": 0,
+                    "matchSides": {}, "teamInputs": 0, "primaryCount": 0, "assistantCount": 0,
                     "dapTotal": 0, "teams": {}, "recentInputs": [], "latestAt": None,
                 })
-                analyst["matchIds"].add(session["gmId"])
+                # 경기 = 한 경기의 홈·원정 양 팀을 모두 입력한 경우만 1경기로 센다.
+                analyst["matchSides"].setdefault(session["gmId"], set()).add(session["side"])
                 analyst["teamInputs"] += 1
                 analyst["primaryCount"] += int(participant["role"] == "primary")
                 analyst["assistantCount"] += int(participant["role"] == "assistant")
@@ -2727,24 +2752,51 @@ class JpdDidData:
                 key=lambda item: (item["dap"], item["date"], item["updatedAt"] or ""),
                 default=None,
             )
+            # Lowest DAP: prefer finished inputs, since a live match is still
+            # accumulating records and would always look like the worst one.
+            low_candidates = [item for item in analyst["recentInputs"] if item["status"] == "final"]                 or [item for item in analyst["recentInputs"] if item["recordCount"] > 0]
+            low_dap_input = min(
+                low_candidates,
+                key=lambda item: (item["dap"], item["date"], item["updatedAt"] or ""),
+                default=None,
+            )
+            if low_dap_input is top_dap_input:
+                low_dap_input = None
             rows.append({
                 "uid": analyst["uid"], "name": analyst["name"], "level": analyst["level"],
-                "matches": len(analyst["matchIds"]), "teamInputs": analyst["teamInputs"],
+                "matches": sum(1 for sides in analyst["matchSides"].values() if len(sides) >= 2), "teamInputs": analyst["teamInputs"],
                 "primaryCount": analyst["primaryCount"], "assistantCount": analyst["assistantCount"],
                 "dapTotal": analyst["dapTotal"], "latestAt": analyst["latestAt"],
                 "teams": sorted(analyst["teams"].values(), key=lambda item: (-item["count"], item["teamName"])),
                 "topDapInput": top_dap_input,
+                "lowDapInput": low_dap_input,
                 "recentInputs": recent[:8],
             })
         rows.sort(key=lambda item: (-item["dapTotal"], -item["matches"], item["name"]))
+        league_docs = self.get_documents_by_ids("leagues", set(league_counts)) if league_counts else {}
+        league_options = sorted(
+            (
+                {"id": league_id, "name": str((league_docs.get(league_id) or {}).get("name") or (league_docs.get(league_id) or {}).get("nameEn") or league_id), "count": count}
+                for league_id, count in league_counts.items()
+            ),
+            key=lambda item: (-item["count"], item["name"]),
+        )
+        # 경기 = 홈·원정 양 팀이 모두 입력된 경기. 한 팀만 입력된 경기는 따로 센다.
+        match_sides: dict[str, set[str]] = {}
+        for session in sessions:
+            match_sides.setdefault(session["gmId"], set()).add(session["side"])
+        complete_matches = sum(1 for sides in match_sides.values() if len(sides) >= 2)
         return {
             "summary": {
                 "analystCount": len(rows),
-                "matchCount": len({session["gmId"] for session in sessions}),
+                "matchCount": complete_matches,
+                "partialMatchCount": len(match_sides) - complete_matches,
                 "teamInputCount": len(sessions),
                 "dapTotal": sum(session["dap"] for session in sessions),
             },
             "analysts": rows,
+            "rounds": sorted(available_rounds, reverse=True),
+            "leagues": league_options,
             "generatedAt": utc_now().isoformat(),
         }
 

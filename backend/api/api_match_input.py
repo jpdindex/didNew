@@ -1112,10 +1112,14 @@ def read_analyst_dashboard(
     date_to: str | None = Query(default=None, max_length=20),
     level: Literal["basic", "advanced"] | None = Query(default=None),
     lifecycle: Literal["ready", "H1", "H1_done", "H2", "H2_done", "final"] | None = Query(default=None),
+    round_from: int | None = Query(default=None, ge=1, le=99),
+    round_to: int | None = Query(default=None, ge=1, le=99),
+    league: str | None = Query(default=None, max_length=64),
     _: RequiredUser = None,
 ) -> dict:
     return JpdDidData().build_analyst_dashboard(
         date_from=date_from, date_to=date_to, level=level, lifecycle=lifecycle,
+        round_from=round_from, round_to=round_to, league=league,
     )
 
 

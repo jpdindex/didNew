@@ -13,6 +13,8 @@ from backend.system.system_schema import LineupEntry, Side
 HALF_OFFSETS = {"H1": 0, "H2": 45 * 60, "H3": 90 * 60, "H4": 105 * 60}
 RANK_ORDER = {"main": 0, "sub": 1, "manager": 2}
 report_reads = ThreadPoolExecutor(max_workers=4, thread_name_prefix="match-report")
+# Small reference lookups run beside the RAW reads above, so they get their own pool.
+lookup_reads = ThreadPoolExecutor(max_workers=8, thread_name_prefix="match-report-lookup")
 
 
 def _round_key(match: dict[str, Any]) -> str:
@@ -127,7 +129,13 @@ class MatchReports:
             "recorders": {*recording.recorders, *legacy_ids},
             "players": unnamed - {"OWN"},
         }
-        docs = {name: self.did.get_documents_by_ids(name, ids) for name, ids in lookups.items()}
+        futures = {name: lookup_reads.submit(self.did.get_documents_by_ids, name, ids) for name, ids in lookups.items()}
+        # Legacy lineups carry no shirt numbers or positions; the team's contracts on the
+        # match date supply both (one collection-group query, same rule as the input screen).
+        contracts_future = (lookup_reads.submit(self._team_contracts, team_id, match.date)
+                            if recording.legacyGiId is not None else None)
+        docs = {name: future.result() for name, future in futures.items()}
+        contracts = contracts_future.result() if contracts_future else {}
 
         def recorder_name(uid: str, stored: str | None = None) -> str:
             profile = docs["recorders"].get(uid, {})
@@ -146,10 +154,11 @@ class MatchReports:
                 return {"name": "Own goal", "no": "", "pos": ""}
             entry = lineup.get(player_id or "")
             master = docs["players"].get(player_id or "", {})
+            contract = contracts.get(player_id or "", {})
             return {
                 "name": (entry.name if entry else "") or master.get("name") or master.get("nameEn") or player_id or "-",
-                "no": (entry.no if entry else "") or "",
-                "pos": (entry.pos if entry else "") or "",
+                "no": (entry.no if entry else "") or str(contract.get("no") or ""),
+                "pos": (entry.pos if entry else "") or str(contract.get("pos") or "") or master.get("currentPos") or "",
             }
 
         cards = sorted(
@@ -186,7 +195,8 @@ class MatchReports:
 
         pairs = self._substitution_pairs(lineup)
         # Legacy SQL lineups have no field positions, so only new DID input gets a pitch.
-        starting_eleven = None if recording.legacyGiId is not None else self._starting_eleven(lineup, pairs, player)
+        starting_eleven = (self._legacy_starting_eleven(lineup, player, team_id) if recording.legacyGiId is not None
+                           else self._starting_eleven(lineup, pairs, player))
         league = docs["leagues"].get(match.leagueId, {})
         season = docs["seasons"].get(match.seasonId, {})
         return {
@@ -261,6 +271,47 @@ class MatchReports:
             out_time = out_times.get(player_id)
             starters.append({"id": player_id, "slot": entry.slot, **player(player_id), "out": out_time["clock"] if out_time else None})
         return starters
+
+    def _team_contracts(self, team_id: str, match_date: str) -> dict[str, dict[str, Any]]:
+        """Each player's contract with this team covering the match date (latest start wins)."""
+        query = self.db.collection_group("contracts").where(filter=FieldFilter("teamId", "==", team_id))
+        result: dict[str, dict[str, Any]] = {}
+        for snapshot in query.stream(retry=None, timeout=30):
+            contract = snapshot.to_dict() or {}
+            parent = snapshot.reference.parent.parent
+            if parent is None or not self.did._contract_covers_match_date(contract, match_date):
+                continue
+            previous = result.get(parent.id)
+            if previous is None or str(contract.get("from") or "") > str(previous.get("from") or ""):
+                result[parent.id] = contract
+        return result
+
+    def _contract_positions(self, player_id: str, team_id: str) -> set[str]:
+        """Positions from a player's contracts, preferring the ones with this team."""
+        contracts = [snapshot.to_dict() or {} for snapshot in
+                     self.db.collection("players").document(player_id).collection("contracts").stream(retry=None, timeout=10)]
+        own = [row for row in contracts if row.get("teamId") == team_id] or contracts
+        return {str(row.get("pos") or "").upper() for row in own}
+
+    def _legacy_starting_eleven(self, lineup: dict[str, LineupEntry], player, team_id: str) -> list[dict[str, Any]]:
+        """SQL lineups have no field slots: the GK comes from the player's position and the
+        outfield START order is the formation reading order (same rule as the input screen).
+        The page maps "order:N" to the N-th outfield slot of the formation."""
+        starters = [(player_id, entry, player(player_id)) for player_id, entry in lineup.items() if entry.type == "START"]
+        keepers = [item for item in starters if item[2]["pos"].upper() in {"GK", "G", "GOALKEEPER"}]
+        if not keepers:
+            # Retired/transferred players have no currentPos. The GK shares order 1 with the
+            # first outfield player, so only those two need their contract history checked.
+            candidates = [item for item in starters if item[1].order == 1]
+            keepers = [item for item in candidates if "GK" in self._contract_positions(item[0], team_id)]
+        if len(starters) != 11 or len(keepers) != 1:
+            return []
+        keeper_id = keepers[0][0]
+        outfield = sorted((item for item in starters if item[0] != keeper_id), key=lambda item: (item[1].order, item[0]))
+        rows = [{"id": keeper_id, "slot": "gk", **keepers[0][2], "out": None}]
+        rows += [{"id": player_id, "slot": f"order:{index}", **info, "out": None}
+                 for index, (player_id, _, info) in enumerate(outfield)]
+        return rows
 
     @staticmethod
     def _bench(lineup: dict[str, LineupEntry], starters: list[dict[str, Any]], player) -> list[dict[str, Any]]:
