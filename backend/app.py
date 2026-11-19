@@ -82,7 +82,9 @@ async def request_validation_error_handler(request: Request, exc: RequestValidat
     # browser snapshot cannot silently stall both analysts' collaboration.
     # Pydantic validators put ValueError instances in ctx, which cannot be
     # serialized by JSONResponse. Retain field locations and messages only.
-    errors = [{key: value for key, value in error.items() if key != 'ctx'} for error in exc.errors()]
+    # Validation inputs can contain raw passwords even when the schema uses
+    # SecretStr. Never echo them to a response or persist them in server logs.
+    errors = [{key: value for key, value in error.items() if key not in {'ctx', 'input'}} for error in exc.errors()]
     logger.warning("Request validation failed: %s %s errors=%s", request.method, request.url.path, errors)
     return JSONResponse(
         status_code=422,

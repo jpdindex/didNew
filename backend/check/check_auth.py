@@ -12,23 +12,77 @@ from backend.api.api_aifootballx import Operator
 from backend.system import system_firestore as firestore
 
 
-def test_short_login_resolves_new_accounts_and_rejects_duplicate_ids(monkeypatch):
+def test_short_login_uses_explicit_uid_mapping_and_current_email(monkeypatch):
     from backend.api import api_login
+    from unittest.mock import Mock
 
-    accounts = [SimpleNamespace(email='local@jpd-did.internal', uid='local')]
-    clock = [100]
-    monkeypatch.setattr(api_login, '_directory_expires', 0)
-    monkeypatch.setattr(api_login, '_accounts_by_id', {})
-    monkeypatch.setattr(api_login, 'monotonic', lambda: clock[0])
-    monkeypatch.setattr(api_login.auth, 'list_users', lambda **_: SimpleNamespace(iterate_all=lambda: iter(accounts)))
+    db = Mock()
+    reference = db.collection.return_value.document.return_value
+    reference.get.return_value.to_dict.return_value = {'uid': 'real-account'}
+    monkeypatch.setattr(api_login, 'get_firestore_client', lambda: db)
+    account = SimpleNamespace(uid='real-account', email='actual@example.com', disabled=False)
+    lookup = Mock(return_value=account)
+    monkeypatch.setattr(api_login.auth, 'get_user', lookup)
+    app = object()
+    assert api_login._find_account('김태호', app) == ('real-account', 'actual@example.com')
+    db.collection.assert_called_with('loginIds')
+    db.collection.return_value.document.assert_called_with('김태호')
+    lookup.assert_called_with('real-account', app=app)
+    account.email = 'changed@example.com'
+    assert api_login._find_account('김태호', app)[1] == 'changed@example.com'
+    account.disabled = True
+    assert api_login._find_account('김태호', app) is None
+    reference.get.return_value.to_dict.return_value = {}
+    assert api_login._find_account('unregistered-email-prefix', app) is None
+    lookup.reset_mock()
+    for invalid in ('', '../other', '.', '..', 'actual@example.com'):
+        assert api_login._find_account(invalid, app) is None
+    lookup.assert_not_called()
 
-    assert api_login._find_account('Local', object()) == ('local', 'local@jpd-did.internal')
-    accounts.append(SimpleNamespace(email='new@company.example', uid='new'))
-    clock[0] += 16
-    assert api_login._find_account('new', object()) == ('new', 'new@company.example')
-    accounts.append(SimpleNamespace(email='new@gmail.com', uid='duplicate'))
-    clock[0] += 16
-    assert api_login._find_account('new', object()) is None
+
+def test_recorder_profile_uses_registered_name_for_email_login(monkeypatch):
+    from backend.api import api_match_input
+    from unittest.mock import Mock
+
+    data = Mock()
+    data.ensure_recorder_profile.return_value = {'name': '김태호', 'level': 'advanced'}
+    monkeypatch.setattr(api_match_input, 'JpdDidData', lambda: data)
+    monkeypatch.setattr(api_match_input, 'registered_login_name', lambda uid: '김태호')
+    user = firestore.CurrentUser(uid='real-account', claims={'email': 'actual@example.com'})
+    result = api_match_input.ensure_recorder_profile(api_match_input.RecorderProfileRequest(name='actual@example.com'), user)
+    assert result['name'] == '김태호'
+    data.ensure_recorder_profile.assert_called_once_with('real-account', name='김태호')
+
+
+def test_recorder_profile_without_alias_keeps_email_login(monkeypatch):
+    from backend.api import api_match_input
+    from unittest.mock import Mock
+
+    data = Mock()
+    data.ensure_recorder_profile.return_value = {'name': 'actual@example.com', 'level': 'basic'}
+    monkeypatch.setattr(api_match_input, 'JpdDidData', lambda: data)
+    monkeypatch.setattr(api_match_input, 'registered_login_name', lambda uid: None)
+    user = firestore.CurrentUser(uid='real-account', claims={'email': 'actual@example.com'})
+    api_match_input.ensure_recorder_profile(api_match_input.RecorderProfileRequest(name='untrusted-name'), user)
+    data.ensure_recorder_profile.assert_called_once_with('real-account', name='actual@example.com')
+
+
+def test_invalid_login_does_not_echo_or_log_password(caplog):
+    from backend.app import app
+
+    password = 'DO-NOT-LOG-THIS-' * 300
+
+    async def check():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            result = await client.post('/api/v1/auth/short-login', json={
+                'loginId': 'Analyst', 'password': password, 'apiKey': 'test-key',
+            })
+            assert result.status_code == 422
+            assert password not in result.text
+            assert 'input' not in str(result.json())
+
+    asyncio.run(check())
+    assert password not in caplog.text
 
 
 @pytest.mark.parametrize('result,claims,accepted', [

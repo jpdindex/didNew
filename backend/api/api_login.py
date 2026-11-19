@@ -1,18 +1,14 @@
-from threading import Lock
-from time import monotonic
-
 import httpx
 from fastapi import APIRouter, Response
 from firebase_admin import auth, exceptions
 from pydantic import BaseModel, Field, SecretStr
+from google.api_core.exceptions import GoogleAPICallError
+from google.cloud.firestore_v1.base_query import FieldFilter
 
-from backend.system.system_firestore import BackendError, ensure_firebase_app
+from backend.system.system_firestore import BackendError, ensure_firebase_app, get_firestore_client
 
 
 router = APIRouter(prefix='/auth', include_in_schema=False)
-_directory_lock = Lock()
-_directory_expires = 0.0
-_accounts_by_id: dict[str, tuple[str, str] | None] = {}
 
 
 class ShortLoginRequest(BaseModel):
@@ -22,23 +18,31 @@ class ShortLoginRequest(BaseModel):
 
 
 def _find_account(login_id: str, firebase_app) -> tuple[str, str] | None:
-    global _directory_expires, _accounts_by_id
-    with _directory_lock:
-        if monotonic() >= _directory_expires:
-            accounts: dict[str, tuple[str, str] | None] = {}
-            for user in auth.list_users(app=firebase_app).iterate_all():
-                if user.email:
-                    alias = user.email.split('@', 1)[0].casefold()
-                    accounts[alias] = None if alias in accounts else (user.uid, user.email)
-            _accounts_by_id = accounts
-            _directory_expires = monotonic() + 15
-        return _accounts_by_id.get(login_id.casefold())
+    # Only explicitly registered aliases are accepted. Email prefixes must not
+    # silently become a second login identity or collide with somebody's name.
+    if not login_id or '/' in login_id or '@' in login_id or login_id in {'.', '..'}:
+        return None
+    snapshot = get_firestore_client().collection('loginIds').document(login_id).get(retry=None, timeout=10)
+    uid = (snapshot.to_dict() or {}).get('uid')
+    if not isinstance(uid, str) or not uid:
+        return None
+    user = auth.get_user(uid, app=firebase_app)
+    return (user.uid, user.email) if user.email and not user.disabled else None
+
+
+def registered_login_name(uid: str) -> str | None:
+    aliases = list(get_firestore_client().collection('loginIds').where(
+        filter=FieldFilter('uid', '==', uid),
+    ).limit(2).stream(retry=None, timeout=10))
+    # Enforce one canonical display name per account; ambiguous configuration
+    # must not randomly rename a recorder on each login.
+    return aliases[0].id if len(aliases) == 1 else None
 
 
 @router.post('/short-login')
 def short_login(request: ShortLoginRequest, response: Response) -> dict[str, str]:
     firebase_app = ensure_firebase_app()
-    invalid_credentials = BackendError('아이디 또는 비밀번호를 확인해 주세요. 같은 아이디가 있으면 이메일 전체를 입력해 주세요.', 401, 'invalid_login')
+    invalid_credentials = BackendError('아이디 또는 비밀번호를 확인해 주세요.', 401, 'invalid_login')
     try:
         account = _find_account(request.loginId.strip(), firebase_app)
         if account is None:
@@ -68,7 +72,7 @@ def short_login(request: ShortLoginRequest, response: Response) -> dict[str, str
         token = auth.create_custom_token(uid, app=firebase_app).decode('ascii')
     except (auth.InvalidIdTokenError, auth.UserDisabledError, auth.UserNotFoundError) as error:
         raise invalid_credentials from error
-    except (httpx.HTTPError, exceptions.FirebaseError, ValueError) as error:
+    except (httpx.HTTPError, exceptions.FirebaseError, GoogleAPICallError, ValueError) as error:
         raise BackendError('로그인 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.', 503, 'login_unavailable') from error
 
     response.headers['Cache-Control'] = 'no-store'

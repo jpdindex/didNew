@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 from starlette.websockets import WebSocketState
 
 from backend.api.api_player_requests import ManagerUser, manager_user
+from backend.api.api_login import registered_login_name
 from backend.system.system_firestore import BackendError, CurrentUser, JpdDidData, NotFoundError, RequiredUser, ensure_firebase_app, get_settings, utc_now
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
 from backend.system.system_schema import Half, InputMode, Side, MatchDoc
@@ -1312,7 +1313,8 @@ def get_recorder_profile(user: RequiredUser = None) -> dict:
 
 @router.post("/match-input/recorder-profile", include_in_schema=False)
 def ensure_recorder_profile(request: RecorderProfileRequest, user: RequiredUser = None) -> dict:
-    profile = JpdDidData().ensure_recorder_profile(user.uid, name=request.name)
+    name = registered_login_name(user.uid) or user.claims.get('name') or user.claims.get('email') or request.name
+    profile = JpdDidData().ensure_recorder_profile(user.uid, name=name)
     return {"status": "ok", "name": profile.get("name") or user.uid, "level": "advanced" if profile.get("level") == "advanced" else "basic"}
 
 

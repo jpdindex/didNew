@@ -2307,7 +2307,7 @@ class JpdDidData:
 
         participants[user_id] = {
             "role": role,
-            "name": display_name or user_id,
+            "name": profile.get("name") or display_name or user_id,
             "level": recorder_level,
             "joinedAt": participants.get(user_id, {}).get("joinedAt", now),
             "lastSeenAt": now,

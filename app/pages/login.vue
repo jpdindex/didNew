@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
+import type { User } from 'firebase/auth'
 import {
   browserLocalPersistence,
   browserSessionPersistence,
   setPersistence,
   signInWithCustomToken,
-  signInWithEmailAndPassword
+  signInWithEmailAndPassword,
+  updateProfile
 } from 'firebase/auth'
 
 const SAVED_ID_KEY = 'did_saved_id'
@@ -74,22 +76,24 @@ async function login() {
   try {
     // 자동로그인 체크: 브라우저를 닫아도 세션 유지. 해제 시: 탭 닫으면 로그아웃.
     await setPersistence($auth, autoLogin.value ? browserLocalPersistence : browserSessionPersistence)
-    let name = id
+    let user: User
     if (id.includes('@')) {
-      await signInWithEmailAndPassword($auth, id, uPw.value)
+      ;({ user } = await signInWithEmailAndPassword($auth, id, uPw.value))
     } else {
       const { token } = await request<{ token: string }>('/api/v1/auth/short-login', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ loginId: id, password: uPw.value, apiKey: $auth.config.apiKey }),
       })
-      const { user } = await signInWithCustomToken($auth, token)
-      if (user.email && !user.email.endsWith('@jpd-did.internal')) name = user.email
+      ;({ user } = await signInWithCustomToken($auth, token))
     }
     // Firestore profile creation is backend-owned; the browser holds Auth only.
-    await request('/api/v1/match-input/recorder-profile', {
+    const profile = await request<{ name: string }>('/api/v1/match-input/recorder-profile', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name: user.displayName || user.email || id }),
     })
+    if (profile.name && user.displayName !== profile.name) {
+      await updateProfile(user, { displayName: profile.name })
+    }
 
     if (saveId.value) {
       localStorage.setItem(SAVED_ID_KEY, id)
