@@ -850,6 +850,63 @@ const tableExpanded = ref(false)
 // 템플릿에 긴 문자열 리터럴을 직접 두면 에디터 자동 포맷터가 줄바꿈을 문자열 안에 넣어
 // 컴파일 에러를 내는 일이 반복돼서, 라벨을 computed로 빼 템플릿에는 짧은 표현식만 남긴다.
 const tableToggleLabel = computed(() => tableExpanded.value ? '▼ 기록 접기' : '▲ 기록 더보기')
+
+// 외부 노출용 코드 보기. 경기 시각을 두 번 빠르게 터치하면 기록표가 원본 데이터 표 + JSON 로그로 바뀐다.
+// 표시만 바꾸므로 입력·저장 로직에는 영향이 없다. 원래 기록표는 숨겨둔 채 그대로 유지한다.
+const codeView = ref(false)
+const codeTableEl = ref<HTMLElement | null>(null)
+const codeLogEl = ref<HTMLElement | null>(null)
+const DOUBLE_TAP_MS = 350
+let lastClockTapAt = 0
+function onClockTap(e: PointerEvent) {
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  const now = Date.now()
+  if (now - lastClockTapAt < DOUBLE_TAP_MS) {
+    lastClockTapAt = 0
+    codeView.value = !codeView.value
+  } else {
+    lastClockTapAt = now
+  }
+}
+function fmtPos(v?: number) {
+  return typeof v === 'number' ? `${v.toFixed(2)}%` : ''
+}
+const codeRows = computed(() => visibleRecords.value.map(r => ({
+  id: r.id,
+  // 선수 입력 대상(DAP)인데 아직 선수를 고르지 않은 기록. 원래 표의 Select 버튼 자리.
+  playerPending: !r.playerId && (analysis.value.flags.get(r.id)?.isDap ?? false),
+  time: `${r.half ?? 'H1'} ${formatMatchClock(r.seconds, r.half ?? 'H1')}`,
+  act: r.act,
+  res: r.res,
+  area: String(r.area),
+  posX: fmtPos(r.posX),
+  posY: fmtPos(r.posY),
+  player: r.playerId ?? '',
+})))
+// 로그는 최근 기록만 보여준다(오래된 줄은 화면 밖이라 그릴 필요가 없다).
+const CODE_LOG_LIMIT = 40
+const codeLogLines = computed(() => visibleRecords.value.slice(-CODE_LOG_LIMIT).map(r => {
+  const half = r.half ?? 'H1'
+  const raw: Record<string, unknown> = {
+    id: r.id, half, seconds: r.seconds, act: r.act, res: r.res, area: r.area,
+  }
+  if (typeof r.posX === 'number') raw.posX = Number(r.posX.toFixed(4))
+  if (typeof r.posY === 'number') raw.posY = Number(r.posY.toFixed(4))
+  if (r.playerId) raw.playerId = r.playerId
+  else if (analysis.value.flags.get(r.id)?.isDap) raw.playerId = null
+  if (r.isShot) raw.isShot = true
+  if (r.isPk) raw.isPk = true
+  return { id: r.id, head: `${half} ${formatMatchClock(r.seconds, half)}`, json: JSON.stringify(raw) }
+}))
+function scrollCodeViewToBottom() {
+  nextTick(() => {
+    if (codeTableEl.value) codeTableEl.value.scrollTop = codeTableEl.value.scrollHeight
+    if (codeLogEl.value) codeLogEl.value.scrollTop = codeLogEl.value.scrollHeight
+  })
+}
+watch(codeView, on => { if (on) scrollCodeViewToBottom() })
+watch(() => visibleRecords.value.length, () => { if (codeView.value) scrollCodeViewToBottom() })
+
 const rangeMode = ref(false)
 const rangeStartId = ref<string | null>(null)
 const rangeEndId = ref<string | null>(null)
@@ -954,6 +1011,9 @@ const editPairedId = ref<string | null>(null)
 const editShootZone = ref<GoalZoneResult | null>(null)
 const editShootPos = ref<{ x: number; y: number } | null>(null)
 const editShootDspRange = ref<boolean | undefined>(undefined)
+// 슛 기록을 수정하다 액트를 바꾸면(S→P, S→H 등) 골대 좌표를 지운다. 적용할 때까지 골대를
+// 다시 찍지 않았으면 결과를 'O'(진행중)로 되돌리고 슛 좌표·슛 표시도 지운다.
+const editShootCleared = ref(false)
 /** rec 와 짝을 이루는 결과 레코드의 id 를 찾는다. 없으면 null. */
 function findPairedResultRecordId(rec: DidRecord): string | null {
   const idx = records.value.findIndex(r => r.id === rec.id)
@@ -1044,7 +1104,8 @@ function clickRecord(id: string) {
   }
   clearPendingEntry()
   lastInsertedId.value = null
-  peekId.value = peekId.value === id ? null : id
+  // 같은 기록을 다시 눌러도 보기를 끄지 않고 계속 그 기록을 보여준다.
+  peekId.value = id
   pinHistory(id)
   if (isEditMode && !peekId.value) anchorSeconds.value = null
 }
@@ -1079,6 +1140,7 @@ function openEdit(id: string) {
   editResClearable.value = !!rec.act && (rec.res === 'X' || rec.res === 'B')
   editOrigAct.value = rec.act
   editPairedId.value = editRes.value ? findPairedResultRecordId(rec) : null
+  editShootCleared.value = false
   // 골대 좌표가 없는 옛 기록도 결과(GB/GOAL/GX 등)만으로 골대 수정을 켠다.
   if (GOAL_ZONE_RESULTS.has(rec.res)) {
     editShootZone.value = rec.res as GoalZoneResult
@@ -1116,6 +1178,7 @@ const editPreview = computed(() => {
     act = ''
     res = editRes.value
   }
+  if (editShootCleared.value && !editShootZone.value && GOAL_ZONE_RESULTS.has(res)) res = 'O'
   const area = editPos.value ? areaFromPos(editPos.value) : String(rec.area)
   return { act, result: res, area }
 })
@@ -1132,6 +1195,15 @@ function applyEdit() {
       rec.shootPosY = outer.point.y
       rec.shootDspRange = isWithinGoalOneMeter(outer.point)
       rec.isShot = true
+    }
+    // 슛 기록의 액트를 바꾸고 골대를 다시 찍지 않았으면 골대 결과·좌표를 지우고 진행중('O')으로 둔다.
+    if (editShootCleared.value && !editShootZone.value && GOAL_ZONE_RESULTS.has(rec.res)) {
+      rec.res = 'O'
+      rec.isShot = SHOOT_KEYS.has(rec.act)
+      rec.shootPosX = undefined
+      rec.shootPosY = undefined
+      rec.shootDspRange = undefined
+      if (pendingShot.value?.id === rec.id) pendingShot.value = null
     }
     if (editPos.value) {
       rec.posX = editPos.value.x
@@ -2142,8 +2214,13 @@ const infoMarkerPos = computed(() => (
 ))
 const lastInputMarkerPos = computed(() => {
   const last = lastInputPos.value
-  if (!last || pendingPos.value || infoMarkerPos.value || !records.value.some(r => r.id === last.id)) return null
-  return { left: last.x + '%', top: last.y + '%' }
+  if (!last || pendingPos.value || infoMarkerPos.value) return null
+  const rec = records.value.find(r => r.id === last.id)
+  if (!rec) return null
+  // 그 기록을 수정해 위치가 바뀌었으면 입력 당시 좌표가 아니라 지금 저장된 좌표를 보여준다.
+  const x = rec.posX ?? last.x
+  const y = rec.posY ?? last.y
+  return { left: x + '%', top: y + '%' }
 })
 const infoCellRect = computed(() => {
   if (displayPos.value) return null // 정확한 좌표가 있으면 사각형 대신 점으로 보여준다
@@ -2304,6 +2381,16 @@ function clickAct(actKey: string, isShot: boolean) {
       return
     }
     editAct.value = actKey as Exclude<ActCode, ''>
+    // 슛 기록이면 액트가 바뀌는 순간 골대 좌표를 지운다 — 슛끼리(S→H) 바꿔도 다시 찍게 한다.
+    if (editShootZone.value || editShootCleared.value) {
+      editShootZone.value = null
+      editShootPos.value = null
+      editShootDspRange.value = undefined
+      editShootCleared.value = true
+      pendingFramePos.value = null
+      pendingOuterResult.value = null
+      pendingOuterScreenPos.value = null
+    }
     // X/B 로 바꾸려던 중에 액트를 다시 고르면 X/B 변환은 취소한다.
     if (editResConvertible.value || editActConvertible.value) editRes.value = null
     return
@@ -2804,7 +2891,7 @@ async function finishHalf() {
                   @pointercancel="stopTimeHold" @contextmenu.prevent>−</button>
                 <div class="halfLabel" :class="{ on: half === '전반', clickable: isEditMode }" @click="selectHalf('전반')">
                   전반</div>
-                <div class="clock" :class="{ paused }">{{ displayClock }}</div>
+                <div class="clock" :class="{ paused, codeOn: codeView }" @pointerup="onClockTap">{{ displayClock }}</div>
                 <div class="halfLabel" :class="{ on: half === '후반', clickable: isEditMode }" @click="selectHalf('후반')">
                   후반</div>
                 <button class="timeStep" :disabled="!isPrimary && !historyPinned && !editingId"
@@ -2848,7 +2935,23 @@ async function finishHalf() {
               @click="deleteRangeRecords">삭제</button><button class="rangeCancel" @click="cancelRangeEdit">취소</button>
           </div>
           <div v-if="!tableShown" class="tableLoading" :class="{ expanded: tableExpanded }">서버 응답 중…</div>
-          <div ref="tableEl" class="table" :class="{ expanded: tableExpanded, notShown: !tableShown }"
+          <div v-if="codeView && tableShown" class="codePanel" :class="{ expanded: tableExpanded }">
+            <div ref="codeTableEl" class="codeTable">
+              <div class="codeHead">
+                <span>TIME</span><span>ACT</span><span>RES</span><span>AREA</span><span>POS-X</span><span>POS-Y</span><span>PLAYER</span>
+              </div>
+              <div v-for="r in codeRows" :key="r.id" class="codeRow">
+                <span>{{ r.time }}</span><span>{{ r.act }}</span><span>{{ r.res }}</span><span>{{ r.area }}</span><span>{{ r.posX }}</span><span>{{ r.posY }}</span><span v-if="r.playerPending" class="codePending">null</span><span v-else>{{ r.player }}</span>
+              </div>
+            </div>
+            <div ref="codeLogEl" class="codeLog">
+              <div v-for="l in codeLogLines" :key="l.id" class="codeLogItem">
+                <div class="codeLogHead">• {{ l.head }} <b>insert</b> record</div>
+                <div class="codeLogJson">{{ l.json }}</div>
+              </div>
+            </div>
+          </div>
+          <div ref="tableEl" class="table" :class="{ expanded: tableExpanded, notShown: !tableShown || codeView }"
             @pointerdown.capture="closeOverlayPanelsOnOutsideTouch">
             <div class="thead">
               <span>No.</span><span>Time</span><span>Act</span><span>Result</span><span>Area</span><span>Player</span>
@@ -4012,6 +4115,112 @@ button {
 
 .clock.paused {
   color: rgba(255, 255, 255, .4)
+}
+
+/* 두 번 터치로 코드 보기를 켜고 끈다. 브라우저 더블탭 확대·글자 선택을 막는다. */
+.clock {
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none
+}
+
+/* 외부 노출용 코드 보기: 기록표 자리를 표 60% + JSON 로그 40%로 나눠 쓴다. */
+.codePanel {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 210px;
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  border-top: 1px solid rgba(255, 255, 255, .08);
+  background: #14161b;
+  font-family: ui-monospace, Consolas, monospace;
+  z-index: 1
+}
+
+.codePanel.expanded {
+  height: 380px
+}
+
+.codeTable {
+  overflow-y: auto;
+  padding-bottom: 10px;
+  border-right: 1px solid rgba(255, 255, 255, .1)
+}
+
+.codeHead,
+.codeRow {
+  display: grid;
+  grid-template-columns: 1.5fr .6fr .6fr .6fr 1.1fr 1.1fr 1.3fr;
+  gap: 2px;
+  padding: 0 6px
+}
+
+.codeHead span,
+.codeRow span {
+  min-width: 0;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap
+}
+
+.codeHead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #1f232b;
+  color: #3fd8c2;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  padding-top: 8px;
+  padding-bottom: 8px
+}
+
+.codeRow {
+  color: #e6e6e6;
+  font-size: 12px;
+  line-height: 30px;
+  border-bottom: 1px solid rgba(255, 255, 255, .05)
+}
+
+.codeRow span.codePending {
+  color: rgba(240, 180, 41, .55);
+  font-style: italic
+}
+
+.codeRow span:first-child {
+  color: #f0b429;
+  font-weight: 700
+}
+
+.codeLog {
+  overflow-y: auto;
+  padding: 6px 8px 10px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: #b9c2cc
+}
+
+.codeLogItem {
+  margin-bottom: 6px
+}
+
+.codeLogHead {
+  color: #7d8794
+}
+
+.codeLogHead b {
+  color: #c678dd;
+  font-weight: 600
+}
+
+.codeLogJson {
+  color: #98c379;
+  word-break: break-all
 }
 
 .clockCtrl {
