@@ -275,7 +275,7 @@ onBeforeUnmount(() => {
 .club img { width: 48px; height: 48px; flex: none; object-fit: contain; filter: grayscale(1); }
 .crestEmpty { width: 44px; height: 44px; flex: none; margin: 2px; box-sizing: border-box; border: 2px solid #c9d1d9; border-radius: 50%; background: #f3f6f8; }
 .clubText { display: grid; gap: 3px; min-width: 0; }
-.clubText b { overflow: hidden; font-size: 17px; text-overflow: ellipsis; white-space: nowrap; }
+.clubText b { font-size: 17px; line-height: 1.2; overflow-wrap: break-word; }
 .clubText small { color: #8a95a2; font-size: 10px; font-weight: 800; letter-spacing: .08em; }
 .club b { color: #6b7684; font-weight: 650; }
 .club.mine b { color: #111; font-weight: 850; }
