@@ -666,7 +666,8 @@ def build_preview(evidence: dict[str, Any], match_id: str, *, covers: Any, match
                                 and r['data']['leagueId'] == match['leagueId'] and r['data']['round'] == match['round']})
             if evidence.get('match_scan_truncated'):
                 raise ValueError('Fixture context truncated; cannot allocate Match')
-            position = round_ids.index(match_id) * 2 + (1 if side == 'H' else 2)
+            fixture_number = evidence.get('fixture_numbers', {}).get(match_id)
+            position = ((fixture_number - 1) * 2 if fixture_number is not None else round_ids.index(match_id) * 2) + (1 if side == 'H' else 2)
             existing_dmst = index.get('dMST', {}).get((season, match['round'], team_id), [])
             if len(existing_dmst) == 1:
                 position = existing_dmst[0]['data']['Match']
@@ -1261,6 +1262,8 @@ def build_aggregates(items: list[dict], code_rows: list[dict], slot_definitions:
                   'unplayed': 'non-final recordings excluded, never padded with a fabricated rating',
               }}
     result['summary'] = {'documents': 0, 'errors': 0, 'collections': {}}
+    if any(i.get('aggregateSource') == 'sql_upload' for i in items):
+        result['policies']['rating'] = 'DID saved JMX; explicit uploaded pMST gi_score for fallback fixtures; no inferred precision'
     final = [i for i in items if i['recording'].get('status') == 'final']
     seasons = {i['match']['seasonId'] for i in final}
     if len(seasons) != 1:
@@ -1830,6 +1833,10 @@ def validate_aggregate_links(generated, items, codes, slots, *, round_only=False
     # The existing fact checker is source-agnostic despite its historical name.
     facts['reference'] = 'DID fixture and stored KPI facts; no SQL or target-value oracle'
     facts['ratings'] = {'status': 'checked separately against DID saved JMX'}
+    mixed = any(i.get('aggregateSource') == 'sql_upload' for i in items)
+    if mixed:
+        facts['reference'] = 'DID facts plus validated existing-upload dMST/pMST facts; not independent SQL RAW validation'
+        facts['ratings'] = {'status': 'checked against each selected DID/upload source rating'}
     for failure in facts['failures']:
         if isinstance(failure, dict) and 'expected_sql' in failure:
             failure['expected_did'] = failure.pop('expected_sql')
@@ -1912,6 +1919,10 @@ def validate_aggregate_links(generated, items, codes, slots, *, round_only=False
     if not round_only and len(ratings) == len(final):
         for field in ('AI Rating', 'AVG'):
             check('sAVG', (season[2:4] + '/' + season[7:9],), field, truncate_rating(precise_mean(ratings)))
+    if mixed:
+        for check_result in checks:
+            if 'expected_did' in check_result:
+                check_result['expected_source'] = check_result.pop('expected_did')
     return {'passed': facts['passed'] and all(c['passed'] for c in checks), 'source_facts': facts,
             'rating_checks': checks, 'rating_checks_count': len(checks),
             'rating_checks_failed': sum(not c['passed'] for c in checks)}
@@ -1938,9 +1949,19 @@ def delivery_mode(scope):
     # Keep old stored job scopes readable; only the three new modes have HTTP routes.
     if mode not in ('matches', 'masters', 'aggregates', 'all', 'latest', 'default'):
         fail('Unknown delivery mode')
+    source_mode(scope)
     if (mode in ('masters', 'latest') or (mode == 'all' and not scope.get('unified'))) and any(scope.get(k) is not None for k in ('roundFrom', 'roundTo', 'matchId')):
         fail('Masters accept a season only; round and match filters are not allowed')
     return mode
+
+
+def source_mode(scope):
+    # Persisted pre-feature jobs keep their original DID-only behavior. New
+    # Swagger requests always explicitly supply auto, even when left unchanged.
+    value = scope.get('sourceMode', 'did_only')
+    if value not in ('auto', 'did_only', 'hybrid'):
+        fail('source_mode must be auto, did_only or hybrid', 'aifootballx_source_mode_invalid')
+    return value
 
 
 def unready_fixture(fixture, recordings):
@@ -1963,6 +1984,271 @@ def round_fixture_numbers(fixtures):
     for fixture in fixtures:
         by_round[fixture['data']['round']].append(fixture['id'])
     return {mid: number for ids in by_round.values() for number, mid in enumerate(sorted(ids), 1)}
+
+
+def destination_fixture_rows(fixtures, rows, season_id):
+    """Normalize legacy Excel identities in memory, never in baselines.
+
+    Legacy dMST has no GM_ID column. Its season/round/paired Match/H-A teams
+    uniquely identify a fixture. A synthetic ID stays internal unless an exact
+    DID schedule identity is available; explicit conflicting IDs never change.
+    """
+    season = season_label(season_id)
+    known = defaultdict(list)
+    for fixture in fixtures:
+        m = fixture['data']
+        known[m['round'], m['homeTeamId'], m['awayTeamId']].append(fixture['id'])
+    grouped = defaultdict(dict)
+    for original in rows:
+        d = deepcopy(original['data'])
+        if d.get('PlSeason') != season:
+            continue
+        number, pos, side, team = (d.get(k) for k in ('gm_round', 'Match', 'H-A', 't_code'))
+        if (type(number) is not int or not 1 <= number <= 38 or type(pos) is not int or
+                not 1 <= pos <= 20 or side not in ('H', 'A') or not isinstance(team, str) or not team):
+            fail('Existing dMST needs valid gm_round, t_code, H-A and Match (1..20)',
+                 'aifootballx_fixture_conflict')
+        if pos % 2 != (1 if side == 'H' else 0):
+            fail('Existing dMST H/A does not match its Match slot', 'aifootballx_fixture_conflict')
+        pair = grouped[number, (pos + 1) // 2]
+        if side in pair:
+            fail('Duplicate destination Match side', 'aifootballx_fixture_conflict')
+        pair[side] = {'id': original['id'], 'data': d}
+    result = []
+    for (number, slot), pair in grouped.items():
+        if set(pair) != {'H', 'A'}:
+            fail('Destination fixture needs both H/A rows', 'aifootballx_fixture_conflict')
+        h, a = pair['H']['data'], pair['A']['data']
+        candidates = known[number, h['t_code'], a['t_code']]
+        explicit = {d['gm_id'] for d in (h, a) if d.get('gm_id') and not d.get('_uploadIdentityOnly')}
+        if len(candidates) > 1 or len(explicit) > 1 or (explicit and candidates and explicit != set(candidates)):
+            fail('Uploaded GM_ID or paired fixture contradicts the DID schedule', 'aifootballx_fixture_conflict')
+        mid = next(iter(explicit)) if explicit else (candidates[0] if candidates else
+                                                    f'sql-upload-{season_id}-r{number:02d}-m{slot:02d}')
+        if not isinstance(mid, str):
+            fail('Uploaded GM_ID must be a string', 'aifootballx_fixture_conflict')
+        for row in pair.values():
+            row['data']['gm_id'] = mid
+            row['data']['_uploadIdentityOnly'] = not bool(explicit)
+            result.append(row)
+    return result
+
+
+def resolve_fixture_numbers(fixtures, rows, season_id, *, fixture_numbers=None):
+    """Resolve shared SQL/DID numbering before constructing any payload.
+
+    A shared GM_ID must identify the same round and H/A teams. SQL uploads
+    reserve their Match slots; DID-only requests use this same identity check.
+    """
+    season = season_label(season_id)
+    by_team, occupied, by_id = {}, {}, defaultdict(dict)
+    for row in destination_fixture_rows(fixtures, rows, season_id):
+        data = row['data']
+        if data.get('PlSeason') != season:
+            continue
+        number, team, pos, side, mid = (data.get(k) for k in ('gm_round', 't_code', 'Match', 'H-A', 'gm_id'))
+        if (type(number) is not int or not 1 <= number <= 38 or not team or
+                type(pos) is not int or not 1 <= pos <= 20 or side not in ('H', 'A') or not mid):
+            fail('Existing dMST needs valid gm_id, gm_round, t_code, H-A and Match (1..20)',
+                 'aifootballx_fixture_conflict')
+        if pos % 2 != (1 if side == 'H' else 0):
+            fail('Existing dMST H/A does not match its Match slot', 'aifootballx_fixture_conflict')
+        if (number, team) in by_team or (number, pos) in occupied or side in by_id[mid]:
+            fail('Duplicate destination team, Match slot or GM_ID side', 'aifootballx_fixture_conflict')
+        by_team[number, team] = data
+        occupied[number, pos] = mid
+        by_id[mid][side] = data
+    for mid, pair in by_id.items():
+        if set(pair) != {'H', 'A'}:
+            fail(f'{mid}: destination fixture needs both H/A rows', 'aifootballx_fixture_conflict')
+        h, a = pair['H'], pair['A']
+        if (h['gm_round'] != a['gm_round'] or h['t_code'] == a['t_code'] or
+                a['Match'] != h['Match'] + 1):
+            fail(f'{mid}: destination H/A identity or slots disagree', 'aifootballx_fixture_conflict')
+    published_rounds = {number for number, _ in occupied}
+    result, seen = {}, set()
+    scheduled = round_fixture_numbers(fixtures)
+    for fixture in sorted(fixtures, key=lambda r: r['id']):
+        mid, match = fixture['id'], fixture['data']
+        number, home, away = match['round'], match['homeTeamId'], match['awayTeamId']
+        if (type(number) is not int or not 1 <= number <= 38 or match['seasonId'] != season_id or
+                home == away or any((number, t) in seen for t in (home, away))):
+            fail('DID fixture season/team identity is ambiguous', 'aifootballx_fixture_conflict')
+        seen.update((number, t) for t in (home, away))
+        pair = by_id.get(mid)
+        h, a = by_team.get((number, home)), by_team.get((number, away))
+        if pair and (pair['H']['gm_round'] != number or pair['H']['t_code'] != home or pair['A']['t_code'] != away):
+            fail(f'{mid}: GM_ID refers to different destination teams/round', 'aifootballx_fixture_conflict')
+        if h or a:
+            if not h or not a or h['gm_id'] != mid or a['gm_id'] != mid or h['H-A'] != 'H' or a['H-A'] != 'A':
+                fail(f'{mid}: DID teams overlap a different destination fixture', 'aifootballx_fixture_conflict')
+            slot = (h['Match'] + 1) // 2
+        else:
+            count = sum(r['data']['round'] == number for r in fixtures)
+            suffix = re.search(r'(\d{4})$', mid)
+            ordinal = int(suffix[1]) if suffix and mid.startswith(season_id) else 0
+            if fixture_numbers is not None and mid in fixture_numbers:
+                slot = fixture_numbers[mid]
+            elif count == 10:
+                slot = scheduled[mid]
+            elif (number - 1) * 10 < ordinal <= number * 10:
+                slot = ordinal - (number - 1) * 10
+            else:
+                free = [n for n in range(1, 11)
+                        if (number, n * 2 - 1) not in occupied and (number, n * 2) not in occupied]
+                if number not in published_rounds:
+                    slot = scheduled[mid]
+                elif len(free) == 1:
+                    slot = free[0]
+                else:
+                    fail(f'{mid}: Match slot is ambiguous; register the full round or align GM_ID numbering',
+                         'aifootballx_fixture_conflict')
+        for pos in (slot * 2 - 1, slot * 2):
+            if occupied.get((number, pos), mid) != mid:
+                fail(f'{mid}: Match slot collides with another fixture', 'aifootballx_fixture_conflict')
+            occupied[number, pos] = mid
+        result[mid] = slot
+    return result
+
+
+def merge_aggregate_sources(fixtures, items, target, codes, season_id, requested_mode):
+    """Choose complete fixtures once, with DID authoritative over SQL uploads.
+
+    Existing aggregate totals are never added to new totals. SQL fallback uses
+    explicit dMST KPI facts and pMST precise rating/conceded goals, with complete
+    identity validation. It never invents precision from a rounded JMX display.
+    """
+    pairs = defaultdict(dict)
+    for item in items:
+        mid, side = item['match_id'], item['side']
+        if side in pairs[mid]:
+            fail('Duplicate DID aggregate side')
+        pairs[mid][side] = item
+    did = {}
+    for mid, pair in pairs.items():
+        if set(pair) != {'H', 'A'}:
+            fail(f'{mid}: DID fixture needs both H/A recordings')
+        if all(i['recording'].get('status') == 'final' for i in pair.values()):
+            if any(unready_fixture({'id': mid, 'data': i['match']},
+                                   {s: p['recording'] for s, p in pair.items()}) for i in pair.values()):
+                fail(f'{mid}: final DID KPI/rating is missing or stale; SQL fallback is not allowed')
+            did[mid] = list(pair.values())
+    season = season_label(season_id)
+    rows = destination_fixture_rows(fixtures, target.get('dMST', []), season_id)
+    numbers = resolve_fixture_numbers(fixtures, rows, season_id)
+    sql_pairs = defaultdict(dict)
+    for row in rows:
+        d = row['data']
+        if not d.get('didUnplayed'):
+            sql_pairs[d['gm_id']][d['H-A']] = d
+    missing = set(sql_pairs) - set(did)
+    if requested_mode == 'did_only' and missing:
+        fail('DID-only source coverage is incomplete; destination has fixtures without final DID recordings',
+             'aifootballx_source_coverage_incomplete')
+    pmst = defaultdict(list)
+    for row in target.get('pMST', []):
+        d = row['data']
+        if d.get('PlSeason') == season and not d.get('didUnplayed'):
+            pmst[d.get('gm_round'), d.get('t_code')].append(d)
+
+    def numeric(data, key):
+        value = data.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            fail(f'SQL upload missing/invalid numeric field: {key}', 'aifootballx_sql_source_incomplete')
+        return value
+
+    def upload_date(data, key='gm_date'):
+        value = data.get(key)
+        try:
+            if not isinstance(value, str):
+                raise ValueError()
+            value = dotted_date(value)
+            datetime.strptime(value, '%Y.%m.%d')
+            return value
+        except ValueError:
+            fail(f'SQL upload missing/invalid {key}', 'aifootballx_sql_source_incomplete')
+
+    selected, contexts = [], {r['id']: deepcopy(r) for r in fixtures}
+    for mid, pair in did.items():
+        selected.extend(deepcopy(pair))
+    for mid in sorted(missing):
+        pair = sql_pairs[mid]
+        if set(pair) != {'H', 'A'}:
+            fail(f'{mid}: incomplete SQL H/A fixture', 'aifootballx_sql_source_incomplete')
+        h, a = pair['H'], pair['A']
+        if upload_date(h) != upload_date(a):
+            fail(f'{mid}: SQL fixture dates disagree', 'aifootballx_fixture_conflict')
+        precise = {}
+        for side, row in pair.items():
+            candidates = pmst[row['gm_round'], row['t_code']]
+            if len(candidates) != 1:
+                fail(f'{mid}/{side}: need one SQL pMST row for precise rating and conceded goals',
+                     'aifootballx_sql_source_incomplete')
+            precise[side] = candidates[0]
+            p = precise[side]
+            if (p.get('Match') != row['Match'] or p.get('IDX_CODE') != row.get('IDX_CODE') or
+                    (p.get('gm_id') and p['gm_id'] != mid) or upload_date(p) != upload_date(row)):
+                fail(f'{mid}/{side}: SQL dMST/pMST identities disagree', 'aifootballx_fixture_conflict')
+        match = {'seasonId': season_id, 'leagueId': 'EPL', 'round': h['gm_round'], 'date': upload_date(h),
+                 'homeTeamId': h['t_code'], 'awayTeamId': a['t_code'],
+                 'score': {'home': numeric(precise['A'], 'Goal'), 'away': numeric(precise['H'], 'Goal')}}
+        if any(type(v) is not int and not float(v).is_integer() for v in match['score'].values()):
+            fail(f'{mid}: official SQL scores must be integers', 'aifootballx_sql_source_incomplete')
+        match['score'] = {k: int(v) for k, v in match['score'].items()}
+        match_rows = [r['data'] for r in target.get('mMST', [])
+                      if r['data'].get('PlSeason') == season and r['data'].get('Round') == match['round']
+                      and (r['data'].get('H-Code'), r['data'].get('A-Code')) == (h['t_code'], a['t_code'])]
+        if len(match_rows) != 1:
+            fail(f'{mid}: need one SQL mMST row for the fixture', 'aifootballx_sql_source_incomplete')
+        if (match_rows[0].get('Match-No') != (h['Match'] + 1) // 2 or
+                (match_rows[0].get('gm_id') and match_rows[0]['gm_id'] != mid) or
+                upload_date(match_rows[0], 'M_date') != match['date']):
+            fail(f'{mid}: SQL mMST fixture identity/number disagrees', 'aifootballx_fixture_conflict')
+        for side, row in pair.items():
+            code = resolve_team_code(codes, season, row['t_code'])
+            if row.get('IDX_CODE') != code['IDX_CODE']:
+                fail(f'{mid}: SQL team index disagrees with code', 'aifootballx_fixture_conflict')
+            p = precise[side]
+            jmx = numeric(p, 'gi_score')
+            if abs(jmx - numeric(row, 'JMX')) > .050001:
+                fail(f'{mid}: SQL precise rating disagrees with dMST display', 'aifootballx_sql_source_incomplete')
+            if abs(numeric(match_rows[0], side + '-FX') - rating_two_decimals(jmx)) > .010001:
+                fail(f'{mid}: SQL mMST rating disagrees with pMST', 'aifootballx_sql_source_incomplete')
+            kpi = {source: numeric(row, dest) for dest, source in KPI_ALIASES.items()}
+            for dest, source in KPI_ALIASES.items():
+                expected = rounded(kpi[source], 3) if source in ('ASR', 'SSR') else kpi[source]
+                pm_value = numeric(p, dest)
+                mm_key = side + '-' + ('TAP' if dest == 'gi_tmp' else dest)
+                mm_value = numeric(match_rows[0], mm_key)
+                if source in ('ASR', 'SSR'):
+                    pm_value, mm_value = rounded(pm_value, 3), rounded(mm_value, 3)
+                if abs(pm_value - expected) > 1e-6 or abs(mm_value - expected) > 1e-6:
+                    fail(f'{mid}: SQL dMST/pMST/mMST disagree on {source}', 'aifootballx_sql_source_incomplete')
+            # SQL mMST can retain more rate precision than its display dMST.
+            # Use that explicit source when present, never estimate hidden digits.
+            for metric in ('ASR', 'SSR'):
+                if match_rows and side + '-' + metric in match_rows[0]:
+                    raw = numeric(match_rows[0], side + '-' + metric)
+                    if abs(rounded(raw, 3) - rounded(kpi[metric], 3)) > 1e-6:
+                        fail(f'{mid}: SQL rate sources disagree', 'aifootballx_sql_source_incomplete')
+                    kpi[metric] = raw
+            kpi['OG'] = numeric(row, 'OG')
+            if (any(kpi[k] > 1 for k in ('ASR', 'SSR')) or
+                    kpi['TAP'] == 0 or
+                    any(not float(v).is_integer() for k, v in kpi.items() if k not in ('ASR', 'SSR'))):
+                fail(f'{mid}: inconsistent SQL KPI/rates', 'aifootballx_sql_source_incomplete')
+            selected.append({'match_id': mid, 'match': deepcopy(match), 'side': side,
+                             'team_name': row.get('t_Nm'), 'aggregateSource': 'sql_upload',
+                             'recording': {'status': 'final', 'teamId': row['t_code'], 'kpi': kpi,
+                                           'kpiVersion': 1, 'ratingBasedOn': 1, 'teamRating': {'jmx': jmx}}})
+        contexts[mid] = {'id': mid, 'data': match}
+        numbers[mid] = (h['Match'] + 1) // 2
+    # Check new synthetic SQL fixtures against DID fixtures and one another too.
+    resolve_fixture_numbers(list(contexts.values()), rows, season_id, fixture_numbers=numbers)
+    info = {'requested': requested_mode, 'detected': 'hybrid' if missing else 'did_only',
+            'didMatches': len(did), 'sqlMatches': len(missing),
+            'didReplacedMatches': len(set(did) & set(sql_pairs)), 'policy': 'DID wins per fixture; rebuild totals once'}
+    return selected, list(contexts.values()), numbers, info
 
 
 def fail(message, code='aifootballx_validation_failed'):
@@ -2016,21 +2302,22 @@ class SourceCapture:
             q = q.where(filter=FieldFilter(field, op, value))
         return q
 
-    def rows(self, client, path, filters=(), *, source=False, bound=20000, season_range=None):
+    def rows(self, client, path, filters=(), *, source=False, bound=20000, season_range=None, guard_target=False):
         guard = {'path': path, 'filters': list(filters), 'bound': bound, 'versions': {},
-                 **({'season_range': season_range} if season_range else {})}
+                 **({'season_range': season_range} if season_range else {}),
+                 **({'database': 'target'} if guard_target else {})}
         rows = []
         snapshots = self.query(client, path, filters).limit(bound + 1).stream(timeout=60, retry=None)
         for count, snapshot in enumerate(snapshots, 1):
             if count > bound:
                 fail(f'Read limit exceeded: {path}')
-            if source:
+            if source or guard_target:
                 versions = self.guard_versions((snapshot,), guard)
                 if not versions:
                     continue
                 guard['versions'].update(versions)
             rows.append({'id': snapshot.id, 'data': encode(snapshot.to_dict())})
-        if source:
+        if source or guard_target:
             self.queries.append(guard)
         return rows
 
@@ -2130,7 +2417,8 @@ class SourceCapture:
                     fail('DID source changed; create a new preview', 'aifootballx_source_changed')
 
         def check_query(guard):
-            query = self.did.collection_group(guard['group']) if guard.get('group') else self.query(self.did, guard['path'], guard['filters'])
+            client = self.target if guard.get('database') == 'target' else self.did
+            query = client.collection_group(guard['group']) if guard.get('group') else self.query(client, guard['path'], guard['filters'])
             if guard.get('group'):
                 from google.cloud.firestore_v1.base_query import FieldFilter
                 for field,op,value in guard.get('filters',[]): query=query.where(filter=FieldFilter(field,op,value))
@@ -2138,8 +2426,24 @@ class SourceCapture:
             if hasattr(query,'select'):
                 query=query.select(['from','to'] if guard.get('season_range') else [])
             snaps = list(query.limit(guard['bound'] + 1).stream(timeout=60, retry=None))
-            if self.guard_versions(snaps,guard) != guard['versions']:
-                fail('DID source collection changed; create a new preview', 'aifootballx_source_changed')
+            actual = self.guard_versions(snaps,guard)
+            if actual != guard['versions']:
+                if guard.get('database') != 'target':
+                    fail('DID source collection changed; create a new preview', 'aifootballx_source_changed')
+                changed = {ident for ident in set(actual) | set(guard['versions'])
+                           if actual.get(ident) != guard['versions'].get(ident)}
+                outputs = guards.get('target_outputs', {})
+                # A retry may see this manifest's own committed documents. Only
+                # an exact validated payload is accepted; changes to consumed
+                # SQL rows, new unrelated identities and deletions always fail.
+                for ident in changed:
+                    path = guard['path'] + '/' + ident
+                    expected = outputs.get(path)
+                    if ident not in actual or expected is None:
+                        fail('SQL/destination source changed; create a new preview', 'aifootballx_source_changed')
+                    snap = client.document(path).get(timeout=30, retry=None)
+                    if not snap.exists or fingerprint(encode(snap.to_dict())) != expected:
+                        fail('SQL/destination source changed; create a new preview', 'aifootballx_source_changed')
 
         paths = list(guards['documents'])
         checks = [(check_documents, paths[start:start + 100]) for start in range(0, len(paths), 100)]
@@ -2258,7 +2562,10 @@ class SourceCapture:
         target = evidence['target_existing']
         for col in ('dMST',):
             field, value = ('SEASON', season[2:4] + '/' + season[7:9]) if col == 'sAVG' else ('PlSeason', season)
-            target[col] = self.rows(self.target, col, [(field, '==', value)], bound=5000)
+            target[col] = self.rows(self.target, col, [(field, '==', value)], bound=5000,
+                                    guard_target='sourceMode' in scope)
+        if 'sourceMode' in scope:
+            evidence['fixture_numbers'] = resolve_fixture_numbers(all_matches, target['dMST'], season_id)
         # Match-only delivery resolves existing/global team codes directly.
         # Season code creation and aggregate slots belong to ALL/LATEST.
         slots = {}
@@ -2281,7 +2588,8 @@ class SourceCapture:
                 evidence['source_recordings'].append({'match_id': mid, 'match': match, 'side': side,
                     'recording': recording_by_path[path], 'children': children})
             for col in MATCH_TARGETS:
-                target.setdefault(col, []).extend(self.rows(self.target, col, [('gm_id', '==', mid)]))
+                target.setdefault(col, []).extend(self.rows(self.target, col, [('gm_id', '==', mid)],
+                                                            guard_target='sourceMode' in scope))
             self.report_progress(10 + 45 * match_number / len(selected))
         evidence['player_team_links']={}
         for item in evidence['source_recordings']:
@@ -2329,6 +2637,14 @@ class SourceCapture:
         report = (generate_delivery(evidence, selected, aggregate_items, slots, setup, match_only=True)
                   if selected else finish_delivery([], [], [], target, 'matches'))
         report['skippedMatches'] = skipped
+        if 'sourceMode' in scope:
+            selected_rounds = {r['data']['round'] for r in selected}
+            report['sourceSelection'] = {
+                'requested': source_mode(scope), 'detected': 'did_only', 'didMatches': len(selected),
+                'sqlMatches': 0, 'contextOnly': True,
+                'existingContextMatches': len({(r['data']['gm_round'], (r['data']['Match'] + 1) // 2) for r in target['dMST']
+                    if r['data'].get('gm_round') in selected_rounds and not r['data'].get('didUnplayed')}),
+                'policy': 'Details use DID only; existing uploads reserve Match slots. Aggregates validate their sources separately.'}
         report['summary']['skippedMatches'] = len(skipped)
         if scope.get('latest'):
             retain_changed_documents(report, target)
@@ -2353,7 +2669,8 @@ class SourceCapture:
         target = {}
         for col in ('dMST', *AGGREGATES):
             field, value = ('SEASON', season[2:4] + '/' + season[7:9]) if col == 'sAVG' else ('PlSeason', season)
-            target[col] = self.rows(self.target, col, [(field, '==', value)], bound=20000)
+            target[col] = self.rows(self.target, col, [(field, '==', value)], bound=20000,
+                                    guard_target='sourceMode' in scope)
         # Earlier edits must propagate through already published cumulative rounds.
         existing_end = max((r['data'].get('gm_round' if col == 'pMST' else 'Round', 0) or 0
                             for col in AGGREGATES if col != 'sAVG' for r in target[col]), default=0)
@@ -2389,10 +2706,31 @@ class SourceCapture:
         skipped = []
         round_only = False
         fixture_numbers = None
+        source_selection = None
+        mixed = False
+        if 'sourceMode' in scope:
+            merged_items, merged_context, fixture_numbers, source_selection = merge_aggregate_sources(
+                context, items, target, overlay_code_rows(codes, setup['code_rows']),
+                scope['seasonId'], source_mode(scope))
+            mixed = bool(source_selection['sqlMatches'])
+            if scope.get('matchId') and not any(i['match_id'] == scope['matchId'] and
+                    i.get('aggregateSource') != 'sql_upload' for i in merged_items):
+                fail('The selected DID fixture is not final with complete KPI/rating on both sides',
+                     'aifootballx_source_coverage_incomplete')
+            if mixed:
+                items, context = merged_items, merged_context
+                setup = plan_new_season(season, context, codes, target, slots,
+                                        require_complete_code=True, require_slots=True)
+                # Never publish a partial historical subset as cumulative totals.
+                played = {i['match']['round'] for i in items}
+                if played and any(sum(i['match']['round'] == n for i in items) != 20
+                                  for n in range(1, max(played) + 1)):
+                    fail('Hybrid aggregates require 10 complete fixtures in every played round through the cutoff',
+                         'aifootballx_source_coverage_incomplete')
         requested_rounds = {r['data']['round'] for r in selected}
         seeded_rounds = {r['data']['Round'] for r in target['rAVG'] if r['data'].get('didRoundDefaults')}
         seeded_request = bool(requested_rounds & seeded_rounds)
-        if not scope.get('unified') and (not scope.get('matchId') or seeded_request):
+        if not mixed and not scope.get('unified') and (not scope.get('matchId') or seeded_request):
             final_sides = defaultdict(set)
             for item in items:
                 if item['recording'].get('status') == 'final':
@@ -2412,7 +2750,7 @@ class SourceCapture:
                         skipped.append(issue)
             selected = [r for r in selected if r['id'] not in unready]
             items = [i for i in items if i['match_id'] not in unready and final_sides[i['match_id']] == {'H', 'A'}]
-            fixture_numbers = round_fixture_numbers(context)
+            fixture_numbers = fixture_numbers or round_fixture_numbers(context)
 
             if requested_rounds == {cutoff} and (scope.get('roundFrom') == scope.get('roundTo') == cutoff
                                                   or (scope.get('matchId') and seeded_request)):
@@ -2468,6 +2806,8 @@ class SourceCapture:
         log_delivery_stage(job_id, 'aggregate_raw_review', raw_started, documents=raw_count, scope=scope)
         self.report_progress(95)
         report['skippedMatches'] = skipped
+        if source_selection is not None:
+            report['sourceSelection'] = source_selection
         report['summary']['skippedMatches'] = len(skipped)
         if round_only:
             report['summary']['aggregationScope'] = 'round_only'
@@ -3099,7 +3439,7 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
 
 
 def round_default_documents(fixtures, codes, slots, existing, *, force=False, previous_rank=None,
-                            collections=DEFAULT_COLLECTIONS, rank_slots=None):
+                            collections=DEFAULT_COLLECTIONS, rank_slots=None, fixture_numbers=None):
     season = season_label(fixtures[0]['data']['seasonId'])
     short_season = int(season[2:4] + season[7:9])
     number = fixtures[0]['data']['round']
@@ -3173,6 +3513,8 @@ def round_default_documents(fixtures, codes, slots, existing, *, force=False, pr
     ravg.update({'M-AVG': 40.0, 'S_AVG': 40.0})
     fields = ('BAP', 'DAP', 'DTP', 'SHOT', 'GOAL', 'JMX')
     for n, fixture in enumerate(sorted(fixtures, key=lambda f: f['id']), 1):
+        if fixture_numbers is not None:
+            n = fixture_numbers[fixture['id']]
         match = fixture['data']
         common = {'gm_id': fixture['id'], 'PlSeason': season, 'gm_round': number,
                   'gm_date': dotted_date(match['date']), 'didUnplayed': True}
@@ -3223,7 +3565,7 @@ def round_default_documents(fixtures, codes, slots, existing, *, force=False, pr
     return documents
 
 
-def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, items):
+def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, items, *, fixture_numbers=None):
     """Complete scheduled rounds from defaults and confirmed team rows, then roll standings forward."""
     season = season_label(fixtures[0]['data']['seasonId'])
     season_slots = slots.get('seasonSlotMappings', {}).get(season, {})
@@ -3261,7 +3603,7 @@ def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, i
             published.get(('rank', (season, number)), {}).get('data', {}), slots, season)
         defaults = round_default_documents(round_fixtures, codes, slot_map, {},
             previous_rank=previous_rank, collections={'pMST', 'mMST', 'cAVG', 'rAVG', 'rank'},
-            rank_slots=season_slots.get('rankSlotToCodeTeamCodeMapping'))
+            rank_slots=season_slots.get('rankSlotToCodeTeamCodeMapping'), fixture_numbers=fixture_numbers)
         values = {(d['collection'], aggregate_key(d['collection'], d['data'])): d for d in defaults}
         for key, doc in values.items():
             old = published.get(key)
@@ -3288,6 +3630,8 @@ def complete_scheduled_aggregates(aggregate, fixtures, codes, slots, existing, i
         rows = []
         fixture_ratings = []
         for fixture_no, fixture in enumerate(sorted(round_fixtures, key=lambda f: f['id']), 1):
+            if fixture_numbers is not None:
+                fixture_no = fixture_numbers[fixture['id']]
             match = fixture['data']
             pair = []
             for side, team in (('H', match['homeTeamId']), ('A', match['awayTeamId'])):
@@ -3547,7 +3891,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
                     aggregate_errors.append('Season aggregate source/rating validation failed')
                 if not aggregate_errors:
                     complete_scheduled_aggregates(aggregate, context, evidence['ai_samples']['code'], slots,
-                        evidence.get('aggregate_history', target), aggregate_items)
+                        evidence.get('aggregate_history', target), aggregate_items, fixture_numbers=fixture_numbers)
                     validate_aggregate_completeness(aggregate, context)
                 generated = {(doc['collection'],aggregate_key(doc['collection'],doc['data'])) for doc in aggregate['documents']}
                 if any((col,aggregate_key(col,row['data'])) not in generated for col in AGGREGATES
@@ -3582,7 +3926,7 @@ def generate_masters(evidence, fixtures, aggregate_items, slots, setup, mode, *,
     return report
 
 
-VALIDATION_POLICY = 'scheduled-aggregate-rank-excel-summary-v30'
+VALIDATION_POLICY = 'source-aware-hybrid-preflight-v31'
 
 
 def dump(value):
@@ -3600,9 +3944,9 @@ def merge_guards(previous, current):
         if path in documents and documents[path] != version:
             fail('DID source changed between preview chunks', 'aifootballx_source_changed')
         documents[path] = version
-    queries = {fingerprint([g.get('path'),g.get('group'),g.get('filters',[])]): g for g in previous['queries']}
+    queries = {fingerprint([g.get('database', 'did'),g.get('path'),g.get('group'),g.get('filters',[])]): g for g in previous['queries']}
     for guard in current['queries']:
-        key = fingerprint([guard.get('path'),guard.get('group'),guard.get('filters',[])])
+        key = fingerprint([guard.get('database', 'did'),guard.get('path'),guard.get('group'),guard.get('filters',[])])
         # Persisted JSON turns filter tuples into lists; compare their canonical
         # representation while still checking every version and query option.
         if key in queries and dump(queries[key]) != dump(guard):
@@ -3821,6 +4165,8 @@ class JobStore:
                 if 'skippedMatches' in report or 'skippedMatches' in previous['report']:
                     report['skippedMatches'] = previous['report'].get('skippedMatches', []) + report.get('skippedMatches', [])
                     report['summary']['skippedMatches'] = len(report['skippedMatches'])
+                if 'sourceSelection' not in report and 'sourceSelection' in previous['report']:
+                    report['sourceSelection'] = previous['report']['sourceSelection']
                 report['summary']['errors'] = len(report['errors'])
                 report['summary']['failed_checks'] = sum(not c['passed'] for c in report['checks'])
                 guards = merge_guards(previous['guards'], guards)
@@ -3831,11 +4177,18 @@ class JobStore:
 
     def finalize_preview(self, ident, owner, source):
         job = self.job(ident, owner)
-        source.assert_fresh(job['meta']['guards'])
         digest = sha256()
+        target_outputs = {}
+        guarded = {g['path'] for g in job['meta']['guards']['queries'] if g.get('database') == 'target'}
         with self.connect() as db:
             for row in db.execute('SELECT payload FROM documents WHERE preview_id=? ORDER BY ordinal', (ident,)):
                 digest.update(row['payload'].encode()); digest.update(b'\n')
+                doc = json.loads(row['payload'])
+                if doc['collection'] in guarded:
+                    target_outputs[doc['collection'] + '/' + doc['document_id']] = fingerprint(doc['data'])
+        if guarded:
+            job['meta']['guards']['target_outputs'] = target_outputs
+        source.assert_fresh(job['meta']['guards'])
         job['meta']['digest'] = digest.hexdigest()
         self.set_job(ident, 'validated' if job['meta']['report']['validation_passed'] else 'invalid', meta=job['meta'])
 
@@ -3914,6 +4267,19 @@ class FirestoreWriter:
         if client.project != 'aifootballx':
             fail('Unexpected destination project')
         self.client = client
+
+    def preflight(self, documents):
+        """Check every destination baseline before the first transaction writes.
+
+        This also catches a deterministic document-ID collision outside the
+        scoped read queries. Transactions still check again for later races.
+        """
+        refs = [self.client.collection(d['collection']).document(d['document_id']) for d in documents]
+        snapshots = {s.reference.path: s for s in self.client.get_all(refs, timeout=60, retry=None)}
+        for doc, ref in zip(documents, refs, strict=True):
+            validate_document(doc)
+            snap = snapshots[ref.path]
+            decide_merge(doc, snap.to_dict() if snap.exists else None)
 
     def send(self, doc, preview_id):
         from firebase_admin import firestore
@@ -4107,6 +4473,12 @@ class DeliveryService:
             self.store.record_progress(ident, 10)
             last_fresh = time.monotonic()
             writer = self.writer_factory()
+            if hasattr(writer, 'preflight'):
+                offset = 0
+                while rows := self.store.page(job, offset, 100):
+                    self.ensure_running()
+                    writer.preflight(rows)
+                    offset += len(rows)
             # Read a fixed ordinal window. Success rows are never retried.
             offset = 0
             while True:
@@ -4249,8 +4621,10 @@ class DeliveryService:
             percent = 100
         return {'status':state,'operation':'send' if latest['kind']=='delivery' else 'preview',
                 'mode':delivery_mode(latest['scope']),
+                'sourceMode':source_mode(latest['scope']), 'sourceSelection':report.get('sourceSelection'),
                 'phase':latest['meta'].get('phase', 'preview'),'percent':percent,'writeEnabled':enabled,'scope':latest['scope'],
-                'validationPassed':report.get('validation_passed'),'summary':report.get('summary'),
+                'validationPassed':(False if preview and preview['state'] in ('failed', 'invalid') else
+                                    report.get('validation_passed')),'summary':report.get('summary'),
                 'aggregateStatus':report.get('aggregate_status'),'blockedGroups':report.get('blocked_groups',[]),
                 'skippedMatches':report.get('skippedMatches',[]),
                 'warnings':report.get('warnings',[]),
@@ -4277,8 +4651,12 @@ def error_code(exc):
 
 
 def failure_reason(code):
-    return {'aifootballx_source_changed':'미리보기 후 DID 원천 또는 코드·슬롯 설정이 바뀌었습니다. 같은 입력으로 다시 검증해야 합니다.',
+    return {'aifootballx_source_changed':'검증 후 DID·기존 업로드 원천 또는 코드·슬롯 설정이 바뀌었습니다. 같은 입력으로 다시 검증해야 합니다.',
             'aifootballx_destination_changed':'대상 문서의 생성 필드가 다른 작업에서 변경됐습니다.',
+            'aifootballx_fixture_conflict':'경기 GM_ID·라운드·홈/원정·Match 번호가 기존 업로드와 충돌합니다. 쓰기 전 검사에서 차단됐습니다.',
+            'aifootballx_sql_source_incomplete':'기존 SQL 업로드의 경기 양쪽 정보·KPI·정밀 평점이 누락되거나 서로 다릅니다. dMST와 pMST/mMST 원천을 확인하세요.',
+            'aifootballx_source_coverage_incomplete':'선택한 경기 또는 이전 라운드의 확정 원천이 부족합니다. 집계를 전송하지 않았습니다.',
+            'aifootballx_source_mode_invalid':'원천 선택은 auto, did_only, hybrid 중 하나여야 합니다.',
             'aifootballx_validation_failed':'필수 데이터 검증에 실패했습니다. 아래 검증 사유를 확인하세요.',
             'aifootballx_write_disabled':'현재 실제 Firestore 전송이 비활성화돼 있습니다.',
             'aifootballx_aggregates_blocked':'선수·감독 등 경기 외 데이터 전송은 완료됐으며 시즌 집계는 검증 실패로 보류됐습니다.',

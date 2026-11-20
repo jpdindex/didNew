@@ -108,6 +108,266 @@ def docs(result, collection):
     return [d['data'] for d in result['documents'] if d['collection'] == collection]
 
 
+def hybrid_source_fixture():
+    items, codes, slots = aggregate_fixture()
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    numbers = delivery.round_fixture_numbers(fixtures)
+    aggregate = build_aggregates(items, codes, slots, fixture_numbers=numbers)
+    target = {col: [] for col in delivery.AGGREGATES}
+    target['dMST'] = []
+    for d in aggregate['documents']:
+        target[d['collection']].append({'id': d['document_id'], 'data': deepcopy(d['data'])})
+    for i in items:
+        kpi = i['recording']['kpi']
+        team = i['recording']['teamId']
+        number = numbers[i['match_id']]
+        data = {'gm_id': i['match_id'], 'PlSeason': '2024-2025', 'gm_round': 1,
+                't_code': team, 'IDX_CODE': resolve_team_code(codes, '2024-2025', team)['IDX_CODE'],
+                'H-A': i['side'], 'Match': number * 2 - (1 if i['side'] == 'H' else 0),
+                'gm_date': '2024.08.12', 'JMX': rounded(i['recording']['teamRating']['jmx'], 1),
+                'OG': kpi['OG'], **{dest: kpi[source] for dest, source in delivery.KPI_ALIASES.items()}}
+        data = delivery.delivery_payload('dMST', data)
+        target['dMST'].append({'id': 'sql-' + team, 'data': data})
+    return items, codes, slots, fixtures, target
+
+
+def test_hybrid_nine_sql_and_one_did_rebuilds_twenty_team_totals_once():
+    items, codes, slots, fixtures, target = hybrid_source_fixture()
+    selected = deepcopy(items[10:12])  # Fixture 6; slots 1/2 already belong to SQL.
+    for i in selected:
+        i['recording']['teamRating']['jmx'] += 10
+    original = deepcopy(target)
+    merged, context, numbers, info = delivery.merge_aggregate_sources(
+        [fixtures[5]], selected, target, codes, '20242025', 'auto')
+    assert info == {'requested': 'auto', 'detected': 'hybrid', 'didMatches': 1,
+                    'sqlMatches': 9, 'didReplacedMatches': 1,
+                    'policy': 'DID wins per fixture; rebuild totals once'}
+    assert len(merged) == 20 and len(context) == 10 and numbers[selected[0]['match_id']] == 6
+    result = build_aggregates(merged, codes, slots, fixture_numbers=numbers)
+    assert result['complete'], result['errors']
+    assert delivery.validate_aggregate_links(result, merged, codes, slots, fixture_numbers=numbers)['passed']
+    assert docs(result, 'rAVG')[0]['MH6-IDX'] == 71
+    assert docs(result, 'rAVG')[0]['MA6-IDX'] == 72
+    assert docs(result, 'cAVG')[0]['R-AVG'] == 61.5
+    assert docs(result, 'sAVG')[0]['AI Rating'] == 61.5
+    assert len(docs(result, 'mMST')) == 10 and len(docs(result, 'pMST')) == 20
+    assert target == original  # No source mutation, including source SQL ratings.
+    again = delivery.merge_aggregate_sources([fixtures[5]], selected, target, codes, '20242025', 'auto')
+    assert again == (merged, context, numbers, info)
+
+
+def test_hybrid_can_add_a_did_fixture_absent_from_sql_without_renumbering_other_games():
+    items, codes, slots, fixtures, target = hybrid_source_fixture()
+    mid = fixtures[5]['id']
+    target['dMST'] = [r for r in target['dMST'] if r['data']['gm_id'] != mid]
+    target['pMST'] = [r for r in target['pMST'] if r['data']['t_code'] not in ('T11', 'T12')]
+    merged, _, numbers, info = delivery.merge_aggregate_sources(
+        [fixtures[5]], items[10:12], target, codes, '20242025', 'hybrid')
+    assert len(merged) == 20 and numbers[mid] == 6 and info['didReplacedMatches'] == 0
+    assert docs(build_aggregates(merged, codes, slots, fixture_numbers=numbers), 'mMST')[5]['Match-No'] == 6
+
+
+def test_auto_did_only_uses_the_existing_calculation_without_sql_stats():
+    items, codes, slots, fixtures, target = hybrid_source_fixture()
+    # Inconsistent old SQL values cannot override a complete final DID source.
+    for row in target['pMST']:
+        row['data']['gi_score'] = -999
+    merged, _, numbers, info = delivery.merge_aggregate_sources(fixtures, items, target, codes, '20242025', 'auto')
+    assert info['detected'] == 'did_only' and info['sqlMatches'] == 0
+    assert build_aggregates(merged, codes, slots, fixture_numbers=numbers) == build_aggregates(items, codes, slots, fixture_numbers=numbers)
+    empty = delivery.merge_aggregate_sources(fixtures, items, {}, codes, '20242025', 'did_only')
+    assert empty[0] == items and empty[3]['sqlMatches'] == 0
+
+
+@pytest.mark.parametrize('issue', ['duplicate_slot', 'wrong_gm_id', 'wrong_side', 'wrong_round',
+                                  'missing_half', 'rating_missing', 'rating_disagrees', 'pmst_identity',
+                                  'mmst_missing', 'legacy_unplayed', 'pmst_kpi', 'mmst_kpi', 'mmst_date'])
+def test_hybrid_conflicts_and_incomplete_sql_fail_before_payloads(issue):
+    items, codes, _, fixtures, target = hybrid_source_fixture()
+    row = target['dMST'][0]['data']
+    if issue == 'duplicate_slot': target['dMST'][2]['data']['Match'] = row['Match']
+    elif issue == 'wrong_gm_id': target['dMST'][10]['data']['gm_id'] = 'different-game'
+    elif issue == 'wrong_side': row['H-A'] = 'A'
+    elif issue == 'wrong_round': target['dMST'][10]['data']['gm_round'] = 2
+    elif issue == 'missing_half': target['dMST'].pop(0)
+    elif issue == 'rating_missing': target['pMST'][0]['data'].pop('gi_score')
+    elif issue == 'rating_disagrees': target['pMST'][0]['data']['gi_score'] += 5
+    elif issue == 'pmst_identity': target['pMST'][0]['data']['Match'] = 20
+    elif issue == 'mmst_missing': target['mMST'].pop(0)
+    elif issue == 'legacy_unplayed': row['gi_tmp'] = 0
+    elif issue == 'pmst_kpi': target['pMST'][0]['data']['DAP'] += 1
+    elif issue == 'mmst_kpi': target['mMST'][0]['data']['H-DAP'] += 1
+    elif issue == 'mmst_date': target['mMST'][0]['data']['M_date'] = '2024.08.13'
+    with pytest.raises(BackendError):
+        delivery.merge_aggregate_sources([fixtures[5]], items[10:12], target, codes, '20242025', 'auto')
+
+
+def test_explicit_did_only_refuses_missing_sql_upload_fixtures():
+    items, codes, _, fixtures, target = hybrid_source_fixture()
+    with pytest.raises(BackendError, match='DID-only source coverage is incomplete'):
+        delivery.merge_aggregate_sources([fixtures[5]], items[10:12], target, codes, '20242025', 'did_only')
+
+
+def test_number_allocation_preserves_native_gm_number_with_only_one_registered_fixture():
+    fixture = {'id': '20262027eplj2rgn13na28rd2b8q0107',
+               'data': {'seasonId': '20262027', 'round': 11, 'homeTeamId': 'H', 'awayTeamId': 'A'}}
+    assert delivery.resolve_fixture_numbers([fixture], [], '20262027') == {fixture['id']: 7}
+
+
+@pytest.mark.parametrize('legacy_excel', [False, True])
+def test_hybrid_capture_one_fixture_generates_complete_round_and_retry_is_unchanged(tmp_path, legacy_excel):
+    items, codes, slots, fixtures, existing = hybrid_source_fixture()
+    mid = fixtures[5]['id']
+    selected = deepcopy(items[10:12])
+    for i in selected:
+        i['recording']['teamRating']['jmx'] += 10
+    existing['dMST'] = [r for r in existing['dMST'] if r['data']['gm_id'] != mid]
+    existing['pMST'] = [r for r in existing['pMST'] if r['data']['t_code'] not in ('T11', 'T12')]
+    existing['mMST'] = [r for r in existing['mMST'] if r['data']['H-Code'] != 'T11']
+    if legacy_excel:
+        for col in ('dMST', 'pMST', 'mMST'):
+            for row in existing[col]:
+                row['data'].pop('gm_id', None)
+    source = object.__new__(delivery.SourceCapture)
+    source.documents = {}; source.queries = []
+    heads = {f'matches/{mid}/recordings/{i["side"]}': i['recording'] for i in selected}
+    source.did = SimpleNamespace(document=lambda p: SimpleNamespace(path=p), get_all=lambda refs, **kwargs: [
+        SimpleNamespace(reference=r, exists=True, update_time=SimpleNamespace(isoformat=lambda: 'v1'),
+                        to_dict=lambda path=r.path: heads[path]) for r in refs])
+    source.target = object()
+    source.rows = lambda client, path, *args, **kwargs: (
+        [fixtures[5]] if client is source.did else
+        existing.get('code', [{'id': str(n), **r} for n, r in enumerate(codes)]) if path == 'code' else
+        existing.get(path, []))
+    source.get_many = lambda paths: {}
+    slot_file = tmp_path / 'slots.json'
+    slot_file.write_text(json.dumps(slots), encoding='utf-8')
+    scope = {'seasonId': '20242025', 'mode': 'aggregates', 'matchId': mid, 'sourceMode': 'auto'}
+    report, _ = source.capture(scope, slot_file)
+    assert report['validation_passed'], report['errors']
+    assert report['sourceSelection']['sqlMatches'] == 9
+    assert report['aggregate_status'] == 'ready'
+    assert len(docs(report, 'pMST')) == 2 and len(docs(report, 'mMST')) == 1
+    assert docs(report, 'mMST')[0]['Match-No'] == 6
+    assert docs(report, 'cAVG')[0]['R-AVG'] == 61.5
+    assert docs(report, 'rAVG')[0]['MH6-IDX'] == 71
+    for doc in report['documents']:
+        rows = existing.setdefault(doc['collection'], [])
+        rows[:] = [r for r in rows if r['id'] != doc['document_id']]
+        rows.append({'id': doc['document_id'], 'data': deepcopy(doc['data'])})
+    again, _ = source.capture({**scope, 'latest': True}, slot_file)
+    assert again['validation_passed'], again['errors']
+    assert again['documents'] == []
+    # A correction replaces the old fact instead of incrementing prior totals.
+    for i in selected:
+        i['recording']['teamRating']['jmx'] += 10
+    corrected, _ = source.capture(scope, slot_file)
+    assert corrected['validation_passed'], corrected['errors']
+    assert docs(corrected, 'cAVG')[0]['R-AVG'] == 62.5
+
+
+def test_legacy_excel_pairing_does_not_modify_source_documents_or_ambiguously_link_ids():
+    items, codes, _, fixtures, target = hybrid_source_fixture()
+    for col in ('dMST', 'pMST', 'mMST'):
+        for row in target[col]:row['data'].pop('gm_id', None)
+    original = deepcopy(target)
+    _, context, numbers, info = delivery.merge_aggregate_sources(
+        [fixtures[5]], items[10:12], target, codes, '20242025', 'auto')
+    assert numbers[fixtures[5]['id']] == 6 and info['sqlMatches'] == 9
+    assert len(context) == 10 and target == original
+    assert sum(r['id'].startswith('sql-upload-') for r in context) == 9
+    target['dMST'][10]['data']['gm_id'] = 'a-different-explicit-id'
+    with pytest.raises(BackendError, match='contradicts'):
+        delivery.merge_aggregate_sources([fixtures[5]], items[10:12], target, codes, '20242025', 'auto')
+
+
+def test_hybrid_prior_round_edit_rolls_forward_through_round_eleven_and_matches_did_only():
+    base, codes, slots, _, _ = hybrid_source_fixture()
+    items = []
+    for round_no in range(1, 12):
+        for index, original in enumerate(base):
+            i = deepcopy(original)
+            i['match_id'] = f'20242025eplfixture{(round_no - 1) * 10 + index // 2 + 1:04d}'
+            i['match']['round'] = round_no
+            items.append(i)
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    numbers = delivery.round_fixture_numbers(fixtures)
+    old = build_aggregates(items, codes, slots, fixture_numbers=numbers)
+    target = {col: [] for col in delivery.AGGREGATES}
+    for d in old['documents']:
+        target[d['collection']].append({'id': d['document_id'], 'data': d['data']})
+    target['dMST'] = []
+    for i in items:
+        row = {'gm_id': i['match_id'], 'PlSeason': '2024-2025', 'gm_round': i['match']['round'],
+               't_code': i['recording']['teamId'], 'H-A': i['side'], 'gm_date': '2024.08.12',
+               'Match': numbers[i['match_id']] * 2 - (i['side'] == 'H'),
+               'IDX_CODE': resolve_team_code(codes, '2024-2025', i['recording']['teamId'])['IDX_CODE'],
+               'JMX': i['recording']['teamRating']['jmx'], 'OG': 0,
+               **{dest: i['recording']['kpi'][source] for dest, source in delivery.KPI_ALIASES.items()}}
+        target['dMST'].append({'id': str(len(target['dMST'])), 'data': delivery.delivery_payload('dMST', row)})
+    corrected = deepcopy(items[10:12])
+    for i in corrected:
+        i['recording']['teamRating']['jmx'] += 30
+        i['match']['score'] = {'home': 2, 'away': 2}
+        i['recording']['kpi'].update(GOAL=2, SSR=2 / 3)
+    merged, _, numbers, info = delivery.merge_aggregate_sources(
+        [fixtures[5]], corrected, target, codes, '20242025', 'auto')
+    assert info['sqlMatches'] == 109 and len(merged) == 220
+    generated = build_aggregates(merged, codes, slots, fixture_numbers=numbers)
+    assert generated['complete'], generated['errors']
+    assert delivery.validate_aggregate_links(generated, merged, codes, slots, fixture_numbers=numbers)['passed']
+    last = next(r for r in docs(generated, 'rAVG') if r['Round'] == 11)
+    assert last['M-AVG'] == 60.5 and last['S_AVG'] == 60.7
+    rank = next(r for r in docs(generated, 'rank') if r['Round'] == 11)
+    assert rank['WTT11'] == 31 and rank['WTT12'] == 1 and rank['WRK11'] == 10
+    fully_did = deepcopy(items)
+    fully_did[10:12] = corrected
+    assert generated['documents'] == build_aggregates(fully_did, codes, slots, fixture_numbers=numbers)['documents']
+
+
+def test_swagger_source_selection_is_a_minimal_post_form_with_status_first():
+    app = FastAPI()
+    app.include_router(api_aifootballx.router, prefix='/api/v1')
+    schema = app.openapi()
+    paths = list(schema['paths'])
+    assert paths[0] == '/api/v1/aifootballx/send/status'
+    assert list(schema['paths'][paths[0]]) == ['get']
+    assert len(paths) == 6  # Existing status + five existing POSTs; no new route.
+    for route in ('aggregates', 'all'):
+        operation = schema['paths']['/api/v1/aifootballx/send/' + route]['post']
+        assert not any(p['in'] == 'query' for p in operation.get('parameters', []))
+        body = operation['requestBody']['content']['application/x-www-form-urlencoded']['schema']
+        fields = schema['components']['schemas'][body['$ref'].split('/')[-1]]['properties']
+        assert fields['source_mode']['default'] == 'auto'
+        assert fields['source_mode']['enum'] == ['auto', 'did_only', 'hybrid']
+        assert 'GET' in fields['source_mode']['description'] and '전송 전' in fields['source_mode']['description']
+    for route in ('matches', 'masters', 'default'):
+        body = schema['paths']['/api/v1/aifootballx/send/' + route]['post']['requestBody']['content']['application/x-www-form-urlencoded']['schema']
+        assert 'source_mode' not in schema['components']['schemas'][body['$ref'].split('/')[-1]]['properties']
+
+
+@pytest.mark.parametrize('route', ['aggregates', 'all'])
+@pytest.mark.parametrize('mode', ['auto', 'did_only', 'hybrid'])
+def test_source_selection_post_form_reaches_scope_without_query_fields(monkeypatch, route, mode):
+    app = FastAPI()
+    app.include_router(api_aifootballx.router, prefix='/api/v1')
+    app.dependency_overrides[api_aifootballx.delivery_operator] = lambda: SimpleNamespace(uid='operator')
+    submitted = []
+    monkeypatch.setattr(api_aifootballx, 'delivery_service', lambda: SimpleNamespace(
+        send_scope=lambda scope, owner: submitted.append((scope, owner)), public_status=lambda owner: {'status': 'queued'}))
+    with TestClient(app) as client:
+        response = client.post('/api/v1/aifootballx/send/' + route,
+                               data={'season': '2026-2027', 'round_from': 11, 'round_to': 11, 'source_mode': mode})
+        assert response.status_code == 202
+        assert submitted[-1][0]['sourceMode'] == mode and submitted[-1][1] == 'operator'
+        response = client.post('/api/v1/aifootballx/send/' + route,
+                               data={'season': '2026-2027', 'source_mode': 'invalid'})
+        assert response.status_code == 422 and len(submitted) == 1
+        response = client.post('/api/v1/aifootballx/send/' + route + '?source_mode=hybrid',
+                               data={'season': '2026-2027'})
+        assert response.status_code == 202 and submitted[-1][0]['sourceMode'] == 'auto'
+
+
 class AggregateTests(unittest.TestCase):
     def test_sql_reference_does_not_depend_on_old_firestore_values(self):
         items, codes, slots = aggregate_fixture()
@@ -433,6 +693,88 @@ def test_invalid_preview_and_changed_source_cannot_send(service):
     assert svc.status(sent, 'operator')['state'] == 'failed'
     assert svc.status(sent, 'operator')['error'] == 'aifootballx_source_changed'
     assert calls == []
+
+
+def test_destination_preflight_checks_later_pages_before_any_write(service):
+    svc, source, writer, calls = service
+    original = source.capture
+    def capture(scope, slots):
+        report, guards = original(scope, slots)
+        report['documents'] = [document(str(n)) for n in range(101)]
+        report['summary']['documents'] = 101
+        return report, guards
+    source.capture = capture
+    checked = []
+    def preflight(rows):
+        checked.append(len(rows))
+        if len(checked) == 2:
+            raise BackendError('late page identity collision', 409, 'aifootballx_destination_changed')
+    writer.preflight = preflight
+    preview = svc.preview({'seasonId': '20242025'}, 'operator')
+    sent = svc.send(preview, 'operator', 'preflight-all-pages')
+    assert checked == [100, 1] and calls == []
+    assert svc.status(sent, 'operator')['error'] == 'aifootballx_destination_changed'
+
+
+def test_all_late_capture_failure_is_not_reported_as_validated_or_written(service):
+    svc, source, _, calls = service
+    original = source.capture
+    source.split_scopes = lambda scope: [{**scope, 'mode': 'masters'}, {**scope, 'mode': 'aggregates'}]
+    def capture(scope, slots):
+        if scope['mode'] == 'aggregates':
+            raise BackendError('SQL fixture identity conflict', 409, 'aifootballx_fixture_conflict')
+        return original(scope, slots)
+    source.capture = capture
+    svc.send_scope({'seasonId': '20242025', 'mode': 'all', 'unified': True, 'sourceMode': 'auto'}, 'operator')
+    result = svc.public_status('operator')
+    assert result['status'] == 'error' and result['validationPassed'] is False
+    assert calls == []
+
+
+def test_sql_source_guards_reject_changes_and_only_accept_own_exact_outputs():
+    source = object.__new__(delivery.SourceCapture)
+    state = {'version': 'v1', 'data': {'DAP': 40}, 'present': True}
+    path = 'dMST/sql-team'
+    def snapshot():
+        return SimpleNamespace(id='sql-team', reference=SimpleNamespace(path=path), exists=state['present'],
+                               update_time=SimpleNamespace(isoformat=lambda: state['version']),
+                               to_dict=lambda: state['data'])
+    class Query:
+        def select(self, fields): return self
+        def limit(self, bound): return self
+        def stream(self, **opts): return [snapshot()] if state['present'] else []
+    source.target = SimpleNamespace(collection=lambda _: Query(),
+                                    document=lambda _: SimpleNamespace(get=lambda **opts: snapshot()))
+    source.did = SimpleNamespace(get_all=lambda *args, **opts: [])
+    guards = {'documents': {}, 'queries': [{'database': 'target', 'path': 'dMST', 'filters': [],
+                                           'bound': 10, 'versions': {'sql-team': 'v1'}}]}
+    source.assert_fresh(guards)
+    state['version'] = 'v2'; state['data'] = {'DAP': 41}
+    with pytest.raises(BackendError, match='SQL/destination source changed'):
+        source.assert_fresh(guards)
+    guards['target_outputs'] = {path: delivery.fingerprint({'DAP': 41})}
+    source.assert_fresh(guards)  # Exact manifest output, e.g. a retry after own write.
+    state['data'] = {'DAP': 42}
+    with pytest.raises(BackendError): source.assert_fresh(guards)
+    state['present'] = False
+    with pytest.raises(BackendError): source.assert_fresh(guards)
+
+
+def test_firestore_writer_preflight_checks_real_baseline_without_writing():
+    row = document('one')
+    state = {'exists': True, 'data': {'m_id': 999, 'uid': 'one'}}
+    ref = SimpleNamespace(path='Manager/one')
+    client = SimpleNamespace(project='aifootballx',
+        collection=lambda _: SimpleNamespace(document=lambda _: ref),
+        get_all=lambda refs, **kwargs: [SimpleNamespace(reference=ref, exists=state['exists'],
+                                                       to_dict=lambda: state['data'])])
+    writer = FirestoreWriter(client)
+    with pytest.raises(BackendError, match='existence changed'):
+        writer.preflight([row])
+    state['exists'] = False
+    writer.preflight([row])
+    state['exists'] = True; state['data'] = row['data']
+    writer.preflight([row])  # An already delivered exact payload is idempotent.
 
 
 def test_keys_and_jobs_are_owner_scoped(service):

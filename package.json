@@ -2,12 +2,15 @@
   "name": "app",
   "type": "module",
   "private": true,
+  "packageManager": "pnpm@10.12.1",
   "scripts": {
     "build": "nuxt build",
     "dev": "nuxt dev --no-fork --port 3000",
-    "dev:backend": ".\\.venv\\Scripts\\python.exe -m backend.app",
+    "dev:backend": ".\\.venv\\Scripts\\python.exe -B -m backend.app",
     "dev:mac": "nuxt dev --no-fork --port 3000",
-    "dev:backend:mac": "./.venv/bin/python -m backend.app",
+    "dev:backend:mac": "./.venv/bin/python -B -m backend.app",
+    "test:backend": ".\\.venv\\Scripts\\python.exe -B -m pytest -c backend/pytest.ini backend/check",
+    "test:backend:mac": "./.venv/bin/python -B -m pytest -c backend/pytest.ini backend/check",
     "generate": "nuxt generate",
     "preview": "nuxt preview",
     "postinstall": "nuxt prepare"

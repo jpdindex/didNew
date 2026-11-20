@@ -1,5 +1,5 @@
 """Status first and form inputs, matching the existing DID pipelines."""
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Form
 
@@ -18,6 +18,8 @@ def delivery_operator(user: RequiredUser):
 
 Operator = Annotated[object, Depends(delivery_operator)]
 router = APIRouter(prefix='/aifootballx', tags=['aifootballx-delivery'])
+SourceMode = Annotated[Literal['auto', 'did_only', 'hybrid'], Form(
+    description='원천 선택: auto(기본)는 DID 확정 기록을 우선하고 부족한 경기는 기존 SQL 업로드에서 확인합니다. did_only는 DID 기록만 허용합니다. hybrid는 두 원천을 병합하되 같은 경기는 DID로 대체합니다. 전송 전에 필수 값 누락·번호 충돌을 검사해 쓰기 전에 차단하며 결과는 GET 상태 조회에서 확인합니다.')]
 
 
 def input_scope(season, round_from, round_to, gm_id):
@@ -57,12 +59,13 @@ def send_default(user: Operator,
 
 @router.post('/send/matches', status_code=202, summary='경기 상세 비동기 전송',
              description='dMST, TACTIC, vibePlayer, playerGoal, multiSheet_BAP, multiSheet_DAP, multiSheet_DTP, multiSheet_SHOT, multiSheet_GOAL, multiSheet_GOAL-시간, multiSheet_JMX, multiSheet_ALL')
-def send(user: Operator, season: str = Form(..., description='2024-2025 또는 20242025'),
+def send(user: Operator, season: str = Form(..., description='대상 시즌. 예: 2026-2027 또는 20262027'),
          round_from: int | None = Form(None, ge=1, le=38), round_to: int | None = Form(None, ge=1, le=38),
-         gm_id: str | None = Form(None, max_length=100),
+         gm_id: str | None = Form(None, max_length=100, description='한 경기만 전송할 때 GM_ID 입력. 비우면 지정 시즌·라운드 범위의 확정 경기를 처리합니다. 기존 업로드와 경기 번호를 사전 대조합니다.'),
          latest: bool = Form(False, description='신규·변경 문서만 전송')):
     service = delivery_service()
-    service.send_scope({**input_scope(season,round_from,round_to,gm_id), 'mode':'matches', 'latest':latest},user.uid)
+    service.send_scope({**input_scope(season,round_from,round_to,gm_id), 'mode':'matches', 'latest':latest,
+                        'sourceMode': 'auto'},user.uid)
     return service.public_status(user.uid)
 
 
@@ -77,22 +80,25 @@ def send_masters(user: Operator, season: str = Form(..., description='2024-2025 
 
 @router.post('/send/aggregates', status_code=202, summary='경기·라운드·시즌 집계 비동기 전송',
              description='pMST, mMST, cAVG, rAVG, rank, sAVG')
-def send_aggregates(user: Operator, season: str = Form(..., description='2024-2025 또는 20242025'),
+def send_aggregates(user: Operator, season: str = Form(..., description='대상 시즌. 예: 2026-2027 또는 20262027'),
                     round_from: int | None = Form(None, ge=1, le=38), round_to: int | None = Form(None, ge=1, le=38),
-                    gm_id: str | None = Form(None, max_length=100),
-                    latest: bool = Form(False, description='신규·변경 문서만 전송')):
+                    gm_id: str | None = Form(None, max_length=100, description='수정·추가한 경기의 GM_ID. 집계 계산에는 필요한 이전 경기 이력도 포함하고 영향받는 라운드·시즌 집계를 갱신합니다.'),
+                    latest: bool = Form(False, description='신규·변경 문서만 전송'),
+                    source_mode: SourceMode = 'auto'):
     service = delivery_service()
-    service.send_scope({**input_scope(season,round_from,round_to,gm_id), 'mode':'aggregates', 'latest':latest},user.uid)
+    service.send_scope({**input_scope(season,round_from,round_to,gm_id), 'mode':'aggregates', 'latest':latest,
+                        'sourceMode': source_mode},user.uid)
     return service.public_status(user.uid)
 
 
 @router.post('/send/all', status_code=202, summary='경기·마스터·집계 ALL 비동기 전송',
              description='dMST, TACTIC, vibePlayer, playerGoal, multiSheet_BAP, multiSheet_DAP, multiSheet_DTP, multiSheet_SHOT, multiSheet_GOAL, multiSheet_GOAL-시간, multiSheet_JMX, multiSheet_ALL, Player, playerDB, Manager, code, pMST, mMST, cAVG, rAVG, rank, sAVG')
-def send_all(user: Operator, season: str = Form(..., description='2024-2025 또는 20242025'),
+def send_all(user: Operator, season: str = Form(..., description='대상 시즌. 예: 2026-2027 또는 20262027'),
              round_from: int | None = Form(None, ge=1, le=38), round_to: int | None = Form(None, ge=1, le=38),
-             gm_id: str | None = Form(None, max_length=100),
-             latest: bool = Form(False, description='신규·변경 문서만 전송')):
+             gm_id: str | None = Form(None, max_length=100, description='상세 전송할 한 경기의 GM_ID. 마스터는 시즌 전체, 집계는 필요한 경기 이력을 포함해 전송 전에 함께 검증합니다.'),
+             latest: bool = Form(False, description='신규·변경 문서만 전송'),
+             source_mode: SourceMode = 'auto'):
     service = delivery_service()
     service.send_scope({**input_scope(season,round_from,round_to,gm_id),
-                        'mode':'all', 'unified':True, 'latest':latest},user.uid)
+                        'mode':'all', 'unified':True, 'latest':latest, 'sourceMode': source_mode},user.uid)
     return service.public_status(user.uid)

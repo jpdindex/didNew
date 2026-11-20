@@ -6,6 +6,7 @@
 .cache
 dist
 .pnpm-store/
+.firebase/
 
 # Node dependencies
 node_modules
@@ -35,6 +36,7 @@ docs/aifootballx/*.json
 *.inspect.ndjson
 outputs/readonly-20242025-audit/
 /outputs/recovery/
+/outputs/**/correction_data.json
 
 # Misc
 .DS_Store

@@ -47,6 +47,7 @@ def test_openapi_lists_health_and_protected_kpi_runs() -> None:
         "/api/v1/legacy-import/player-update",
         "/api/v1/legacy-import/player-update/status",
         "/api/v1/aifootballx/send/status",
+        "/api/v1/aifootballx/send/default",
         "/api/v1/aifootballx/send/matches",
         "/api/v1/aifootballx/send/masters",
         "/api/v1/aifootballx/send/aggregates",
