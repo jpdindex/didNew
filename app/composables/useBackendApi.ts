@@ -17,9 +17,11 @@ export function useBackendApi() {
   const backendUrl = useState<string>('did-backend-url', () => '')
 
   async function resolveBackendUrl() {
-    if (backendUrl.value) return backendUrl.value
-
     const configured = typeof config.public.backendUrl === 'string' ? config.public.backendUrl : ''
+    // A dev-server restart can change runtime config while Nuxt preserves state.
+    // Never keep a previously resolved remote host over the configured backend.
+    if (backendUrl.value && (!configured || backendUrl.value === trimTrailingSlash(configured))) return backendUrl.value
+
     const candidates = configured ? [configured] : LOCAL_BACKEND_PORTS.map((port) => `http://127.0.0.1:${port}`)
 
     for (const candidate of candidates) {

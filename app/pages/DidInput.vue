@@ -37,7 +37,7 @@ import { formatMatchClock, formatMatchMinute } from '~/utils/matchClock'
 const route = useRoute()
 const home = computed(() => String(route.query.home ?? route.query.homeName ?? 'Vallecano').trim() || 'Vallecano')
 const away = computed(() => String(route.query.away ?? route.query.awayName ?? route.query.opponent ?? 'Real Madrid').trim() || 'Real Madrid')
-const gi_part = computed(() => (route.query.side === 'right' ? 'R' : 'L')) // TeamSelection의 진영선택 값
+const gi_part = computed(() => ((game.value.side ?? route.query.side) === 'right' ? 'R' : 'L')) // 저장된 전반 진영을 우선 사용
 const inputMode = computed(() => (route.query.mode === '실시간' ? '실시간' : '분석')) // 실시간=정지불가, 분석(디폴트)=정지가능
 
 // TeamSelection(대기 화면)과 공유하는 상태. 전반/후반 종료 시 여기에 저장하고
@@ -703,6 +703,14 @@ watch(records, () => queueDraftSave(), { deep: true })
 
 // 입력 중인 팀. TeamSelection 에서 team 쿼리로 넘어온다.
 const team = computed(() => (route.query.team === 'away' ? 'away' : 'home'))
+// 진영은 입력하는 팀 기준이다. 홈/원정 기록 소속은 유지하고 표시 순서만 바꾼다.
+const ownTeamOnLeft = computed(() => (gi_part.value === 'L') === (half.value === '전반'))
+const leftTeam = computed(() => ownTeamOnLeft.value ? team.value : (team.value === 'home' ? 'away' : 'home'))
+const rightTeam = computed(() => leftTeam.value === 'home' ? 'away' : 'home')
+const leftTeamName = computed(() => leftTeam.value === 'home' ? home.value : away.value)
+const rightTeamName = computed(() => rightTeam.value === 'home' ? home.value : away.value)
+const leftScore = computed(() => leftTeam.value === 'home' ? homeScore.value : awayScore.value)
+const rightScore = computed(() => rightTeam.value === 'home' ? homeScore.value : awayScore.value)
 // 입력 중인 팀의 스코어는 GOAL 결과 레코드 수에서 다시 계산한다. 골을 넣을 때 ++ 만
 // 하면 기록을 삭제하거나 결과를 B/X/선방 등으로 고쳤을 때 점수가 내려가지 않는다.
 function syncOwnScore() {
@@ -2882,8 +2890,8 @@ async function finishHalf() {
           </div>
 
           <div class="scoreBar">
-            <div class="team" :class="{ mine: team === 'home' }">{{ home }}</div>
-            <div class="score">{{ homeScore }}</div>
+            <div class="team" :class="{ mine: team === leftTeam }">{{ leftTeamName }}</div>
+            <div class="score">{{ leftScore }}</div>
             <div class="halfBox">
               <div class="clockRow">
                 <button class="timeStep" :disabled="!isPrimary && !historyPinned && !editingId"
@@ -2899,8 +2907,8 @@ async function finishHalf() {
                   @pointercancel="stopTimeHold" @contextmenu.prevent>+</button>
               </div>
             </div>
-            <div class="score">{{ awayScore }}</div>
-            <div class="team right" :class="{ mine: team === 'away' }">{{ away }}</div>
+            <div class="score">{{ rightScore }}</div>
+            <div class="team right" :class="{ mine: team === rightTeam }">{{ rightTeamName }}</div>
           </div>
 
           <div class="pitch" :style="pitchStyle" @pointerdown="clickPitch">

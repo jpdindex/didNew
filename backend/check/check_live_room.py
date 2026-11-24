@@ -524,6 +524,58 @@ def test_final_correction_access_is_read_only_and_restore_rechecks_current_level
     assert api.restore_raw_to_draft('m', 'H', user, request).savedRevision == response.savedRevision
 
 
+@pytest.mark.parametrize('existing_manager', [False, True])
+def test_manager_corrects_final_raw_with_original_primary_retained(data, monkeypatch, existing_manager):
+    from backend.api import api_match_input as api
+    from backend.system.system_firestore import CurrentUser
+
+    root = data.db.documents['inputDrafts/m_H']
+    root.update(liveClosed=True, payload=None, roomEpoch=2)
+    if existing_manager:
+        root['participants']['manager'] = {'role': 'manager', 'level': 'advanced'}
+    data.db.documents['recorders/manager'] = {'level': 'advanced'}
+    data.db.documents['matches/m/recordings/H'] = {'status': 'final', 'recorders': {'p': {'rank': 'main'}}}
+    raw = payload([record()])
+    raw['status'] = 'final'
+    data.read_input_state_from_raw = lambda *args: {'payload': raw, 'clientState': {'restoredFromRaw': True}}
+    monkeypatch.setattr(api, 'JpdDidData', lambda: data)
+    monkeypatch.setattr(api, '_publish_draft_response', lambda response: None)
+    user = CurrentUser(uid='manager', claims={})
+    original = deepcopy(data.db.documents)
+
+    access = api.read_correction_access('m', 'H', api.ParticipantJoinRequest(role='manager'), user)
+    assert access['role'] == 'manager' and access['control'] and access['level'] == 'advanced'
+    assert data.db.documents == original
+
+    request = api.RestoreCommandRequest(commandId='manager-restore', baseRevision=0, roomEpoch=2, role='manager')
+    response = api.restore_raw_to_draft('m', 'H', user, request)
+    assert response.participant.model_dump() == {'role': 'manager', 'level': 'advanced', 'control': True}
+    restored = data.db.documents['inputDrafts/m_H']
+    assert restored['primaryUid'] is None
+    assert restored['participants']['p']['role'] == 'primary'
+    assert live.require_draft_writer(restored, 'manager', control=True)
+    assert response.payload.records[0].id == 'r'
+    assert api.restore_raw_to_draft('m', 'H', user, request).savedRevision == response.savedRevision
+    assert live.finalize_command(data, 'm', 'H', api.FinalizeCommandRequest(
+        commandId='manager-final', baseRevision=response.savedRevision, roomEpoch=2,
+    ), 'manager', lambda _: {'status': 'ok'})['commandId'] == 'manager-final'
+
+
+def test_live_manager_keeps_primary_control_and_demoted_manager_cannot_correct(data):
+    data.get_recording_statuses = lambda _: {'H': None, 'A': None}
+    data.db.documents['recorders/manager'] = {'level': 'advanced'}
+    original = deepcopy(data.db.documents['inputDrafts/m_H'])
+    resolved = data.resolve_input_draft_participant('m', 'H', original, user_id='manager', role='manager')
+    assert resolved['primaryUid'] == 'p'
+    with pytest.raises(BackendError):
+        live.require_draft_writer(resolved, 'manager', control=True)
+
+    data.db.documents['recorders/manager']['level'] = 'basic'
+    with pytest.raises(BackendError) as caught:
+        data.resolve_input_draft_participant('m', 'H', resolved, user_id='manager', role='manager', correction=True)
+    assert caught.value.code == 'manager_requires_advanced'
+
+
 @pytest.mark.parametrize('half', ['ready', 'H1', 'H2_done', 'final'])
 @pytest.mark.parametrize('raw_status', [None, 'final'])
 def test_correction_draft_never_reopens_final_raw_on_schedule(data, half, raw_status):

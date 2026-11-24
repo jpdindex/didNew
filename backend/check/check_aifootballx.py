@@ -215,8 +215,26 @@ def test_number_allocation_preserves_native_gm_number_with_only_one_registered_f
 
 
 @pytest.mark.parametrize('legacy_excel', [False, True])
-def test_hybrid_capture_one_fixture_generates_complete_round_and_retry_is_unchanged(tmp_path, legacy_excel):
+@pytest.mark.parametrize('fractional_ratings', [False, True])
+def test_hybrid_capture_one_fixture_generates_complete_round_and_retry_is_unchanged(tmp_path, legacy_excel, fractional_ratings):
     items, codes, slots, fixtures, existing = hybrid_source_fixture()
+    if fractional_ratings:
+        # Existing SQL stores more precision than the payload; fixture 6 will
+        # arrive later from DID. Keep an actual rounding/truncation boundary.
+        for item in items:
+            item['recording']['teamRating']['jmx'] = 77.55888
+        original_dmst = existing['dMST']
+        existing = {'dMST': [], 'code': [{'id': str(n), **r} for n, r in enumerate(codes)]}
+        for doc in build_aggregates(items, codes, slots)['documents']:
+            existing.setdefault(doc['collection'], []).append(
+                {'id': doc['document_id'], 'data': deepcopy(doc['data'])})
+        for item in items:
+            team = item['recording']['teamId']
+            row = deepcopy(next(r for r in original_dmst if r['data']['t_code'] == team))
+            row['data']['JMX'] = 77.6
+            existing['dMST'].append(row)
+        for row in existing['pMST']:
+            row['data']['gi_score'] = 77.55888
     mid = fixtures[5]['id']
     selected = deepcopy(items[10:12])
     for i in selected:
@@ -249,8 +267,8 @@ def test_hybrid_capture_one_fixture_generates_complete_round_and_retry_is_unchan
     assert report['aggregate_status'] == 'ready'
     assert len(docs(report, 'pMST')) == 2 and len(docs(report, 'mMST')) == 1
     assert docs(report, 'mMST')[0]['Match-No'] == 6
-    assert docs(report, 'cAVG')[0]['R-AVG'] == 61.5
-    assert docs(report, 'rAVG')[0]['MH6-IDX'] == 71
+    assert docs(report, 'cAVG')[0]['R-AVG'] == (78.5 if fractional_ratings else 61.5)
+    assert docs(report, 'rAVG')[0]['MH6-IDX'] == (87.5 if fractional_ratings else 71)
     for doc in report['documents']:
         rows = existing.setdefault(doc['collection'], [])
         rows[:] = [r for r in rows if r['id'] != doc['document_id']]
@@ -263,7 +281,166 @@ def test_hybrid_capture_one_fixture_generates_complete_round_and_retry_is_unchan
         i['recording']['teamRating']['jmx'] += 10
     corrected, _ = source.capture(scope, slot_file)
     assert corrected['validation_passed'], corrected['errors']
-    assert docs(corrected, 'cAVG')[0]['R-AVG'] == 62.5
+    assert docs(corrected, 'cAVG')[0]['R-AVG'] == (79.5 if fractional_ratings else 62.5)
+
+
+def test_aggregate_rating_inputs_are_truncated_before_averages_and_final_validation():
+    items, codes, slots = aggregate_fixture()
+    for item in items:
+        item['recording']['teamRating']['jmx'] = 77.55888
+    original = deepcopy(items)
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    numbers = delivery.round_fixture_numbers(fixtures)
+    generated = build_aggregates(items, codes, slots, fixture_numbers=numbers)
+    assert {r['gi_score'] for r in docs(generated, 'pMST')} == {77.55}
+    assert {r['HA-avg'] for r in docs(generated, 'mMST')} == {77.55}
+    assert docs(generated, 'sAVG')[0]['AI Rating'] == 77.5
+    expected_rank = deepcopy(docs(generated, 'rank')[0])
+    delivery.complete_scheduled_aggregates(generated, fixtures, codes, slots, {}, items,
+                                         fixture_numbers=numbers)
+    actual_rank = docs(generated, 'rank')[0]
+    assert actual_rank['Season'] == expected_rank['Season'] == 77.6
+    assert actual_rank['S_Avg'] == expected_rank['S_Avg'] == 77.6
+    assert validate_aggregate_links(generated, items, codes, slots, fixture_numbers=numbers)['passed']
+    actual_rank['Season'] = 77.5
+    assert not validate_aggregate_links(generated, items, codes, slots, fixture_numbers=numbers)['passed']
+    assert items == original  # Stored DID RATING precision is untouched.
+
+
+@pytest.mark.parametrize('sql_count', [0, 3])
+@pytest.mark.parametrize('history', [False, True])
+@pytest.mark.parametrize('legacy_defaults', [False, True])
+def test_progressive_aggregates_keep_defaults_add_inputs_and_are_idempotent(tmp_path, sql_count, history, legacy_defaults):
+    base, codes, slots, first_fixtures, sql = hybrid_source_fixture()
+    number = 2 if history else 1
+    current = deepcopy(base)
+    for index, item in enumerate(current):
+        item['match_id'] += '-current'
+        item['match']['round'] = number
+        item['recording']['teamRating']['jmx'] = 70.123456 + index / 100
+    current_fixtures = [{'id': i['match_id'], 'data': i['match']} for i in current if i['side'] == 'H']
+    fixtures = (first_fixtures if history else []) + current_fixtures
+    numbers = delivery.round_fixture_numbers(fixtures)
+    block = slots['seasonSlotMappings']['2024-2025']
+    defaults = delivery.round_default_documents(current_fixtures, codes, block['cavgSlotToCodeTeamCodeMapping'], {},
+        rank_slots=block['rankSlotToCodeTeamCodeMapping'], fixture_numbers=numbers)
+    existing = deepcopy(sql) if history else {}
+    existing['code'] = [{'id': str(n), **r} for n, r in enumerate(codes)]
+    for doc in defaults:
+        data = deepcopy(doc['data'])
+        if legacy_defaults:
+            data.pop('didUnplayed', None)
+        existing.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': data})
+    uploaded = current[-sql_count * 2:] if sql_count else []
+    uploaded_teams = {i['recording']['teamId'] for i in uploaded}
+    sql_generated = build_aggregates((base if history else []) + current, codes, slots, fixture_numbers=numbers)
+    for doc in sql_generated['documents']:
+        col, data = doc['collection'], doc['data']
+        if col not in ('pMST', 'mMST') or data.get('gm_round', data.get('Round')) != number:
+            continue
+        if (data.get('t_code') if col == 'pMST' else data.get('H-Code')) not in uploaded_teams:
+            continue
+        key = delivery.aggregate_key(col, data)
+        existing[col] = [r for r in existing[col] if delivery.aggregate_key(col, r['data']) != key]
+        existing[col].append({'id': doc['document_id'], 'data': deepcopy(data)})
+    for item in uploaded:
+        old = deepcopy(next(r for r in sql['dMST'] if r['data']['t_code'] == item['recording']['teamId']))
+        old['id'] += '-current'
+        old['data'].update(gm_id=item['match_id'], gm_round=number,
+                           JMX=delivery.rounded(item['recording']['teamRating']['jmx'], 1))
+        existing['dMST'] = [r for r in existing['dMST'] if not (
+            r['data']['gm_round'] == number and r['data']['t_code'] == old['data']['t_code'])]
+        existing['dMST'].append(old)
+    source = object.__new__(delivery.SourceCapture)
+    source.documents = {}; source.queries = []
+    heads = {}
+    source.did = SimpleNamespace(document=lambda p: SimpleNamespace(path=p), get_all=lambda refs, **kwargs: [
+        SimpleNamespace(reference=r, exists=r.path in heads, update_time=SimpleNamespace(isoformat=lambda: 'v1'),
+                        to_dict=lambda path=r.path: heads.get(path, {})) for r in refs])
+    source.target = object()
+    source.rows = lambda client, path, *a, **kw: deepcopy(fixtures if client is source.did else existing.get(path, []))
+    source.get_many = lambda paths: {}
+    slot_file = tmp_path / 'slots.json'; slot_file.write_text(json.dumps(slots), encoding='utf-8')
+    scope = {'seasonId': '20242025', 'mode': 'aggregates', 'roundFrom': number, 'roundTo': number, 'sourceMode': 'auto'}
+    for did_count in [2, 4, 10 - sql_count]:
+        chosen = current[:did_count * 2]
+        heads.update({f'matches/{i["match_id"]}/recordings/{i["side"]}': i['recording'] for i in chosen})
+        report, _ = source.capture(scope, slot_file)
+        assert report['validation_passed'], report['errors']
+        assert report['sourceSelection']['pendingMatches'] == 10 - sql_count - did_count
+        real = chosen + uploaded
+        assert docs(report, 'cAVG')[0]['R-AVG'] == truncate_rating(delivery.precise_mean([
+            truncate_rating(i['recording']['teamRating']['jmx'], 2) for i in real]))
+        assert docs(report, 'sAVG')[0]['DAP'] == 40  # Defaults never dilute the mean.
+        assert sum(bool(r.get('didUnplayed')) for r in docs(report, 'pMST')) == (10 - sql_count - did_count) * 2
+        rank = docs(report, 'rank')[0]
+        for item in real:
+            code = delivery.resolve_team_code(codes, '2024-2025', item['recording']['teamId'])
+            slot = delivery.rank_slot_for_team(slots, '2024-2025', code['team_code_number'])
+            expected_points = (6 if history else 3) if item['side'] == 'H' else 0
+            assert rank[f'WTT{slot}'] == expected_points
+        for doc in report['documents']:
+            rs = existing.setdefault(doc['collection'], [])
+            rs[:] = [r for r in rs if r['id'] != doc['document_id']]
+            rs.append({'id': doc['document_id'], 'data': deepcopy(doc['data'])})
+        again, _ = source.capture({**scope, 'latest': True}, slot_file)
+        assert again['validation_passed'] and not again['documents'], again['errors']
+
+
+@pytest.mark.parametrize('corruption', ['missing_pmst', 'nonzero_pmst', 'nonzero_mmst', 'wrong_slot'])
+def test_pending_slots_do_not_hide_incomplete_or_conflicting_uploads(corruption):
+    items, codes, slots, fixtures, _ = hybrid_source_fixture()
+    block = slots['seasonSlotMappings']['2024-2025']
+    target = {}
+    for doc in delivery.round_default_documents(fixtures, codes, block['cavgSlotToCodeTeamCodeMapping'], {},
+            rank_slots=block['rankSlotToCodeTeamCodeMapping']):
+        target.setdefault(doc['collection'], []).append({'id': doc['document_id'], 'data': deepcopy(doc['data'])})
+    if corruption == 'missing_pmst': target['pMST'].pop(0)
+    elif corruption == 'nonzero_pmst': target['pMST'][0]['data']['DAP'] = 1
+    elif corruption == 'nonzero_mmst': target['mMST'][0]['data']['H-DAP'] = 1
+    else: target['mMST'][0]['data']['Match-No'] = 9
+    with pytest.raises(BackendError):
+        delivery.validate_pending_fixtures(fixtures, [], target, '20242025')
+
+
+@pytest.mark.parametrize('first,second,gap,rate', [
+    (77.5599, 76.4399, -1.12, -.015),
+    (77.5099, 76.4099, -1.1, -.014),
+])
+def test_final_round_comparisons_keep_decimal_means_and_match_repeated_builds(first, second, gap, rate):
+    base, codes, slots = aggregate_fixture()
+    items = []
+    for number, jmx in [(1, first), (2, second)]:
+        for original in base:
+            item = deepcopy(original)
+            item['match_id'] += f'-r{number}'
+            item['match']['round'] = number
+            item['recording']['teamRating']['jmx'] = jmx
+            items.append(item)
+    fixtures = [{'id': i['match_id'], 'data': i['match']} for i in items if i['side'] == 'H']
+    numbers = delivery.round_fixture_numbers(fixtures)
+    generated = build_aggregates(items, codes, slots, fixture_numbers=numbers)
+    original_rank = deepcopy(docs(generated, 'rank')[1])
+    assert original_rank['R_Gap'] == gap
+    assert original_rank['R_Rate'] == rate
+    delivery.complete_scheduled_aggregates(generated, fixtures, codes, slots, {}, items,
+                                         fixture_numbers=numbers)
+    rank = docs(generated, 'rank')[1]
+    assert rank['R_Gap'] == gap and rank['R_Rate'] == rate
+    assert validate_aggregate_links(generated, items, codes, slots, fixture_numbers=numbers)['passed']
+    published = {}
+    for doc in generated['documents']:
+        published.setdefault(doc['collection'], []).append(
+            {'id': doc['document_id'], 'data': deepcopy(doc['data'])})
+    repeated = build_aggregates(items, codes, slots, fixture_numbers=numbers)
+    delivery.complete_scheduled_aggregates(repeated, fixtures, codes, slots, published, items,
+                                         fixture_numbers=numbers)
+    assert docs(repeated, 'rank') == docs(generated, 'rank')
+    for field in ('R_Gap', 'R_Rate'):
+        old = rank[field]
+        rank[field] += .01
+        assert not validate_aggregate_links(generated, items, codes, slots, fixture_numbers=numbers)['passed']
+        rank[field] = old
 
 
 def test_legacy_excel_pairing_does_not_modify_source_documents_or_ambiguously_link_ids():
@@ -339,7 +516,8 @@ def test_swagger_source_selection_is_a_minimal_post_form_with_status_first():
         body = operation['requestBody']['content']['application/x-www-form-urlencoded']['schema']
         fields = schema['components']['schemas'][body['$ref'].split('/')[-1]]['properties']
         assert fields['source_mode']['default'] == 'auto'
-        assert fields['source_mode']['enum'] == ['auto', 'did_only', 'hybrid']
+        assert fields['source_mode']['enum'] == ['auto', 'did_only']
+        assert 'hybrid' not in fields['source_mode']['description']
         assert 'GET' in fields['source_mode']['description'] and '전송 전' in fields['source_mode']['description']
     for route in ('matches', 'masters', 'default'):
         body = schema['paths']['/api/v1/aifootballx/send/' + route]['post']['requestBody']['content']['application/x-www-form-urlencoded']['schema']
@@ -349,6 +527,7 @@ def test_swagger_source_selection_is_a_minimal_post_form_with_status_first():
 @pytest.mark.parametrize('route', ['aggregates', 'all'])
 @pytest.mark.parametrize('mode', ['auto', 'did_only', 'hybrid'])
 def test_source_selection_post_form_reaches_scope_without_query_fields(monkeypatch, route, mode):
+    # hybrid remains accepted for old callers, but is absent from Swagger.
     app = FastAPI()
     app.include_router(api_aifootballx.router, prefix='/api/v1')
     app.dependency_overrides[api_aifootballx.delivery_operator] = lambda: SimpleNamespace(uid='operator')

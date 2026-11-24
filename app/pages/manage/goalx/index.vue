@@ -1,21 +1,26 @@
 <script setup lang="ts">
+import { estimateGoalShot, validEstimatedCoordinates, goalxEstimationSheets, type EstimatedShot, type EstimatedShotInput, type GoalxExportRecord } from '~/utils/goalx'
 type Grade = 'high' | 'medium' | 'low'
 type Category = 'artistry' | 'defense' | 'trajectory'
 type Grades = Record<Category, Grade>
 type Metric = 'distance' | 'speed'
 type RankingSortKey = Metric | 'finalSpeed' | Category | 'score'
 type Point = { x: number; y: number; z: number }
+type RawCoordinates = Partial<Record<'posX' | 'posY' | 'shootPosX' | 'shootPosY' | 'goalX', number | null>>
 type League = { id: string; name: string }
 type Season = { id: string; leagueId: string; name: string; from: string | null; to: string | null }
 type Round = { id: string; latestDate: string; earliestDate: string }
 type Team = { name: string; aliases: string[] }
 type Analysis = {
+  representative: { status: 'approved' | 'needs_review'; approvedBy: string; approvedAt: string } | null
+  myEstimatedShot: EstimatedShot | null
   shotId: string | null; myGrades: Grades | null; evaluationCount: number
   evaluators: { id: string; name: string }[]
   score: number | null; categoryScores: Partial<Record<Category, number>>; autoGrades: Partial<Record<Metric, Grade>>
   metrics: Partial<Record<string, number | null>>
 }
 type Goal = Analysis & {
+  rawCoordinates?: RawCoordinates
   gmId: string; side: 'H' | 'A'; recordId: string; teamId: string; homeTeamId: string; awayTeamId: string
   date: string; half: string; clock: string; playerName: string | null; seasonId: string; round: string
   manual?: boolean
@@ -27,12 +32,24 @@ type Shot = {
   goalPoint: Point | null; goalX: number | null; goalCenterY: number | null; videoUrl: string | null
   scoreboard: { home: string | null; away: string | null; clock: string | null }
 }
+type RepresentativeProposal = {
+  sourceVersion: string; evaluationCount: number; categoryScores: Record<Category, number>; score: number
+  trajectoryCounts: Partial<Record<Grade, number>>; trajectoryCandidates: Grade[]
+  timeToGoal: number | null; timeSampleCount: number; coordinates: RawCoordinates; goalX: 0 | 105; directionGoalX: 0 | 105 | null; shotId: string | null
+}
 
 const api = '/api/v1/goalx'
 const supportedLeagueIds = new Set(['EPL', 'LALIGA', 'TESTGOAL'])
 const { request } = useBackendApi()
 const grades: Grade[] = ['high', 'medium', 'low']
 const labels = { high: '상', medium: '중', low: '하' }
+const trajectoryLabels = { high: '딥 커브', medium: '커브', low: '스트레이트' }
+const coordinateFields = [
+  { key: 'posX', label: '슈팅 X (%)', min: 0, max: 100 },
+  { key: 'posY', label: '슈팅 Y (%)', min: 0, max: 100 },
+  { key: 'shootPosX', label: '골문 결과 X', min: 83, max: 464 },
+  { key: 'shootPosY', label: '골문 결과 Y', min: 83, max: 300 },
+] as const
 const categories: { key: Category; label: string }[] = [
   { key: 'artistry', label: '예술성' }, { key: 'defense', label: '수비 환경' }, { key: 'trajectory', label: '궤적' },
 ]
@@ -42,6 +59,7 @@ const rankingColumns: { label: string; sortKey?: RankingSortKey; numeric?: boole
   { label: '종료 속도', sortKey: 'finalSpeed' }, { label: '평가 인원' },
   ...categories.map(({ label, key }) => ({ label, sortKey: key, numeric: true })),
   { label: '평균 점수', sortKey: 'score', numeric: true },
+  { label: '대표 승인' },
 ]
 const metrics = [
   { key: 'distance', label: '슈팅 거리', unit: 'm' }, { key: 'speed', label: '초기 속도', unit: 'km/h' },
@@ -79,6 +97,24 @@ const loadingRanking = ref(false)
 const loadingRankingRounds = ref(false)
 const participantsDialog = ref<HTMLDialogElement>()
 const participantsGoal = ref<Goal>()
+const canApproveRepresentative = ref(false)
+const representativeDialog = ref<HTMLDialogElement>()
+const representativeGoal = ref<Goal>()
+const representativeProposal = ref<RepresentativeProposal>()
+const representativeTrajectory = ref<Grade>()
+const representativeCoordinates = ref<Record<string, number | null | ''>>({})
+const loadingRepresentative = ref(false)
+const approvingRepresentative = ref(false)
+const representativeError = ref('')
+let representativeRequest: AbortController | undefined
+const representativeCoordinatesValid = computed(() => validEstimatedCoordinates({ ...representativeCoordinates.value, goalX: representativeProposal.value?.goalX }))
+const representativeHasCoordinates = computed(() => coordinateFields.some(({ key }) => representativeCoordinates.value[key] != null && representativeCoordinates.value[key] !== ''))
+const representativeEstimate = computed(() => {
+  const proposal = representativeProposal.value
+  if (!proposal || !representativeTrajectory.value || !representativeCoordinatesValid.value) return null
+  const goalX = proposal.directionGoalX ?? (Number(representativeCoordinates.value.posX) < 50 ? 0 : 105)
+  return estimateGoalShot({ ...representativeCoordinates.value, goalX, timeToGoal: proposal.timeToGoal } as EstimatedShotInput, representativeTrajectory.value)
+})
 const leagueSeasons = computed(() => {
   const registered = seasons.value.filter(item => item.leagueId === league.value)
   const knownIds = new Set(registered.map(item => item.id))
@@ -158,6 +194,88 @@ const saving = ref(false)
 const linking = ref(false)
 const shot = ref<Shot | null>(null)
 const showShot = ref(false)
+const showEstimated = ref(false)
+const loadingRawCoordinates = ref(false)
+const rawCoordinatesError = ref('')
+let rawCoordinatesRequest: AbortController | undefined
+const estimateDraft = ref<Record<string, number | null | ''>>({})
+const rawGoalX = ref<0 | 105 | null>(null)
+const automaticGoalX = computed(() => rawGoalX.value ?? (typeof estimateDraft.value.posX === 'number' && estimateDraft.value.posX < 50 ? 0 : 105))
+const timerRunning = ref(false)
+const stopwatchElapsed = ref(0)
+const stopwatchDisplay = computed(() => {
+  const value = timerRunning.value ? stopwatchElapsed.value : estimateDraft.value.timeToGoal
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : '0.00'
+})
+let stopwatch: ReturnType<typeof setInterval> | undefined
+let stopwatchStarted = 0
+const estimatedCoordinatesValid = computed(() => validEstimatedCoordinates({ ...estimateDraft.value, goalX: automaticGoalX.value }))
+const estimatedTimeValid = computed(() => estimateDraft.value.timeToGoal == null
+  || (typeof estimateDraft.value.timeToGoal === 'number' && Number.isFinite(estimateDraft.value.timeToGoal)
+    && estimateDraft.value.timeToGoal > 0 && estimateDraft.value.timeToGoal <= 600))
+const estimatedPreview = computed(() => {
+  if (!estimatedCoordinatesValid.value || !estimatedTimeValid.value || !draft.value.trajectory) return null
+  return estimateGoalShot({ ...estimateDraft.value, goalX: automaticGoalX.value } as EstimatedShotInput, draft.value.trajectory)
+})
+const hasEstimateCoordinates = computed(() => coordinateFields.some(field => estimateDraft.value[field.key] != null && estimateDraft.value[field.key] !== ''))
+const estimateInvalid = computed(() => timerRunning.value || !estimatedTimeValid.value
+  || ((hasEstimateCoordinates.value || estimateDraft.value.timeToGoal != null) && !estimatedCoordinatesValid.value))
+
+function stopStopwatch() {
+  if (stopwatch !== undefined) clearInterval(stopwatch)
+  stopwatch = undefined
+  timerRunning.value = false
+}
+function resetEstimate(goal?: Goal) {
+  stopStopwatch()
+  const raw = goal?.rawCoordinates ?? {}
+  const saved = goal?.myEstimatedShot?.input
+  rawGoalX.value = raw.goalX === 0 || raw.goalX === 105 ? raw.goalX : null
+  estimateDraft.value = {
+    ...Object.fromEntries(coordinateFields.map(field => [field.key, saved?.[field.key] ?? raw[field.key] ?? null])),
+    timeToGoal: saved?.timeToGoal ?? null,
+  }
+}
+async function loadRawCoordinates(goal?: Goal) {
+  rawCoordinatesRequest?.abort()
+  loadingRawCoordinates.value = false
+  rawCoordinatesError.value = ''
+  if (!goal || goal.manual) return
+  const controller = new AbortController()
+  rawCoordinatesRequest = controller
+  const initial = { ...estimateDraft.value }
+  loadingRawCoordinates.value = true
+  try {
+    const { coordinates } = await request<{ coordinates: RawCoordinates }>(pathOf(goal) + '/raw-coordinates', { signal: controller.signal })
+    if (controller.signal.aborted || selectedKey.value !== keyOf(goal)) return
+    goal.rawCoordinates = coordinates
+    rawGoalX.value = coordinates.goalX === 0 || coordinates.goalX === 105 ? coordinates.goalX : null
+    for (const { key } of coordinateFields) {
+      if (initial[key] == null && estimateDraft.value[key] == null) estimateDraft.value[key] = coordinates[key] ?? null
+    }
+  } catch (error) {
+    if (!controller.signal.aborted && selectedKey.value === keyOf(goal)) rawCoordinatesError.value = errorMessage(error)
+  } finally {
+    if (!controller.signal.aborted) loadingRawCoordinates.value = false
+  }
+}
+function toggleStopwatch() {
+  if (timerRunning.value) {
+    estimateDraft.value.timeToGoal = Math.max(.001, Math.round((performance.now() - stopwatchStarted) / 10) / 100)
+    stopStopwatch()
+    return
+  }
+  stopwatchStarted = performance.now()
+  stopwatchElapsed.value = 0
+  timerRunning.value = true
+  stopwatch = setInterval(() => {
+    stopwatchElapsed.value = Math.min(600, Math.round((performance.now() - stopwatchStarted) / 10) / 100)
+    if (stopwatchElapsed.value >= 600) {
+      estimateDraft.value.timeToGoal = 600
+      stopStopwatch()
+    }
+  }, 30)
+}
 const search = ref('')
 const candidates = ref<Candidate[] | null>(null)
 const candidateId = ref('')
@@ -221,6 +339,7 @@ async function afterTestGoalSave(id: string) {
 
 async function downloadCompletedGoals() {
   if (exporting.value || !completedGoals.value.length) return
+  const completed = [...completedGoals.value]
   exporting.value = true
   exportError.value = ''
   const leagueLabel = leagues.value.find(item => item.id === league.value)?.name || league.value
@@ -229,7 +348,7 @@ async function downloadCompletedGoals() {
   const headers = ['대회', '시즌', '라운드', '경기 날짜', '득점 시각', '득점자', '득점 팀', '홈팀', '원정팀', '평가 인원',
     ...categories.map(category => category.label + ' 평균'), '평균 총점', '분석관 이름', '분석관 ID', 'ShotX ID',
     ...metrics.map(metric => metric.label + ' (' + metric.unit + ')')]
-  const rows = completedGoals.value.map(goal => [
+  const rows = completed.map(goal => [
     leagueLabel, seasonName, roundLabel(goal.round), dateLabel(goal.date), goal.clock,
     goal.playerName, teamName(goal.teamId), teamName(goal.homeTeamId), teamName(goal.awayTeamId),
     goal.evaluationCount, ...categories.map(category => goal.categoryScores?.[category.key] ?? null), goal.score,
@@ -237,11 +356,18 @@ async function downloadCompletedGoals() {
     goal.shotId, ...metrics.map(metric => goal.metrics[metric.key] ?? null),
   ])
   try {
+    const exported = await request<{ goals: GoalxExportRecord[] }>(api + '/export?' + new URLSearchParams({ league_id: league.value, season_id: season.value, round_id: round.value }))
     const XLSX = await import('xlsx')
     const sheet = XLSX.utils.aoa_to_sheet([headers, ...rows])
     sheet['!cols'] = headers.map((_, i) => ({ wch: i < 5 ? 15 : 22 }))
     const workbook = XLSX.utils.book_new()
     XLSX.utils.book_append_sheet(workbook, sheet, '분석 완료')
+    const labels = new Map(completed.map(goal => [keyOf(goal), [goal.gmId, goal.side, goal.recordId, goal.playerName, goal.clock]]))
+    for (const extra of goalxEstimationSheets(exported.goals, labels)) {
+      const extraSheet = XLSX.utils.aoa_to_sheet(extra.rows)
+      extraSheet['!cols'] = extra.rows[0]!.map(() => ({ wch: 20 }))
+      XLSX.utils.book_append_sheet(workbook, extraSheet, extra.name)
+    }
     XLSX.writeFile(workbook, filename)
   } catch (error) {
     exportError.value = errorMessage(error)
@@ -292,7 +418,10 @@ async function showGoalCard(goal: Goal) {
   void nextTick(() => scrollCards(Math.floor(goals.value.findIndex(item => keyOf(item) === keyOf(goal)) / cardsPerPage), 'instant'))
 }
 function selectGoal(goal: Goal | undefined) {
+  resetEstimate(goal)
+  showEstimated.value = false
   selectedKey.value = goal ? keyOf(goal) : ''
+  void loadRawCoordinates(goal)
   draft.value = { ...goal?.myGrades }
   editing.value = !!goal && !goal.myGrades
   search.value = ''
@@ -307,20 +436,28 @@ function selectGoal(goal: Goal | undefined) {
   void loadShot()
 }
 function startEditing() {
+  resetEstimate(selected.value)
   draft.value = { ...selected.value?.myGrades }
   notice.value = ''
   actionError.value = ''
   editing.value = true
 }
 function cancelEditing() {
+  resetEstimate(selected.value)
   draft.value = { ...selected.value?.myGrades }
   actionError.value = ''
   editing.value = false
 }
 
 function toggleShot() {
+  showEstimated.value = false
   showShot.value = !showShot.value
   void loadShot(showShot.value ? selected.value : undefined)
+}
+function toggleEstimated() {
+  showShot.value = false
+  showEstimated.value = !showEstimated.value
+  void loadShot()
 }
 async function loadShot(goal?: Goal) {
   shotRequest?.abort()
@@ -377,7 +514,10 @@ async function loadGoals(preserveSelection = false) {
     result.value = next
     if (team.value && !next.teams[team.value]) team.value = ''
     if (!selected.value || previous?.shotId !== selected.value.shotId) selectGoal(selected.value ?? goals.value[0])
-    else if (!editing.value) draft.value = { ...selected.value.myGrades }
+    else if (!editing.value) {
+      draft.value = { ...selected.value.myGrades }
+      resetEstimate(selected.value)
+    }
   } catch (error) {
     if (!controller.signal.aborted) loadError.value = errorMessage(error)
   } finally {
@@ -523,11 +663,61 @@ async function showParticipants(goal: Goal) {
   participantsDialog.value?.showModal()
 }
 
+async function openRepresentative(goal: Goal) {
+  representativeRequest?.abort()
+  const controller = new AbortController()
+  representativeRequest = controller
+  representativeGoal.value = goal
+  representativeProposal.value = undefined
+  representativeTrajectory.value = undefined
+  representativeError.value = ''
+  loadingRepresentative.value = true
+  await nextTick()
+  representativeDialog.value?.showModal()
+  try {
+    const { proposal } = await request<{ proposal: RepresentativeProposal }>(pathOf(goal) + '/representative', { signal: controller.signal })
+    if (controller.signal.aborted) return
+    representativeProposal.value = proposal
+    representativeCoordinates.value = Object.fromEntries(coordinateFields.map(({ key }) => [key, proposal.coordinates[key] ?? null]))
+    representativeTrajectory.value = proposal.trajectoryCandidates.length === 1 ? proposal.trajectoryCandidates[0] : undefined
+  } catch (error) {
+    if (!controller.signal.aborted) representativeError.value = errorMessage(error)
+  } finally {
+    if (!controller.signal.aborted) loadingRepresentative.value = false
+  }
+}
+function closeRepresentative() {
+  representativeRequest?.abort()
+  representativeGoal.value = undefined
+}
+async function approveRepresentative() {
+  const goal = representativeGoal.value
+  const proposal = representativeProposal.value
+  if (!goal || !proposal || !representativeTrajectory.value || approvingRepresentative.value
+    || (representativeHasCoordinates.value && !representativeCoordinatesValid.value)) return
+  approvingRepresentative.value = true
+  representativeError.value = ''
+  try {
+    const { analysis } = await request<{ analysis: Analysis }>(pathOf(goal) + '/representative', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sourceVersion: proposal.sourceVersion, trajectory: representativeTrajectory.value,
+        coordinates: representativeEstimate.value?.input ?? null }),
+    })
+    patchGoal(goal, analysis)
+    representativeDialog.value?.close()
+  } catch (error) {
+    representativeError.value = errorMessage(error)
+  } finally {
+    approvingRepresentative.value = false
+  }
+}
+
 async function loadCatalog() {
   loadingCatalog.value = true
   loadError.value = ''
   try {
-    const data = await request<{ leagues: League[]; seasons: Season[] }>(api + '/catalog')
+    const data = await request<{ leagues: League[]; seasons: Season[]; canApproveRepresentative: boolean }>(api + '/catalog')
+    canApproveRepresentative.value = data.canApproveRepresentative
     leagues.value = data.leagues
       .filter(item => supportedLeagueIds.has(item.id))
       .sort((a, b) => a.name.localeCompare(b.name, 'ko'))
@@ -566,21 +756,25 @@ async function findCandidates() {
 function patchGoal(goal: Goal, analysis: Analysis) {
   const current = result.value?.goals.find(item => keyOf(item) === keyOf(goal))
   if (current) Object.assign(current, analysis)
+  const ranked = rankingResult.value?.goals.find(item => keyOf(item) === keyOf(goal))
+  if (ranked) Object.assign(ranked, analysis)
 }
 
 async function saveGrades() {
   const goal = selected.value
-  if (!goal || !editing.value || saving.value || linking.value || categories.some(({ key }) => !draft.value[key])) return
+  if (!goal || !editing.value || saving.value || linking.value || loadingRawCoordinates.value || estimateInvalid.value || categories.some(({ key }) => !draft.value[key])) return
   saving.value = true
   actionError.value = ''
   notice.value = ''
   try {
     const { analysis } = await request<{ analysis: Analysis }>(pathOf(goal) + '/evaluation', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draft.value),
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...draft.value, estimatedShot: estimatedPreview.value?.input ?? null }),
     })
     patchGoal(goal, analysis)
     if (selectedKey.value === keyOf(goal)) {
       draft.value = { ...analysis.myGrades }
+      resetEstimate({ ...goal, ...analysis })
       editing.value = false
       notice.value = '내 평가를 저장했습니다.'
     }
@@ -617,6 +811,9 @@ async function updateLink(id: string | null) {
 
 onMounted(loadCatalog)
 onBeforeUnmount(() => {
+  representativeRequest?.abort()
+  rawCoordinatesRequest?.abort()
+  stopStopwatch()
   roundRequest?.abort()
   listRequest?.abort()
   shotRequest?.abort()
@@ -735,10 +932,13 @@ onBeforeUnmount(() => {
             <button class="quiet shot-toggle" type="button" :aria-expanded="showShot" aria-controls="goalx-shotx" @click="toggleShot">
               {{ showShot ? 'ShotX 분석 접기' : 'ShotX 분석 보기' }}
             </button>
+            <button class="quiet shot-toggle" type="button" :aria-expanded="showEstimated" aria-controls="goalx-estimated" @click="toggleEstimated">
+              {{ showEstimated ? '추정 3D렌더링 접기' : '추정 3D렌더링' }}
+            </button>
           </div>
         </header>
 
-        <div class="review-grid" :class="{ 'with-shot': showShot }">
+        <div class="review-grid" :class="{ 'with-shot': showShot || showEstimated }">
           <form class="grading" @submit.prevent="saveGrades">
             <div class="grading-heading">
               <h3>내 평가</h3>
@@ -750,17 +950,17 @@ onBeforeUnmount(() => {
                 <div v-if="editing" class="choices">
                   <label v-for="grade in grades" :key="grade" :class="{ chosen: draft[category.key] === grade }">
                     <input v-model="draft[category.key]" type="radio" :name="category.key" :value="grade" required>
-                    <span>{{ labels[grade] }}</span><small>{{ result?.points[grade] }}점</small>
+                    <span>{{ category.key === 'trajectory' ? trajectoryLabels[grade] : labels[grade] }}</span><small>{{ result?.points[grade] }}점</small>
                   </label>
                 </div>
                 <div v-else-if="selected.myGrades" class="saved-grade">
-                  <strong>{{ labels[selected.myGrades[category.key]] }}</strong>
+                  <strong>{{ category.key === 'trajectory' ? trajectoryLabels[selected.myGrades[category.key]] : labels[selected.myGrades[category.key]] }}</strong>
                   <span>{{ result?.points[selected.myGrades[category.key]] }}점</span>
                 </div>
               </fieldset>
             </div>
             <div v-if="editing" class="form-actions">
-              <button type="submit" class="primary" :disabled="saving || linking || categories.some(({ key }) => !draft[key])">{{ saving ? '저장 중…' : '평가 저장' }}</button>
+              <button type="submit" class="primary" :disabled="saving || linking || loadingRawCoordinates || estimateInvalid || categories.some(({ key }) => !draft[key])">{{ saving ? '저장 중…' : '평가 저장' }}</button>
               <button v-if="selected.myGrades" type="button" class="quiet" :disabled="saving" @click="cancelEditing">취소</button>
             </div>
             <p v-if="actionError" class="error" role="alert">{{ actionError }}</p>
@@ -776,6 +976,66 @@ onBeforeUnmount(() => {
             </div>
           </form>
 
+          <div v-if="showShot || showEstimated" class="render-panels">
+          <section v-if="showEstimated" id="goalx-estimated" class="shot-panel">
+            <h3>추정 3D렌더링</h3>
+            <fieldset class="time-card" :class="{ 'is-running': timerRunning }" :disabled="!editing || saving || linking">
+              <legend class="time-legend">골라인 통과 소요시간</legend>
+              <div class="time-card-heading">
+                <span class="time-title">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M9 2h6M12 2v3m6 1 2-2" /><circle cx="12" cy="14" r="8" /><path d="M12 9v5l3 2" /></svg>
+                  골라인 통과 소요시간
+                </span>
+                <span class="time-status" role="status"><span aria-hidden="true"></span>{{ timerRunning ? '측정 중' : estimateDraft.timeToGoal != null ? '측정 완료' : '측정 대기' }}</span>
+              </div>
+              <div class="time-main">
+                <div class="time-readout" aria-label="경과 시간">
+                  <span class="time-digits">{{ stopwatchDisplay }}</span><span class="time-unit">초</span>
+                </div>
+                <button type="button" class="time-toggle" :aria-pressed="timerRunning" @click="toggleStopwatch">
+                  <span class="time-button-icon" :class="{ stop: timerRunning }" aria-hidden="true"></span>
+                  {{ timerRunning ? '측정 정지' : estimateDraft.timeToGoal != null ? '다시 측정' : '측정 시작' }}
+                </button>
+              </div>
+              <div class="time-footer">
+                <label class="time-adjust">시간 미세조정
+                  <span class="time-input-wrap"><input :value="timerRunning ? stopwatchElapsed : estimateDraft.timeToGoal ?? ''" type="number" min="0.001" max="600" step="0.01" :disabled="timerRunning" placeholder="0.00" aria-label="골라인 통과 소요시간 미세조정 (초)"
+                    @input="estimateDraft.timeToGoal = ($event.target as HTMLInputElement).value === '' ? null : ($event.target as HTMLInputElement).valueAsNumber">
+                    <span>초</span></span>
+                </label>
+                <button type="button" class="time-reset" :disabled="!timerRunning && estimateDraft.timeToGoal == null" @click="stopStopwatch(); estimateDraft.timeToGoal = null">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 8a7 7 0 1 1 0 5M3 3v5h5" /></svg>초기화
+                </button>
+              </div>
+              <p class="time-hint">{{ timerRunning ? '골라인을 통과하는 순간 정지를 눌러 주세요.' : '슈팅 순간 시작하고, 골라인 통과 순간 정지하세요.' }}</p>
+            </fieldset>
+            <p v-if="!estimatedTimeValid && !timerRunning" class="error">시간은 0초 초과 600초 이하로 입력해 주세요.</p>
+            <p v-else-if="rawCoordinatesError || (estimateInvalid && !timerRunning)" class="error">RAW 좌표를 확인해 주세요.</p>
+            <p v-if="loadingRawCoordinates" class="muted" role="status">RAW 좌표를 불러오는 중…</p>
+            <p v-else-if="rawCoordinatesError" class="error" role="alert">RAW 좌표를 불러오지 못했습니다. {{ rawCoordinatesError }}</p>
+            <button v-if="rawCoordinatesError" type="button" :disabled="saving || linking" @click="loadRawCoordinates(selected)">RAW 좌표 다시 불러오기</button>
+            <fieldset class="estimate-inputs" :disabled="!editing || saving || linking">
+              <legend>슈팅·골문 좌표</legend>
+              <p class="muted">RAW 좌표를 기본값으로 사용하며, 공격 골대는 자동으로 결정됩니다.</p>
+              <div class="coordinate-inputs">
+                <label v-for="field in coordinateFields" :key="field.key">{{ field.label }}
+                  <input v-model.number="estimateDraft[field.key]" type="number" :min="field.min" :max="field.max" step="any" placeholder="좌표 없음">
+                </label>
+              </div>
+              <p class="muted">슈팅 X·Y: 경기장 0–100%. 골문 결과 X: 83–464, Y: 83(상단)–300(지면).</p>
+            </fieldset>
+            <p v-if="!estimatedCoordinatesValid && hasEstimateCoordinates" class="error">좌표를 범위 안에서 모두 입력해 주세요.</p>
+            <p class="muted">{{ draft.trajectory ? trajectoryLabels[draft.trajectory] : '궤적 유형 미선택' }} · 평가 기반 추정 궤적</p>
+            <LazyGoalxGoalTrajectory v-if="estimatedPreview" :points="estimatedPreview.trajectory" :measured-points="[]"
+              :goal-point="estimatedPreview.goalPoint" :goal-x="estimatedPreview.input.goalX" :goal-center-y="34"
+              :flight-time="estimatedPreview.input.timeToGoal" />
+            <p v-else class="muted">슈팅·골문 결과 좌표와 궤적 유형을 입력하면 3D 그래픽이 표시됩니다.</p>
+            <dl v-if="estimatedPreview" class="measurements">
+              <div><dt>추정 궤적 거리</dt><dd>{{ formatMetric(estimatedPreview.distance, 'm') }}</dd></div>
+              <div><dt>추정 평균 속도</dt><dd>{{ formatMetric(estimatedPreview.averageSpeed, 'km/h') }}</dd></div>
+            </dl>
+            <p class="muted">좌우 휨 없이 고정 곡률을 적용합니다. 딥 커브 0.20 · 커브 0.10 · 스트레이트 0.00. 최고 추가 높이는 직선거리 × 곡률이며, 표시된 궤적 길이로 평균 속도를 계산합니다.</p>
+          </section>
           <section v-if="showShot" id="goalx-shotx" class="shot-panel">
             <h3>ShotX 영상과 측정값</h3>
             <p v-if="loadingShot" role="status">ShotX 데이터를 불러오는 중…</p>
@@ -823,6 +1083,7 @@ onBeforeUnmount(() => {
               </div>
             </details>
           </section>
+          </div>
         </div>
       </article>
     </section>
@@ -871,12 +1132,66 @@ onBeforeUnmount(() => {
                 {{ goal.categoryScores?.[category.key]?.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) ?? '—' }}
               </td>
               <td class="ranking-score"><strong>{{ goal.score?.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) }}</strong></td>
+              <td>
+                <button type="button" class="representative-button" :disabled="!canApproveRepresentative" aria-haspopup="dialog"
+                  :title="canApproveRepresentative ? '대표 분석 검토 및 확정' : '관리자만 대표 분석을 승인할 수 있습니다.'" @click="openRepresentative(goal)">
+                  {{ goal.representative?.status === 'approved' ? '승인 완료' : goal.representative?.status === 'needs_review' ? '재검토 필요' : '대표 승인' }}
+                </button>
+              </td>
             </tr>
           </tbody>
         </table>
       </div>
     </section>
     <LazyGoalxTestGoalEditor v-if="testEditor" :initial="testEditor" @close="testEditor = undefined" @saved="afterTestGoalSave" />
+    <dialog ref="representativeDialog" class="representative-dialog" aria-labelledby="representative-title" @close="closeRepresentative"
+      @cancel="approvingRepresentative && $event.preventDefault()">
+      <template v-if="representativeGoal">
+        <header class="detail-header">
+          <div><h2 id="representative-title">대표 분석 승인</h2><p>{{ representativeGoal.playerName }} · {{ rankingMatch(representativeGoal) }} · {{ representativeGoal.clock }}</p></div>
+          <button type="button" class="quiet" :disabled="approvingRepresentative" @click="representativeDialog?.close()">닫기</button>
+        </header>
+        <div class="representative-content">
+          <p v-if="loadingRepresentative" class="muted" role="status">분석관 평가를 취합하는 중…</p>
+          <form v-if="representativeProposal" @submit.prevent="approveRepresentative">
+            <p class="muted">평가 {{ representativeProposal.evaluationCount }}건을 기준으로 대표 결과를 확정합니다. 이후 평가가 바뀌면 재검토가 필요합니다.</p>
+            <dl class="measurements">
+              <div v-for="category in categories" :key="category.key"><dt>{{ category.label }} 평균</dt><dd>{{ formatMetric(representativeProposal.categoryScores[category.key], '점') }}</dd></div>
+              <div><dt>대표 평균 총점</dt><dd>{{ formatMetric(representativeProposal.score, '점') }}</dd></div>
+              <div><dt>소요시간 중앙값</dt><dd>{{ formatMetric(representativeProposal.timeToGoal, '초') }} <small>측정 {{ representativeProposal.timeSampleCount }}건</small></dd></div>
+            </dl>
+            <fieldset :disabled="approvingRepresentative" class="representative-field">
+              <legend>대표 궤적</legend>
+              <p class="muted">{{ representativeProposal.trajectoryCandidates.length > 1 ? '최다 선택이 동률입니다. 대표 유형을 선택해 주세요.' : '분석관들이 가장 많이 선택한 유형입니다.' }}</p>
+              <div class="choices">
+                <label v-for="grade in representativeProposal.trajectoryCandidates" :key="grade" :class="{ chosen: representativeTrajectory === grade }">
+                  <input v-model="representativeTrajectory" type="radio" name="representative-trajectory" :value="grade" required>
+                  <span>{{ trajectoryLabels[grade] }}</span><small>{{ representativeProposal.trajectoryCounts[grade] }}명</small>
+                </label>
+              </div>
+            </fieldset>
+            <fieldset :disabled="approvingRepresentative" class="representative-field">
+              <legend>대표 좌표 확인</legend><p class="muted">RAW 좌표를 기본으로 사용합니다. 필요한 경우 수정 후 확정하세요.</p>
+              <div class="coordinate-inputs"><label v-for="field in coordinateFields" :key="field.key">{{ field.label }}
+                <input v-model.number="representativeCoordinates[field.key]" type="number" :min="field.min" :max="field.max" step="any" placeholder="좌표 없음">
+              </label></div>
+              <p v-if="representativeHasCoordinates && !representativeCoordinatesValid" class="error">좌표를 범위 안에서 모두 입력해 주세요.</p>
+            </fieldset>
+            <template v-if="representativeEstimate">
+              <LazyGoalxGoalTrajectory :points="representativeEstimate.trajectory" :measured-points="[]" :goal-point="representativeEstimate.goalPoint"
+                :goal-x="representativeEstimate.input.goalX" :goal-center-y="34" :flight-time="representativeEstimate.input.timeToGoal" />
+              <dl class="measurements"><div><dt>대표 추정 거리</dt><dd>{{ formatMetric(representativeEstimate.distance, 'm') }}</dd></div>
+                <div><dt>대표 추정 평균 속도</dt><dd>{{ formatMetric(representativeEstimate.averageSpeed, 'km/h') }}</dd></div></dl>
+            </template>
+            <p v-else class="muted">좌표 또는 대표 궤적이 없으면 추정 3D는 포함되지 않습니다.</p>
+            <p v-if="representativeProposal.timeToGoal == null" class="muted">측정된 소요시간이 없어 추정 평균 속도는 포함되지 않습니다.</p>
+            <div class="form-actions"><button type="submit" class="primary" :disabled="approvingRepresentative || !representativeTrajectory || (representativeHasCoordinates && !representativeCoordinatesValid)">
+              {{ approvingRepresentative ? '확정 중…' : '대표 분석 확정' }}</button></div>
+          </form>
+          <p v-if="representativeError" class="error" role="alert">{{ representativeError }}</p>
+        </div>
+      </template>
+    </dialog>
     <dialog ref="participantsDialog" class="participants-dialog" aria-labelledby="participants-title" @close="participantsGoal = undefined">
       <template v-if="participantsGoal">
         <header class="detail-header">
@@ -898,6 +1213,47 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.representative-button { white-space: nowrap; color: var(--accent); font-size: 12px; }
+.representative-dialog { width: min(720px, calc(100vw - 32px)); max-height: 90vh; box-sizing: border-box; padding: 0; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
+.representative-dialog::backdrop { background: #071014b8; }
+.representative-content { padding: 18px 20px; }
+.representative-field { margin: 18px 0; }
+.representative-field legend { margin-bottom: 8px; font-weight: 650; }
+.representative-field .muted { margin-bottom: 10px; }
+.render-panels { min-width: 0; display: grid; align-content: start; gap: 16px; }
+.estimate-inputs { margin: 16px 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
+.coordinate-inputs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.coordinate-inputs label { display: grid; gap: 5px; font-size: 12px; }
+.coordinate-inputs input, .coordinate-inputs select { box-sizing: border-box; min-width: 0; width: 100%; }
+.time-card { min-width: 0; margin: 20px 0 16px; padding: 18px 20px; border: 1px solid #314b46; border-radius: 14px; background: linear-gradient(120deg, #182d2b 0%, #101e24 75%); transition: border-color .2s, box-shadow .2s; }
+.time-card.is-running { border-color: #92dcb7; box-shadow: inset 0 0 0 1px #a4e7c91a; }
+.time-legend { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.time-card-heading, .time-title, .time-status, .time-main, .time-readout, .time-footer, .time-adjust { display: flex; align-items: center; }
+.time-card-heading, .time-main, .time-footer { justify-content: space-between; gap: 12px; }
+.time-title { gap: 8px; color: #d7e8e1; font-size: 13px; font-weight: 650; }
+.time-title svg { width: 20px; height: 20px; color: var(--accent); flex: none; }
+.time-status { gap: 6px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.time-status > span { width: 5px; height: 5px; border-radius: 50%; background: #6d8582; }
+.is-running .time-status { color: var(--accent); }
+.is-running .time-status > span { background: var(--accent); box-shadow: 0 0 0 4px #a4e7c914; }
+.time-main { padding: 17px 0 19px; flex-wrap: wrap; }
+.time-readout { gap: 9px; align-items: baseline; }
+.time-digits { font-size: clamp(38px, 4vw, 52px); line-height: 1.1; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -.045em; color: #effbf4; }
+.time-unit { color: #8eaaa0; font-size: 15px; }
+.time-card .time-toggle { min-height: 46px; min-width: 132px; display: inline-flex; justify-content: center; align-items: center; gap: 9px; padding: 11px 18px; color: #10291e; background: #a4e7c9; border-color: #a4e7c9; font-size: 14px; font-weight: 750; border-radius: 10px; }
+.time-card .time-toggle:hover:not(:disabled) { background: #baf3d9; border-color: #baf3d9; }
+.time-card.is-running .time-toggle { color: #ffe4cf; background: #4a3028; border-color: #a47759; }
+.time-card.is-running .time-toggle:hover:not(:disabled) { background: #5c3b2e; border-color: #d49c71; }
+.time-button-icon { width: 0; height: 0; border-top: 5px solid transparent; border-bottom: 5px solid transparent; border-left: 8px solid currentColor; }
+.time-button-icon.stop { width: 9px; height: 9px; border: 0; border-radius: 2px; background: currentColor; }
+.time-footer { border-top: 1px solid #30453f; padding-top: 13px; flex-wrap: wrap; }
+.time-adjust { gap: 10px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+.time-input-wrap { display: flex; align-items: center; gap: 6px; }
+.time-input-wrap input { box-sizing: border-box; width: 108px; min-height: 36px; padding: 7px 9px; background: #101e22; border-color: #38524a; font-size: 13px; font-variant-numeric: tabular-nums; }
+.time-input-wrap input:disabled { opacity: .5; }
+.time-card .time-reset { display: inline-flex; align-items: center; gap: 5px; padding: 7px 2px; background: transparent; border-color: transparent; color: var(--muted); font-size: 12px; }
+.time-reset svg { width: 15px; height: 15px; }
+.time-hint { margin-top: 11px; color: #8ca39d; font-size: 11px; line-height: 1.6; }
 .goalx-page {
   --page: #0c141a;
   --surface: #141f26;

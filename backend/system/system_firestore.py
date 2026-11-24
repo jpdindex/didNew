@@ -2305,6 +2305,15 @@ class JpdDidData:
         elif role == "assistant" and not primary_uid and not finished_role_reentry:
             raise BackendError("The primary analyst must join before an assistant", status_code=409, code="primary_required")
 
+        # A manager opening final RAW starts a correction session, independent
+        # of the original primary's retained seat. Keep the participant roster
+        # for attribution, but do not let that old owner block manager control.
+        # Ordinary live joins retain the original primary's lifecycle authority.
+        if correction and role == "manager":
+            if recorder_level != "advanced":
+                raise BackendError("Only an advanced analyst can join as a manager", status_code=403, code="manager_requires_advanced")
+            primary_uid = None
+
         participants[user_id] = {
             "role": role,
             "name": profile.get("name") or display_name or user_id,

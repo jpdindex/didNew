@@ -18,8 +18,10 @@ def delivery_operator(user: RequiredUser):
 
 Operator = Annotated[object, Depends(delivery_operator)]
 router = APIRouter(prefix='/aifootballx', tags=['aifootballx-delivery'])
+# Keep legacy hybrid clients valid while exposing only the two distinct choices.
 SourceMode = Annotated[Literal['auto', 'did_only', 'hybrid'], Form(
-    description='원천 선택: auto(기본)는 DID 확정 기록을 우선하고 부족한 경기는 기존 SQL 업로드에서 확인합니다. did_only는 DID 기록만 허용합니다. hybrid는 두 원천을 병합하되 같은 경기는 DID로 대체합니다. 전송 전에 필수 값 누락·번호 충돌을 검사해 쓰기 전에 차단하며 결과는 GET 상태 조회에서 확인합니다.')]
+    json_schema_extra={'enum': ['auto', 'did_only']},
+    description='원천 선택: auto(기본)는 DID 확정 기록을 우선하고 기존 SQL 실데이터가 있는 경기는 보충합니다. did_only는 DID 확정 기록만 사용하며 필요한 기존 SQL 실데이터를 DID로 충족하지 못하면 차단합니다. 등록된 전체 일정에서 미입력 경기는 기본값으로 유지하고, 추가 입력 후 재전송하면 해당 경기와 관련 집계를 갱신합니다. 전송 전에 필수 값 누락·번호 충돌을 검사하며 결과는 GET 상태 조회에서 확인합니다.')]
 
 
 def input_scope(season, round_from, round_to, gm_id):

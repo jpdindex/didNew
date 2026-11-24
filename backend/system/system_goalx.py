@@ -4,14 +4,16 @@ import json
 import logging
 import re
 import unicodedata
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, timedelta
 from fractions import Fraction
 from functools import lru_cache
 from hashlib import sha256
-from math import isfinite
+from math import dist, isfinite
 from pathlib import Path
+from statistics import median
 from typing import Literal
 from uuid import uuid4
 
@@ -43,11 +45,111 @@ record_reads = ThreadPoolExecutor(max_workers=8, thread_name_prefix="goalx-recor
 Grade = Literal["high", "medium", "low"]
 
 
+def automatic_goal_x(record, recording, pos_x):
+    half = record.get("half")
+    field_side = recording.get("fieldSideEx" if half in ("H3", "H4") else "fieldSide")
+    if field_side in ("left", "right") and half in ("H1", "H2", "H3", "H4"):
+        own_on_left = (field_side == "left") == (half in ("H1", "H3"))
+        return 105 if own_on_left else 0
+    return 0 if pos_x is not None and pos_x < 50 else 105
+
+
+class EstimatedShotInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    posX: float = Field(ge=0, le=100, allow_inf_nan=False)
+    posY: float = Field(ge=0, le=100, allow_inf_nan=False)
+    shootPosX: float = Field(ge=83, le=464, allow_inf_nan=False)
+    shootPosY: float = Field(ge=83, le=300, allow_inf_nan=False)
+    goalX: Literal[0, 105]
+    timeToGoal: float | None = Field(default=None, gt=0, le=600, allow_inf_nan=False)
+
+
+def estimate_shot(value: EstimatedShotInput, grade: str):
+    start = (value.posX * 1.05, value.posY * .68, 0)
+    end = (value.goalX, 34 + (value.shootPosX - 83) / 381 * 7.32 - 3.66,
+           (300 - value.shootPosY) / 217 * 2.44)
+    # Peak lift above the straight segment = distance * fixed type coefficient.
+    weight = {"high": .20, "medium": .10, "low": 0}[grade]
+    lift = dist(start, end) * weight
+    points = []
+    for i in range(101):
+        t = i / 100
+        x, y, z = (a + (b - a) * t for a, b in zip(start, end))
+        points.append({"x": x, "y": y, "z": z + 4 * lift * t * (1 - t)})
+    length = sum(dist(tuple(a.values()), tuple(b.values())) for a, b in zip(points, points[1:]))
+    return {"input": value.model_dump(), "modelVersion": 1, "trajectoryGrade": grade,
+            "curveWeight": weight, "trajectory": points, "goalPoint": points[-1],
+            "distance": length, "averageSpeed": length / value.timeToGoal * 3.6 if value.timeToGoal else None}
+
+
+class RepresentativeApproval(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    sourceVersion: str = Field(pattern=r"^[a-f0-9]{64}$")
+    trajectory: Literal["high", "medium", "low"]
+    coordinates: EstimatedShotInput | None = None
+
+
+def fingerprint(value):
+    return sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+
+
+def evaluation_version(analysis):
+    return fingerprint({"evaluations": analysis.get("evaluations") or {}, "shotx": analysis.get("shotx") or {}})
+
+
+def representative_proposal(analysis, record, recording, points):
+    evaluations = analysis.get("evaluations") or {}
+    if not evaluations:
+        raise BackendError("평가가 있는 득점만 대표 승인할 수 있습니다.", 409, "goalx_no_evaluations")
+    scores = {category: sum(points[entry["grades"][category]] for entry in evaluations.values()) / len(evaluations)
+              for category in ("artistry", "defense", "trajectory")}
+    counts = Counter(entry["grades"]["trajectory"] for entry in evaluations.values())
+    modes = [grade for grade in ("high", "medium", "low") if counts[grade] == max(counts.values())]
+    times = []
+    for entry in evaluations.values():
+        value = ((entry.get("estimatedShot") or {}).get("input") or {}).get("timeToGoal")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= 600:
+            times.append(value)
+    coordinates = {key: record.get(key) for key in ("posX", "posY", "shootPosX", "shootPosY")}
+    goal_x = automatic_goal_x(record, recording, coordinates["posX"])
+    direction_side = recording.get("fieldSideEx" if record.get("half") in ("H3", "H4") else "fieldSide")
+    direction_known = direction_side in ("left", "right") and record.get("half") in ("H1", "H2", "H3", "H4")
+    return {"sourceVersion": fingerprint({"evaluationVersion": evaluation_version(analysis), "record": record,
+                                          "recording": recording, "points": points}),
+            "evaluationVersion": evaluation_version(analysis), "evaluationCount": len(evaluations),
+            "categoryScores": scores, "score": sum(scores.values()), "trajectoryCounts": dict(counts),
+            "trajectoryCandidates": modes, "timeToGoal": median(times) if times else None,
+            "timeSampleCount": len(times), "coordinates": coordinates, "goalX": goal_x,
+            "directionGoalX": goal_x if direction_known else None,
+            "shotId": (analysis.get("shotx") or {}).get("id")}
+
+
+def finalize_representative(analysis, record, recording, points, payload):
+    proposal = representative_proposal(analysis, record, recording, points)
+    if payload.sourceVersion != proposal["sourceVersion"]:
+        raise BackendError("검토 중 평가 또는 RAW가 변경됐습니다. 창을 다시 열어 확인해 주세요.", 409, "goalx_review_changed")
+    if payload.trajectory not in proposal["trajectoryCandidates"]:
+        raise BackendError("최다 선택된 궤적 중 하나를 선택하세요.", 422, "goalx_invalid_representative_trajectory")
+    estimation = None
+    if payload.coordinates:
+        value = payload.coordinates.model_copy(update={
+            "goalX": automatic_goal_x(record, recording, payload.coordinates.posX), "timeToGoal": proposal["timeToGoal"],
+        })
+        estimation = estimate_shot(value, payload.trajectory)
+    return {**proposal, "trajectory": payload.trajectory, "estimatedShot": estimation,
+            "coordinates": payload.coordinates.model_dump(include={"posX", "posY", "shootPosX", "shootPosY"}) if payload.coordinates else None,
+            "schemaVersion": 1}
+
+
 class Grades(BaseModel):
     model_config = ConfigDict(extra="forbid")
     artistry: Grade
     defense: Grade
     trajectory: Grade
+
+
+class EvaluationInput(Grades):
+    estimatedShot: EstimatedShotInput | None = None
 
 
 class TestGoalInput(BaseModel):
@@ -295,6 +397,25 @@ class GoalAnalysis:
             raise NotFoundError("득점 기록을 찾을 수 없습니다.")
         return record
 
+    def raw_coordinates(self, gm_id, side, record_id):
+        """Read the selected goal directly, independently of list projections/ShotX."""
+        record = self._read_goal(gm_id, side, record_id)
+        coordinates = {key: number(record.get(key)) for key in ("posX", "posY", "shootPosX", "shootPosY")}
+        recording = self._recording_direction(gm_id, side, record_id)
+        # Null means the browser should infer the nearer goal from its editable shooting position.
+        coordinates["goalX"] = automatic_goal_x(record, recording, coordinates["posX"]) if (
+            recording.get("fieldSideEx" if record.get("half") in ("H3", "H4") else "fieldSide") in ("left", "right")
+            and record.get("half") in ("H1", "H2", "H3", "H4")
+        ) else None
+        return coordinates
+
+    def _recording_direction(self, gm_id, side, record_id):
+        if gm_id.startswith(TEST_GOAL_PREFIX) and gm_id == record_id and side == "H":
+            return {}
+        return self._record_ref(gm_id, side, record_id).parent.parent.get(
+            field_paths=["fieldSide", "fieldSideEx"], timeout=10,
+        ).to_dict() or {}
+
     def _rules(self, config):
         points = config.get("points")
         if not isinstance(points, dict) or any(type(points.get(grade)) is not int or points[grade] < 0 for grade in POINTS):
@@ -318,11 +439,12 @@ class GoalAnalysis:
             "half": record["half"], "halfSeconds": record["halfSeconds"],
             "clock": match_clock(record["half"], record["halfSeconds"]),
             "playerId": record.get("playerId"),
+            "rawCoordinates": {key: number(record.get(key)) for key in ("posX", "posY", "shootPosX", "shootPosY")},
         }
 
     def _goal_records(self, snapshot, match, side):
         records = snapshot.reference.collection("recordings").document(side).collection("records")
-        query = records.where(filter=FieldFilter("res", "in", list(GOAL_RESULTS))).select(["half", "halfSeconds", "playerId"])
+        query = records.where(filter=FieldFilter("res", "in", list(GOAL_RESULTS))).select(["half", "halfSeconds", "playerId", "posX", "posY", "shootPosX", "shootPosY"])
         return [self._goal_row(snapshot.id, match, side, goal.id, goal.to_dict()) for goal in query.stream(timeout=15)]
 
     def _analysis_state(self, analysis, uid, points, thresholds):
@@ -340,9 +462,15 @@ class GoalAnalysis:
             for category in Grades.model_fields
         }
         score = Fraction(sum(category_totals.values()), evaluation_count) if evaluation_count else None
+        representative = analysis.get("representative")
         return {
+            "representative": ({"status": "approved" if representative.get("evaluationVersion") == evaluation_version(analysis)
+                                and representative.get("points") == points else "needs_review",
+                                "approvedBy": representative.get("approvedBy"), "approvedAt": representative.get("approvedAt")}
+                               if representative else None),
             "shotId": link.get("id"), "metrics": metrics, "autoGrades": grades,
             "myGrades": (evaluations.get(uid) or {}).get("grades"),
+            "myEstimatedShot": (evaluations.get(uid) or {}).get("estimatedShot"),
             "evaluationCount": evaluation_count,
             "evaluators": [
                 {"id": entry.get("analystUid") or key, "name": entry.get("analystName") or key}
@@ -388,7 +516,7 @@ class GoalAnalysis:
         for scope in previous_season_ids:
             self._collect_analyses(analyses, self._previous_goal_collection(scope, league_id))
         for scope in season_ids:
-            query = self._goal_collection(scope, league_id).select(["gmId", "side", "recordId", "evaluations", "shotx", "shotxUpdatedAt"])
+            query = self._goal_collection(scope, league_id).select(["gmId", "side", "recordId", "evaluations", "shotx", "shotxUpdatedAt", "representative"])
             self._collect_analyses(analyses, query)
         evaluated = [row for row in analyses.values() if not row.get("manualGoal") and row.get("evaluations") and row.get("gmId")
                      and row.get("side") in ("H", "A") and row.get("recordId")]
@@ -414,7 +542,7 @@ class GoalAnalysis:
         goals, stored, team_ids = [], {}, set()
         if scoped:
             refs = [ref for ref, _ in scoped.values()]
-            fields = ["res", "half", "halfSeconds", "playerId"]
+            fields = ["res", "half", "halfSeconds", "playerId", "posX", "posY", "shootPosX", "shootPosY"]
             for doc in self.db.get_all(refs, field_paths=fields, timeout=20):
                 record = doc.to_dict()
                 if not record or record.get("res") not in GOAL_RESULTS:
@@ -524,17 +652,82 @@ class GoalAnalysis:
 
     def save(self, gm_id, side, record_id, uid, grades):
         name = self.verify_analyst(uid)
-        self._read_goal(gm_id, side, record_id)
+        record = self._read_goal(gm_id, side, record_id)
         ref = self._ref(gm_id, side, record_id)
         self.move_legacy_goals(ref)
         batch = self.db.batch()
         self._write_scope(batch, ref)
+        estimation_input = getattr(grades, "estimatedShot", None)
+        if estimation_input:
+            goal_x = automatic_goal_x(record, self._recording_direction(gm_id, side, record_id), estimation_input.posX)
+            estimation_input = estimation_input.model_copy(update={"goalX": goal_x})
+        estimation = estimate_shot(estimation_input, grades.trajectory) if estimation_input else None
         batch.set(ref, {
             "gmId": gm_id, "side": side, "recordId": record_id,
-            "evaluations": {uid: {"analystUid": uid, "analystName": name, "grades": grades.model_dump(), "updatedAt": firestore.SERVER_TIMESTAMP}},
+            "evaluations": {uid: {"analystUid": uid, "analystName": name,
+                                  "grades": grades.model_dump(include=set(Grades.model_fields)),
+                                  "estimatedShot": estimation, "updatedAt": firestore.SERVER_TIMESTAMP}},
         }, merge=True)
         batch.commit(timeout=15)
         return self._read_analysis_state(ref, uid)
+
+    def _representative_source(self, gm_id, side, record_id, ref, transaction=None):
+        if transaction:
+            analysis = ref.get(transaction=transaction, timeout=15).to_dict() or {}
+        else:
+            analysis = self._read_goal_analysis(ref)
+        manual = gm_id.startswith(TEST_GOAL_PREFIX) and gm_id == record_id and side == "H"
+        if manual:
+            record, recording = analysis.get("manualGoal") or {}, {}
+        else:
+            raw_ref = self._record_ref(gm_id, side, record_id)
+            record = raw_ref.get(transaction=transaction, timeout=15).to_dict() or {}
+            if record.get("res") not in GOAL_RESULTS:
+                raise NotFoundError("득점 기록을 찾을 수 없습니다.")
+            recording = raw_ref.parent.parent.get(transaction=transaction, field_paths=["fieldSide", "fieldSideEx"], timeout=15).to_dict() or {}
+        config = self.analyses.document("_settings").get(transaction=transaction, timeout=15).to_dict() or {}
+        points, _ = self._rules(config)
+        return analysis, record, recording, points
+
+    def representative_preview(self, gm_id, side, record_id):
+        ref = self._ref(gm_id, side, record_id)
+        return representative_proposal(*self._representative_source(gm_id, side, record_id, ref))
+
+    def approve_representative(self, gm_id, side, record_id, user, payload):
+        from backend.system.system_player_requests import require_manager
+        require_manager(user)
+        ref = self._ref(gm_id, side, record_id)
+        self.move_legacy_goals(ref)
+
+        @firestore.transactional
+        def approve(transaction):
+            source = self._representative_source(gm_id, side, record_id, ref, transaction)
+            result = finalize_representative(*source, payload)
+            result.update({"approvedBy": user.uid, "approvedAt": firestore.SERVER_TIMESTAMP, "points": source[3],
+                           "gmId": gm_id, "side": side, "recordId": record_id,
+                           "leagueId": ref.parent.parent.parent.parent.id, "seasonId": ref.parent.parent.id})
+            transaction.update(ref, {"representative": result})
+
+        approve(self.db.transaction())
+        return self._read_analysis_state(ref, user.uid)
+
+    def export_completed(self, league_id, season_id, round_id, uid):
+        goals = [goal for goal in self.list(league_id, season_id, round_id, uid)["goals"] if goal["evaluationCount"]]
+        refs = [self._ref(goal["gmId"], goal["side"], goal["recordId"], season_id, league_id) for goal in goals]
+        sources = [source for ref in refs for source in [*self._historical_refs(ref), ref]]
+        stored = {}
+        for offset in range(0, len(sources), 200):
+            stored.update({doc.reference.path: doc.to_dict() for doc in self.db.get_all(sources[offset:offset + 200], timeout=20) if doc.exists})
+        output = []
+        for goal, ref in zip(goals, refs, strict=True):
+            analysis = {}
+            for source in [*self._historical_refs(ref), ref]:
+                analysis = self._merge_analysis(analysis, stored.get(source.path)) or {}
+            output.append({"gmId": goal["gmId"], "side": goal["side"], "recordId": goal["recordId"],
+                           "evaluations": [{"id": analyst, **entry} for analyst, entry in sorted((analysis.get("evaluations") or {}).items())],
+                           "representative": analysis.get("representative"),
+                           "representativeStatus": (goal.get("representative") or {}).get("status")})
+        return output
 
     def _shot_document(self, shot_id):
         db, bucket = shotx_clients()

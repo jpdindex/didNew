@@ -5,8 +5,9 @@ from typing import Annotated
 from fastapi import APIRouter, Path, Query
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
-from backend.api.api_player_requests import User
-from backend.system.system_goalx import GoalAnalysis, Grades, TestGoalInput, shotx_access
+from backend.api.api_player_requests import User, ManagerUser
+from backend.system.system_player_requests import is_manager
+from backend.system.system_goalx import GoalAnalysis, EvaluationInput, TestGoalInput, RepresentativeApproval, shotx_access
 from backend.system.system_schema import Side
 
 router = APIRouter(prefix="/goalx", tags=["GoalX"], include_in_schema=False)
@@ -24,8 +25,8 @@ def goal_analysis():
 
 
 @router.get("/catalog")
-def catalog(_: User):
-    return goal_analysis().catalog(int(monotonic() // 60))
+def catalog(user: User):
+    return {**goal_analysis().catalog(int(monotonic() // 60)), "canApproveRepresentative": is_manager(user)}
 
 
 @router.get("/rounds")
@@ -54,6 +55,12 @@ def ranking(
     return GoalAnalysis().ranking(league_id, season_id, round_id, user.uid)
 
 
+@router.get("/export")
+def export_completed(user: User, league_id: str, season_id: str,
+                     round_id: Annotated[str, Query(pattern=r"^(?:[0-9]{1,4}|R32|R16|QF|SF|F|unassigned)$")]):
+    return {"goals": GoalAnalysis().export_completed(league_id, season_id, round_id, user.uid)}
+
+
 @router.get("/test-goals/shotx-candidates")
 def test_shot_candidates(_: User, search: Annotated[str, Query(max_length=150)] = ""):
     with shotx_access():
@@ -78,6 +85,11 @@ def shot_detail(gm_id: GoalId, side: Side, record_id: GoalId, _: User):
         return {"shot": GoalAnalysis().detail(gm_id, side, record_id)}
 
 
+@router.get("/goals/{gm_id}/{side}/{record_id}/raw-coordinates")
+def raw_coordinates(gm_id: GoalId, side: Side, record_id: GoalId, _: User):
+    return {"coordinates": GoalAnalysis().raw_coordinates(gm_id, side, record_id)}
+
+
 @router.get("/goals/{gm_id}/{side}/{record_id}/candidates")
 def shot_candidates(
     gm_id: GoalId, side: Side, record_id: GoalId, _: User,
@@ -94,5 +106,15 @@ def link_shot(gm_id: GoalId, side: Side, record_id: GoalId, payload: ShotLink, u
 
 
 @router.put("/goals/{gm_id}/{side}/{record_id}/evaluation")
-def save_evaluation(gm_id: GoalId, side: Side, record_id: GoalId, payload: Grades, user: User):
+def save_evaluation(gm_id: GoalId, side: Side, record_id: GoalId, payload: EvaluationInput, user: User):
     return {"analysis": GoalAnalysis().save(gm_id, side, record_id, user.uid, payload)}
+
+
+@router.get("/goals/{gm_id}/{side}/{record_id}/representative")
+def representative_preview(gm_id: GoalId, side: Side, record_id: GoalId, _: ManagerUser):
+    return {"proposal": GoalAnalysis().representative_preview(gm_id, side, record_id)}
+
+
+@router.put("/goals/{gm_id}/{side}/{record_id}/representative")
+def approve_representative(gm_id: GoalId, side: Side, record_id: GoalId, payload: RepresentativeApproval, user: ManagerUser):
+    return {"analysis": GoalAnalysis().approve_representative(gm_id, side, record_id, user, payload)}

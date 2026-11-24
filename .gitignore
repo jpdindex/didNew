@@ -56,3 +56,6 @@ migration/service-account.json
 keys/migration/service-account.json
 keys
 
+
+# Local frontend verification scripts
+/app/check/*.test.cjs
