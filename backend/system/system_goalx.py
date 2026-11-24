@@ -62,6 +62,7 @@ class EstimatedShotInput(BaseModel):
     shootPosY: float = Field(ge=83, le=300, allow_inf_nan=False)
     goalX: Literal[0, 105]
     timeToGoal: float | None = Field(default=None, gt=0, le=600, allow_inf_nan=False)
+    curveDirection: Literal["left", "right"] | None = None
 
 
 def estimate_shot(value: EstimatedShotInput, grade: str):
@@ -71,13 +72,20 @@ def estimate_shot(value: EstimatedShotInput, grade: str):
     # Peak lift above the straight segment = distance * fixed type coefficient.
     weight = {"high": .20, "medium": .10, "low": 0}[grade]
     lift = dist(start, end) * weight
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    horizontal = (dx * dx + dy * dy) ** .5
+    sign = {"left": 1, "right": -1}.get(value.curveDirection, 0)
+    # Pitch Y increases downwards: shooter's left is (dy, -dx).
+    bend = horizontal * weight * .5 * sign
     points = []
     for i in range(101):
         t = i / 100
         x, y, z = (a + (b - a) * t for a, b in zip(start, end))
-        points.append({"x": x, "y": y, "z": z + 4 * lift * t * (1 - t)})
+        arc = 4 * t * (1 - t)
+        points.append({"x": x + (dy / horizontal * bend * arc if horizontal else 0),
+                       "y": y - (dx / horizontal * bend * arc if horizontal else 0), "z": z + lift * arc})
     length = sum(dist(tuple(a.values()), tuple(b.values())) for a, b in zip(points, points[1:]))
-    return {"input": value.model_dump(), "modelVersion": 1, "trajectoryGrade": grade,
+    return {"input": value.model_dump(), "modelVersion": 2, "trajectoryGrade": grade,
             "curveWeight": weight, "trajectory": points, "goalPoint": points[-1],
             "distance": length, "averageSpeed": length / value.timeToGoal * 3.6 if value.timeToGoal else None}
 
@@ -87,6 +95,15 @@ class RepresentativeApproval(BaseModel):
     sourceVersion: str = Field(pattern=r"^[a-f0-9]{64}$")
     trajectory: Literal["high", "medium", "low"]
     coordinates: EstimatedShotInput | None = None
+    curveDirection: Literal["left", "right"] | None = None
+
+    @model_validator(mode="after")
+    def required_curve_direction(self):
+        if self.trajectory != "low" and self.curveDirection is None:
+            raise ValueError("딥 커브·커브는 좌우 방향을 선택해야 합니다.")
+        if self.trajectory == "low":
+            self.curveDirection = None
+        return self
 
 
 def fingerprint(value):
@@ -105,6 +122,15 @@ def representative_proposal(analysis, record, recording, points):
               for category in ("artistry", "defense", "trajectory")}
     counts = Counter(entry["grades"]["trajectory"] for entry in evaluations.values())
     modes = [grade for grade in ("high", "medium", "low") if counts[grade] == max(counts.values())]
+    direction_counts, direction_candidates = {}, {}
+    for grade in ("high", "medium"):
+        votes = Counter()
+        for entry in evaluations.values():
+            direction = entry.get("curveDirection") or ((entry.get("estimatedShot") or {}).get("input") or {}).get("curveDirection")
+            if entry["grades"]["trajectory"] == grade and direction in ("left", "right"):
+                votes[direction] += 1
+        direction_counts[grade] = dict(votes)
+        direction_candidates[grade] = [direction for direction in ("left", "right") if not votes or votes[direction] == max(votes.values())]
     times = []
     for entry in evaluations.values():
         value = ((entry.get("estimatedShot") or {}).get("input") or {}).get("timeToGoal")
@@ -119,6 +145,7 @@ def representative_proposal(analysis, record, recording, points):
             "evaluationVersion": evaluation_version(analysis), "evaluationCount": len(evaluations),
             "categoryScores": scores, "score": sum(scores.values()), "trajectoryCounts": dict(counts),
             "trajectoryCandidates": modes, "timeToGoal": median(times) if times else None,
+            "curveDirectionCounts": direction_counts, "curveDirectionCandidates": direction_candidates,
             "timeSampleCount": len(times), "coordinates": coordinates, "goalX": goal_x,
             "directionGoalX": goal_x if direction_known else None,
             "shotId": (analysis.get("shotx") or {}).get("id")}
@@ -130,15 +157,18 @@ def finalize_representative(analysis, record, recording, points, payload):
         raise BackendError("검토 중 평가 또는 RAW가 변경됐습니다. 창을 다시 열어 확인해 주세요.", 409, "goalx_review_changed")
     if payload.trajectory not in proposal["trajectoryCandidates"]:
         raise BackendError("최다 선택된 궤적 중 하나를 선택하세요.", 422, "goalx_invalid_representative_trajectory")
+    if payload.trajectory != "low" and payload.curveDirection not in proposal["curveDirectionCandidates"][payload.trajectory]:
+        raise BackendError("최다 선택된 좌우 방향 중 하나를 선택하세요.", 422, "goalx_invalid_representative_direction")
     estimation = None
     if payload.coordinates:
         value = payload.coordinates.model_copy(update={
             "goalX": automatic_goal_x(record, recording, payload.coordinates.posX), "timeToGoal": proposal["timeToGoal"],
+            "curveDirection": payload.curveDirection,
         })
         estimation = estimate_shot(value, payload.trajectory)
-    return {**proposal, "trajectory": payload.trajectory, "estimatedShot": estimation,
+    return {**proposal, "trajectory": payload.trajectory, "curveDirection": payload.curveDirection, "estimatedShot": estimation,
             "coordinates": payload.coordinates.model_dump(include={"posX", "posY", "shootPosX", "shootPosY"}) if payload.coordinates else None,
-            "schemaVersion": 1}
+            "schemaVersion": 2}
 
 
 class Grades(BaseModel):
@@ -150,6 +180,17 @@ class Grades(BaseModel):
 
 class EvaluationInput(Grades):
     estimatedShot: EstimatedShotInput | None = None
+    curveDirection: Literal["left", "right"] | None = None
+
+    @model_validator(mode="after")
+    def required_curve_direction(self):
+        if self.trajectory != "low" and self.curveDirection is None:
+            raise ValueError("딥 커브·커브는 좌우 방향을 선택해야 합니다.")
+        if self.trajectory == "low":
+            self.curveDirection = None
+        if self.estimatedShot:
+            self.estimatedShot = self.estimatedShot.model_copy(update={"curveDirection": self.curveDirection})
+        return self
 
 
 class TestGoalInput(BaseModel):
@@ -471,6 +512,7 @@ class GoalAnalysis:
             "shotId": link.get("id"), "metrics": metrics, "autoGrades": grades,
             "myGrades": (evaluations.get(uid) or {}).get("grades"),
             "myEstimatedShot": (evaluations.get(uid) or {}).get("estimatedShot"),
+            "myCurveDirection": (evaluations.get(uid) or {}).get("curveDirection"),
             "evaluationCount": evaluation_count,
             "evaluators": [
                 {"id": entry.get("analystUid") or key, "name": entry.get("analystName") or key}
@@ -666,7 +708,8 @@ class GoalAnalysis:
             "gmId": gm_id, "side": side, "recordId": record_id,
             "evaluations": {uid: {"analystUid": uid, "analystName": name,
                                   "grades": grades.model_dump(include=set(Grades.model_fields)),
-                                  "estimatedShot": estimation, "updatedAt": firestore.SERVER_TIMESTAMP}},
+                                  "estimatedShot": estimation, "curveDirection": getattr(grades, "curveDirection", None),
+                                  "updatedAt": firestore.SERVER_TIMESTAMP}},
         }, merge=True)
         batch.commit(timeout=15)
         return self._read_analysis_state(ref, uid)

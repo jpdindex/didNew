@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { estimateGoalShot, validEstimatedCoordinates, goalxEstimationSheets, type EstimatedShot, type EstimatedShotInput, type GoalxExportRecord } from '~/utils/goalx'
+import { estimateGoalShot, validEstimatedCoordinates, goalxEstimationSheets, type CurveDirection, type EstimatedShot, type EstimatedShotInput, type GoalxExportRecord } from '~/utils/goalx'
 type Grade = 'high' | 'medium' | 'low'
 type Category = 'artistry' | 'defense' | 'trajectory'
 type Grades = Record<Category, Grade>
@@ -12,6 +12,7 @@ type Season = { id: string; leagueId: string; name: string; from: string | null;
 type Round = { id: string; latestDate: string; earliestDate: string }
 type Team = { name: string; aliases: string[] }
 type Analysis = {
+  myCurveDirection: CurveDirection | null
   representative: { status: 'approved' | 'needs_review'; approvedBy: string; approvedAt: string } | null
   myEstimatedShot: EstimatedShot | null
   shotId: string | null; myGrades: Grades | null; evaluationCount: number
@@ -35,6 +36,8 @@ type Shot = {
 type RepresentativeProposal = {
   sourceVersion: string; evaluationCount: number; categoryScores: Record<Category, number>; score: number
   trajectoryCounts: Partial<Record<Grade, number>>; trajectoryCandidates: Grade[]
+  curveDirectionCounts: Record<'high' | 'medium', Partial<Record<CurveDirection, number>>>
+  curveDirectionCandidates: Record<'high' | 'medium', CurveDirection[]>
   timeToGoal: number | null; timeSampleCount: number; coordinates: RawCoordinates; goalX: 0 | 105; directionGoalX: 0 | 105 | null; shotId: string | null
 }
 
@@ -44,6 +47,7 @@ const { request } = useBackendApi()
 const grades: Grade[] = ['high', 'medium', 'low']
 const labels = { high: '상', medium: '중', low: '하' }
 const trajectoryLabels = { high: '딥 커브', medium: '커브', low: '스트레이트' }
+const curveDirectionLabels = { left: '좌', right: '우' }
 const coordinateFields = [
   { key: 'posX', label: '슈팅 X (%)', min: 0, max: 100 },
   { key: 'posY', label: '슈팅 Y (%)', min: 0, max: 100 },
@@ -102,6 +106,8 @@ const representativeDialog = ref<HTMLDialogElement>()
 const representativeGoal = ref<Goal>()
 const representativeProposal = ref<RepresentativeProposal>()
 const representativeTrajectory = ref<Grade>()
+const representativeCurveDirection = ref<CurveDirection | null>(null)
+const representativeDirectionValid = computed(() => representativeTrajectory.value === 'low' || representativeCurveDirection.value != null)
 const representativeCoordinates = ref<Record<string, number | null | ''>>({})
 const loadingRepresentative = ref(false)
 const approvingRepresentative = ref(false)
@@ -111,9 +117,10 @@ const representativeCoordinatesValid = computed(() => validEstimatedCoordinates(
 const representativeHasCoordinates = computed(() => coordinateFields.some(({ key }) => representativeCoordinates.value[key] != null && representativeCoordinates.value[key] !== ''))
 const representativeEstimate = computed(() => {
   const proposal = representativeProposal.value
-  if (!proposal || !representativeTrajectory.value || !representativeCoordinatesValid.value) return null
+  if (!proposal || !representativeTrajectory.value || !representativeCoordinatesValid.value || !representativeDirectionValid.value) return null
   const goalX = proposal.directionGoalX ?? (Number(representativeCoordinates.value.posX) < 50 ? 0 : 105)
-  return estimateGoalShot({ ...representativeCoordinates.value, goalX, timeToGoal: proposal.timeToGoal } as EstimatedShotInput, representativeTrajectory.value)
+  return estimateGoalShot({ ...representativeCoordinates.value, goalX, timeToGoal: proposal.timeToGoal,
+    curveDirection: representativeTrajectory.value === 'low' ? null : representativeCurveDirection.value } as EstimatedShotInput, representativeTrajectory.value)
 })
 const leagueSeasons = computed(() => {
   const registered = seasons.value.filter(item => item.leagueId === league.value)
@@ -195,6 +202,9 @@ const linking = ref(false)
 const shot = ref<Shot | null>(null)
 const showShot = ref(false)
 const showEstimated = ref(false)
+const curveDirection = ref<CurveDirection | null>(null)
+const curveDirectionRequired = computed(() => draft.value.trajectory === 'high' || draft.value.trajectory === 'medium')
+const curveDirectionValid = computed(() => !curveDirectionRequired.value || curveDirection.value != null)
 const loadingRawCoordinates = ref(false)
 const rawCoordinatesError = ref('')
 let rawCoordinatesRequest: AbortController | undefined
@@ -214,8 +224,9 @@ const estimatedTimeValid = computed(() => estimateDraft.value.timeToGoal == null
   || (typeof estimateDraft.value.timeToGoal === 'number' && Number.isFinite(estimateDraft.value.timeToGoal)
     && estimateDraft.value.timeToGoal > 0 && estimateDraft.value.timeToGoal <= 600))
 const estimatedPreview = computed(() => {
-  if (!estimatedCoordinatesValid.value || !estimatedTimeValid.value || !draft.value.trajectory) return null
-  return estimateGoalShot({ ...estimateDraft.value, goalX: automaticGoalX.value } as EstimatedShotInput, draft.value.trajectory)
+  if (!estimatedCoordinatesValid.value || !estimatedTimeValid.value || !draft.value.trajectory || !curveDirectionValid.value) return null
+  return estimateGoalShot({ ...estimateDraft.value, goalX: automaticGoalX.value,
+    curveDirection: draft.value.trajectory === 'low' ? null : curveDirection.value } as EstimatedShotInput, draft.value.trajectory)
 })
 const hasEstimateCoordinates = computed(() => coordinateFields.some(field => estimateDraft.value[field.key] != null && estimateDraft.value[field.key] !== ''))
 const estimateInvalid = computed(() => timerRunning.value || !estimatedTimeValid.value
@@ -230,6 +241,7 @@ function resetEstimate(goal?: Goal) {
   stopStopwatch()
   const raw = goal?.rawCoordinates ?? {}
   const saved = goal?.myEstimatedShot?.input
+  curveDirection.value = goal?.myGrades?.trajectory === 'low' ? null : goal?.myCurveDirection ?? saved?.curveDirection ?? null
   rawGoalX.value = raw.goalX === 0 || raw.goalX === 105 ? raw.goalX : null
   estimateDraft.value = {
     ...Object.fromEntries(coordinateFields.map(field => [field.key, saved?.[field.key] ?? raw[field.key] ?? null])),
@@ -670,6 +682,7 @@ async function openRepresentative(goal: Goal) {
   representativeGoal.value = goal
   representativeProposal.value = undefined
   representativeTrajectory.value = undefined
+  representativeCurveDirection.value = null
   representativeError.value = ''
   loadingRepresentative.value = true
   await nextTick()
@@ -680,11 +693,17 @@ async function openRepresentative(goal: Goal) {
     representativeProposal.value = proposal
     representativeCoordinates.value = Object.fromEntries(coordinateFields.map(({ key }) => [key, proposal.coordinates[key] ?? null]))
     representativeTrajectory.value = proposal.trajectoryCandidates.length === 1 ? proposal.trajectoryCandidates[0] : undefined
+    chooseRepresentativeDirection()
   } catch (error) {
     if (!controller.signal.aborted) representativeError.value = errorMessage(error)
   } finally {
     if (!controller.signal.aborted) loadingRepresentative.value = false
   }
+}
+function chooseRepresentativeDirection() {
+  const grade = representativeTrajectory.value
+  const candidates = grade && grade !== 'low' ? representativeProposal.value?.curveDirectionCandidates[grade] ?? [] : []
+  representativeCurveDirection.value = candidates.length === 1 ? candidates[0]! : null
 }
 function closeRepresentative() {
   representativeRequest?.abort()
@@ -693,7 +712,7 @@ function closeRepresentative() {
 async function approveRepresentative() {
   const goal = representativeGoal.value
   const proposal = representativeProposal.value
-  if (!goal || !proposal || !representativeTrajectory.value || approvingRepresentative.value
+  if (!goal || !proposal || !representativeTrajectory.value || !representativeDirectionValid.value || approvingRepresentative.value
     || (representativeHasCoordinates.value && !representativeCoordinatesValid.value)) return
   approvingRepresentative.value = true
   representativeError.value = ''
@@ -701,6 +720,7 @@ async function approveRepresentative() {
     const { analysis } = await request<{ analysis: Analysis }>(pathOf(goal) + '/representative', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sourceVersion: proposal.sourceVersion, trajectory: representativeTrajectory.value,
+        curveDirection: representativeTrajectory.value === 'low' ? null : representativeCurveDirection.value,
         coordinates: representativeEstimate.value?.input ?? null }),
     })
     patchGoal(goal, analysis)
@@ -762,14 +782,15 @@ function patchGoal(goal: Goal, analysis: Analysis) {
 
 async function saveGrades() {
   const goal = selected.value
-  if (!goal || !editing.value || saving.value || linking.value || loadingRawCoordinates.value || estimateInvalid.value || categories.some(({ key }) => !draft.value[key])) return
+  if (!goal || !editing.value || saving.value || linking.value || loadingRawCoordinates.value || estimateInvalid.value || !curveDirectionValid.value || categories.some(({ key }) => !draft.value[key])) return
   saving.value = true
   actionError.value = ''
   notice.value = ''
   try {
     const { analysis } = await request<{ analysis: Analysis }>(pathOf(goal) + '/evaluation', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...draft.value, estimatedShot: estimatedPreview.value?.input ?? null }),
+      body: JSON.stringify({ ...draft.value, curveDirection: draft.value.trajectory === 'low' ? null : curveDirection.value,
+        estimatedShot: estimatedPreview.value?.input ?? null }),
     })
     patchGoal(goal, analysis)
     if (selectedKey.value === keyOf(goal)) {
@@ -949,18 +970,30 @@ onBeforeUnmount(() => {
                 <legend>{{ category.label }}</legend>
                 <div v-if="editing" class="choices">
                   <label v-for="grade in grades" :key="grade" :class="{ chosen: draft[category.key] === grade }">
-                    <input v-model="draft[category.key]" type="radio" :name="category.key" :value="grade" required>
+                    <input v-model="draft[category.key]" type="radio" :name="category.key" :value="grade" required @change="category.key === 'trajectory' && (curveDirection = null)">
                     <span>{{ category.key === 'trajectory' ? trajectoryLabels[grade] : labels[grade] }}</span><small>{{ result?.points[grade] }}점</small>
                   </label>
                 </div>
-                <div v-else-if="selected.myGrades" class="saved-grade">
+                <div v-if="category.key === 'trajectory' && editing && curveDirectionRequired" class="curve-direction">
+                  <p>어느 방향으로 휘었나요? <small>슈팅자가 골대를 바라보는 기준 · 점수 미반영</small></p>
+                  <div class="choices">
+                    <label v-for="direction in (['left', 'right'] as const)" :key="direction" :class="{ chosen: curveDirection === direction }">
+                      <input v-model="curveDirection" type="radio" name="curve-direction" :value="direction" required>
+                      <span>{{ direction === 'left' ? '↶ 좌' : '우 ↷' }}</span>
+                    </label>
+                  </div>
+                </div>
+                <p v-else-if="category.key === 'trajectory' && !editing && selected.myGrades?.trajectory !== 'low' && selected.myGrades" class="curve-direction-saved">
+                  커브 방향 · {{ curveDirection ? curveDirectionLabels[curveDirection] : '미선택' }} <small>점수 미반영</small>
+                </p>
+                <div v-if="!editing && selected.myGrades" class="saved-grade">
                   <strong>{{ category.key === 'trajectory' ? trajectoryLabels[selected.myGrades[category.key]] : labels[selected.myGrades[category.key]] }}</strong>
                   <span>{{ result?.points[selected.myGrades[category.key]] }}점</span>
                 </div>
               </fieldset>
             </div>
             <div v-if="editing" class="form-actions">
-              <button type="submit" class="primary" :disabled="saving || linking || loadingRawCoordinates || estimateInvalid || categories.some(({ key }) => !draft[key])">{{ saving ? '저장 중…' : '평가 저장' }}</button>
+              <button type="submit" class="primary" :disabled="saving || linking || loadingRawCoordinates || estimateInvalid || !curveDirectionValid || categories.some(({ key }) => !draft[key])">{{ saving ? '저장 중…' : '평가 저장' }}</button>
               <button v-if="selected.myGrades" type="button" class="quiet" :disabled="saving" @click="cancelEditing">취소</button>
             </div>
             <p v-if="actionError" class="error" role="alert">{{ actionError }}</p>
@@ -1034,7 +1067,7 @@ onBeforeUnmount(() => {
               <div><dt>추정 궤적 거리</dt><dd>{{ formatMetric(estimatedPreview.distance, 'm') }}</dd></div>
               <div><dt>추정 평균 속도</dt><dd>{{ formatMetric(estimatedPreview.averageSpeed, 'km/h') }}</dd></div>
             </dl>
-            <p class="muted">좌우 휨 없이 고정 곡률을 적용합니다. 딥 커브 0.20 · 커브 0.10 · 스트레이트 0.00. 최고 추가 높이는 직선거리 × 곡률이며, 표시된 궤적 길이로 평균 속도를 계산합니다.</p>
+            <p class="muted">선택한 궤적 유형과 {{ curveDirection ? curveDirectionLabels[curveDirection] + ' 방향' : '방향' }}을 반영한 추정 궤적입니다. 좌·우는 슈팅자가 골대를 바라보는 기준이며, 궤적 길이로 평균 속도를 계산합니다.</p>
           </section>
           <section v-if="showShot" id="goalx-shotx" class="shot-panel">
             <h3>ShotX 영상과 측정값</h3>
@@ -1165,10 +1198,18 @@ onBeforeUnmount(() => {
               <p class="muted">{{ representativeProposal.trajectoryCandidates.length > 1 ? '최다 선택이 동률입니다. 대표 유형을 선택해 주세요.' : '분석관들이 가장 많이 선택한 유형입니다.' }}</p>
               <div class="choices">
                 <label v-for="grade in representativeProposal.trajectoryCandidates" :key="grade" :class="{ chosen: representativeTrajectory === grade }">
-                  <input v-model="representativeTrajectory" type="radio" name="representative-trajectory" :value="grade" required>
+                  <input v-model="representativeTrajectory" type="radio" name="representative-trajectory" :value="grade" required @change="chooseRepresentativeDirection">
                   <span>{{ trajectoryLabels[grade] }}</span><small>{{ representativeProposal.trajectoryCounts[grade] }}명</small>
                 </label>
               </div>
+            </fieldset>
+            <fieldset v-if="representativeTrajectory && representativeTrajectory !== 'low'" class="representative-field curve-direction" :disabled="approvingRepresentative">
+              <legend>대표 커브 방향 · 점수 미반영</legend>
+              <p class="muted">선택한 궤적의 최다 방향입니다. 동률이거나 기존 방향 정보가 없으면 관리자가 선택하세요.</p>
+              <div class="choices"><label v-for="direction in representativeProposal.curveDirectionCandidates[representativeTrajectory]" :key="direction" :class="{ chosen: representativeCurveDirection === direction }">
+                <input v-model="representativeCurveDirection" type="radio" name="representative-direction" :value="direction" required>
+                <span>{{ curveDirectionLabels[direction] }}</span><small>{{ representativeProposal.curveDirectionCounts[representativeTrajectory][direction] ?? 0 }}명</small>
+              </label></div>
             </fieldset>
             <fieldset :disabled="approvingRepresentative" class="representative-field">
               <legend>대표 좌표 확인</legend><p class="muted">RAW 좌표를 기본으로 사용합니다. 필요한 경우 수정 후 확정하세요.</p>
@@ -1185,7 +1226,7 @@ onBeforeUnmount(() => {
             </template>
             <p v-else class="muted">좌표 또는 대표 궤적이 없으면 추정 3D는 포함되지 않습니다.</p>
             <p v-if="representativeProposal.timeToGoal == null" class="muted">측정된 소요시간이 없어 추정 평균 속도는 포함되지 않습니다.</p>
-            <div class="form-actions"><button type="submit" class="primary" :disabled="approvingRepresentative || !representativeTrajectory || (representativeHasCoordinates && !representativeCoordinatesValid)">
+            <div class="form-actions"><button type="submit" class="primary" :disabled="approvingRepresentative || !representativeTrajectory || !representativeDirectionValid || (representativeHasCoordinates && !representativeCoordinatesValid)">
               {{ approvingRepresentative ? '확정 중…' : '대표 분석 확정' }}</button></div>
           </form>
           <p v-if="representativeError" class="error" role="alert">{{ representativeError }}</p>
@@ -1213,6 +1254,12 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.curve-direction { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.curve-direction p, .curve-direction-saved { margin-bottom: 8px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.curve-direction p small { display: block; margin-top: 3px; font-size: 11px; }
+.curve-direction .choices { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.curve-direction-saved { margin-top: 8px; }
+.curve-direction-saved small { margin-left: 6px; }
 .representative-button { white-space: nowrap; color: var(--accent); font-size: 12px; }
 .representative-dialog { width: min(720px, calc(100vw - 32px)); max-height: 90vh; box-sizing: border-box; padding: 0; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
 .representative-dialog::backdrop { background: #071014b8; }

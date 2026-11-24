@@ -70,7 +70,7 @@ def test_save_persists_per_analyst_estimation_and_preserves_three_grade_categori
     service._write_scope = Mock()
     service._read_analysis_state = Mock(return_value={"saved": True})
     service._recording_direction = Mock(return_value={})
-    payload = EvaluationInput(artistry="high", defense="medium", trajectory="high", estimatedShot=shot_input())
+    payload = EvaluationInput(artistry="high", defense="medium", trajectory="high", curveDirection="left", estimatedShot=shot_input())
     assert service.save("match", "H", "record", "analyst", payload) == {"saved": True}
     row = batch.set.call_args.args[1]["evaluations"]["analyst"]
     assert set(row["grades"]) == set(Grades.model_fields)
@@ -79,6 +79,8 @@ def test_save_persists_per_analyst_estimation_and_preserves_three_grade_categori
     state = service._analysis_state({"evaluations": {"analyst": row}}, "analyst", POINTS, {})
     assert state["myEstimatedShot"] == row["estimatedShot"]
     assert state["score"] == 8
+    assert row["curveDirection"] == "left"
+    assert state["myCurveDirection"] == "left"
 
 
 @pytest.mark.parametrize("half,recording,pos_x,expected", [
@@ -106,14 +108,16 @@ def test_saved_goal_is_automatic_even_if_client_sends_manual_goal():
     service.move_legacy_goals = Mock()
     service._write_scope = Mock()
     service._read_analysis_state = Mock(return_value={})
-    payload = EvaluationInput(artistry="high", defense="medium", trajectory="medium", estimatedShot=shot_input(goalX=105))
+    payload = EvaluationInput(artistry="high", defense="medium", trajectory="medium", curveDirection="left", estimatedShot=shot_input(goalX=105))
     service.save("match", "A", "goal", "analyst", payload)
     saved = batch.set.call_args.args[1]["evaluations"]["analyst"]["estimatedShot"]
     assert saved["input"]["goalX"] == 0
     assert saved["goalPoint"]["x"] == 0
 
 
-def test_browser_and_server_generate_identical_curves():
+@pytest.mark.parametrize("direction", [None, "left", "right"])
+@pytest.mark.parametrize("goal_x", [0, 105])
+def test_browser_and_server_generate_identical_curves(direction, goal_x):
     root = Path(__file__).resolve().parents[2]
     script = """
 const fs = require('node:fs');
@@ -125,7 +129,7 @@ vm.runInNewContext(transformSync(source, { loader: 'ts', format: 'cjs' }).code, 
 const input = JSON.parse(process.argv[1]);
 process.stdout.write(JSON.stringify(['high', 'medium', 'low'].map(grade => module.exports.estimateGoalShot(input, grade))));
 """
-    browser = json.loads(subprocess.check_output(["node", "-e", script, json.dumps(shot_input(shootPosY=100, posY=20))], cwd=root))
+    browser = json.loads(subprocess.check_output(["node", "-e", script, json.dumps(shot_input(shootPosY=100, posY=20, goalX=goal_x, curveDirection=direction))], cwd=root))
     for grade, actual in zip(("high", "medium", "low"), browser):
         expected = estimate_shot(EstimatedShotInput(**actual["input"]), grade)
         assert actual["distance"] == pytest.approx(expected["distance"], abs=1e-10)
@@ -146,7 +150,7 @@ def sources():
 
 def approval(source, **changes):
     proposal = representative_proposal(*source)
-    return RepresentativeApproval(**{"sourceVersion": proposal["sourceVersion"], "trajectory": "medium",
+    return RepresentativeApproval(**{"sourceVersion": proposal["sourceVersion"], "trajectory": "medium", "curveDirection": "left",
         "coordinates": {**proposal["coordinates"], "goalX": 0, "timeToGoal": 100}, **changes})
 
 
@@ -262,3 +266,48 @@ def test_approval_transaction_writes_only_representative_snapshot(monkeypatch):
     assert values["representative"]["approvedBy"] == "manager"
     assert values["representative"]["leagueId"] == "EPL"
     assert values["representative"]["timeToGoal"] == .6
+
+
+@pytest.mark.parametrize("grade", ["high", "medium"])
+def test_curved_evaluation_and_approval_require_direction_without_estimation(grade):
+    with pytest.raises(ValidationError):
+        EvaluationInput(artistry="high", defense="medium", trajectory=grade)
+    with pytest.raises(ValidationError):
+        RepresentativeApproval(sourceVersion="a" * 64, trajectory=grade)
+    assert EvaluationInput(artistry="high", defense="medium", trajectory=grade, curveDirection="right").curveDirection == "right"
+
+
+def test_straight_evaluation_removes_stale_direction_from_saved_input():
+    payload = EvaluationInput(artistry="high", defense="medium", trajectory="low", curveDirection="right",
+                              estimatedShot=shot_input(curveDirection="left"))
+    assert payload.curveDirection is None
+    assert payload.estimatedShot.curveDirection is None
+
+
+@pytest.mark.parametrize("goal_x,pos_x", [(105, 80), (0, 20)])
+@pytest.mark.parametrize("grade", ["high", "medium"])
+def test_left_and_right_curves_are_mirrored_in_shooters_frame(goal_x, pos_x, grade):
+    left = estimate_shot(EstimatedShotInput(**shot_input(goalX=goal_x, posX=pos_x, curveDirection="left")), grade)
+    right = estimate_shot(EstimatedShotInput(**shot_input(goalX=goal_x, posX=pos_x, curveDirection="right")), grade)
+    assert left["trajectory"][0] == right["trajectory"][0]
+    assert left["trajectory"][-1] == right["trajectory"][-1]
+    forward = 1 if goal_x == 105 else -1
+    assert (left["trajectory"][50]["y"] - 34) * forward < 0
+    assert (right["trajectory"][50]["y"] - 34) * forward > 0
+    assert left["distance"] == pytest.approx(right["distance"])
+    assert left["modelVersion"] == 2
+
+
+def test_representative_direction_is_voted_within_selected_trajectory_only():
+    source = sources()
+    source[0]["evaluations"]["0"]["curveDirection"] = "left"  # high
+    source[0]["evaluations"]["1"]["curveDirection"] = "right"  # medium
+    source[0]["evaluations"]["2"]["curveDirection"] = "right"  # medium
+    proposal = representative_proposal(*source)
+    assert proposal["curveDirectionCandidates"]["medium"] == ["right"]
+    assert proposal["curveDirectionCandidates"]["high"] == ["left"]
+    with pytest.raises(BackendError):
+        finalize_representative(*source, approval(source, curveDirection="left"))
+    result = finalize_representative(*source, approval(source, curveDirection="right"))
+    assert result["curveDirection"] == "right"
+    assert result["estimatedShot"]["input"]["curveDirection"] == "right"
