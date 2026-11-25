@@ -23,6 +23,7 @@ JobState = Literal["queued", "preparing", "preflight", "resuming", "replacing", 
 @dataclass(slots=True)
 class LegacyImportJob:
     state: JobState = "queued"
+    percent: int = 0
     matches_total: int = 0
     matches_processed: int = 0
     documents_total: int = 0
@@ -184,12 +185,17 @@ def _import_response(job: LegacyImportJob | None) -> LegacyImportStatusResponse:
             percent = min(40, 5 + int((job.matches_processed / job.matches_total) * 35))
         elif job.state == "preparing":
             percent = 3
+        elif job.state == "preflight":
+            percent = min(35, 3 + int(job.matches_processed / job.matches_total * 32)) if job.matches_total else 3
         elif job.documents_total:
-            percent = min(99, int((job.documents_written / job.documents_total) * 100))
+            percent = min(99, 35 + int((job.documents_written / job.documents_total) * 64))
         elif job.matches_total:
             percent = min(35, int((job.matches_processed / job.matches_total) * 35))
         else:
             percent = 0
+        # A retried write can revisit earlier batches. Preserve the last
+        # displayed progress, reserving 100% for successful completion.
+        job.percent = max(job.percent, percent)
         return LegacyImportStatusResponse(
             status=job.state,
             matchesTotal=job.matches_total,
@@ -197,7 +203,7 @@ def _import_response(job: LegacyImportJob | None) -> LegacyImportStatusResponse:
             documentsTotal=job.documents_total,
             documentsWritten=job.documents_written,
             recordsWritten=job.records_written,
-            percent=percent,
+            percent=job.percent,
             error=job.error,
         )
 
@@ -205,12 +211,11 @@ def _import_response(job: LegacyImportJob | None) -> LegacyImportStatusResponse:
 def _run_import(job: LegacyImportJob, upload_path: Path) -> None:
     try:
         logger.info("SQL legacy import started")
-        sql = upload_path.read_text(encoding="utf-8-sig")
 
         def progress(state: str, matches_total: int, matches_processed: int, documents_total: int, documents_written: int) -> None:
             job.update(state, matches_total, matches_processed, documents_total, documents_written)
 
-        result = BuildLegacyImport().import_sql(sql, on_progress=progress)
+        result = BuildLegacyImport().import_file(upload_path, on_progress=progress)
         with job.lock:
             job.state = "complete"
             job.matches_total = result.matches_replaced
@@ -479,8 +484,14 @@ async def import_legacy_sql(
     if not dump.filename or not dump.filename.lower().endswith((".sql", ".txt")):
         raise BackendError("Upload a .sql dump file", status_code=422, code="legacy_file_invalid")
     with NamedTemporaryFile(delete=False, suffix=".sql") as upload:
-        upload.write(await dump.read())
         upload_path = Path(upload.name)
+        try:
+            while chunk := await dump.read(1024 * 1024):
+                upload.write(chunk)
+        except BaseException:
+            upload.close()
+            upload_path.unlink(missing_ok=True)
+            raise
     global _import_job
     with _import_job_lock:
         if _player_update.status in {'queued', 'running'}:

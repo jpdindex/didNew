@@ -5,11 +5,16 @@ import json
 import argparse
 import re
 import time
+import logging
+import pickle
+import sqlite3
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import chain
 from pathlib import Path
-from typing import Any, Callable
+from tempfile import TemporaryDirectory, NamedTemporaryFile
+from typing import Any, Callable, Iterator, TextIO
 from google.api_core import retry as retries
 from pydantic import ValidationError, BaseModel
 from backend.system.system_firestore import BackendError, JpdDidData, PROJECT_ROOT
@@ -50,6 +55,157 @@ CHECKPOINT_DIRECTORY = Path(__file__).resolve().parents[1] / "data" / "legacy-im
 MAX_MATCH_ATTEMPTS = 3
 IMPORTER_CHECKPOINT_VERSION = "legacy-source-order-v3"
 SOURCE_ROW_INDEX = "__legacy_source_index"
+logger = logging.getLogger(__name__)
+
+
+def _log_import_memory(stage: str, gm_id: str | None = None) -> None:
+    memory: dict[str, int] = {}
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            field, _, value = line.partition(":")
+            if field in {"VmRSS", "VmHWM"}:
+                memory[field] = int(value.split()[0])
+    except OSError:
+        pass
+    logger.info("SQL legacy import stage=%s match=%s rss_kib=%s process_peak_kib=%s",
+                stage, gm_id, memory.get("VmRSS"), memory.get("VmHWM"))
+
+
+def _sql_units(source: TextIO) -> Iterator[tuple[str, str]]:
+    """Split outside quoted values, retaining at most one VALUES tuple.
+
+    Dump INSERT statements can be hundreds of MB, even on a single line.
+    Neither line reads nor statement reads bound their memory usage.
+    """
+    buffer: list[str] = []
+    depth = 0
+    quote = ""
+    escaped = False
+    line_comment = False
+    block_comment = False
+    previous = ""
+    pending = ""
+    # The sentinel gives the final real character the same lookahead handling
+    # as every other character (including a closing quote/comment at EOF).
+    for chunk in chain(iter(lambda: source.read(64 * 1024), ""), (" ",)):
+        text = pending + chunk
+        pending = text[-1:]
+        for index, char in enumerate(text[:-1]):
+            following = text[index + 1]
+            if line_comment:
+                if char == "\n":
+                    line_comment = False
+                    buffer.append(" ")
+                continue
+            if block_comment:
+                if previous == "*" and char == "/":
+                    block_comment = False
+                    buffer.append(" ")
+                previous = char
+                continue
+            if quote:
+                buffer.append(char)
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = ""
+                continue
+            if char == "#" or (char == "-" and following == "-"):
+                line_comment = True
+            elif char == "/" and following == "*":
+                block_comment = True
+                previous = ""
+            elif char in {"'", '"', "`"}:
+                quote = char
+                buffer.append(char)
+            elif char == "(":
+                depth += 1
+                buffer.append(char)
+            elif char == ")":
+                depth -= 1
+                buffer.append(char)
+            elif char == ";" or (char == "," and depth == 0):
+                yield "".join(buffer).strip(), char
+                buffer.clear()
+            else:
+                buffer.append(char)
+    if pending:
+        if pending == ";" and not quote and not line_comment and not block_comment:
+            yield "".join(buffer).strip(), ";"
+            buffer.clear()
+        elif not line_comment and not block_comment:
+            buffer.append(pending)
+    if quote or depth or block_comment:
+        raise BackendError("Incomplete SQL dump", 422, "legacy_sql_incomplete")
+    if "".join(buffer).strip():
+        yield "".join(buffer).strip(), ";"
+
+
+class _LegacyDiskStage:
+    """Index raw rows on disk so only one match is converted at a time."""
+
+    def __init__(self, directory: Path) -> None:
+        self.db = sqlite3.connect(directory / "rows.sqlite")
+        self.db.execute("PRAGMA cache_size=-2048")
+        self.db.execute("PRAGMA temp_store=FILE")
+        self.db.execute("CREATE TABLE rows (name TEXT, ordinal INTEGER, gm TEXT, gi TEXT, payload BLOB)")
+        self.columns: dict[str, list[str] | None] = {}
+
+    def load(self, path: Path) -> None:
+        header = re.compile(r"INSERT\s+INTO\s+`?(\w+)`?\s*(?:\(([^)]+)\))?\s*VALUES\s*", re.I)
+        counts: Counter[str] = Counter()
+        name: str | None = None
+        with path.open(encoding="utf-8-sig") as source:
+            for unit, delimiter in _sql_units(source):
+                if match := header.match(unit):
+                    name = match[1]
+                    if match[2]:
+                        self.columns[name] = [value.strip().strip("`") for value in match[2].split(",")]
+                    unit = unit[match.end():]
+                elif name is None:
+                    self.columns.update({key: table.columns for key, table in parse_sql_dump(unit).items()})
+                if name in SUPPORTED_TABLES and unit:
+                    columns = self.columns.get(name)
+                    if not columns:
+                        raise BackendError(f"SQL dump has no column mapping: {name}", 422, "legacy_columns_missing")
+                    if not unit.startswith("(") or not unit.endswith(")"):
+                        raise BackendError(f"Invalid SQL row in {name}", 422, "legacy_sql_invalid")
+                    values = _tuple_values(unit[1:-1])
+                    row = dict(zip(columns, values))
+                    self.db.execute("INSERT INTO rows VALUES (?, ?, ?, ?, ?)", (
+                        name, counts[name], _string(row.get("gm_id")), _string(row.get("gi_id")), pickle.dumps(values),
+                    ))
+                    counts[name] += 1
+                if delimiter == ";":
+                    name = None
+        self.db.execute("CREATE INDEX by_gm ON rows(name, gm, ordinal)")
+        self.db.execute("CREATE INDEX by_gi ON rows(name, gi, ordinal)")
+        self.db.commit()
+
+    def tables(self, *, shared: bool = False, gm_id: str | None = None) -> dict[str, ParsedTable]:
+        tables: dict[str, ParsedTable] = {}
+        for name, columns in self.columns.items():
+            if name not in SUPPORTED_TABLES:
+                continue
+            is_shared = not name.startswith("ff_game")
+            if shared and not is_shared and name != "ff_game":
+                continue
+            if not shared and is_shared:
+                continue
+            if shared:
+                query, args = "SELECT payload FROM rows WHERE name=? ORDER BY ordinal", (name,)
+            elif name in {"ff_game", "ff_game_info"}:
+                query, args = "SELECT payload FROM rows WHERE name=? AND gm=? ORDER BY ordinal", (name, gm_id)
+            else:
+                query = "SELECT payload FROM rows WHERE name=? AND gi IN (SELECT gi FROM rows WHERE name='ff_game_info' AND gm=?) ORDER BY ordinal"
+                args = (name, gm_id)
+            tables[name] = ParsedTable(columns, [pickle.loads(row[0]) for row in self.db.execute(query, args)])
+        return tables
+
+    def close(self) -> None:
+        self.db.close()
 
 # Competition documents remain in the existing ``leagues`` collection.  The
 # importer only accepts this controlled registry; an arbitrary value in an old
@@ -317,29 +473,74 @@ class BuildLegacyImport:
         self.db = self.data.db
 
     def import_sql(self, sql: str, *, on_progress: ImportProgress | None = None) -> LegacyImportResult:
-        tables = parse_sql_dump(sql)
-        games = _rows(tables.get("ff_game"))
+        # Compatibility for callers with an existing string; HTTP/CLI use the
+        # file entry point and never allocate a full SQL string.
+        with NamedTemporaryFile(suffix=".sql", delete=False) as source:
+            path = Path(source.name)
+            source.write(sql.encode("utf-8"))
+        try:
+            return self.import_file(path, on_progress=on_progress)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def import_file(self, path: Path, *, on_progress: ImportProgress | None = None) -> LegacyImportResult:
+        if on_progress:
+            on_progress("preparing", 0, 0, 0, 0)
+        digest = hashlib.sha256()
+        digest.update(f"{IMPORTER_CHECKPOINT_VERSION}\n".encode())
+        with path.open(encoding="utf-8-sig") as source:
+            while chunk := source.read(64 * 1024):
+                digest.update(chunk.encode("utf-8"))
+        with TemporaryDirectory(prefix="legacy-import-") as temporary:
+            directory = Path(temporary)
+            stage = _LegacyDiskStage(directory)
+            try:
+                _log_import_memory("parse_start")
+                stage.load(path)
+                _log_import_memory("parse_complete")
+                return self._import_staged(stage, directory, digest.hexdigest(), on_progress)
+            finally:
+                stage.close()
+
+    def _import_staged(
+        self, stage: _LegacyDiskStage, directory: Path, dump_hash: str,
+        on_progress: ImportProgress | None,
+    ) -> LegacyImportResult:
+        shared = stage.tables(shared=True)
+        games = _rows(shared.get("ff_game"))
         if not games:
             raise BackendError("SQL dump must include ff_game rows", status_code=422, code="legacy_games_missing")
-        unsupported = [name for name, table in tables.items() if name in SUPPORTED_TABLES and table.columns is None]
-        if unsupported:
-            raise BackendError(f"SQL dump has no column mapping: {', '.join(sorted(unsupported))}", status_code=422, code="legacy_columns_missing")
         if on_progress:
             on_progress("preparing", len(games), 0, 0, 0)
-        items, gm_ids, record_count = self._build_items(tables, games)
+        items, gm_ids, _ = self._build_items(shared, games)
         if not gm_ids:
             raise BackendError("SQL dump has no valid gm_id", status_code=422, code="legacy_games_missing")
-        expected_documents = self._expected_match_documents(items)
         ordered_gm_ids = sorted(gm_ids)
         global_items = [item for item in items if not item[0].startswith("matches/")]
-        documents_total = len(global_items) + len(expected_documents)
-        expected_by_match: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-        for path, document in expected_documents.items():
-            expected_by_match[path.split("/")[1]][path] = document
-        dump_hash = hashlib.sha256(f"{IMPORTER_CHECKPOINT_VERSION}\n{sql}".encode("utf-8")).hexdigest()
-        self._preflight_import(expected_documents)
+        del items
+        shared.pop("ff_game", None)
+        document_counts: dict[str, int] = {}
+        record_count = 0
+        # Validate every match before ANY Firestore write, retaining prepared
+        # payloads on disk rather than keeping the whole season in RAM.
+        for index, gm_id in enumerate(ordered_gm_ids):
+            tables = {**shared, **stage.tables(gm_id=gm_id)}
+            items, _, records = self._build_items(tables, _rows(tables.get("ff_game")))
+            documents = self._expected_match_documents(items)
+            self._preflight_import(documents, check_connection=index == 0)
+            document_counts[gm_id] = len(documents)
+            record_count += records
+            with (directory / f"match-{index}.pickle").open("wb") as output:
+                pickle.dump(documents, output, protocol=pickle.HIGHEST_PROTOCOL)
+            del tables, items, documents
+            _log_import_memory("match_preflight_complete", gm_id)
+            if on_progress:
+                on_progress("preflight", len(ordered_gm_ids), index + 1, 0, 0)
+        del shared, games
+        documents_total = len(global_items) + sum(document_counts.values())
+        logger.info("SQL legacy import stage=preflight complete matches=%s documents=%s records=%s", len(gm_ids), documents_total, record_count)
         completed_gm_ids, global_complete = self._load_checkpoint(dump_hash, set(ordered_gm_ids))
-        completed_document_count = sum(len(expected_by_match[gm_id]) for gm_id in completed_gm_ids)
+        completed_document_count = sum(document_counts[gm_id] for gm_id in completed_gm_ids)
         resumed_written = (len(global_items) if global_complete else 0) + completed_document_count
         if on_progress:
             on_progress("resuming" if (completed_gm_ids or global_complete) else "writing", len(ordered_gm_ids), len(completed_gm_ids), documents_total, resumed_written)
@@ -362,7 +563,9 @@ class BuildLegacyImport:
         for index, gm_id in enumerate(ordered_gm_ids, start=1):
             if gm_id in completed_gm_ids:
                 continue
-            match_documents = expected_by_match[gm_id]
+            with (directory / f"match-{index - 1}.pickle").open("rb") as source:
+                match_documents = pickle.load(source)
+            logger.info("SQL legacy import stage=write match=%s documents=%s", gm_id, len(match_documents))
             def report_match(match_written: int) -> None:
                 if on_progress:
                     on_progress("writing", len(ordered_gm_ids), index - 1, documents_total, written + match_written)
@@ -385,10 +588,13 @@ class BuildLegacyImport:
             self._save_checkpoint(dump_hash, completed_gm_ids, global_complete=True)
             if on_progress:
                 on_progress("writing", len(ordered_gm_ids), len(completed_gm_ids), documents_total, written)
+            del match_documents
+            _log_import_memory("match_write_complete", gm_id)
         self._clear_checkpoint(dump_hash)
+        _log_import_memory("complete")
         return LegacyImportResult(len(gm_ids), written, record_count)
 
-    def _preflight_import(self, expected_documents: dict[str, dict[str, Any]]) -> None:
+    def _preflight_import(self, expected_documents: dict[str, dict[str, Any]], *, check_connection: bool = True) -> None:
         """Fail before writes for malformed output or an unavailable Firestore query path."""
         largest_path = ""
         largest_size = 0
@@ -408,6 +614,8 @@ class BuildLegacyImport:
                     status_code=422,
                     code="legacy_import_document_too_large",
                 )
+        if not check_connection:
+            return
         try:
             # Use the exact retry mode used by stale cleanup, before any write.
             next(iter(self.db.collection("matches").limit(1).stream(retry=NO_QUERY_RETRY, timeout=10)), None)
@@ -1081,10 +1289,9 @@ def main() -> None:
     parser.add_argument("sql_file", type=Path, help="Path to a UTF-8 mysqldump file")
     args = parser.parse_args()
     try:
-        sql = args.sql_file.read_text(encoding="utf-8-sig")
+        result = BuildLegacyImport().import_file(args.sql_file)
     except (OSError, UnicodeDecodeError) as exc:
         parser.error(f"Cannot read SQL file: {exc}")
-    result = BuildLegacyImport().import_sql(sql)
     print(
         f"Imported {result.matches_replaced} matches, "
         f"{result.documents_written} documents, {result.records_written} raw records."

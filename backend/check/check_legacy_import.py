@@ -3,6 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from io import StringIO
+from types import SimpleNamespace
+
+import pytest
+from backend.build import build_legacy_import as legacy
 from backend.build.build_legacy_import import (
     BuildLegacyImport,
     COMPETITION_TYPES,
@@ -76,6 +81,225 @@ def test_future_import_keeps_current_team_league_and_normalizes_contract_ids() -
     assert by_path["players/P-1/contracts/E-LI_2020-07-31"]["to"] == "2020-09-08"
     assert by_path["players/P-1/contracts/E-LI_2020-07-31"]["competitionType"] == "league"
     assert by_path["players/P-1/contracts/ENG1_2022-11-20"]["competitionType"] == "national"
+
+
+# Disk-staged import regression checks (no Firebase connection or writes).
+def _write_streaming_dump(path: Path, matches: int = 3, records: int = 5) -> None:
+    """Write an extended INSERT without constructing its contents in RAM."""
+    with path.open("w", encoding="utf-8") as output:
+        output.write("-- test dump\nCREATE TABLE `ff_player` (\n`p_id` varchar(20),\n`p_name` text\n) ENGINE=InnoDB;\n")
+        output.write("INSERT INTO ff_player VALUES ('P1','Player comma, 한글');\n")
+        output.write("INSERT INTO ff_player_team (p_id,t_code,pt_begin,pt_end,pt_num,pt_pos,l_code) VALUES ('P1','HOME','2020.01.01',NULL,'1','GK','EPL');\n")
+        output.write("INSERT INTO ff_stadium (s_code,s_name) VALUES ('S1','Ground');\n")
+        output.write("INSERT INTO ff_game (gm_id,gm_date,gm_h_t_code,gm_a_t_code,gm_league,gm_round,gm_s_code) VALUES ")
+        for index in range(matches):
+            if index:
+                output.write(",")
+            competition = "EPL" if index % 2 == 0 else "UCL"
+            output.write(f"('20262027m{index:04}','2026.11.01','HOME','AWAY','{competition}',{index // 10 + 1},'S1')")
+        output.write(";\nINSERT INTO ff_game_info (gi_id,gm_id,gi_write_code,gi_h_t_code,gi_a_t_code) VALUES ")
+        for index in range(matches):
+            if index:
+                output.write(",")
+            output.write(f"('GI{index}','20262027m{index:04}','H','HOME','AWAY')")
+        output.write(";\nINSERT INTO ff_game_record (gr_id,gi_id,gr_half,gr_half_seconds,gr_act_code,gr_res_code,gr_area_code,p_id,gt_id) VALUES ")
+        for index in range(matches):
+            for record in range(records):
+                if index or record:
+                    output.write(",")
+                output.write(f"('R{index}-{record}','GI{index}',1,{record // 2},'P','O',5,'P1','T{index}-{record // 10}')")
+        output.write(";\nINSERT INTO ff_game_path (gi_id,gt_id,gt_ttp) VALUES ")
+        for index in range(matches):
+            for group in range((records + 9) // 10):
+                if index or group:
+                    output.write(",")
+                output.write(f"('GI{index}','T{index}-{group}',1)")
+        output.write(";\nINSERT INTO ff_game_player (gi_id,p_id,t_code,gp_type,gp_order) VALUES ")
+        for index in range(matches):
+            if index:
+                output.write(",")
+            output.write(f"('GI{index}','P1','HOME','START',1)")
+        output.write(";\nINSERT INTO ff_game_bap (gi_id,gr_id) VALUES ('GI0','R0-0');\n")
+
+
+def _without_streaming_timestamps(value):
+    if isinstance(value, dict):
+        return {key: _without_streaming_timestamps(item) for key, item in value.items() if not isinstance(item, datetime)}
+    if isinstance(value, list):
+        return [_without_streaming_timestamps(item) for item in value]
+    return value
+
+
+class _OfflineLegacyImporter(legacy.BuildLegacyImport):
+    def __init__(self):
+        self.written = {}
+        self.data = SimpleNamespace(get_match=lambda gm: {}, refresh_input_squads=lambda *args: None,
+                                    refresh_input_summary=lambda *args: None)
+
+    def _preflight_import(self, documents, **kwargs):
+        super()._preflight_import(documents, check_connection=False)
+
+    def _write_items(self, items, **kwargs):
+        for path, payload, merge in items:
+            if merge and path in self.written:
+                legacy._merge_document_values(self.written[path], payload)
+            else:
+                self.written[path] = payload
+        return len(items)
+
+    def _write_documents(self, documents, **kwargs):
+        self.written.update(documents)
+        return len(documents)
+
+    def _verify_written_match(self, gm_id, documents):
+        assert all(self.written[path] == payload for path, payload in documents.items())
+
+    def _delete_unexpected_paths(self, *args):
+        pass
+
+
+def test_streaming_import_matches_original_conversion(tmp_path, monkeypatch):
+    monkeypatch.setattr(legacy, "CHECKPOINT_DIRECTORY", tmp_path / "checkpoints")
+    source = tmp_path / "input.sql"
+    _write_streaming_dump(source)
+    importer = _OfflineLegacyImporter()
+    tables = legacy.parse_sql_dump(source.read_text(encoding="utf-8"))
+    items, gm_ids, records = importer._build_items(tables, legacy._rows(tables["ff_game"]))
+    expected = {}
+    for path, payload, merge in items:
+        if merge and path in expected:
+            legacy._merge_document_values(expected[path], payload)
+        else:
+            expected[path] = dict(payload)
+    result = importer.import_file(source)
+    assert _without_streaming_timestamps(importer.written) == _without_streaming_timestamps(expected)
+    assert result.matches_replaced == len(gm_ids) == 3
+    assert result.records_written == records == 15
+    assert result.documents_written == len(expected)
+    assert not list((tmp_path / "checkpoints").glob("*.json"))
+
+
+def test_later_match_validation_failure_prevents_all_writes(tmp_path, monkeypatch):
+    monkeypatch.setattr(legacy, "CHECKPOINT_DIRECTORY", tmp_path / "checkpoints")
+    source = tmp_path / "input.sql"
+    _write_streaming_dump(source)
+    source.write_text(source.read_text(encoding="utf-8").replace("'R2-0','GI2',1,0,'P','O',5", "'R2-0','GI2',1,0,'P','O',99"), encoding="utf-8")
+    importer = _OfflineLegacyImporter()
+    with pytest.raises(legacy.BackendError, match="contract violation"):
+        importer.import_file(source)
+    assert importer.written == {}
+
+
+def test_resume_skips_completed_matches(tmp_path, monkeypatch):
+    monkeypatch.setattr(legacy, "CHECKPOINT_DIRECTORY", tmp_path / "checkpoints")
+    source = tmp_path / "input.sql"
+    _write_streaming_dump(source)
+    importer = _OfflineLegacyImporter()
+    original = importer._write_documents
+    def interrupted(documents, **kwargs):
+        if "matches/20262027m0001" in documents:
+            raise legacy.BackendError("interrupted", 500, "test")
+        return original(documents, **kwargs)
+    importer._write_documents = interrupted
+    with pytest.raises(legacy.BackendError, match="interrupted"):
+        importer.import_file(source)
+    checkpoints = list((tmp_path / "checkpoints").glob("*.json"))
+    assert len(checkpoints) == 1
+    importer._write_documents = original
+    result = importer.import_file(source)
+    assert result.matches_replaced == 3
+    assert "matches/20262027m0002" in importer.written
+
+
+def test_sql_units_handles_chunk_boundaries_and_quoted_delimiters():
+    class TinyChunks(StringIO):
+        def read(self, size=-1):
+            return super().read(3)
+    source = TinyChunks("/* comment */ INSERT INTO ff_player (p_id,p_name) VALUES ('1','a;,b'),('2','it\\'s'); -- end\n")
+    units = list(legacy._sql_units(source))
+    assert units == [("INSERT INTO ff_player (p_id,p_name) VALUES ('1','a;,b')", ","), ("('2','it\\'s')", ";")]
+
+
+def test_incomplete_sql_is_rejected():
+    with pytest.raises(legacy.BackendError, match="Incomplete SQL"):
+        list(legacy._sql_units(StringIO("INSERT INTO ff_player (p_id) VALUES ('broken")))
+
+
+def test_final_comment_and_tuple_are_handled_without_trailing_newline():
+    assert list(legacy._sql_units(StringIO("/* final comment */"))) == []
+    assert list(legacy._sql_units(StringIO("INSERT INTO ff_player (p_id) VALUES ('1')"))) == [
+        ("INSERT INTO ff_player (p_id) VALUES ('1')", ";")]
+
+
+def test_http_upload_reads_bounded_chunks_and_starts_file_worker(monkeypatch):
+    from backend.api import api_legacy_import as api
+    received = {}
+    class Dump:
+        filename = "test.sql"
+        chunks = iter([b"SELECT 1;", b""])
+        async def read(self, size):
+            assert size == 1024 * 1024
+            return next(self.chunks)
+    class Worker:
+        def __init__(self, *, target, args, daemon):
+            received.update(target=target, args=args)
+        def start(self):
+            received["started"] = True
+    monkeypatch.setattr(api, "Thread", Worker)
+    monkeypatch.setattr(api, "_import_job", None)
+    try:
+        # The fake upload completes immediately; drive the coroutine directly
+        # without Windows' event-loop socket setup in the restricted sandbox.
+        coroutine = api.import_legacy_sql(Dump())
+        with pytest.raises(StopIteration) as completed:
+            coroutine.send(None)
+        response = completed.value.value
+        assert response.status == "queued"
+        assert received["started"] is True
+        assert received["target"] is api._run_import
+        assert received["args"][1].read_bytes() == b"SELECT 1;"
+    finally:
+        if "args" in received:
+            received["args"][1].unlink(missing_ok=True)
+
+
+def test_import_progress_does_not_regress_between_real_pipeline_stages(tmp_path, monkeypatch):
+    from backend.api.api_legacy_import import LegacyImportJob, _import_response
+    monkeypatch.setattr(legacy, "CHECKPOINT_DIRECTORY", tmp_path / "checkpoints")
+    source = tmp_path / "input.sql"
+    _write_streaming_dump(source)
+    job = LegacyImportJob()
+    snapshots = []
+    def progress(*values):
+        job.update(*values)
+        snapshots.append(_import_response(job))
+    result = _OfflineLegacyImporter().import_file(source, on_progress=progress)
+    percentages = [snapshot.percent for snapshot in snapshots]
+    assert percentages == sorted(percentages)
+    assert snapshots[0].percent == 3
+    assert [snapshot.percent for snapshot in snapshots if snapshot.status == "preflight"][-1] == 35
+    assert next(snapshot.percent for snapshot in snapshots if snapshot.status == "writing") == 35
+    assert snapshots[-1].percent == 99
+    assert snapshots[-1].matchesProcessed == result.matches_replaced
+    job.state = "complete"
+    assert _import_response(job).percent == 100
+
+
+def test_import_progress_preserves_percentage_during_retry_and_failure():
+    from backend.api.api_legacy_import import LegacyImportJob, _import_response
+    job = LegacyImportJob()
+    job.update("resuming", 10, 5, 1000, 500)
+    resumed = _import_response(job).percent
+    job.update("writing", 10, 5, 1000, 700)
+    before_retry = _import_response(job).percent
+    assert before_retry > resumed >= 35
+    job.update("writing", 10, 5, 1000, 550)
+    assert _import_response(job).percent == before_retry
+    job.state = "failed"
+    job.error = "Write interrupted"
+    failed = _import_response(job)
+    assert failed.percent == before_retry < 100
+    assert failed.status == "failed"
 
 
 # Read-only SQL pipeline verification CLI.
