@@ -10,6 +10,7 @@ dist
 
 # Node dependencies
 node_modules
+.venv/
 
 # Logs
 logs
@@ -22,13 +23,19 @@ __pycache__
 /tmp/
 /tmp/pytest-*/
 *.db
+*.db-*
+*.sqlite
+*.sqlite-*
 *.sqlite3
 *.sqlite3-*
-*.png
 *.pdf
 
 # Generated backend KPI artifacts
 backend/data/
+
+# Local exports, screenshots, video renders and browser profiles
+/outputs/
+/output/
 
 # Local Firestore mapping audit outputs (shared notes live in one Markdown file)
 docs/aifootballx/*.json
@@ -57,5 +64,4 @@ keys/migration/service-account.json
 keys
 
 
-# Local frontend verification scripts
-/app/check/*.test.cjs
+# Frontend verification scripts in app/check are source files; keep them trackable.

@@ -8,7 +8,6 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, timedelta
-from fractions import Fraction
 from functools import lru_cache
 from hashlib import sha256
 from math import dist, isfinite
@@ -38,6 +37,85 @@ TEST_GOAL_PREFIX = "testgoal-"
 TEST_CLOCK = r"^(?:[0-9]{1,3}\+)?[0-9]{1,3}:[0-5][0-9]$"
 POINTS = {"high": 3, "medium": 2, "low": 1}
 METRICS = ("distance", "speed")
+RATING_VERSION = "goalx-100-v3"
+HEADING_JUMP_M = .5
+ANALYST_POINTS = {"high": 3, "medium": 2, "low": 1}  # Independent of legacy approval settings.
+CATEGORY_WEIGHTS = {"artistry": 20, "defense": 30, "trajectory": 20}
+GRADE_FACTORS = {"low": .8, "medium": .9, "high": 1.0}
+DISTANCE_STARTS = (0, 12, 20, 26, 29)
+SPEED_STARTS = (0, 80, 90, 100, 105)
+METRIC_FACTORS = (.6, .7, .8, .9, 1.0)
+METRIC_WEIGHTS = {"distance": 15, "speed": 15}
+
+
+def rating_rules():
+    """Code is authoritative. Firestore stores a management-only copy."""
+    import inspect
+    rules = {"version": RATING_VERSION, "categoryWeights": CATEGORY_WEIGHTS,
+             "gradeFactors": GRADE_FACTORS, "analystPoints": ANALYST_POINTS,
+             "distanceStarts": list(DISTANCE_STARTS), "speedStarts": list(SPEED_STARTS),
+             "metricFactors": list(METRIC_FACTORS), "metricWeights": METRIC_WEIGHTS,
+             "metricSource": "analyst_estimated_coordinates_and_goal_line_time",
+             "speedFormula": "distance / timeToGoal * 3.6", "aggregation": "median",
+             "headingJumpM": HEADING_JUMP_M, "headingStartFormula": "playerHeightCm / 100 + headingJumpM",
+             "원본 출처": "backend/system/system_goalx.py::goal_rating / rating_rules / estimate_shot",
+             "authority": "code_only"}
+    rules["rulesHash"] = fingerprint({"rules": rules, "calculation": inspect.getsource(goal_rating),
+                                      "estimation": inspect.getsource(estimate_shot), "inputModel": inspect.getsource(EstimatedShotInput),
+                                      "shotContext": inspect.getsource(shot_context)})
+    return rules
+
+
+def goal_rating(analysis):
+    """Calculate only from analyst grades and saved coordinate/time inputs.
+
+    ShotX and representative approvals are deliberately not rating inputs.
+    Recompute distance from inputs, not a previously cached derived distance.
+    """
+    evaluations = analysis.get("evaluations") or {}
+    categories = {key: sum(GRADE_FACTORS[e["grades"][key]] * weight for e in evaluations.values()) / len(evaluations)
+                  for key, weight in CATEGORY_WEIGHTS.items()} if evaluations else {}
+    raw_categories = {key: sum(ANALYST_POINTS[e["grades"][key]] for e in evaluations.values()) / len(evaluations)
+                      for key in CATEGORY_WEIGHTS} if evaluations else {}
+    distances, times, inputs = [], [], {}
+    for uid, entry in sorted(evaluations.items()):
+        value = ((entry.get("estimatedShot") or {}).get("input") or {})
+        inputs[uid] = {"grades": entry["grades"], "input": value}
+        time = number(value.get("timeToGoal"))
+        if time is not None and 0 < time <= 600:
+            times.append(time)
+        try:
+            shot = estimate_shot(EstimatedShotInput.model_validate(value), entry["grades"]["trajectory"])
+            distances.append(shot["distance"])
+        except (ValueError, TypeError):
+            continue
+    distance = median(distances) if distances else None
+    flight = median(times) if times else None
+    speed = distance / flight * 3.6 if distance is not None and flight is not None else None
+    def metric_score(value, starts, key):
+        if value is None or value < 0:
+            return None
+        index = sum(value >= start for start in starts) - 1
+        return METRIC_WEIGHTS[key] * METRIC_FACTORS[index]
+    components = {**categories, "distance": metric_score(distance, DISTANCE_STARTS, "distance"),
+                  "speed": metric_score(speed, SPEED_STARTS, "speed")}
+    complete = bool(evaluations) and all(v is not None for v in components.values())
+    rules = rating_rules()
+    return {"score": round(sum(components.values()), 6) if complete else None,
+            "analystScore": round(sum(raw_categories.values()), 6) if evaluations else None,
+            "analystCategoryScores": raw_categories, "categoryScores": categories,
+            "categoryStages": {**{key: max(1, min(3, int(value + .5))) for key, value in raw_categories.items()},
+                               "distance": sum(distance >= v for v in DISTANCE_STARTS) if distance is not None else None,
+                               "speed": sum(speed >= v for v in SPEED_STARTS) if speed is not None else None},
+            "categoryMaxScores": {**CATEGORY_WEIGHTS, **METRIC_WEIGHTS},
+            "categoryStageCounts": {**{key: len(GRADE_FACTORS) for key in CATEGORY_WEIGHTS}, "distance": len(DISTANCE_STARTS), "speed": len(SPEED_STARTS)},
+            "ratingComponents": components, "ratingVersion": RATING_VERSION,
+            "ratingRulesHash": rules["rulesHash"], "ratingSourceVersion": fingerprint(inputs),
+            "ratingMetrics": {"distance": distance, "averageSpeed": speed, "flightTime": flight,
+                              "timeSampleCount": len(times), "distanceSampleCount": len(distances),
+                              "source": "did_estimated"}}
+
+
 GOAL_RESULTS = ("GOAL", "G")  # RAW can still contain the legacy SQL result code.
 HALF_OFFSETS = {"H1": 0, "H2": 45 * 60, "H3": 90 * 60, "H4": 105 * 60}
 logger = logging.getLogger(__name__)
@@ -54,6 +132,21 @@ def automatic_goal_x(record, recording, pos_x):
     return 0 if pos_x is not None and pos_x < 50 else 105
 
 
+def shot_context(record, *, player_height=None, analysis=None):
+    """RAW action and saved authoritative player height; no ShotX or client-supplied elevation."""
+    action = record.get("act") if record.get("act") in ("S", "R", "H") else None
+    height = number(player_height)
+    if height is None and analysis:
+        heights = [number(((entry.get("estimatedShot") or {}).get("input") or {}).get("playerHeightCm"))
+                   for entry in (analysis.get("evaluations") or {}).values()]
+        heights = [value for value in heights if value is not None and 100 <= value <= 250]
+        height = median(heights) if heights else None
+    height = height if height is not None and 100 <= height <= 250 else None
+    return {"shotType": action, "playerHeightCm": height,
+            "jumpHeightM": HEADING_JUMP_M if action == "H" else 0,
+            "startHeightM": height / 100 + HEADING_JUMP_M if action == "H" and height is not None else None if action == "H" else 0}
+
+
 class EstimatedShotInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     posX: float = Field(ge=0, le=100, allow_inf_nan=False)
@@ -63,10 +156,22 @@ class EstimatedShotInput(BaseModel):
     goalX: Literal[0, 105]
     timeToGoal: float | None = Field(default=None, gt=0, le=600, allow_inf_nan=False)
     curveDirection: Literal["left", "right"] | None = None
+    shotType: Literal["S", "R", "H"] | None = None
+    playerHeightCm: float | None = Field(default=None, ge=100, le=250, allow_inf_nan=False)
+    jumpHeightM: float = Field(default=0, ge=0, le=1, allow_inf_nan=False)
+    startHeightM: float = Field(default=0, ge=0, le=3.5, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def contact_height(self):
+        if self.shotType == "H" and self.playerHeightCm is None:
+            raise ValueError("헤딩은 선수관리의 신장이 필요합니다.")
+        self.jumpHeightM = HEADING_JUMP_M if self.shotType == "H" else 0
+        self.startHeightM = self.playerHeightCm / 100 + HEADING_JUMP_M if self.shotType == "H" else 0
+        return self
 
 
 def estimate_shot(value: EstimatedShotInput, grade: str):
-    start = (value.posX * 1.05, value.posY * .68, 0)
+    start = (value.posX * 1.05, value.posY * .68, value.startHeightM)
     end = (value.goalX, 34 + (value.shootPosX - 83) / 381 * 7.32 - 3.66,
            (300 - value.shootPosY) / 217 * 2.44)
     # Peak lift above the straight segment = distance * fixed type coefficient.
@@ -85,7 +190,7 @@ def estimate_shot(value: EstimatedShotInput, grade: str):
         points.append({"x": x + (dy / horizontal * bend * arc if horizontal else 0),
                        "y": y - (dx / horizontal * bend * arc if horizontal else 0), "z": z + lift * arc})
     length = sum(dist(tuple(a.values()), tuple(b.values())) for a, b in zip(points, points[1:]))
-    return {"input": value.model_dump(), "modelVersion": 2, "trajectoryGrade": grade,
+    return {"input": value.model_dump(), "modelVersion": 3, "trajectoryGrade": grade,
             "curveWeight": weight, "trajectory": points, "goalPoint": points[-1],
             "distance": length, "averageSpeed": length / value.timeToGoal * 3.6 if value.timeToGoal else None}
 
@@ -118,8 +223,8 @@ def representative_proposal(analysis, record, recording, points):
     evaluations = analysis.get("evaluations") or {}
     if not evaluations:
         raise BackendError("평가가 있는 득점만 대표 승인할 수 있습니다.", 409, "goalx_no_evaluations")
-    scores = {category: sum(points[entry["grades"][category]] for entry in evaluations.values()) / len(evaluations)
-              for category in ("artistry", "defense", "trajectory")}
+    rating = goal_rating(analysis)
+    scores = rating["categoryScores"]
     counts = Counter(entry["grades"]["trajectory"] for entry in evaluations.values())
     modes = [grade for grade in ("high", "medium", "low") if counts[grade] == max(counts.values())]
     direction_counts, direction_candidates = {}, {}
@@ -143,11 +248,11 @@ def representative_proposal(analysis, record, recording, points):
     return {"sourceVersion": fingerprint({"evaluationVersion": evaluation_version(analysis), "record": record,
                                           "recording": recording, "points": points}),
             "evaluationVersion": evaluation_version(analysis), "evaluationCount": len(evaluations),
-            "categoryScores": scores, "score": sum(scores.values()), "trajectoryCounts": dict(counts),
+            "categoryScores": scores, "score": rating["score"], "trajectoryCounts": dict(counts),
             "trajectoryCandidates": modes, "timeToGoal": median(times) if times else None,
             "curveDirectionCounts": direction_counts, "curveDirectionCandidates": direction_candidates,
             "timeSampleCount": len(times), "coordinates": coordinates, "goalX": goal_x,
-            "directionGoalX": goal_x if direction_known else None,
+            "directionGoalX": goal_x if direction_known else None, **shot_context(record, analysis=analysis),
             "shotId": (analysis.get("shotx") or {}).get("id")}
 
 
@@ -161,12 +266,15 @@ def finalize_representative(analysis, record, recording, points, payload):
         raise BackendError("최다 선택된 좌우 방향 중 하나를 선택하세요.", 422, "goalx_invalid_representative_direction")
     estimation = None
     if payload.coordinates:
-        value = payload.coordinates.model_copy(update={
+        if proposal.get("shotType") == "H" and proposal.get("playerHeightCm") is None:
+            raise BackendError("헤딩은 선수 신장을 반영해 평가를 다시 저장한 후 대표 승인하세요.", 422, "goalx_heading_height_missing")
+        value = EstimatedShotInput.model_validate({**payload.coordinates.model_dump(),
             "goalX": automatic_goal_x(record, recording, payload.coordinates.posX), "timeToGoal": proposal["timeToGoal"],
-            "curveDirection": payload.curveDirection,
+            "curveDirection": payload.curveDirection, **shot_context(record, analysis=analysis),
         })
         estimation = estimate_shot(value, payload.trajectory)
-    return {**proposal, "trajectory": payload.trajectory, "curveDirection": payload.curveDirection, "estimatedShot": estimation,
+    rating = goal_rating({**analysis, "representative": {"estimatedShot": estimation}})
+    return {**proposal, **rating, "trajectory": payload.trajectory, "curveDirection": payload.curveDirection, "estimatedShot": estimation,
             "coordinates": payload.coordinates.model_dump(include={"posX", "posY", "shootPosX", "shootPosY"}) if payload.coordinates else None,
             "schemaVersion": 2}
 
@@ -248,9 +356,18 @@ def match_round(match):
     return match.get("stage") or "unassigned"
 
 
+def english_master_name(profile):
+    """DID masters store full English names in nameFull; nameEn is a short-name fallback."""
+    for field in ("nameFull", "nameEn", "name"):
+        value = str(profile.get(field) or "").strip()
+        if value and value.upper() not in {"NONE", "NULL", "NAN", "\\N"} and not re.search(r"[가-힣]", value):
+            return value
+    return None
+
+
 def team_info(team, team_id):
     names = [team.get(key) for key in ("nameKr", "name", "nameShort", "nameEn", "nameFull")]
-    return {"name": next((name for name in names if name), team_id), "aliases": list(dict.fromkeys([team_id, *(name for name in names if name)]))}
+    return {"name": next((name for name in names if name), team_id), "nameEn": english_master_name(team), "aliases": list(dict.fromkeys([team_id, *(name for name in names if name)]))}
 
 
 def normalize(value):
@@ -280,11 +397,228 @@ def shotx_clients():
     )
 
 
+def capture_goalx_delivery(source, scope):
+    """Build GoalX with the existing delivery manifest, source guards and writer."""
+    from backend.system.system_aifootballx import encode, finish_delivery, resolve_team_code, player_identity, season_label
+    league, season_id = scope.get("leagueId", "EPL"), scope["seasonId"]
+    manual = league == TEST_LEAGUE
+    season = TEST_SEASON if manual else season_label(season_id)
+    read_cache = {}
+    def read(path):
+        if path not in read_cache:
+            snap = source.did.document(path).get(timeout=30, retry=None)
+            source.documents[path] = source.version(snap)
+            read_cache[path] = snap.to_dict() if snap.exists else {}
+        return read_cache[path]
+    config = read(f"{COLLECTION}/_settings")
+    points, _ = GoalAnalysis._rules(config)
+    rows = source.rows(source.did, f"{COLLECTION}/{league}/seasons/{season_id}/goals", source=True)
+    fixtures = {} if manual else {r['id']: r['data'] for r in source.rows(
+        source.did, 'matches', [('seasonId', '==', season_id), ('leagueId', '==', league)], source=True, bound=2000)}
+    fixtures = {mid: m for mid, m in fixtures.items() if (not scope.get('matchId') or mid == scope['matchId'])
+                and (scope.get('roundFrom') is None or m.get('round', 0) >= scope['roundFrom'])
+                and (scope.get('roundTo') is None or m.get('round', 0) <= scope['roundTo'])}
+    codes = [] if manual else source.rows(source.target, 'code', guard_target=True)
+    existing = source.rows(source.target, 'goalx', [('PlSeason', '==', season)])
+    old_by_id = {r['id']: r['data'] for r in existing}
+    documents, errors, seen = [], [], set()
+    for item in rows:
+        analysis = read(f"{COLLECTION}/{league}/seasons/{season_id}/goals/{item['id']}")
+        mid, side, rid = analysis.get('gmId'), analysis.get('side'), analysis.get('recordId')
+        if scope.get('matchId') and mid != scope['matchId']:
+            continue
+        if not manual and mid not in fixtures:
+            continue
+        ident = GoalAnalysis._goal_key(mid, side, rid)
+        if manual:
+            record, recording = analysis.get('manualGoal') or {}, {}
+        else:
+            record = read(f'matches/{mid}/recordings/{side}/records/{rid}')
+            full_recording = read(f'matches/{mid}/recordings/{side}')
+            # Match the approval endpoint's exact projection. Recording metadata
+            # (KPI, lineup, status, etc.) is not part of its approval fingerprint.
+            recording = {key: full_recording[key] for key in ("fieldSide", "fieldSideEx") if key in full_recording}
+        representative = analysis.get('representative') or {}
+        valid = bool(record and representative and analysis.get('evaluations') and (manual or record.get('res') in GOAL_RESULTS))
+        if valid:
+            proposal = representative_proposal(analysis, record, recording, points)
+            valid = (representative.get('sourceVersion') == proposal['sourceVersion']
+                     and representative.get('evaluationVersion') == evaluation_version(analysis)
+                     and representative.get('points') == points)
+        if not valid:
+            continue  # Previously published rows are withdrawn below.
+        rating = goal_rating(analysis)
+        stored_rating = analysis.get('rating') or {}
+        if any(stored_rating.get(key) != value for key, value in rating.items()):
+            errors.append(f'{mid}/{rid}: 최신 코드 기준의 GOALX 평가 리빌드를 먼저 실행하세요.')
+            continue
+        if rating['score'] is None:
+            errors.append(f'{mid}/{rid}: 분석관 좌표·골라인 통과 소요시간이 없어 공식 평점을 계산할 수 없습니다.')
+            continue
+        shot = representative.get('estimatedShot') or {}
+        trajectory = shot.get('trajectory') or []
+        if len(trajectory) < 2:
+            errors.append(f'{mid}/{rid}: 승인된 대표 3D 좌표가 없습니다.')
+            continue
+        metadata = shot_context(record, analysis=analysis)
+        if metadata['shotType'] == 'H' and ((shot.get('input') or {}).get('shotType') != 'H'
+                or metadata['startHeightM'] is None or abs(trajectory[0].get('z', 0) - metadata['startHeightM']) > .001):
+            errors.append(f'{mid}/{rid}: 헤딩 높이를 반영해 평가를 다시 저장하고 대표 승인을 진행하세요.')
+            continue
+        if manual:
+            match = {'date': record['date'], 'round': TEST_ROUND, 'homeTeamId': None, 'awayTeamId': None}
+            side_out = record['scoringSide']
+            team_id, idx, pid, player_id = None, None, None, None
+            home, away, player_name = record['home'], record['away'], record['playerName']
+            clock, half, seconds = record['clock'], None, None
+        else:
+            match = fixtures[mid]
+            side_out = side
+            team_id = match['homeTeamId' if side == 'H' else 'awayTeamId']
+            try:
+                idx = resolve_team_code(codes, season, team_id)['IDX_CODE']
+            except ValueError as exc:
+                errors.append(f'{mid}: {exc}')
+                continue
+            player_id = record.get('playerId')
+            profile = read(f'players/{player_id}') if player_id and player_id != 'OWN' else {}
+            pid = player_identity(player_id, profile) if player_id and player_id != 'OWN' else None
+            player_name = '자책골' if player_id == 'OWN' else profile.get('name') or player_id
+            home = team_info(read(f"teams/{match['homeTeamId']}"), match['homeTeamId'])['name']
+            away = team_info(read(f"teams/{match['awayTeamId']}"), match['awayTeamId'])['name']
+            half, seconds = record['half'], record['halfSeconds']
+            clock = match_clock(half, seconds)
+        if manual:
+            player_name_en = english_master_name({'nameFull': record.get('playerNameEn'), 'name': player_name})
+            home_name_en = english_master_name({'nameFull': record.get('homeNameEn'), 'name': home})
+            away_name_en = english_master_name({'nameFull': record.get('awayNameEn'), 'name': away})
+            home_idx, away_idx = None, None
+        else:
+            player_name_en = 'Own goal' if player_id == 'OWN' else english_master_name(profile)
+            home_name_en = english_master_name(read(f"teams/{match['homeTeamId']}"))
+            away_name_en = english_master_name(read(f"teams/{match['awayTeamId']}"))
+            try:
+                home_idx = resolve_team_code(codes, season, match['homeTeamId'])['IDX_CODE']
+                away_idx = resolve_team_code(codes, season, match['awayTeamId'])['IDX_CODE']
+            except ValueError as exc:
+                errors.append(f'{mid}: {exc}')
+                continue
+        missing_names = []
+        for label, value in (("TESTGOAL/playerName" if manual else f"players/{player_id}", player_name_en), ("TESTGOAL/home" if manual else f"teams/{match['homeTeamId']}", home_name_en), ("TESTGOAL/away" if manual else f"teams/{match['awayTeamId']}", away_name_en)):
+            if not value or re.search(r"[가-힣]", str(value)):
+                missing_names.append(label)
+        if missing_names:
+            errors.append(f"{mid}/{rid}: 영문명 누락: {', '.join(missing_names)}. DID 선수·팀 관리의 nameFull(영문 전체 이름) 또는 선수 nameEn을 보완한 뒤 GOALX SEND force=true를 실행하세요. 재평가·대표 재승인은 필요 없습니다.")
+            continue
+        seen.add(ident)
+        data = {'schemaVersion': 3, **metadata, 'identitySource': 'did_master', 'identityVersion': 1, 'ratingVersion': RATING_VERSION,
+                'ratingRulesHash': rating['ratingRulesHash'], 'ratingSourceVersion': rating['ratingSourceVersion'], 'status': 'published',
+                'PlSeason': season, 'leagueId': league, 'gm_id': mid, 'gm_round': match['round'],
+                'H-A': side_out, 'team_type': 'HOME' if side_out == 'H' else 'AWAY',
+                't_code': team_id, 'IDX_CODE': idx, 'p_id': pid, 'DID_PLAYER_ID': player_id,
+                'recordId': rid, 'playerName': player_name, 'playerNameEn': player_name_en,
+                'homeNameEn': home_name_en, 'awayNameEn': away_name_en, 'homeIDX_CODE': home_idx, 'awayIDX_CODE': away_idx,
+                'teamNameEn': home_name_en if side_out == 'H' else away_name_en, 'homeTeamId': match['homeTeamId'],
+                'awayTeamId': match['awayTeamId'], 'homeName': home, 'awayName': away,
+                'teamName': home if side_out == 'H' else away, 'gm_date': match['date'],
+                'half': half, 'halfSeconds': seconds, 'clock': clock, 'isTest': manual,
+                'shotId': (analysis.get('shotx') or {}).get('id'),
+                'score': rating['score'], 'categoryScores': rating['ratingComponents'],
+                'categoryStages': rating['categoryStages'], 'categoryMaxScores': rating['categoryMaxScores'], 'categoryStageCounts': rating['categoryStageCounts'],
+                'analystScore': rating['analystScore'], 'analystCategoryScores': rating['analystCategoryScores'],
+                'metrics': rating['ratingMetrics'], 'trajectory': trajectory,
+                'goalPoint': shot.get('goalPoint'), 'goalX': (shot.get('input') or {}).get('goalX'),
+                'renderInput': shot.get('input'), 'trajectoryType': representative.get('trajectory'),
+                'flightTime': (shot.get('input') or {}).get('timeToGoal'),
+                'trajectorySource': 'did_estimated', 'modelVersion': shot.get('modelVersion'),
+                'sourceVersion': representative['sourceVersion'], 'approvedAt': encode(representative.get('approvedAt')),
+                'source': 'did', 'sourcePath': f'{COLLECTION}/{league}/seasons/{season_id}/goals/{item["id"]}'}
+        documents.append({'collection': 'goalx', 'document_id': ident, 'data': encode(data), 'force': bool(scope.get('force'))})
+    # Re-sending a scope also removes stale approvals/deleted goals from public results.
+    for ident, old in old_by_id.items():
+        mid = old.get('gm_id')
+        in_scope = old.get('source') == 'did' and old.get('leagueId') == league
+        in_scope = in_scope and (not scope.get('matchId') or mid == scope['matchId'])
+        in_scope = in_scope and (scope.get('roundFrom') is None or isinstance(old.get('gm_round'), int) and old['gm_round'] >= scope['roundFrom'])
+        in_scope = in_scope and (scope.get('roundTo') is None or isinstance(old.get('gm_round'), int) and old['gm_round'] <= scope['roundTo'])
+        if in_scope and ident not in seen and old.get('status') == 'published':
+            documents.append({'collection': 'goalx', 'document_id': ident, 'data': {**old, 'status': 'withdrawn'}})
+    report = finish_delivery(documents, errors, [], {'goalx': existing}, 'goalx', len(fixtures),
+                             latest=scope.get('latest', False) and not scope.get('force'))
+    return report, {'documents': source.documents, 'queries': source.queries}
+
+
 class GoalAnalysis:
     def __init__(self):
         self.did = JpdDidData()
         self.db = self.did.db
         self.analyses = self.db.collection(COLLECTION)
+
+    def _persist_rating(self, ref, uid, *, sync_rules=True):
+        """Write only the derived rating and the read-only rules mirror."""
+        settings_ref = self.analyses.document("_settings")
+        rules = rating_rules()
+
+        @firestore.transactional
+        def persist(transaction):
+            snapshot = ref.get(transaction=transaction, timeout=15)
+            settings = (settings_ref.get(transaction=transaction, timeout=15).to_dict() or {}) if sync_rules else {}
+            if not snapshot.exists:
+                return None
+            analysis = snapshot.to_dict() or {}
+            result = goal_rating(analysis)
+            previous = {key: value for key, value in (analysis.get("rating") or {}).items()
+                        if key not in ("calculatedAt", "calculatedBy")}
+            if previous != result:
+                transaction.update(ref, {"rating": {**result, "calculatedAt": firestore.SERVER_TIMESTAMP,
+                                                    "calculatedBy": uid}})
+            if sync_rules and (settings.get("goalxRatingRules") or {}).get("rulesHash") != rules["rulesHash"]:
+                transaction.set(settings_ref, {"goalxRatingRules": rules}, merge=True)
+            return result
+
+        return persist(self.db.transaction())
+
+    def rebuild_ratings(self, scope, uid, progress):
+        """Rebuild ratings without writing evaluations, coordinates or approvals."""
+        league, season_id = scope["leagueId"], scope["seasonId"]
+        collection = self._goal_collection(season_id, league)
+        fixtures = {}
+        if scope.get("matchId"):
+            rows = list(collection.where(filter=FieldFilter("gmId", "==", scope["matchId"])).stream(timeout=30))
+        elif league != TEST_LEAGUE and (scope.get("roundFrom") is not None or scope.get("roundTo") is not None):
+            # Reuse the indexed season query. Adding a round range here would
+            # require a separate Firestore composite index.
+            fixtures = {snap.id: snap.to_dict() or {} for snap in
+                        self._matches(league, season_id).select(["round"]).stream(timeout=30)}
+            ids = [mid for mid, fixture in fixtures.items()
+                   if isinstance(fixture.get("round"), int)
+                   and (scope.get("roundFrom") is None or fixture["round"] >= scope["roundFrom"])
+                   and (scope.get("roundTo") is None or fixture["round"] <= scope["roundTo"])]
+            rows = [snap for first in range(0, len(ids), 30)
+                    for snap in collection.where(filter=FieldFilter("gmId", "in", ids[first:first + 30])).stream(timeout=30)]
+        else:
+            rows = list(collection.stream(timeout=30))
+        self.analyses.document("_settings").set({"goalxRatingRules": rating_rules()}, merge=True, timeout=15)
+        counts = {"processed": 0, "rebuilt": 0, "incomplete": 0, "skipped": 0}
+        for index, snapshot in enumerate(rows):
+            analysis = snapshot.to_dict() or {}
+            mid = analysis.get("gmId")
+            selected = bool(analysis.get("evaluations")) and (not scope.get("matchId") or scope["matchId"] == mid)
+            if selected and league != TEST_LEAGUE and (scope.get("roundFrom") is not None or scope.get("roundTo") is not None):
+                if mid not in fixtures:
+                    fixtures[mid] = self.db.collection("matches").document(mid).get(timeout=15).to_dict() or {}
+                round_no = fixtures[mid].get("round")
+                selected = isinstance(round_no, int) and (scope.get("roundFrom") is None or round_no >= scope["roundFrom"])
+                selected = selected and (scope.get("roundTo") is None or round_no <= scope["roundTo"])
+            if selected:
+                result = self._persist_rating(snapshot.reference, uid, sync_rules=False)
+                counts["processed"] += 1
+                counts["rebuilt"] += int(result is not None)
+                counts["incomplete"] += int(result is not None and result["score"] is None)
+            else:
+                counts["skipped"] += 1
+            progress(99 * (index + 1) / max(1, len(rows)), **counts)
+        return counts
 
     def verify_analyst(self, uid):
         profile = self.db.collection("recorders").document(uid).get(timeout=10).to_dict()
@@ -339,7 +673,8 @@ class GoalAnalysis:
                 row["earliestDate"] = min(row["earliestDate"] or date, date)
         return sorted(rounds.values(), key=lambda row: (row["latestDate"], row["id"]), reverse=True)
 
-    def _goal_key(self, gm_id, side, record_id):
+    @staticmethod
+    def _goal_key(gm_id, side, record_id):
         return sha256(json.dumps([gm_id, side, record_id], ensure_ascii=False).encode()).hexdigest()
 
     def _goal_collection(self, season_id, league_id):
@@ -448,7 +783,16 @@ class GoalAnalysis:
             recording.get("fieldSideEx" if record.get("half") in ("H3", "H4") else "fieldSide") in ("left", "right")
             and record.get("half") in ("H1", "H2", "H3", "H4")
         ) else None
+        coordinates.update(self._shot_context(record))
         return coordinates
+
+    def _shot_context(self, record):
+        player_id = record.get("playerId")
+        height = None
+        if player_id and player_id != "OWN":
+            profile = self.db.collection("players").document(player_id).get(field_paths=["height"], timeout=10).to_dict() or {}
+            height = profile.get("height")
+        return shot_context(record, player_height=height)
 
     def _recording_direction(self, gm_id, side, record_id):
         if gm_id.startswith(TEST_GOAL_PREFIX) and gm_id == record_id and side == "H":
@@ -457,7 +801,8 @@ class GoalAnalysis:
             field_paths=["fieldSide", "fieldSideEx"], timeout=10,
         ).to_dict() or {}
 
-    def _rules(self, config):
+    @staticmethod
+    def _rules(config):
         points = config.get("points")
         if not isinstance(points, dict) or any(type(points.get(grade)) is not int or points[grade] < 0 for grade in POINTS):
             points = POINTS.copy()
@@ -498,11 +843,7 @@ class GoalAnalysis:
             if value is not None:
                 grades[metric] = rule.grade(value)
         evaluation_count = len(evaluations)
-        category_totals = {
-            category: sum(points[entry["grades"][category]] for entry in evaluations.values())
-            for category in Grades.model_fields
-        }
-        score = Fraction(sum(category_totals.values()), evaluation_count) if evaluation_count else None
+        rating = goal_rating(analysis)
         representative = analysis.get("representative")
         return {
             "representative": ({"status": "approved" if representative.get("evaluationVersion") == evaluation_version(analysis)
@@ -518,10 +859,7 @@ class GoalAnalysis:
                 {"id": entry.get("analystUid") or key, "name": entry.get("analystName") or key}
                 for key, entry in sorted(evaluations.items())
             ],
-            "score": float(score) if score is not None else None,
-            "categoryScores": {
-                category: total / evaluation_count for category, total in category_totals.items()
-            } if evaluation_count else {},
+            **rating,
         }
 
     def list(self, league_id, season_id, round_id, uid):
@@ -616,13 +954,18 @@ class GoalAnalysis:
         points, thresholds = self._rules(stored.get(settings.path) or {})
         for goal, ref in zip(goals, goal_refs, strict=True):
             player = goal["playerId"]
-            name = stored.get(players.document(player).path, {}).get("name") if player and player != "OWN" else None
+            profile = stored.get(players.document(player).path, {}) if player and player != "OWN" else {}
+            name = profile.get("name")
+            goal["playerNameEn"] = "Own goal" if player == "OWN" else english_master_name(profile)
+            goal["homeNameEn"] = english_master_name(stored.get(teams.document(goal["homeTeamId"]).path) or {})
+            goal["awayNameEn"] = english_master_name(stored.get(teams.document(goal["awayTeamId"]).path) or {})
+            goal["teamNameEn"] = goal["homeNameEn"] if goal["side"] == "H" else goal["awayNameEn"]
             goal["playerName"] = "자책골" if player == "OWN" else name or player
             analysis = self._merge_analysis(legacy.get(ref.id), stored.get(ref.path)) or {}
             goal.update(self._analysis_state(analysis, uid, points, thresholds))
         return {
             "goals": sorted(goals, key=lambda goal: (goal["date"], goal["gmId"], goal["half"], goal["halfSeconds"], goal["recordId"])),
-            "points": points, "maxScore": max(points.values()) * len(Grades.model_fields), "automaticMetrics": list(thresholds),
+            "points": points, "maxScore": 100, "automaticMetrics": list(thresholds), "ratingRules": rating_rules(),
             "teams": {tid: team_info(stored.get(teams.document(tid).path) or {}, tid) for tid in sorted(team_ids)},
         }
 
@@ -665,7 +1008,7 @@ class GoalAnalysis:
                     **self._analysis_state(row, uid, points, thresholds),
                 })
         return {"goals": sorted(goals, key=lambda goal: (goal["date"], clock_seconds(goal["clock"]) or 0, goal["gmId"])),
-                "teams": teams, "points": points, "maxScore": max(points.values()) * len(Grades.model_fields)}
+                "teams": teams, "points": points, "maxScore": 100, "ratingRules": rating_rules()}
 
     def write_test_goal(self, payload, uid, goal_id=None):
         self.verify_analyst(uid)
@@ -702,7 +1045,10 @@ class GoalAnalysis:
         estimation_input = getattr(grades, "estimatedShot", None)
         if estimation_input:
             goal_x = automatic_goal_x(record, self._recording_direction(gm_id, side, record_id), estimation_input.posX)
-            estimation_input = estimation_input.model_copy(update={"goalX": goal_x})
+            metadata = self._shot_context(record)
+            if metadata["shotType"] == "H" and metadata["playerHeightCm"] is None:
+                raise BackendError("선수관리에서 신장을 입력한 후 헤딩 평가를 저장하세요.", 422, "goalx_heading_height_missing")
+            estimation_input = EstimatedShotInput.model_validate({**estimation_input.model_dump(), "goalX": goal_x, **metadata})
         estimation = estimate_shot(estimation_input, grades.trajectory) if estimation_input else None
         batch.set(ref, {
             "gmId": gm_id, "side": side, "recordId": record_id,
@@ -712,6 +1058,7 @@ class GoalAnalysis:
                                   "updatedAt": firestore.SERVER_TIMESTAMP}},
         }, merge=True)
         batch.commit(timeout=15)
+        self._persist_rating(ref, uid)
         return self._read_analysis_state(ref, uid)
 
     def _representative_source(self, gm_id, side, record_id, ref, transaction=None):
@@ -766,9 +1113,11 @@ class GoalAnalysis:
             analysis = {}
             for source in [*self._historical_refs(ref), ref]:
                 analysis = self._merge_analysis(analysis, stored.get(source.path)) or {}
+            representative = analysis.get("representative")
             output.append({"gmId": goal["gmId"], "side": goal["side"], "recordId": goal["recordId"],
                            "evaluations": [{"id": analyst, **entry} for analyst, entry in sorted((analysis.get("evaluations") or {}).items())],
-                           "representative": analysis.get("representative"),
+                           "representative": representative,
+                           "rating": {key: goal[key] for key in ("score", "analystScore", "ratingMetrics", "ratingVersion", "ratingRulesHash") if key in goal},
                            "representativeStatus": (goal.get("representative") or {}).get("status")})
         return output
 

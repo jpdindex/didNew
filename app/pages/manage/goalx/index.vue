@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { estimateGoalShot, validEstimatedCoordinates, goalxEstimationSheets, type CurveDirection, type EstimatedShot, type EstimatedShotInput, type GoalxExportRecord } from '~/utils/goalx'
+import { estimateGoalShot, validEstimatedCoordinates, goalxEstimationSheets, type CurveDirection, type ShotType, type EstimatedShot, type EstimatedShotInput, type GoalxExportRecord } from '~/utils/goalx'
 type Grade = 'high' | 'medium' | 'low'
 type Category = 'artistry' | 'defense' | 'trajectory'
 type Grades = Record<Category, Grade>
 type Metric = 'distance' | 'speed'
-type RankingSortKey = Metric | 'finalSpeed' | Category | 'score'
+type RankingSortKey = 'distance' | 'averageSpeed' | 'flightTime' | 'analystScore' | Category | 'score'
 type Point = { x: number; y: number; z: number }
-type RawCoordinates = Partial<Record<'posX' | 'posY' | 'shootPosX' | 'shootPosY' | 'goalX', number | null>>
+type ShotContext = { shotType?: ShotType | null; playerHeightCm?: number | null; jumpHeightM?: number; startHeightM?: number | null }
+type RawCoordinates = Partial<Record<'posX' | 'posY' | 'shootPosX' | 'shootPosY' | 'goalX', number | null>> & ShotContext
 type League = { id: string; name: string }
 type Season = { id: string; leagueId: string; name: string; from: string | null; to: string | null }
 type Round = { id: string; latestDate: string; earliestDate: string }
@@ -17,7 +18,9 @@ type Analysis = {
   myEstimatedShot: EstimatedShot | null
   shotId: string | null; myGrades: Grades | null; evaluationCount: number
   evaluators: { id: string; name: string }[]
-  score: number | null; categoryScores: Partial<Record<Category, number>>; autoGrades: Partial<Record<Metric, Grade>>
+  score: number | null; analystScore: number | null; analystCategoryScores: Partial<Record<Category, number>>
+  ratingMetrics: { distance: number | null; averageSpeed: number | null; flightTime: number | null }
+  categoryScores: Partial<Record<Category, number>>; autoGrades: Partial<Record<Metric, Grade>>
   metrics: Partial<Record<string, number | null>>
 }
 type Goal = Analysis & {
@@ -26,15 +29,16 @@ type Goal = Analysis & {
   date: string; half: string; clock: string; playerName: string | null; seasonId: string; round: string
   manual?: boolean
 }
-type Goals = { goals: Goal[]; points: Record<Grade, number>; maxScore: number; teams: Record<string, Team> }
+type Goals = { goals: Goal[]; points: Record<Grade, number>; maxScore: number; teams: Record<string, Team>
+  ratingRules: { categoryWeights: Record<Category, number>; gradeFactors: Record<Grade, number> } }
 type Candidate = { id: string; title: string; home: string | null; away: string | null; clock: string | null }
 type Shot = {
   id: string; title: string; metrics: Record<string, number | null>; trajectory: Point[]; measuredTrajectory: Point[]
   goalPoint: Point | null; goalX: number | null; goalCenterY: number | null; videoUrl: string | null
   scoreboard: { home: string | null; away: string | null; clock: string | null }
 }
-type RepresentativeProposal = {
-  sourceVersion: string; evaluationCount: number; categoryScores: Record<Category, number>; score: number
+type RepresentativeProposal = ShotContext & {
+  sourceVersion: string; evaluationCount: number; categoryScores: Record<Category, number>; score: number | null
   trajectoryCounts: Partial<Record<Grade, number>>; trajectoryCandidates: Grade[]
   curveDirectionCounts: Record<'high' | 'medium', Partial<Record<CurveDirection, number>>>
   curveDirectionCandidates: Record<'high' | 'medium', CurveDirection[]>
@@ -44,6 +48,10 @@ type RepresentativeProposal = {
 const api = '/api/v1/goalx'
 const supportedLeagueIds = new Set(['EPL', 'LALIGA', 'TESTGOAL'])
 const { request } = useBackendApi()
+function categoryPoints(category: Category, grade: Grade) {
+  const rules = result.value?.ratingRules
+  return rules ? rules.categoryWeights[category] * rules.gradeFactors[grade] : '—'
+}
 const grades: Grade[] = ['high', 'medium', 'low']
 const labels = { high: '상', medium: '중', low: '하' }
 const trajectoryLabels = { high: '딥 커브', medium: '커브', low: '스트레이트' }
@@ -59,10 +67,11 @@ const categories: { key: Category; label: string }[] = [
 ]
 const rankingColumns: { label: string; sortKey?: RankingSortKey; numeric?: boolean }[] = [
   { label: '순위' }, { label: '득점자' }, { label: '경기' }, { label: '득점 시각' },
-  { label: '거리', sortKey: 'distance' }, { label: '초기 속도', sortKey: 'speed' },
-  { label: '종료 속도', sortKey: 'finalSpeed' }, { label: '평가 인원' },
+  { label: '거리', sortKey: 'distance' }, { label: '시속 (km/h)', sortKey: 'averageSpeed' },
+  { label: '평가 인원' },
   ...categories.map(({ label, key }) => ({ label, sortKey: key, numeric: true })),
-  { label: '평균 점수', sortKey: 'score', numeric: true },
+  { label: '분석관 평가 점수', sortKey: 'analystScore', numeric: true },
+  { label: '총점', sortKey: 'score', numeric: true },
   { label: '대표 승인' },
 ]
 const metrics = [
@@ -117,9 +126,9 @@ const representativeCoordinatesValid = computed(() => validEstimatedCoordinates(
 const representativeHasCoordinates = computed(() => coordinateFields.some(({ key }) => representativeCoordinates.value[key] != null && representativeCoordinates.value[key] !== ''))
 const representativeEstimate = computed(() => {
   const proposal = representativeProposal.value
-  if (!proposal || !representativeTrajectory.value || !representativeCoordinatesValid.value || !representativeDirectionValid.value) return null
+  if (!proposal || (proposal.shotType === 'H' && proposal.playerHeightCm == null) || !representativeTrajectory.value || !representativeCoordinatesValid.value || !representativeDirectionValid.value) return null
   const goalX = proposal.directionGoalX ?? (Number(representativeCoordinates.value.posX) < 50 ? 0 : 105)
-  return estimateGoalShot({ ...representativeCoordinates.value, goalX, timeToGoal: proposal.timeToGoal,
+  return estimateGoalShot({ ...representativeCoordinates.value, shotType: proposal.shotType, playerHeightCm: proposal.playerHeightCm, goalX, timeToGoal: proposal.timeToGoal,
     curveDirection: representativeTrajectory.value === 'low' ? null : representativeCurveDirection.value } as EstimatedShotInput, representativeTrajectory.value)
 })
 const leagueSeasons = computed(() => {
@@ -143,12 +152,12 @@ const goals = computed(() => (result.value?.goals ?? []).filter(goal => !team.va
 const completedGoals = computed(() => goals.value.filter(goal => goal.evaluationCount > 0))
 const ranking = computed(() => {
   const rows = (rankingResult.value?.goals ?? [])
-    .filter(goal => goal.score !== null && (!rankingTeam.value || goal.teamId === rankingTeam.value))
-    .sort((a, b) => b.score! - a.score!)
+    .filter(goal => goal.evaluationCount > 0 && (!rankingTeam.value || goal.teamId === rankingTeam.value))
+    .sort((a, b) => (b.score ?? -Infinity) - (a.score ?? -Infinity))
   let rank = 0
   const ranked = rows.map((goal, index) => {
     if (index === 0 || goal.score !== rows[index - 1]?.score) rank = index + 1
-    return { ...goal, rank }
+    return { ...goal, rank: goal.score == null ? null : rank }
   })
   const { key, direction } = rankingSort.value
   return ranked.sort((a, b) => {
@@ -162,8 +171,9 @@ const ranking = computed(() => {
 
 function rankingValue(goal: Goal, key: RankingSortKey) {
   if (key === 'score') return goal.score
-  if (key === 'distance' || key === 'speed' || key === 'finalSpeed') return goal.metrics[key]
-  return goal.categoryScores?.[key]
+  if (key === 'analystScore') return goal.analystScore
+  if (key === 'distance' || key === 'averageSpeed' || key === 'flightTime') return goal.ratingMetrics?.[key]
+  return goal.analystCategoryScores?.[key]
 }
 
 function setRankingSort(key: RankingSortKey) {
@@ -201,7 +211,6 @@ const saving = ref(false)
 const linking = ref(false)
 const shot = ref<Shot | null>(null)
 const showShot = ref(false)
-const showEstimated = ref(false)
 const curveDirection = ref<CurveDirection | null>(null)
 const curveDirectionRequired = computed(() => draft.value.trajectory === 'high' || draft.value.trajectory === 'medium')
 const curveDirectionValid = computed(() => !curveDirectionRequired.value || curveDirection.value != null)
@@ -209,6 +218,8 @@ const loadingRawCoordinates = ref(false)
 const rawCoordinatesError = ref('')
 let rawCoordinatesRequest: AbortController | undefined
 const estimateDraft = ref<Record<string, number | null | ''>>({})
+const shotContext = ref<ShotContext>({})
+const headingHeightValid = computed(() => shotContext.value.shotType !== 'H' || (typeof shotContext.value.playerHeightCm === 'number' && shotContext.value.playerHeightCm >= 100 && shotContext.value.playerHeightCm <= 250))
 const rawGoalX = ref<0 | 105 | null>(null)
 const automaticGoalX = computed(() => rawGoalX.value ?? (typeof estimateDraft.value.posX === 'number' && estimateDraft.value.posX < 50 ? 0 : 105))
 const timerRunning = ref(false)
@@ -224,12 +235,12 @@ const estimatedTimeValid = computed(() => estimateDraft.value.timeToGoal == null
   || (typeof estimateDraft.value.timeToGoal === 'number' && Number.isFinite(estimateDraft.value.timeToGoal)
     && estimateDraft.value.timeToGoal > 0 && estimateDraft.value.timeToGoal <= 600))
 const estimatedPreview = computed(() => {
-  if (!estimatedCoordinatesValid.value || !estimatedTimeValid.value || !draft.value.trajectory || !curveDirectionValid.value) return null
-  return estimateGoalShot({ ...estimateDraft.value, goalX: automaticGoalX.value,
+  if (!headingHeightValid.value || !estimatedCoordinatesValid.value || !estimatedTimeValid.value || !draft.value.trajectory || !curveDirectionValid.value) return null
+  return estimateGoalShot({ ...estimateDraft.value, ...shotContext.value, goalX: automaticGoalX.value,
     curveDirection: draft.value.trajectory === 'low' ? null : curveDirection.value } as EstimatedShotInput, draft.value.trajectory)
 })
 const hasEstimateCoordinates = computed(() => coordinateFields.some(field => estimateDraft.value[field.key] != null && estimateDraft.value[field.key] !== ''))
-const estimateInvalid = computed(() => timerRunning.value || !estimatedTimeValid.value
+const estimateInvalid = computed(() => loadingRawCoordinates.value || !headingHeightValid.value || timerRunning.value || !estimatedTimeValid.value
   || ((hasEstimateCoordinates.value || estimateDraft.value.timeToGoal != null) && !estimatedCoordinatesValid.value))
 
 function stopStopwatch() {
@@ -241,6 +252,8 @@ function resetEstimate(goal?: Goal) {
   stopStopwatch()
   const raw = goal?.rawCoordinates ?? {}
   const saved = goal?.myEstimatedShot?.input
+  shotContext.value = { shotType: raw.shotType ?? saved?.shotType, playerHeightCm: raw.playerHeightCm ?? saved?.playerHeightCm,
+    jumpHeightM: raw.jumpHeightM ?? saved?.jumpHeightM, startHeightM: raw.startHeightM ?? saved?.startHeightM }
   curveDirection.value = goal?.myGrades?.trajectory === 'low' ? null : goal?.myCurveDirection ?? saved?.curveDirection ?? null
   rawGoalX.value = raw.goalX === 0 || raw.goalX === 105 ? raw.goalX : null
   estimateDraft.value = {
@@ -261,6 +274,8 @@ async function loadRawCoordinates(goal?: Goal) {
     const { coordinates } = await request<{ coordinates: RawCoordinates }>(pathOf(goal) + '/raw-coordinates', { signal: controller.signal })
     if (controller.signal.aborted || selectedKey.value !== keyOf(goal)) return
     goal.rawCoordinates = coordinates
+    shotContext.value = { shotType: coordinates.shotType, playerHeightCm: coordinates.playerHeightCm,
+      jumpHeightM: coordinates.jumpHeightM, startHeightM: coordinates.startHeightM }
     rawGoalX.value = coordinates.goalX === 0 || coordinates.goalX === 105 ? coordinates.goalX : null
     for (const { key } of coordinateFields) {
       if (initial[key] == null && estimateDraft.value[key] == null) estimateDraft.value[key] = coordinates[key] ?? null
@@ -358,12 +373,14 @@ async function downloadCompletedGoals() {
   const seasonName = seasonLabel(season.value)
   const filename = 'GOALX-' + [league.value, season.value, round.value].join('-').replace(/[^\w-]/g, '_') + '.xlsx'
   const headers = ['대회', '시즌', '라운드', '경기 날짜', '득점 시각', '득점자', '득점 팀', '홈팀', '원정팀', '평가 인원',
-    ...categories.map(category => category.label + ' 평균'), '평균 총점', '분석관 이름', '분석관 ID', 'ShotX ID',
-    ...metrics.map(metric => metric.label + ' (' + metric.unit + ')')]
+    ...categories.map(category => category.label + ' 평균'), '분석관 평가 점수', '총점',
+    '평가 거리 (m)', '평가 시속 (km/h)', '골라인 통과 소요시간 (초)', '분석관 이름', '분석관 ID', 'ShotX ID',
+    ...metrics.map(metric => 'ShotX 참고 ' + metric.label + ' (' + metric.unit + ')')]
   const rows = completed.map(goal => [
     leagueLabel, seasonName, roundLabel(goal.round), dateLabel(goal.date), goal.clock,
     goal.playerName, teamName(goal.teamId), teamName(goal.homeTeamId), teamName(goal.awayTeamId),
-    goal.evaluationCount, ...categories.map(category => goal.categoryScores?.[category.key] ?? null), goal.score,
+    goal.evaluationCount, ...categories.map(category => goal.analystCategoryScores?.[category.key] ?? null), goal.analystScore, goal.score,
+    goal.ratingMetrics?.distance ?? null, goal.ratingMetrics?.averageSpeed ?? null, goal.ratingMetrics?.flightTime ?? null,
     goal.evaluators.map(analyst => analyst.name).join(', '), goal.evaluators.map(analyst => analyst.id).join(', '),
     goal.shotId, ...metrics.map(metric => goal.metrics[metric.key] ?? null),
   ])
@@ -431,7 +448,6 @@ async function showGoalCard(goal: Goal) {
 }
 function selectGoal(goal: Goal | undefined) {
   resetEstimate(goal)
-  showEstimated.value = false
   selectedKey.value = goal ? keyOf(goal) : ''
   void loadRawCoordinates(goal)
   draft.value = { ...goal?.myGrades }
@@ -462,14 +478,8 @@ function cancelEditing() {
 }
 
 function toggleShot() {
-  showEstimated.value = false
   showShot.value = !showShot.value
   void loadShot(showShot.value ? selected.value : undefined)
-}
-function toggleEstimated() {
-  showShot.value = false
-  showEstimated.value = !showEstimated.value
-  void loadShot()
 }
 async function loadShot(goal?: Goal) {
   shotRequest?.abort()
@@ -931,9 +941,9 @@ onBeforeUnmount(() => {
       <div ref="rail" class="card-rail" aria-label="득점 카드" @scroll.passive="syncCardPage">
         <div v-for="(page, index) in pages" :key="index" class="card-page">
           <template v-for="(goal, slot) in page" :key="goal ? keyOf(goal) : 'empty-' + slot">
-            <button v-if="goal" type="button" class="goal-card" :class="{ completed: goal.myGrades }"
+            <button v-if="goal" type="button" class="goal-card" :class="{ completed: goal.myGrades, approved: goal.representative?.status === 'approved' }"
               :aria-pressed="selectedKey === keyOf(goal)" @click="selectedKey !== keyOf(goal) && selectGoal(goal)">
-              <span class="card-top"><span class="clock">{{ goal.clock }}</span><span class="state">{{ goal.myGrades ? '평가 완료' : '평가 전' }}</span></span>
+              <span class="card-top"><span class="clock">{{ goal.clock }}</span><span class="state">{{ goal.representative?.status === 'approved' ? '✓ 대표 승인 완료' : goal.myGrades ? '평가 완료' : '평가 전' }}</span></span>
               <strong>{{ goal.playerName || '득점자 미기록' }}</strong>
               <span class="card-team">{{ teamName(goal.teamId) }} <span>·</span> {{ dateLabel(goal.date) }}</span>
             </button>
@@ -950,16 +960,14 @@ onBeforeUnmount(() => {
           </div>
           <div class="goal-actions">
             <button v-if="selected.manual" class="quiet" type="button" :disabled="saving || linking" @click="openTestEditor(selected)">득점 정보 수정</button>
-            <button class="quiet shot-toggle" type="button" :aria-expanded="showShot" aria-controls="goalx-shotx" @click="toggleShot">
-              {{ showShot ? 'ShotX 분석 접기' : 'ShotX 분석 보기' }}
-            </button>
-            <button class="quiet shot-toggle" type="button" :aria-expanded="showEstimated" aria-controls="goalx-estimated" @click="toggleEstimated">
-              {{ showEstimated ? '추정 3D렌더링 접기' : '추정 3D렌더링' }}
+            <button class="quiet hint-toggle" type="button" :aria-expanded="showShot" aria-controls="goalx-shotx"
+              title="평가 전 참고하는 ShotX 분석입니다. 공식 총점 계산에는 사용하지 않습니다." @click="toggleShot">
+              ShotX 분석
             </button>
           </div>
         </header>
 
-        <div class="review-grid" :class="{ 'with-shot': showShot || showEstimated }">
+        <div class="review-grid with-shot">
           <form class="grading" @submit.prevent="saveGrades">
             <div class="grading-heading">
               <h3>내 평가</h3>
@@ -971,7 +979,7 @@ onBeforeUnmount(() => {
                 <div v-if="editing" class="choices">
                   <label v-for="grade in grades" :key="grade" :class="{ chosen: draft[category.key] === grade }">
                     <input v-model="draft[category.key]" type="radio" :name="category.key" :value="grade" required @change="category.key === 'trajectory' && (curveDirection = null)">
-                    <span>{{ category.key === 'trajectory' ? trajectoryLabels[grade] : labels[grade] }}</span><small>{{ result?.points[grade] }}점</small>
+                    <span>{{ category.key === 'trajectory' ? trajectoryLabels[grade] : labels[grade] }}</span><small>{{ categoryPoints(category.key, grade) }}점</small>
                   </label>
                 </div>
                 <div v-if="category.key === 'trajectory' && editing && curveDirectionRequired" class="curve-direction">
@@ -988,7 +996,7 @@ onBeforeUnmount(() => {
                 </p>
                 <div v-if="!editing && selected.myGrades" class="saved-grade">
                   <strong>{{ category.key === 'trajectory' ? trajectoryLabels[selected.myGrades[category.key]] : labels[selected.myGrades[category.key]] }}</strong>
-                  <span>{{ result?.points[selected.myGrades[category.key]] }}점</span>
+                  <span>{{ categoryPoints(category.key, selected.myGrades[category.key]) }}점</span>
                 </div>
               </fieldset>
             </div>
@@ -1002,16 +1010,20 @@ onBeforeUnmount(() => {
               <h3>평가 분석관 <span>{{ selected.evaluationCount }}명</span></h3>
               <ul>
                 <li v-for="analyst in selected.evaluators" :key="analyst.id">
-                  <strong v-if="analyst.name !== analyst.id">{{ analyst.name }}</strong>
-                  <span>{{ analyst.id }}</span>
+                  <strong>{{ analyst.name && analyst.name !== analyst.id ? analyst.name : '닉네임 미등록' }}</strong>
                 </li>
               </ul>
             </div>
           </form>
 
-          <div v-if="showShot || showEstimated" class="render-panels">
-          <section v-if="showEstimated" id="goalx-estimated" class="shot-panel">
+          <div class="render-panels">
+          <section v-if="!showShot" id="goalx-estimated" class="shot-panel">
             <h3>추정 3D렌더링</h3>
+            <p class="muted shot-context">슈팅 유형 <strong>{{ shotContext.shotType || '미확인' }}</strong>
+              <template v-if="shotContext.playerHeightCm != null"> · 선수 신장 {{ shotContext.playerHeightCm }}cm</template>
+              <template v-if="shotContext.shotType === 'H' && headingHeightValid"> · 헤딩 출발 {{ ((shotContext.playerHeightCm ?? 0) / 100 + .5).toFixed(2) }}m (점프 0.5m)</template>
+            </p>
+            <p v-if="!headingHeightValid" class="error">선수관리에서 신장을 입력한 후 좌표를 다시 불러와 주세요.</p>
             <fieldset class="time-card" :class="{ 'is-running': timerRunning }" :disabled="!editing || saving || linking">
               <legend class="time-legend">골라인 통과 소요시간</legend>
               <div class="time-card-heading">
@@ -1143,7 +1155,7 @@ onBeforeUnmount(() => {
           </thead>
           <tbody>
             <tr v-for="goal in ranking" :key="keyOf(goal)">
-              <td class="clock">{{ goal.rank }}</td>
+              <td class="clock">{{ goal.rank ?? '—' }}</td>
               <td><button type="button" class="text-button" @click="showGoalCard(goal)">{{ goal.playerName || '득점자 미기록' }}</button></td>
               <td class="ranking-match">
                 <div class="ranking-teams">
@@ -1157,18 +1169,18 @@ onBeforeUnmount(() => {
                 <span class="ranking-round">{{ seasonLabel(goal.seasonId) }} · {{ roundLabel(goal.round) }}</span>
               </td>
               <td>{{ goal.clock }}</td>
-              <td>{{ formatMetric(goal.metrics.distance, 'm') }}</td>
-              <td>{{ formatMetric(goal.metrics.speed, 'km/h') }}</td>
-              <td>{{ formatMetric(goal.metrics.finalSpeed, 'km/h') }}</td>
+              <td>{{ formatMetric(goal.ratingMetrics?.distance, 'm') }}</td>
+              <td>{{ formatMetric(goal.ratingMetrics?.averageSpeed, 'km/h') }}</td>
               <td><button type="button" class="text-button participants-button" aria-haspopup="dialog" @click="showParticipants(goal)">{{ goal.evaluationCount }}명</button></td>
               <td v-for="category in categories" :key="category.key" class="ranking-score">
-                {{ goal.categoryScores?.[category.key]?.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) ?? '—' }}
+                {{ goal.analystCategoryScores?.[category.key]?.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) ?? '—' }}
               </td>
-              <td class="ranking-score"><strong>{{ goal.score?.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) }}</strong></td>
+              <td class="ranking-score">{{ goal.analystScore?.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) ?? '—' }}</td>
+              <td class="ranking-score"><strong>{{ goal.score == null ? '—' : goal.score.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) }}</strong></td>
               <td>
-                <button type="button" class="representative-button" :disabled="!canApproveRepresentative" aria-haspopup="dialog"
+                <button type="button" class="representative-button" :class="{ approved: goal.representative?.status === 'approved' }" :disabled="!canApproveRepresentative" aria-haspopup="dialog"
                   :title="canApproveRepresentative ? '대표 분석 검토 및 확정' : '관리자만 대표 분석을 승인할 수 있습니다.'" @click="openRepresentative(goal)">
-                  {{ goal.representative?.status === 'approved' ? '승인 완료' : goal.representative?.status === 'needs_review' ? '재검토 필요' : '대표 승인' }}
+                  {{ goal.representative?.status === 'approved' ? '✓ 승인 완료' : goal.representative?.status === 'needs_review' ? '재검토 필요' : '대표 승인' }}
                 </button>
               </td>
             </tr>
@@ -1244,8 +1256,7 @@ onBeforeUnmount(() => {
         </header>
         <ul>
           <li v-for="analyst in participantsGoal.evaluators" :key="analyst.id">
-            <strong v-if="analyst.name !== analyst.id">{{ analyst.name }}</strong>
-            <span>{{ analyst.id }}</span>
+            <strong>{{ analyst.name && analyst.name !== analyst.id ? analyst.name : '닉네임 미등록' }}</strong>
           </li>
         </ul>
       </template>
@@ -1254,6 +1265,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.shot-context { margin: 10px 0 16px; }
 .curve-direction { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
 .curve-direction p, .curve-direction-saved { margin-bottom: 8px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .curve-direction p small { display: block; margin-top: 3px; font-size: 11px; }
@@ -1379,8 +1391,16 @@ button:disabled { cursor: default; opacity: .46; }
 .detail-header h2 { margin-top: 2px; }
 .detail-header .clock { font-size: 14px; margin-left: 7px; }
 .versus { color: #73938d; margin: 0 3px; }
-.shot-toggle { color: var(--accent); border-color: #3e5a54; white-space: nowrap; }
 .goal-actions { display: flex; flex-wrap: wrap; justify-content: end; gap: 8px; }
+.hint-toggle { display: inline-flex; align-items: center; justify-content: center; gap: 7px; color: #aab9c1; border-style: dashed; border-color: #46545e; white-space: nowrap; font-size: 12px; }
+.hint-toggle[aria-expanded="true"] { background: #253039; color: #d0d9de; border-style: solid; }
+.goal-card.approved { background: #121b20; color: #9da9ad; border-color: #303d43; }
+.goal-card.approved .clock, .goal-card.approved .card-team { color: #8d9ca2; }
+.goal-card.approved .state { color: #acb8ba; background: #293438; }
+.goal-card.approved[aria-pressed="true"] { background: #202b30; border-color: #687b81; box-shadow: inset 0 2px #87979c; }
+.representative-button.approved { color: #a5b3b7; background: #202c32; border-color: #39484e; }
+.representative-button.approved:hover:not(:disabled) { background: #29363b; border-color: #697c83; }
+
 .review-grid { display: grid; gap: 18px; padding: 16px 20px 20px; }
 .review-grid.with-shot { grid-template-columns: minmax(0, 1.03fr) minmax(0, 1fr); }
 .grading { min-width: 0; }

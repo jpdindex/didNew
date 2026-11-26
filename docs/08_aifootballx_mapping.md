@@ -1,5 +1,102 @@
 # DID → AIfootballX 데이터 매핑
 
+## FootballX GoalX 콘텐츠 파이프라인 — 2026-11-25
+
+FootballX는 `server/backend/pipelines/goalx/build_goalx.py`와
+`server/backend/api/api_goalx.py`를 독립 사용한다. ShotX/VibeTactic API·페이지 산출물을 참조하지 않는다.
+FootballX Swagger `POST /api/goalx/rebuild`가 비동기로 goalx 원본·TACTIC·Player를 읽어
+GOALX 전용 `DATA_ROOT/goalx/page/{season}/{league}/snapshot.json`을 원자적으로 갱신한다.
+Form의 season/league_id는 필수 범위이며 round_no/team_code는 선택 조건이다. 부분 갱신은
+선택 범위의 기존 골만 교체하고 다른 결과를 보존한다. GET `/api/goalx/rebuild-status`에서 확인한다.
+공개 page/detail API는 이 스냅샷만 읽으며 Firestore 원본을 직접 읽지 않는다.
+
+TACTIC은 DID t_code와 목적지 IDX_CODE를 매핑하고 경기·시즌·팀·전후반·득점 시각·선수를 맞춰
+동일 gt_id 전개를 연결한다. 기록된 터치라인 바로 바깥 재개 좌표는 제한된 런오프 범위 안에서 보존한다.
+전개가 없거나 모호하면 임의 경로를 생성하지 않는다. Player.pt_num은 같은 시즌·선수·팀·계약기간으로 연결한다.
+
+첫 중계 장면에서 전개 5초→마지막 패스→도움닫기/점프→접촉→득점을 연속 재생한 뒤,
+드론/골대 뒤/측면/키커의 네 리플레이를 반복한다. 비행은 측정 골라인 통과 시간에 공통 연출 배속을 적용한다.
+골라인 이후의 골망 도착은 그래픽 전용이며 거리·시속·공식 비행시간에 더하지 않는다. 골망은 접촉 후 반응한다.
+랭킹은 현재 필터의 TOP10 표와 동일 인덱스의 작은 카드이며, 카드 중앙 정렬 완료 후 2.5초 미리보기를 시작한다.
+BGM은 기존 `public/audio/*-intro.mp3`를 IDX_CODE로 매핑한다. 브라우저 소리 허용 이후 재생하고,
+일시정지·음소거·백그라운드에서는 정지한다. 운영 데이터 평가·전송·리빌드는 사용자가 직접 실행한다.
+
+## ALL 범위 축소 — 2026-11-25
+
+현재 `POST /send/all`은 선택 경기의 matches와 관련 aggregates만 처리한다.
+masters, GoalX, default는 각각 독립 실행하며 ALL에서 조회·생성하지 않는다.
+일부 경기를 며칠에 나눠 입력해도 다음 라운드 default 검증이 ALL에 영향을 주지 않는다.
+집계에 필요한 기존 선수/팀 참조 조회 및 누락 시즌 코드 처리는 유지한다.
+기존 비동기 전송과 GET `/send/status`를 사용하며, 내부 `allScope=matches-aggregates-v1`로
+이전 마스터 포함 ALL의 실패 문서를 새 요청에서 재시도하지 않는다.
+아래 과거 통합 ALL 설명 중 세 그룹 실행에 관한 내용은 이 절로 대체한다.
+
+## GoalX 독립 전송 — 2026-11-25
+
+`GET /api/v1/aifootballx/goalx/status`는 현재 요청자가 가장 최근에 시작한 GOALX 리빌드 또는
+전송 한 건만 반환한다. 새 GOALX 요청이 접수되면 이전 작업의 결과 대신 새 작업을 표시하며,
+이전 작업이 나중에 완료되어도 최신 요청을 유지한다. 다른 전송 그룹과 다른 요청자의 작업은 제외한다.
+응답 맨 위에 `status`, `reason`, `failures`를 표시하며 `operation`으로 rebuild/send를 구분한다.
+실행 이력이 없으면 idle이다. 리빌드/전송별 결과를 동시에 반환하던 형식은 이 단일 결과 형식으로 대체한다.
+
+`POST /api/v1/aifootballx/send/goalx`는 기존 비동기 작업·검증·재시도·수신 기록을 사용한다.
+경기/마스터/집계/ALL 전송에는 포함하지 않는다. 시즌·대회·라운드 범위·경기 ID를 Form으로 입력하고
+`GET /api/v1/aifootballx/send/status`에서 진행률과 검증/실패 사유를 확인한다.
+TESTGOAL은 대회 `TESTGOAL`, 시즌 `test`로 전송한다. 쓰기 활성화 설정과 기존 관리자 인증을 사용한다.
+
+### 평가 리빌드·FORCE — 2026-11-25 (v3)
+
+공식 기준은 `backend/system/system_goalx.py`의 상수와 `goal_rating()`만 사용한다.
+`GoalAalysis/_settings.goalxRatingRules`는 코드 기준의 관리용 사본이다. `원본 출처`에 파일·함수,
+`version`과 `rulesHash`에 적용 버전/해시를 남기며 이 문서를 수정해도 공식 계산에는 반영하지 않는다.
+
+분석관 평가 점수는 예술성·수비환경·궤적의 하/중/상 1/2/3점을 합산한 뒤 분석관 간 평균을 낸 값이다.
+총점은 분석관별 가중 환산값의 평균에 거리·시속 점수를 더한 100점 총점이다.
+거리는 저장된 분석관 좌표 입력과 궤적 유형으로 다시 계산한 거리의 중앙값,
+시간은 분석관 골라인 통과 소요시간의 중앙값이다. 시속은 거리÷시간×3.6이다.
+ShotX 측정값, 캐시된 거리, 대표 승인 좌표·시간은 평점 입력으로 사용하지 않는다.
+좌표·시간이 부족하면 총점은 null로 두고 분석관 평가 점수는 표시한다.
+
+평가 저장 후 별도 `rating` 필드에 점수를 저장한다. 기준 변경 후에는
+`POST /api/v1/aifootballx/goalx/rebuild`에서 시즌·대회·라운드·경기 범위를 Form으로 입력한다.
+기존 비동기 작업 관리와 GET `/send/status`를 사용하며 operation=rebuild, mode=goalx_rebuild로
+진행률·처리/미계산 건수·실패 사유를 확인한다. 리빌드는 aifootballx 접속 없이 DID에서만 실행하며,
+`evaluations`, `manualGoal`, `representative`, RAW 좌표·시간은 갱신하지 않는다.
+
+전송은 최신 코드 해시와 평가 입력 해시가 일치하는 저장된 rating을 요구한다. 없거나 오래되면
+리빌드 안내와 함께 검증 단계에서 차단한다. `/send/goalx`의 `force=true`는 latest보다 우선하여
+동일 결과도 다시 쓰고 전송 시각을 갱신한다. 원본/대표 승인/목적지 동시 변경 검증과 수신 기록을
+유지하며, 기존 외부 관리 필드는 보존한다. `analystScore`, `analystCategoryScores`, `score`,
+`categoryScores`, `metrics`, `ratingRulesHash`, `ratingSourceVersion`을 함께 전송한다.
+
+대상은 `aifootballx/goalx/{sha256([gm_id, DID side, recordId])}`이며 기존 `shot_x`는 유지한다.
+유효한 대표 승인과 3D 좌표, 평점용 거리/시간이 있는 골만 발행한다. 재전송은 동일 문서를 갱신하며,
+선택 범위에서 삭제되거나 승인이 무효화된 기존 DID 문서는 `status=withdrawn`으로 전환한다.
+승인 무효화가 FootballX에 반영되려면 해당 범위를 다시 전송해야 한다.
+
+식별 필드는 `PlSeason`, `leagueId`, `gm_id`, `gm_round`, `H-A`, `team_type`, `t_code`, `IDX_CODE`,
+`p_id`, `DID_PLAYER_ID`, `recordId`, `playerName`, `clock`, `half`, `halfSeconds`, `shotId`다.
+`IDX_CODE`는 기존 전송과 동일한 팀 코드 레지스트리에서 가져온다. 선수 식별은 `p_id`를 사용한다.
+TESTGOAL의 내부 H 고정 저장값과 실제 득점 팀의 H/A는 구분하며 정식 경기/선수 ID는 null로 저장한다.
+
+공식 평점 버전은 `goalx-100-v3`이다. 예술성/수비환경/궤적은 각각 20/30/20점에
+하/중/상 80/90/100%를 적용한 분석관별 점수를 평균 낸다. 거리/시속은 각각 15점이며,
+시작값 `[0,12,20,26,29]m`, `[0,80,90,100,105]km/h`의 5단계에 60/70/80/90/100%를 적용한다.
+평균 시속은 분석관 좌표 기반 추정 거리÷골라인 통과 소요시간×3.6이다.
+`metrics.source=did_estimated`이며 ShotX는 참고용으로만 남긴다.
+
+좌표 불러오기는 RAW act(S/R/H)와 DID players.height(cm)를 함께 반환한다. 평가 저장 시 서버가
+이 원본 값으로 클라이언트의 메타데이터를 검증·덮어쓴다. S/R은 기존 지면 출발, H는 신장/100 + 0.5m에서 출발한다.
+신장이 없는 H는 계산·저장 안내 오류를 반환하며 임의의 키를 사용하지 않는다. 추정 모델 버전은 3이다.
+`shotType`, `playerHeightCm`, `jumpHeightM`, `startHeightM`을 평가 입력·대표 궤적·goalx schemaVersion=3에 보존한다.
+기존 H는 평가를 다시 저장하고 관리자가 대표 승인해야 새 높이가 전송된다. 평점 리빌드는 대표 승인을 변경하지 않는다.
+
+그래픽은 승인된 `trajectory`, `renderInput`, `goalPoint`, `goalX`, `flightTime`, `trajectoryType`,
+`modelVersion`을 보관한다. 공용 API는 표시용 데이터만 반환하며 분석관 ID·가중치·구간표·계산식은
+반환하지 않는다. FootballX 공개 조회는 스냅샷만 읽는다. ADMIN의 MASTER/ADMIN 계정은 goalx 원본 읽기를 허용하며 클라이언트 쓰기는 금지한다.
+추가한 Firestore 인덱스/규칙은 FootballX 배포 설정에 있으며 운영 사용 전에 배포해야 한다.
+Postmatch 연결·영상 업로드·사용자 수치 조정은 이번 범위에 포함하지 않는다.
+
 ## SQL 이관 RAW 기준 통일 — 2026-11-03
 
 전송 검증 정책은 `imported-raw-team-player-authority-v24`, rating 입력 지문 정책은

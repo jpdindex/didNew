@@ -128,6 +128,14 @@ def custom_openapi() -> dict:
     if app.openapi_schema:
         return app.openapi_schema
     schema = get_openapi(title=settings.app_name, version="0.4.0", routes=app.routes)
+    # Preserve existing category order and keep Goalx directly below delivery.
+    tags = list(dict.fromkeys(tag for path in schema["paths"].values()
+                              for operation in path.values() if isinstance(operation, dict)
+                              for tag in operation.get("tags", [])))
+    if "Goalx" in tags and "aifootballx-delivery" in tags:
+        tags.remove("Goalx")
+        tags.insert(tags.index("aifootballx-delivery") + 1, "Goalx")
+    schema["tags"] = [{"name": tag, **({"description": "GOALX 평가 리빌드와 승인 골 비동기 전송. GET /goalx/status에서 두 작업의 진행률·완료·실패를 각각 확인합니다."} if tag == "Goalx" else {})} for tag in tags]
     schema.setdefault("components", {}).setdefault("securitySchemes", {})["SwaggerKey"] = {
         "type": "apiKey",
         "in": "header",

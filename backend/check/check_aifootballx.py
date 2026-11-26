@@ -509,7 +509,7 @@ def test_swagger_source_selection_is_a_minimal_post_form_with_status_first():
     paths = list(schema['paths'])
     assert paths[0] == '/api/v1/aifootballx/send/status'
     assert list(schema['paths'][paths[0]]) == ['get']
-    assert len(paths) == 6  # Existing status + five existing POSTs; no new route.
+    assert len(paths) == 10  # Status, cancellation, delivery and GOALX routes.
     for route in ('aggregates', 'all'):
         operation = schema['paths']['/api/v1/aifootballx/send/' + route]['post']
         assert not any(p['in'] == 'query' for p in operation.get('parameters', []))
@@ -829,6 +829,62 @@ def service(tmp_path, monkeypatch):
     svc.pool.shutdown()
     svc.pool = Immediate()
     return svc, source, writer, calls
+
+
+def goalx_status_client(monkeypatch, svc):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from backend.api import api_aifootballx
+    monkeypatch.setattr(api_aifootballx, 'delivery_service', lambda: svc)
+    app = FastAPI()
+    app.include_router(api_aifootballx.router)
+    app.dependency_overrides[api_aifootballx.delivery_operator] = lambda: SimpleNamespace(uid='operator')
+    return TestClient(app)
+
+
+@pytest.mark.parametrize('modes', [('goalx_rebuild', 'goalx'), ('goalx', 'goalx_rebuild')])
+def test_goalx_status_only_returns_latest_goalx_request(service, monkeypatch, modes):
+    svc, _, _, _ = service
+    client = goalx_status_client(monkeypatch, svc)
+    assert client.get('/aifootballx/goalx/status').json()['status'] == 'idle'
+    jobs = []
+    for index, mode in enumerate(modes):
+        kind = 'goalx_rebuild' if mode == 'goalx_rebuild' else 'delivery'
+        job, _ = svc.store.create(kind, {'seasonId': '20262027', 'mode': mode, 'roundFrom': index + 1}, 'operator')
+        jobs.append(job)
+        with svc.store.connect() as db:
+            db.execute('UPDATE jobs SET created=? WHERE id=?', (index + 1, job))
+        result = client.get('/aifootballx/goalx/status').json()
+        assert result['jobId'] == job and result['mode'] == mode
+        assert result['status'] == 'queued'
+        assert 'rebuild' not in result and 'send' not in result
+    # Older jobs finishing later must not replace the newest request.
+    svc.store.set_job(jobs[0], 'complete', meta={'summary': {'oldResult': True}})
+    # Other delivery groups, owners and internal jobs must not replace it either.
+    svc.store.create('delivery', {'seasonId': '20262027', 'mode': 'matches'}, 'operator')
+    svc.store.create('delivery', {'seasonId': '20262027', 'mode': 'goalx'}, 'another-operator')
+    svc.store.create('preview', {'seasonId': '20262027', 'mode': 'goalx'}, 'operator', public=False)
+    result = client.get('/aifootballx/goalx/status').json()
+    assert result['jobId'] == jobs[-1] and result['status'] == 'queued'
+    assert result['scope']['roundFrom'] == 2
+    assert not result['summary']
+
+
+@pytest.mark.parametrize('mode', ['goalx', 'goalx_rebuild'])
+@pytest.mark.parametrize('state,expected', [('complete', 'complete'), ('failed', 'error'), ('running', 'running')])
+def test_goalx_status_result_and_failure_reason_are_first(service, monkeypatch, mode, state, expected):
+    svc, _, _, _ = service
+    client = goalx_status_client(monkeypatch, svc)
+    idle = client.get('/aifootballx/goalx/status').json()
+    assert list(idle)[:3] == ['status', 'reason', 'failures']
+    job, _ = svc.store.create('goalx_rebuild' if mode == 'goalx_rebuild' else 'delivery',
+                              {'seasonId': '20262027', 'mode': mode}, 'operator')
+    reason = '평점용 데이터가 부족합니다.' if state == 'failed' else None
+    svc.store.set_job(job, state, meta={'failureReason': reason})
+    result = client.get('/aifootballx/goalx/status').json()
+    assert list(result)[:3] == ['status', 'reason', 'failures']
+    assert result['status'] == expected and result['reason'] == reason
+    assert result['operation'] == ('rebuild' if mode == 'goalx_rebuild' else 'send')
 
 
 def test_persistent_idempotency_and_retry_only_failed_documents(service):
@@ -1205,7 +1261,7 @@ def test_send_by_inputs_runs_async_validation_and_retries_only_failures(service)
     status=svc.public_status('operator')
     assert status['status']=='fail' and status['reason']
     assert status['failures'][0]['documentId']=='two'
-    assert 'jobId' not in status and 'previewId' not in status
+    assert status['jobId'] and 'previewId' not in status
     writer.fail_two=False
     svc.send_scope(scope,'operator')
     assert svc.public_status('operator')['status']=='complete'
@@ -1248,13 +1304,13 @@ def test_swagger_routes_validate_scope_and_require_operator(service, monkeypatch
     assert client.post('/api/v1/aifootballx/send/matches', data={'season':'2024-2025','gm_id':'20252026x'}).status_code == 422
     result = client.post('/api/v1/aifootballx/send/matches', data={'season':'2024-2025','round_from':1,'round_to':1})
     assert result.status_code == 202
-    assert 'jobId' not in result.json()
+    assert result.json()['jobId']
     assert result.json()['scope']['seasonId'] == '20242025'
     response=client.get('/api/v1/aifootballx/send/status').json()
     assert response['validationPassed'] and response['status']=='complete'
     paths=app.openapi()['paths']
-    assert list(paths)==['/api/v1/aifootballx/send/status', '/api/v1/aifootballx/send/default', '/api/v1/aifootballx/send/matches',
-                         '/api/v1/aifootballx/send/masters', '/api/v1/aifootballx/send/aggregates', '/api/v1/aifootballx/send/all']
+    assert list(paths)==['/api/v1/aifootballx/send/status', '/api/v1/aifootballx/send/cancel', '/api/v1/aifootballx/send/default', '/api/v1/aifootballx/send/matches',
+                             '/api/v1/aifootballx/goalx/status', '/api/v1/aifootballx/goalx/rebuild', '/api/v1/aifootballx/send/goalx', '/api/v1/aifootballx/send/masters', '/api/v1/aifootballx/send/aggregates', '/api/v1/aifootballx/send/all']
     assert not paths['/api/v1/aifootballx/send/status']['get'].get('parameters')
     for path in ('default','matches','masters','aggregates','all'):
         endpoint=paths['/api/v1/aifootballx/send/'+path]['post']
@@ -2897,7 +2953,7 @@ def test_preserved_metadata_keeps_firestore_timestamp_and_nested_types():
     stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
     current = {'createdAt': stamp, 'manual': {'timestamp': stamp}, 'calculation': {'removed': 1}}
     reviewed = delivery.delivery_payload('dMST', {'calculation': {'new': 2}}, delivery.encode(current))
-    payload = delivery.firestore_payload({'data': reviewed}, current)
+    payload = delivery.firestore_payload({'collection': 'dMST', 'data': reviewed}, current)
     assert payload['createdAt'] == stamp and isinstance(payload['createdAt'], datetime)
     assert payload['manual']['timestamp'] == stamp
     assert payload['calculation'] == {'new': 2}
@@ -4033,7 +4089,7 @@ def test_default_route_queues_round_form_and_exposes_mode_in_status(service, mon
     assert len(submitted) == 1
 
 
-def test_unified_all_expands_to_all_three_scopes_with_shared_latest_and_filters():
+def test_unified_all_expands_to_matches_and_aggregates_with_shared_latest_and_filters():
     source = object.__new__(delivery.SourceCapture)
     source.did = object()
     source.rows = lambda *args, **kwargs: [{'id': str(n), 'data': {'round': n}} for n in (1, 2, 3)]
@@ -4041,19 +4097,18 @@ def test_unified_all_expands_to_all_three_scopes_with_shared_latest_and_filters(
              'roundFrom': 2, 'roundTo': 3, 'matchId': None}
     assert delivery.delivery_mode(scope) == 'all'
     scopes = source.split_scopes(scope)
-    assert [s['mode'] for s in scopes] == ['masters', 'matches', 'matches', 'aggregates']
-    assert scopes[0]['roundFrom'] is None and scopes[0]['roundTo'] is None
-    assert [s['roundFrom'] for s in scopes[1:3]] == [2, 3]
+    assert [s['mode'] for s in scopes] == ['matches', 'matches', 'aggregates']
+    assert [s['roundFrom'] for s in scopes[:2]] == [2, 3]
     assert scopes[-1]['roundFrom'] == 2 and scopes[-1]['roundTo'] == 3
     assert all(s['latest'] for s in scopes)
 
 
-@pytest.mark.parametrize('invalid_group', [None, 'masters', 'matches', 'aggregates', 'source-change'])
+@pytest.mark.parametrize('invalid_group', [None, 'matches', 'aggregates', 'source-change'])
 def test_unified_all_validates_every_group_before_any_writes(service, invalid_group, caplog):
     svc, source, writer, calls = service
     writer.fail_two = False
     scope = {'seasonId': '20232024', 'mode': 'all', 'unified': True, 'latest': False}
-    source.split_scopes = lambda _: [{**scope, 'mode': mode} for mode in ('masters', 'matches', 'aggregates')]
+    source.split_scopes = lambda _: [{**scope, 'mode': mode} for mode in ('matches', 'aggregates')]
     captured = []
     def capture(group, slot):
         assert not calls
@@ -4071,15 +4126,17 @@ def test_unified_all_validates_every_group_before_any_writes(service, invalid_gr
         operation_id = svc.send_scope(scope, 'operator')
     status = svc.public_status('operator')
     assert status['mode'] == 'all'
-    assert captured == ['masters', 'matches', 'aggregates']
+    assert captured == ['matches', 'aggregates']
+    assert status['scope']['allScope'] == 'matches-aggregates-v1'
     if invalid_group:
         assert status['status'] in ('fail', 'error') and not calls
     else:
         assert status['status'] == 'complete' and status['percent'] == 100
-        assert status['counts'] == {'success': 3}
+        assert status['counts'] == {'success': 2}
         assert status['summary']['matches'] == 1
-        assert calls == ['masters', 'matches', 'aggregates']
-        for stage in ('capture_masters', 'capture_matches', 'capture_aggregates', 'final_validation', 'send'):
+        assert calls == ['matches', 'aggregates']
+        assert 'stage=capture_masters' not in caplog.text
+        for stage in ('capture_matches', 'capture_aggregates', 'final_validation', 'send'):
             for event in ('start', 'end'):
                 assert f'job_id={operation_id} stage={stage} event={event}' in caplog.text
 

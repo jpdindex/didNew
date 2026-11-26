@@ -1973,7 +1973,7 @@ DEFAULT_COLLECTIONS = frozenset(('dMST', 'pMST', 'mMST', 'cAVG', 'rAVG', 'rank',
 def delivery_mode(scope):
     mode = scope.get('mode', 'matches')
     # Keep old stored job scopes readable; only the three new modes have HTTP routes.
-    if mode not in ('matches', 'masters', 'aggregates', 'all', 'latest', 'default'):
+    if mode not in ('matches', 'masters', 'aggregates', 'all', 'latest', 'default', 'goalx', 'goalx_rebuild'):
         fail('Unknown delivery mode')
     source_mode(scope)
     if (mode in ('masters', 'latest') or (mode == 'all' and not scope.get('unified'))) and any(scope.get(k) is not None for k in ('roundFrom', 'roundTo', 'matchId')):
@@ -2577,9 +2577,8 @@ class SourceCapture:
 
     def split_scopes(self, scope):
         if delivery_mode(scope) == 'all' and scope.get('unified'):
-            masters = {**scope, 'mode': 'masters', 'roundFrom': None, 'roundTo': None, 'matchId': None}
             matches = self.split_scopes({**scope, 'mode': 'matches'})
-            return [masters, *matches, {**scope, 'mode': 'aggregates'}]
+            return [*matches, {**scope, 'mode': 'aggregates'}]
         if delivery_mode(scope) != 'matches':
             return [scope]
         if scope.get('matchId'):
@@ -2593,6 +2592,9 @@ class SourceCapture:
         return [{**scope, 'roundFrom': n, 'roundTo': n} for n in rounds]
 
     def capture(self, scope, slot_path):
+        if delivery_mode(scope) == 'goalx':
+            from backend.system.system_goalx import capture_goalx_delivery
+            return capture_goalx_delivery(self, scope)
         if delivery_mode(scope) == 'default':
             return self.capture_defaults(scope, slot_path)
         if delivery_mode(scope) == 'aggregates':
@@ -3484,7 +3486,7 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
     errors = list(errors)
     by_id = {col:{r['id']:r['data'] for r in rows} for col,rows in existing.items()}
     unique = {}
-    allowed = (DEFAULT_COLLECTIONS | {'code'} if mode == 'default' else
+    allowed = ({'goalx'} if mode == 'goalx' else DEFAULT_COLLECTIONS | {'code'} if mode == 'default' else
                MATCH_COLLECTIONS if mode == 'matches' else IDENTITY_COLLECTIONS if mode == 'masters'
                else frozenset((*AGGREGATES, 'code')) if mode == 'aggregates' else MASTER_COLLECTIONS)
     for original in documents:
@@ -3506,7 +3508,8 @@ def finish_delivery(documents, errors, checks, existing, mode, matches=0, *, lat
     result = changed if latest or mode=='latest' else list(unique.values())
     return {'mode':mode,'validation_passed':not errors and all(c['passed'] for c in checks),'write_enabled':False,
             'documents':result,'checks':checks,'errors':errors,
-            'scope_note':('Selected match documents only' if mode == 'matches' else
+            'scope_note':('Approved GoalX snapshots and withdrawn stale goals only' if mode == 'goalx' else
+                          'Selected match documents only' if mode == 'matches' else
                           'Player, playerDB, Manager, code only' if mode == 'masters' else
                           'pMST, mMST, cAVG, rAVG, rank, sAVG and missing season code' if mode == 'aggregates' else
                           'Legacy combined master/aggregate scope'),
@@ -4071,7 +4074,7 @@ def merge_guards(previous, current):
 ALLOWED_COLLECTIONS = {'code', 'Manager', 'Player', 'playerDB', 'playerMST', 'vibePlayer', 'dMST', 'TACTIC',
     'playerGoal', 'mMST', 'pMST', 'cAVG', 'rAVG', 'sAVG', 'rank', 'bmas_DTA', 'bmas_DTB', 'bmas_DTM', 'bmas_DTS',
     'multiSheet_ALL', 'multiSheet_BAP', 'multiSheet_DAP', 'multiSheet_DTP', 'multiSheet_GOAL',
-    'multiSheet_JMX', 'multiSheet_SHOT', 'multiSheet_GOAL-시간'}
+    'multiSheet_JMX', 'multiSheet_SHOT', 'multiSheet_GOAL-시간', 'goalx'}
 ALLOWED_COLLECTIONS -= EXCLUDED_COLLECTIONS
 MASTER_FIELDS = {
     'Manager': {'PlSeason', 'Round', 'T_Code', 'IDX_CODE', 'T_Name', 'm_id', 'Manager_EN', 'Manager_KR',
@@ -4186,17 +4189,20 @@ class JobStore:
                 db.execute("INSERT INTO results (job_id,ordinal,state) SELECT ?,ordinal,'pending' FROM documents WHERE preview_id=?", (ident, preview_id))
         return ident, True
 
-    def latest(self, owner, *, kind=None, scope=None, exclude=None, public=True):
+    def latest(self, owner, *, kind=None, scope=None, exclude=None, public=True, modes=None):
         query, args = 'SELECT id FROM jobs WHERE owner=?', [owner]
         for field, value in [('kind', kind), ('scope', dump(scope) if scope is not None else None)]:
             if value is not None:
                 query += f' AND {field}=?'; args.append(value)
         if exclude:
             query += ' AND id<>?'; args.append(exclude)
+        if modes:
+            query += " AND json_extract(scope, '$.mode') IN (" + ','.join('?' for _ in modes) + ')'
+            args.extend(modes)
         if public:
             query += ' AND public=1'
             if kind is None:
-                query += " AND kind IN ('delivery','preview')"
+                query += " AND kind IN ('delivery','preview','goalx_rebuild')"
         with self.connect() as db:
             row = db.execute(query + ' ORDER BY created DESC LIMIT 1', args).fetchone()
         return self.job(row['id'], owner) if row else None
@@ -4210,6 +4216,21 @@ class JobStore:
     def claim(self, ident):
         with self.connect() as db:
             return db.execute("UPDATE jobs SET state='running',updated=? WHERE id=? AND state='queued'", (time.time(), ident)).rowcount == 1
+
+    def cancel_queued(self, ident, owner):
+        # Serialize cancellation with claim(); only one transition can win.
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT state FROM jobs WHERE id=? AND owner=? AND public=1 "
+                             "AND kind IN ('delivery','preview','goalx_rebuild')", (ident, owner)).fetchone()
+            if row is None:
+                raise BackendError('Delivery job not found', 404, 'aifootballx_job_not_found')
+            if row['state'] == 'cancelled':
+                return
+            if row['state'] != 'queued':
+                raise BackendError('대기 중인 작업만 취소할 수 있습니다.', 409, 'aifootballx_cancel_not_queued')
+            db.execute("UPDATE jobs SET state='cancelled',updated=?,error=NULL WHERE id=? AND state='queued'",
+                       (time.time(), ident))
 
     def set_job(self, ident, state, *, meta=None, error=None):
         with self.connect() as db:
@@ -4341,7 +4362,7 @@ def decide_merge(doc, current):
     """Commit the reviewed overlay only against the complete captured baseline."""
     current = encode(current) if current is not None else None
     data = doc['data']
-    if current == data:
+    if current == data and not (doc['collection'] == 'goalx' and doc.get('force')):
         return False
     if doc['existed'] != (current is not None):
         fail('Destination existence changed; create a new preview', 'aifootballx_destination_changed')
@@ -4357,9 +4378,13 @@ def firestore_payload(doc, current):
     Preview JSON encodes timestamps as strings. Reuse the transaction's raw
     value when unchanged, so preserving metadata never converts its type.
     """
-    return {field: deepcopy(current[field])
+    payload = {field: deepcopy(current[field])
             if current is not None and field in current and encode(current[field]) == value else deepcopy(value)
             for field, value in doc['data'].items()}
+    if doc['collection'] == 'goalx':
+        from google.cloud import firestore
+        payload['publishedAt'] = firestore.SERVER_TIMESTAMP
+    return payload
 
 
 class FirestoreWriter:
@@ -4616,11 +4641,37 @@ class DeliveryService:
 
     def send_scope(self, scope, owner):
         delivery_mode(scope)
+        if scope.get('mode') in ('goalx', 'goalx_rebuild'):
+            from backend.system.system_goalx import rating_rules
+            scope = {**scope, 'ratingRulesHash': rating_rules()['rulesHash']}
+        if scope.get('mode') == 'goalx_rebuild':
+            ident, created = self.store.create('goalx_rebuild', scope, owner, deduplicate_active=True)
+            if created:
+                self.pool.submit(self.run_goalx_rebuild, ident, owner)
+            return ident
+        if scope.get('mode') == 'all' and scope.get('unified'):
+            # Do not resume an old ALL manifest containing master documents.
+            scope = {**scope, 'allScope': 'matches-aggregates-v1'}
         self.require_enabled()
         ident, created = self.store.create('delivery', scope, owner, deduplicate_active=True)
         if created:
             self.pool.submit(self.run_scope_send, ident, owner)
         return ident
+
+    def run_goalx_rebuild(self, ident, owner):
+        if not self.store.claim(ident):
+            return
+        try:
+            from backend.system.system_goalx import GoalAnalysis
+            job = self.store.job(ident, owner)
+            def progress(percent, **details):
+                self.ensure_running()
+                self.store.record_progress(ident, percent, **details)
+            self.ensure_running()
+            counts = GoalAnalysis().rebuild_ratings(job['scope'], owner, progress)
+            self.store.set_job(ident, 'complete', meta={'phase': 'rebuild', 'summary': counts})
+        except Exception as exc:
+            self.store.fail_job(ident, exc)
 
     def run_scope_send(self, ident, owner):
         if not self.store.claim(ident): return
@@ -4667,13 +4718,23 @@ class DeliveryService:
         except Exception as exc:
             self.store.fail_job(ident, exc)
 
-    def public_status(self, owner):
-        # IDs remain internal. The same selector inputs identify a submission;
-        # GET shows the caller's latest operation like the existing pipelines.
-        latest = self.store.latest(owner)
+    def public_status(self, owner, *, mode=None, modes=None):
+        # GET shows the caller's latest operation; its ID targets cancellation.
+        selected_modes = modes if modes is not None else ([mode] if mode else None)
+        latest = self.store.latest(owner, modes=selected_modes) if selected_modes else self.store.latest(owner)
         enabled = get_settings().aifootballx_write_enabled
         if latest is None:
-            return {'status':'idle','percent':0,'writeEnabled':enabled,'scope':None,'reason':None,'failures':[]}
+            return {'status':'idle','reason':None,'failures':[],'percent':0,'jobId':None,'writeEnabled':enabled,'scope':None}
+        if latest['kind'] == 'goalx_rebuild':
+            meta = latest['meta']
+            complete = latest['state'] == 'complete'
+            return {'status': 'error' if latest['state'] == 'failed' else latest['state'],
+                    'reason': meta.get('failureReason'), 'failures': [],
+                    'summary': meta.get('summary') or meta.get('progress', {}),
+                    'jobId': latest['id'],
+                    'operation': 'rebuild', 'mode': 'goalx_rebuild', 'scope': latest['scope'], 'phase': 'rebuild',
+                    'percent': 100 if complete else meta.get('progress', {}).get('percent', 0),
+                    'writeEnabled': enabled}
         preview_id = latest['id'] if latest['kind']=='preview' else latest['meta'].get('previewId')
         send_id = latest['meta'].get('sendId') if latest['kind']=='delivery' else None
         preview = self.store.job(preview_id, owner) if preview_id else None
@@ -4719,18 +4780,20 @@ class DeliveryService:
                 self.store.record_progress(latest['id'], percent)
         if latest['state'] in ('complete', 'validated'):
             percent = 100
-        return {'status':state,'operation':'send' if latest['kind']=='delivery' else 'preview',
+        return {'status':state,
+                'reason':'; '.join(dict.fromkeys(reasons)) if reasons else (failure_reason(latest['error']) if latest['error'] else None),
+                'failures':failures,'failedChecks':failed_checks[:100],
+                'validationPassed':(False if preview and preview['state'] in ('failed', 'invalid') else
+                                    report.get('validation_passed')),
+                'summary':report.get('summary'),'counts':counts,
+                'jobId':latest['id'],'operation':'send' if latest['kind']=='delivery' else 'preview',
                 'mode':delivery_mode(latest['scope']),
                 'sourceMode':source_mode(latest['scope']), 'sourceSelection':report.get('sourceSelection'),
                 'phase':latest['meta'].get('phase', 'preview'),'percent':percent,'writeEnabled':enabled,'scope':latest['scope'],
-                'validationPassed':(False if preview and preview['state'] in ('failed', 'invalid') else
-                                    report.get('validation_passed')),'summary':report.get('summary'),
                 'aggregateStatus':report.get('aggregate_status'),'blockedGroups':report.get('blocked_groups',[]),
                 'skippedMatches':report.get('skippedMatches',[]),
                 'warnings':report.get('warnings',[]),
-                'counts':counts,
-                'reason':'; '.join(dict.fromkeys(reasons)) if reasons else (failure_reason(latest['error']) if latest['error'] else None),
-                'failures':failures,'failedChecks':failed_checks[:100],'previewValues':values,
+                'previewValues':values,
                 'waivedChecks':[c for c in report.get('checks',[]) if c.get('waived')],
                 'previewValuesNote':'최대 20개 생성값을 표시합니다. 전체 값과 상세 이력은 서버의 작업 저장소에 보관됩니다.'}
 

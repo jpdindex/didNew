@@ -48,7 +48,7 @@ def test_raw_coordinates_reads_the_selected_record_without_shotx():
                    "shootPosX": 211, "shootPosY": 275}
     service._read_goal = Mock(return_value={"res": "GOAL", **coordinates})
     service._recording_direction = Mock(return_value={})
-    assert service.raw_coordinates("match", "A", "goal") == {**coordinates, "goalX": None}
+    assert service.raw_coordinates("match", "A", "goal") == {**coordinates, "goalX": None, "shotType": None, "playerHeightCm": None, "jumpHeightM": 0, "startHeightM": 0}
     service._read_goal.assert_called_once_with("match", "A", "goal")
 
 
@@ -69,6 +69,7 @@ def test_save_persists_per_analyst_estimation_and_preserves_three_grade_categori
     service.move_legacy_goals = Mock()
     service._write_scope = Mock()
     service._read_analysis_state = Mock(return_value={"saved": True})
+    service._persist_rating = Mock()
     service._recording_direction = Mock(return_value={})
     payload = EvaluationInput(artistry="high", defense="medium", trajectory="high", curveDirection="left", estimatedShot=shot_input())
     assert service.save("match", "H", "record", "analyst", payload) == {"saved": True}
@@ -76,9 +77,10 @@ def test_save_persists_per_analyst_estimation_and_preserves_three_grade_categori
     assert set(row["grades"]) == set(Grades.model_fields)
     assert row["estimatedShot"] == estimate_shot(payload.estimatedShot, "high")
     batch.commit.assert_called_once()
+    service._persist_rating.assert_called_once_with("goal-ref", "analyst")
     state = service._analysis_state({"evaluations": {"analyst": row}}, "analyst", POINTS, {})
     assert state["myEstimatedShot"] == row["estimatedShot"]
-    assert state["score"] == 8
+    assert state["score"] == 94
     assert row["curveDirection"] == "left"
     assert state["myCurveDirection"] == "left"
 
@@ -108,6 +110,7 @@ def test_saved_goal_is_automatic_even_if_client_sends_manual_goal():
     service.move_legacy_goals = Mock()
     service._write_scope = Mock()
     service._read_analysis_state = Mock(return_value={})
+    service._persist_rating = Mock()
     payload = EvaluationInput(artistry="high", defense="medium", trajectory="medium", curveDirection="left", estimatedShot=shot_input(goalX=105))
     service.save("match", "A", "goal", "analyst", payload)
     saved = batch.set.call_args.args[1]["evaluations"]["analyst"]["estimatedShot"]
@@ -159,7 +162,7 @@ def test_proposal_combines_means_mode_and_median_without_averaging_outlier_time(
     assert proposal["timeToGoal"] == .6
     assert proposal["timeSampleCount"] == 3
     assert proposal["trajectoryCandidates"] == ["medium"]
-    assert proposal["categoryScores"] == {"artistry": 3, "defense": 1, "trajectory": pytest.approx(7 / 3)}
+    assert proposal["categoryScores"] == {"artistry": 20, "defense": 24, "trajectory": pytest.approx(56 / 3)}
 
 
 def test_finalization_recalculates_speed_from_median_and_automatic_goal():
@@ -295,7 +298,7 @@ def test_left_and_right_curves_are_mirrored_in_shooters_frame(goal_x, pos_x, gra
     assert (left["trajectory"][50]["y"] - 34) * forward < 0
     assert (right["trajectory"][50]["y"] - 34) * forward > 0
     assert left["distance"] == pytest.approx(right["distance"])
-    assert left["modelVersion"] == 2
+    assert left["modelVersion"] == 3
 
 
 def test_representative_direction_is_voted_within_selected_trajectory_only():
