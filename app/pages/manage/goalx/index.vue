@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { estimateGoalShot, validEstimatedCoordinates, goalxEstimationSheets, type CurveDirection, type ShotType, type EstimatedShot, type EstimatedShotInput, type GoalxExportRecord } from '~/utils/goalx'
+import { calculateGoalxGeometry, estimateGoalShot, validEstimatedCoordinates, goalxEstimationSheets, type CurveDirection, type ShotType, type EstimatedShot, type EstimatedShotInput, type GoalxExportRecord } from '~/utils/goalx'
 type Grade = 'high' | 'medium' | 'low'
 type Category = 'artistry' | 'defense' | 'trajectory'
 type Grades = Record<Category, Grade>
@@ -43,6 +43,7 @@ type RepresentativeProposal = ShotContext & {
   curveDirectionCounts: Record<'high' | 'medium', Partial<Record<CurveDirection, number>>>
   curveDirectionCandidates: Record<'high' | 'medium', CurveDirection[]>
   timeToGoal: number | null; timeSampleCount: number; coordinates: RawCoordinates; goalX: 0 | 105; directionGoalX: 0 | 105 | null; shotId: string | null
+  coordinateSource?: 'evaluations' | 'raw'; coordinateSampleCount?: number
 }
 
 const api = '/api/v1/goalx'
@@ -72,7 +73,6 @@ const rankingColumns: { label: string; sortKey?: RankingSortKey; numeric?: boole
   ...categories.map(({ label, key }) => ({ label, sortKey: key, numeric: true })),
   { label: '분석관 평가 점수', sortKey: 'analystScore', numeric: true },
   { label: '총점', sortKey: 'score', numeric: true },
-  { label: '대표 승인' },
 ]
 const metrics = [
   { key: 'distance', label: '슈팅 거리', unit: 'm' }, { key: 'speed', label: '초기 속도', unit: 'km/h' },
@@ -111,6 +111,13 @@ const loadingRankingRounds = ref(false)
 const participantsDialog = ref<HTMLDialogElement>()
 const participantsGoal = ref<Goal>()
 const canApproveRepresentative = ref(false)
+const bulkDialog = ref<HTMLDialogElement>()
+const bulkTargets = ref<Goal[]>([])
+const bulkApproving = ref(false)
+const bulkProcessed = ref(0)
+const bulkError = ref('')
+const bulkSummary = ref<{ approved: number; skipped: number; failed: number }>()
+const bulkIssues = ref<{ goal: Goal; reason: string }[]>([])
 const representativeDialog = ref<HTMLDialogElement>()
 const representativeGoal = ref<Goal>()
 const representativeProposal = ref<RepresentativeProposal>()
@@ -222,6 +229,7 @@ const shotContext = ref<ShotContext>({})
 const headingHeightValid = computed(() => shotContext.value.shotType !== 'H' || (typeof shotContext.value.playerHeightCm === 'number' && shotContext.value.playerHeightCm >= 100 && shotContext.value.playerHeightCm <= 250))
 const rawGoalX = ref<0 | 105 | null>(null)
 const automaticGoalX = computed(() => rawGoalX.value ?? (typeof estimateDraft.value.posX === 'number' && estimateDraft.value.posX < 50 ? 0 : 105))
+const coordinateMeasurements = computed(() => calculateGoalxGeometry({ ...estimateDraft.value, goalX: automaticGoalX.value }))
 const timerRunning = ref(false)
 const stopwatchElapsed = ref(0)
 const stopwatchDisplay = computed(() => {
@@ -340,7 +348,7 @@ function compareRounds(a: Round, b: Round) {
 }
 function errorMessage(error: unknown) { return error instanceof Error ? error.message : '요청을 처리하지 못했습니다.' }
 function formatMetric(value: number | null | undefined, unit: string) {
-  return value == null ? '—' : value.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) + ' ' + unit
+  return value == null ? '—' : value.toLocaleString('ko-KR', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + ' ' + unit
 }
 function normalize(value: string) { return value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '') }
 
@@ -685,6 +693,43 @@ async function showParticipants(goal: Goal) {
   participantsDialog.value?.showModal()
 }
 
+async function confirmBulkApproval() {
+  if (!canApproveRepresentative.value || bulkApproving.value || !ranking.value.length) return
+  bulkTargets.value = [...ranking.value]
+  bulkProcessed.value = 0
+  await nextTick()
+  bulkDialog.value?.showModal()
+}
+async function approveBulk() {
+  if (bulkApproving.value || !canApproveRepresentative.value || !bulkTargets.value.length) return
+  bulkApproving.value = true
+  bulkError.value = ''
+  bulkIssues.value = []
+  bulkSummary.value = { approved: 0, skipped: 0, failed: 0 }
+  try {
+    for (let offset = 0; offset < bulkTargets.value.length; offset += 10) {
+      const goals = bulkTargets.value.slice(offset, offset + 10)
+      const data = await request<{ results: { gmId: string; side: 'H' | 'A'; recordId: string; status: 'approved' | 'skipped' | 'failed'; analysis?: Analysis; reason?: string }[] }>(api + '/representative/bulk', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ goals: goals.map(({ gmId, side, recordId }) => ({ gmId, side, recordId })) }),
+      })
+      for (const item of data.results) {
+        const goal = goals.find(goal => goal.gmId === item.gmId && goal.side === item.side && goal.recordId === item.recordId)
+        if (!goal) continue
+        bulkSummary.value[item.status]++
+        if (item.status === 'approved' && item.analysis) patchGoal(goal, item.analysis)
+        else bulkIssues.value.push({ goal, reason: item.reason || '처리 결과를 확인해 주세요.' })
+      }
+      bulkProcessed.value += goals.length
+    }
+  } catch (error) {
+    bulkError.value = errorMessage(error) + ' 일부 골은 이미 처리되었을 수 있습니다. 랭킹을 다시 조회해 확인해 주세요.'
+  } finally {
+    bulkApproving.value = false
+    bulkDialog.value?.close()
+  }
+}
+
 async function openRepresentative(goal: Goal) {
   representativeRequest?.abort()
   const controller = new AbortController()
@@ -1021,7 +1066,7 @@ onBeforeUnmount(() => {
             <h3>추정 3D렌더링</h3>
             <p class="muted shot-context">슈팅 유형 <strong>{{ shotContext.shotType || '미확인' }}</strong>
               <template v-if="shotContext.playerHeightCm != null"> · 선수 신장 {{ shotContext.playerHeightCm }}cm</template>
-              <template v-if="shotContext.shotType === 'H' && headingHeightValid"> · 헤딩 출발 {{ ((shotContext.playerHeightCm ?? 0) / 100 + .5).toFixed(2) }}m (점프 0.5m)</template>
+              <template v-if="shotContext.shotType === 'H' && headingHeightValid"> · 헤딩 출발 {{ ((shotContext.playerHeightCm ?? 0) / 100 + .5).toFixed(1) }}m (점프 0.5m)</template>
             </p>
             <p v-if="!headingHeightValid" class="error">선수관리에서 신장을 입력한 후 좌표를 다시 불러와 주세요.</p>
             <fieldset class="time-card" :class="{ 'is-running': timerRunning }" :disabled="!editing || saving || linking">
@@ -1068,6 +1113,11 @@ onBeforeUnmount(() => {
                 </label>
               </div>
               <p class="muted">슈팅 X·Y: 경기장 0–100%. 골문 결과 X: 83–464, Y: 83(상단)–300(지면).</p>
+              <dl class="measurements" aria-label="좌표 계산 데이터">
+                <div><dt>골라인 통과 높이</dt><dd>{{ formatMetric(coordinateMeasurements.height, 'm') }}</dd></div>
+                <div><dt>발사각</dt><dd>{{ formatMetric(coordinateMeasurements.launchAngle, '°') }}</dd></div>
+              </dl>
+              <p class="muted">JAIONX AI가 계산한 데이터입니다. 높이는 지면 기준이며, 발사각은 골대 중앙 방향과 실제 골라인 통과 방향 사이의 평면 각도입니다.</p>
             </fieldset>
             <p v-if="!estimatedCoordinatesValid && hasEstimateCoordinates" class="error">좌표를 범위 안에서 모두 입력해 주세요.</p>
             <p class="muted">{{ draft.trajectory ? trajectoryLabels[draft.trajectory] : '궤적 유형 미선택' }} · 평가 기반 추정 궤적</p>
@@ -1134,7 +1184,14 @@ onBeforeUnmount(() => {
     </section>
 
     <section v-if="tab === 'ranking'" class="detail ranking">
-      <header class="detail-header"><h2>골 랭킹</h2><span v-if="rankingResult">{{ ranking.length }}골 · {{ rankingResult.maxScore }}점 만점</span></header>
+      <header class="detail-header"><h2>골 랭킹</h2><span v-if="rankingResult">{{ ranking.length }}골 · {{ rankingResult.maxScore }}점 만점</span>
+        <button v-if="canApproveRepresentative" type="button" class="primary" :disabled="loadingRanking || bulkApproving || !ranking.length" aria-haspopup="dialog" @click="confirmBulkApproval">일괄 처리</button>
+      </header>
+      <p v-if="bulkSummary" class="notice" role="status">일괄 처리 결과 · 승인 {{ bulkSummary.approved }}건 · 제외 {{ bulkSummary.skipped }}건 · 오류 {{ bulkSummary.failed }}건</p>
+      <p v-if="bulkError" class="error" role="alert">{{ bulkError }}</p>
+      <ul v-if="bulkIssues.length" class="bulk-issues"><li v-for="item in bulkIssues" :key="keyOf(item.goal)">
+        <button type="button" class="text-button" @click="openRepresentative(item.goal)">{{ item.goal.playerName || '득점자 미기록' }} · {{ item.goal.clock }} 검토</button> — {{ item.reason }}
+      </li></ul>
       <p v-if="rankingRoundsError" class="error" role="alert">{{ rankingRoundsError }}</p>
       <p v-if="rankingError" class="error" role="alert">{{ rankingError }}</p>
       <p v-else-if="loadingRanking" class="muted" role="status">랭킹을 불러오는 중…</p>
@@ -1173,21 +1230,23 @@ onBeforeUnmount(() => {
               <td>{{ formatMetric(goal.ratingMetrics?.averageSpeed, 'km/h') }}</td>
               <td><button type="button" class="text-button participants-button" aria-haspopup="dialog" @click="showParticipants(goal)">{{ goal.evaluationCount }}명</button></td>
               <td v-for="category in categories" :key="category.key" class="ranking-score">
-                {{ goal.analystCategoryScores?.[category.key]?.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) ?? '—' }}
+                {{ goal.analystCategoryScores?.[category.key]?.toLocaleString('ko-KR', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) ?? '—' }}
               </td>
-              <td class="ranking-score">{{ goal.analystScore?.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) ?? '—' }}</td>
-              <td class="ranking-score"><strong>{{ goal.score == null ? '—' : goal.score.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) }}</strong></td>
-              <td>
-                <button type="button" class="representative-button" :class="{ approved: goal.representative?.status === 'approved' }" :disabled="!canApproveRepresentative" aria-haspopup="dialog"
-                  :title="canApproveRepresentative ? '대표 분석 검토 및 확정' : '관리자만 대표 분석을 승인할 수 있습니다.'" @click="openRepresentative(goal)">
-                  {{ goal.representative?.status === 'approved' ? '✓ 승인 완료' : goal.representative?.status === 'needs_review' ? '재검토 필요' : '대표 승인' }}
-                </button>
-              </td>
+              <td class="ranking-score">{{ goal.analystScore?.toLocaleString('ko-KR', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) ?? '—' }}</td>
+              <td class="ranking-score"><strong>{{ goal.score == null ? '—' : goal.score.toLocaleString('ko-KR', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) }}</strong></td>
             </tr>
           </tbody>
         </table>
       </div>
     </section>
+    <dialog ref="bulkDialog" class="representative-dialog" aria-labelledby="bulk-approval-title" @cancel="bulkApproving && $event.preventDefault()">
+      <h2 id="bulk-approval-title">대표 승인 일괄 처리</h2>
+      <p>현재 조회 목록의 {{ bulkTargets.length }}골을 최신 저장 평가·좌표로 대표 승인합니다. 이미 승인된 골도 최신 값으로 다시 검토합니다.</p>
+      <p>좌표·시간·평점이 부족하거나 궤적·커브 방향이 동률인 골은 제외하고 사유를 표시합니다. 처리하시겠습니까?</p>
+      <p v-if="bulkApproving" role="status">처리 중… {{ bulkProcessed }} / {{ bulkTargets.length }}골</p>
+      <div class="form-actions"><button type="button" class="quiet" :disabled="bulkApproving" @click="bulkDialog?.close()">취소</button>
+        <button type="button" class="primary" :disabled="bulkApproving" @click="approveBulk">{{ bulkApproving ? '처리 중…' : '확인하고 처리' }}</button></div>
+    </dialog>
     <LazyGoalxTestGoalEditor v-if="testEditor" :initial="testEditor" @close="testEditor = undefined" @saved="afterTestGoalSave" />
     <dialog ref="representativeDialog" class="representative-dialog" aria-labelledby="representative-title" @close="closeRepresentative"
       @cancel="approvingRepresentative && $event.preventDefault()">
@@ -1224,10 +1283,15 @@ onBeforeUnmount(() => {
               </label></div>
             </fieldset>
             <fieldset :disabled="approvingRepresentative" class="representative-field">
-              <legend>대표 좌표 확인</legend><p class="muted">RAW 좌표를 기본으로 사용합니다. 필요한 경우 수정 후 확정하세요.</p>
+              <legend>대표 좌표 확인</legend><p class="muted">{{ representativeProposal.coordinateSource === 'evaluations' ? `분석에서 저장한 좌표를 자동 반영했습니다. 분석관 ${representativeProposal.coordinateSampleCount}명의 항목별 중앙값입니다.` : '저장된 분석 좌표가 없어 RAW 좌표를 사용합니다.' }} 필요한 경우 수정 후 확정하세요.</p>
               <div class="coordinate-inputs"><label v-for="field in coordinateFields" :key="field.key">{{ field.label }}
                 <input v-model.number="representativeCoordinates[field.key]" type="number" :min="field.min" :max="field.max" step="any" placeholder="좌표 없음">
               </label></div>
+              <dl class="measurements" aria-label="대표 좌표 계산 데이터">
+                <div><dt>골라인 통과 높이</dt><dd>{{ formatMetric(calculateGoalxGeometry({ ...representativeCoordinates, goalX: representativeProposal.directionGoalX }).height, 'm') }}</dd></div>
+                <div><dt>발사각</dt><dd>{{ formatMetric(calculateGoalxGeometry({ ...representativeCoordinates, goalX: representativeProposal.directionGoalX }).launchAngle, '°') }}</dd></div>
+              </dl>
+              <p class="muted">JAIONX AI가 계산한 데이터 · 발사각은 골대 중앙 방향 대비 평면 각도</p>
               <p v-if="representativeHasCoordinates && !representativeCoordinatesValid" class="error">좌표를 범위 안에서 모두 입력해 주세요.</p>
             </fieldset>
             <template v-if="representativeEstimate">

@@ -46,6 +46,13 @@ TESTGOAL은 대회 `TESTGOAL`, 시즌 `test`로 전송한다. 쓰기 활성화 �
 
 ### 평가 리빌드·FORCE — 2026-11-25 (v3)
 
+대표 승인 제안 좌표는 분석에서 저장한 유효한 전체 좌표를 우선 사용한다. 한 명이면 그대로,
+여러 명이면 각 좌표의 중앙값을 사용하며 유효한 좌표 표본이 없을 때만 RAW로 대체한다.
+평가 좌표 수정은 승인 제안과 버전 검사에 반영되며 기존 승인 결과를 자동 덮어쓰지 않는다.
+랭킹의 `일괄 처리`는 확인 창에 동의한 뒤 현재 필터에 표시된 골만 관리자 권한으로 승인한다.
+좌표·시간·평점 누락, 헤딩 신장 누락, 궤적/방향 동률, 검토 중 원본 변경은 제외하고 사유를 표시한다.
+각 승인에 기존 트랜잭션 버전 검사를 적용하며 분석관 평가·RAW 및 외부 전송은 변경하지 않는다.
+
 공식 기준은 `backend/system/system_goalx.py`의 상수와 `goal_rating()`만 사용한다.
 `GoalAalysis/_settings.goalxRatingRules`는 코드 기준의 관리용 사본이다. `원본 출처`에 파일·함수,
 `version`과 `rulesHash`에 적용 버전/해시를 남기며 이 문서를 수정해도 공식 계산에는 반영하지 않는다.
@@ -88,7 +95,15 @@ TESTGOAL의 내부 H 고정 저장값과 실제 득점 팀의 H/A는 구분하�
 좌표 불러오기는 RAW act(S/R/H)와 DID players.height(cm)를 함께 반환한다. 평가 저장 시 서버가
 이 원본 값으로 클라이언트의 메타데이터를 검증·덮어쓴다. S/R은 기존 지면 출발, H는 신장/100 + 0.5m에서 출발한다.
 신장이 없는 H는 계산·저장 안내 오류를 반환하며 임의의 키를 사용하지 않는다. 추정 모델 버전은 3이다.
-`shotType`, `playerHeightCm`, `jumpHeightM`, `startHeightM`을 평가 입력·대표 궤적·goalx schemaVersion=3에 보존한다.
+`shotType`, `playerHeightCm`, `jumpHeightM`, `startHeightM`을 평가 입력·대표 궤적·goalx schemaVersion=4에 보존한다.
+추가 계산 데이터는 승인된 대표 좌표에서 DID가 계산해 `metrics.height`, `metrics.launchAngle`로 전송한다.
+높이(m)는 `(300 - shootPosY) / 217 * 2.44`이며 Y=83은 크로스바(2.44m), Y=300은 지면(0m)이다.
+발사각(도)은 슈팅 지점에서 골대 중앙으로 향하는 벡터와 실제 골라인 통과점으로 향하는 벡터의 평면 각도다.
+수직 초기 발사각이 아니며 `metrics.angleReference=goal_center_horizontal`, `metrics.calculationVersion=goalx-geometry-v1`로 구분한다.
+거리·속도의 기존 총점 계산은 변경하지 않는다. 유효한 기존 대표 승인은 재승인 없이 좌표에서 추가값을 계산해 전송한다.
+배포 후 DID GOALX 평가 리빌드 → GOALX SEND(force=true) → FootballX GOALX 페이지 리빌드 순서로 반영한다.
+FootballX 공개 응답·화면·전광판·해설에는 총점과 거리/높이/발사각/속도만 제공하며 항목별 점수·단계·기준과 이전 평가 해설은 제외한다.
+화면 문구는 “총점에는 예술성·수비 환경·궤적 항목 평가 반영”, “거리·높이·발사각·속도는 JAIONX AI가 계산한 데이터입니다.”로 통일한다.
 기존 H는 평가를 다시 저장하고 관리자가 대표 승인해야 새 높이가 전송된다. 평점 리빌드는 대표 승인을 변경하지 않는다.
 
 그래픽은 승인된 `trajectory`, `renderInput`, `goalPoint`, `goalX`, `flightTime`, `trajectoryType`,

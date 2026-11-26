@@ -8,14 +8,15 @@ from unittest.mock import Mock
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from backend.api import api_goalx, api_player_requests
 from backend.system.system_firestore import BackendError, CurrentUser
 from backend.system.system_goalx import (
-    EstimatedShotInput, automatic_goal_x, estimate_shot,
+    EstimatedShotInput, automatic_goal_x, coordinate_geometry, estimate_shot,
     EvaluationInput, GoalAnalysis, Grades, POINTS,
-    RepresentativeApproval, representative_proposal, finalize_representative,
+    RepresentativeApproval, representative_proposal, finalize_representative, automatic_representative_approval,
 )
 
 
@@ -48,7 +49,7 @@ def test_raw_coordinates_reads_the_selected_record_without_shotx():
                    "shootPosX": 211, "shootPosY": 275}
     service._read_goal = Mock(return_value={"res": "GOAL", **coordinates})
     service._recording_direction = Mock(return_value={})
-    assert service.raw_coordinates("match", "A", "goal") == {**coordinates, "goalX": None, "shotType": None, "playerHeightCm": None, "jumpHeightM": 0, "startHeightM": 0}
+    assert service.raw_coordinates("match", "A", "goal") == {**coordinates, "goalX": None, "shotType": None, "playerHeightCm": None, "jumpHeightM": 0, "startHeightM": 0, **coordinate_geometry(coordinates)}
     service._read_goal.assert_called_once_with("match", "A", "goal")
 
 
@@ -57,6 +58,61 @@ def test_raw_coordinates_reads_the_selected_record_without_shotx():
 def test_invalid_estimation_rejected(changes):
     with pytest.raises(ValidationError):
         EstimatedShotInput(**shot_input(**changes))
+
+
+@pytest.mark.parametrize("result_y,expected", [(83, 2.44), (191.5, 1.22), (300, 0)])
+def test_calculated_height_reverses_goal_result_y(result_y, expected):
+    assert coordinate_geometry(shot_input(shootPosY=result_y))["height"] == pytest.approx(expected)
+
+
+def test_horizontal_launch_angle_is_symmetric_and_not_elevation():
+    from math import atan2, degrees
+    expected = degrees(atan2(3.66, 21))
+    for goal_x, pos_x in ((105, 80), (0, 20)):
+        assert coordinate_geometry(shot_input(goalX=goal_x, posX=pos_x))["launchAngle"] == pytest.approx(0)
+        for result_x in (83, 464):
+            geometry = coordinate_geometry(shot_input(goalX=goal_x, posX=pos_x, shootPosX=result_x, shootPosY=83))
+            assert geometry["launchAngle"] == pytest.approx(expected)
+            assert geometry["height"] == pytest.approx(2.44)
+
+
+def test_invalid_or_degenerate_coordinates_do_not_fabricate_angle():
+    assert coordinate_geometry(shot_input(posX=100, goalX=105))["launchAngle"] is None
+    assert coordinate_geometry({"shootPosY": 83})["height"] == pytest.approx(2.44)
+    assert coordinate_geometry({"shootPosY": float("nan")})["height"] is None
+
+
+def test_delivery_adds_geometry_from_existing_approved_coordinates_without_reapproval():
+    from backend.system import system_goalx
+    record = {**shot_input(shootPosY=83), "date": "2026-11-21", "clock": "12:34",
+              "playerName": "Example Player", "playerNameEn": "Example Player",
+              "home": "Home", "away": "Away", "homeNameEn": "Home FC", "awayNameEn": "Away FC", "scoringSide": "H"}
+    analysis = {"gmId": "testgoal-a", "side": "H", "recordId": "goal", "manualGoal": record,
+                "evaluations": {"analyst": {"grades": {"artistry": "high", "defense": "medium", "trajectory": "low"},
+                                                "estimatedShot": {"input": shot_input(shootPosY=83)}}}}
+    proposal = representative_proposal(analysis, record, {}, POINTS)
+    payload = RepresentativeApproval(sourceVersion=proposal["sourceVersion"], trajectory="low", coordinates=shot_input(shootPosY=83))
+    analysis["representative"] = finalize_representative(analysis, record, {}, POINTS, payload)
+    analysis["representative"]["points"] = POINTS.copy()
+    # Simulate an approval saved before the derived geometry fields existed.
+    for key in ("height", "launchAngle", "calculationVersion", "angleReference"):
+        analysis["representative"]["estimatedShot"].pop(key, None)
+    analysis["rating"] = system_goalx.goal_rating(analysis)
+    approval_before = deepcopy(analysis["representative"])
+    docs = {"GoalAalysis/_settings": {}, "GoalAalysis/TESTGOAL/seasons/test/goals/manual-one": analysis}
+    class Ref:
+        def __init__(self, path): self.path = path
+        def get(self, **kwargs):
+            return SimpleNamespace(exists=self.path in docs, to_dict=lambda: deepcopy(docs.get(self.path)))
+    source = SimpleNamespace(did=SimpleNamespace(document=Ref), target=object(), documents={}, queries=[], version=lambda snap: "v1")
+    source.rows = lambda client, path, *args, **kwargs: [{"id": "manual-one", "data": analysis}] if path == "GoalAalysis/TESTGOAL/seasons/test/goals" else []
+    report, _ = system_goalx.capture_goalx_delivery(source, {"seasonId": "test", "leagueId": "TESTGOAL", "mode": "goalx", "force": True})
+    assert report["validation_passed"], report["errors"]
+    data = report["documents"][0]["data"]
+    assert data["schemaVersion"] == 4
+    assert data["metrics"]["height"] == pytest.approx(2.44)
+    assert data["metrics"]["launchAngle"] == pytest.approx(0)
+    assert analysis["representative"] == approval_before
 
 
 def test_save_persists_per_analyst_estimation_and_preserves_three_grade_categories():
@@ -137,6 +193,8 @@ process.stdout.write(JSON.stringify(['high', 'medium', 'low'].map(grade => modul
         expected = estimate_shot(EstimatedShotInput(**actual["input"]), grade)
         assert actual["distance"] == pytest.approx(expected["distance"], abs=1e-10)
         assert actual["averageSpeed"] == pytest.approx(expected["averageSpeed"], abs=1e-10)
+        assert actual["height"] == pytest.approx(expected["height"], abs=1e-10)
+        assert actual["launchAngle"] == pytest.approx(expected["launchAngle"], abs=1e-10)
         for a, b in zip(actual["trajectory"], expected["trajectory"]):
             assert a == pytest.approx(b, abs=1e-10)
 
@@ -314,3 +372,78 @@ def test_representative_direction_is_voted_within_selected_trajectory_only():
     result = finalize_representative(*source, approval(source, curveDirection="right"))
     assert result["curveDirection"] == "right"
     assert result["estimatedShot"]["input"]["curveDirection"] == "right"
+
+
+def _bulk_approval_source():
+    saved={'posX':75,'posY':48,'shootPosX':300,'shootPosY':250,'goalX':105,'timeToGoal':.8}
+    analysis={'evaluations':{'one':{'grades':{'artistry':'high','defense':'high','trajectory':'low'},'estimatedShot':{'input':saved}}}}
+    raw={'half':'H1','act':'S','posX':80,'posY':50,'shootPosX':273.5,'shootPosY':300}
+    return analysis,raw,{'fieldSide':'left'},POINTS
+
+
+def test_saved_analysis_coordinates_replace_raw_in_approval_and_version():
+    values=_bulk_approval_source();proposal=representative_proposal(*values)
+    assert proposal['coordinateSource']=='evaluations' and proposal['coordinateSampleCount']==1
+    assert proposal['coordinates']=={'posX':75,'posY':48,'shootPosX':300,'shootPosY':250}
+    payload=automatic_representative_approval(proposal)
+    result=finalize_representative(*values,payload)
+    assert result['estimatedShot']['input']['posX']==75
+    assert values[1]['posX']==80
+    values[0]['evaluations']['one']['estimatedShot']['input']['posX']=70
+    assert representative_proposal(*values)['coordinates']['posX']==70
+    with pytest.raises(BackendError,match='변경'):
+        finalize_representative(*values,payload)
+
+
+def test_approval_coordinates_use_complete_valid_analyst_samples_and_medians():
+    values=_bulk_approval_source();entries=values[0]['evaluations']
+    entries['two']=deepcopy(entries['one']);entries['two']['estimatedShot']['input'].update(posX=65,posY=44,shootPosX=320,shootPosY=200)
+    entries['bad']=deepcopy(entries['one']);entries['bad']['estimatedShot']['input']['posX']=-1
+    entries['partial']=deepcopy(entries['one']);del entries['partial']['estimatedShot']['input']['shootPosX']
+    proposal=representative_proposal(*values)
+    assert proposal['coordinateSampleCount']==2
+    assert proposal['coordinates']=={'posX':70,'posY':46,'shootPosX':310,'shootPosY':225}
+    for entry in entries.values():entry['estimatedShot']['input']={'timeToGoal':.8}
+    proposal=representative_proposal(*values)
+    assert proposal['coordinateSource']=='raw' and proposal['coordinateSampleCount']==0
+    assert proposal['coordinates']['posX']==80
+
+
+@pytest.mark.parametrize('change', [
+    {'score':None}, {'timeToGoal':None}, {'trajectoryCandidates':['high','low']},
+    {'trajectoryCandidates':['medium'],'curveDirectionCandidates':{'medium':['left','right']}},
+    {'coordinates':{'posX':-1}}, {'shotType':'H','playerHeightCm':None},
+])
+def test_bulk_skips_missing_invalid_or_ambiguous_proposals(change):
+    proposal=representative_proposal(*_bulk_approval_source());proposal.update(change)
+    with pytest.raises(BackendError):automatic_representative_approval(proposal)
+
+
+def test_bulk_isolated_results_deduplicates_and_continues_after_invalid_and_errors():
+    service=GoalAnalysis.__new__(GoalAnalysis)
+    good=representative_proposal(*_bulk_approval_source());bad={**good,'coordinates':{'posX':-1}}
+    service.representative_preview=Mock(side_effect=[good,bad,good,good])
+    service.approve_representative=Mock(side_effect=[{'representative':{'status':'approved'}},BackendError('검토 중 변경',409,'changed'),RuntimeError('secret')])
+    keys=[{'gmId':'match','side':'H','recordId':str(i)} for i in range(4)]
+    result=service.approve_representatives([keys[0],keys[0],*keys[1:]],CurrentUser(uid='manager',claims={'email':'jpdindex@gmail.com'}))
+    assert (result['total'],result['approved'],result['skipped'],result['failed'])==(4,1,2,1)
+    assert service.approve_representative.call_count==3
+    assert 'secret' not in str(result)
+    assert result['results'][2]['reason']=='검토 중 변경'
+
+
+def test_bulk_api_requires_manager_and_valid_bounded_goal_list(monkeypatch):
+    app=FastAPI();app.include_router(api_goalx.router)
+    app.add_exception_handler(BackendError,lambda request,exc:JSONResponse({'error':exc.message},status_code=exc.status_code))
+    service=Mock();service.approve_representatives.return_value={'results':[]}
+    monkeypatch.setattr(api_goalx,'GoalAnalysis',lambda:service)
+    app.dependency_overrides[api_player_requests.verified_user]=lambda:CurrentUser(uid='analyst',claims={'email':'analyst@example.com'})
+    client=TestClient(app);path='/goalx/representative/bulk';goal={'gmId':'match','side':'H','recordId':'goal'}
+    assert client.post(path,json={'goals':[goal]}).status_code==403
+    service.approve_representatives.assert_not_called()
+    app.dependency_overrides[api_player_requests.verified_user]=lambda:CurrentUser(uid='manager',claims={'email':'jpdindex@gmail.com'})
+    assert client.post(path,json={'goals':[]}).status_code==422
+    assert client.post(path,json={'goals':[goal]*101}).status_code==422
+    assert client.post(path,json={'goals':[{**goal,'gmId':'bad/path'}]}).status_code==422
+    assert client.post(path,json={'goals':[goal]}).status_code==200
+    service.approve_representatives.assert_called_once()

@@ -3,7 +3,7 @@ from time import monotonic
 from typing import Annotated
 
 from fastapi import APIRouter, Path, Query
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from backend.api.api_player_requests import User, ManagerUser
 from backend.system.system_player_requests import is_manager
@@ -18,6 +18,23 @@ GoalId = Annotated[str, Path(min_length=1, max_length=500, pattern=r"^[^/]+$")]
 class ShotLink(BaseModel):
     model_config = ConfigDict(extra="forbid")
     shotId: DocumentId | None
+
+
+class RepresentativeGoalKey(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    gmId: DocumentId
+    side: Side
+    recordId: DocumentId
+
+
+class BulkRepresentativeApproval(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    goals: list[RepresentativeGoalKey] = Field(min_length=1, max_length=100)
+
+
+@router.post("/representative/bulk")
+def approve_representatives(payload: BulkRepresentativeApproval, user: ManagerUser):
+    return GoalAnalysis().approve_representatives([goal.model_dump() for goal in payload.goals], user)
 
 @lru_cache(maxsize=1)
 def goal_analysis():

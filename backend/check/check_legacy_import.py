@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 from backend.build import build_legacy_import as legacy
+
+
 from backend.build.build_legacy_import import (
     BuildLegacyImport,
     COMPETITION_TYPES,
@@ -29,6 +31,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from backend.system.system_kpi_rules import KpiRecord, calculate_kpis
+
+@pytest.mark.parametrize('x,y,px,py,expected', [
+    (-3, 287, .512618, .0391753, (19, 309)),
+    (-2, 591, .033123, .0412371, (20, 613)),
+    (883, 288, .488959, .135802, (905, 310)),
+    (463, 175, .310726, 1, (485, 197)),
+    (0, 0, None, None, (0, 0)),
+    (-3, 287, None, None, (-3, 287)),
+    (22, 266, .545741, .0453608, (22, 266)),
+    (19, 309, .512618, .0391753, (19, 309)),
+])
+def test_legacy_marker_center_requires_independent_evidence(x, y, px, py, expected):
+    assert legacy.legacy_pitch_coordinates({'gr_pos_x': x, 'gr_pos_y': y,
+                                           'gr_part_pos_x': px, 'gr_part_pos_y': py}) == expected
+
+
+def test_legacy_marker_coordinates_preserve_missing_axes():
+    assert legacy.legacy_pitch_coordinates({'gr_pos_x': None, 'gr_pos_y': 287}) == (None, 287)
+
 
 def test_legacy_contract_dates_use_one_identity_format() -> None:
     assert normalize_legacy_date("2020.07.31") == "2020-07-31"

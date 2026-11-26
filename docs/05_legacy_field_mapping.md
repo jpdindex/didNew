@@ -130,7 +130,7 @@
 | `gr_area_code` | `area` | 이름변경 |
 | `gr_act_code` | `act` | 이름변경 |
 | `gr_res_code` | `res` | 이름변경 — `GB`/`GX`/`GOAL` 신 코드 |
-| `gr_pos_x` / `gr_pos_y` | `posX` / `posY` | 이름변경 + **단위 변환** — 971×634 픽셀 → 0~100%. `posX = gr_pos_x/971*100` |
+| `gr_pos_x` / `gr_pos_y` | `posX` / `posY` | 이름변경 + **단위 변환** — 971×634 픽셀 → %. 부분좌표로 44px 볼 마커 모서리 저장이 입증되면 X·Y에 22px을 더해 중심으로 변환. 근거가 없으면 원본을 유지하며 필드 밖 좌표를 임의 제한하지 않음 |
 | `gr_shoot_pos_x/y` | `shootPosX` / `shootPosY` | 이름변경 |
 | `gr_regdt` | `createdAt` | 이름변경 |
 | `gt_id` | — | **삭제(계산)** — export 시 `computeAttackPaths()`가 채움 |

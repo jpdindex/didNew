@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import date, timedelta
 from functools import lru_cache
 from hashlib import sha256
-from math import dist, isfinite
+from math import atan2, degrees, dist, hypot, isfinite
 from pathlib import Path
 from statistics import median
 from typing import Literal
@@ -62,7 +62,8 @@ def rating_rules():
              "authority": "code_only"}
     rules["rulesHash"] = fingerprint({"rules": rules, "calculation": inspect.getsource(goal_rating),
                                       "estimation": inspect.getsource(estimate_shot), "inputModel": inspect.getsource(EstimatedShotInput),
-                                      "shotContext": inspect.getsource(shot_context)})
+                                      "shotContext": inspect.getsource(shot_context),
+                                      "geometry": inspect.getsource(coordinate_geometry)})
     return rules
 
 
@@ -170,6 +171,24 @@ class EstimatedShotInput(BaseModel):
         return self
 
 
+def coordinate_geometry(value):
+    """Goal-line height and horizontal deviation from the goal-center direction."""
+    values = {key: number(value.get(key)) for key in ("posX", "posY", "shootPosX", "shootPosY", "goalX")}
+    y = values["shootPosY"]
+    height = (300 - y) / 217 * 2.44 if y is not None and 83 <= y <= 300 else None
+    angle = None
+    if all(values[key] is not None and lo <= values[key] <= hi for key, lo, hi in
+           (("posX", 0, 100), ("posY", 0, 100), ("shootPosX", 83, 464))):
+        goal_x = values["goalX"] if values["goalX"] in (0, 105) else (0 if values["posX"] < 50 else 105)
+        dx = goal_x - values["posX"] * 1.05
+        center_y = 34 - values["posY"] * .68
+        crossing_y = center_y + (values["shootPosX"] - 83) / 381 * 7.32 - 3.66
+        if hypot(dx, center_y) > 1e-9 and hypot(dx, crossing_y) > 1e-9:
+            angle = degrees(atan2(abs(dx * crossing_y - center_y * dx), dx * dx + center_y * crossing_y))
+    return {"height": height, "launchAngle": angle,
+            "calculationVersion": "goalx-geometry-v1", "angleReference": "goal_center_horizontal"}
+
+
 def estimate_shot(value: EstimatedShotInput, grade: str):
     start = (value.posX * 1.05, value.posY * .68, value.startHeightM)
     end = (value.goalX, 34 + (value.shootPosX - 83) / 381 * 7.32 - 3.66,
@@ -192,7 +211,8 @@ def estimate_shot(value: EstimatedShotInput, grade: str):
     length = sum(dist(tuple(a.values()), tuple(b.values())) for a, b in zip(points, points[1:]))
     return {"input": value.model_dump(), "modelVersion": 3, "trajectoryGrade": grade,
             "curveWeight": weight, "trajectory": points, "goalPoint": points[-1],
-            "distance": length, "averageSpeed": length / value.timeToGoal * 3.6 if value.timeToGoal else None}
+            "distance": length, "averageSpeed": length / value.timeToGoal * 3.6 if value.timeToGoal else None,
+            **coordinate_geometry(value.model_dump())}
 
 
 class RepresentativeApproval(BaseModel):
@@ -241,7 +261,14 @@ def representative_proposal(analysis, record, recording, points):
         value = ((entry.get("estimatedShot") or {}).get("input") or {}).get("timeToGoal")
         if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= 600:
             times.append(value)
-    coordinates = {key: record.get(key) for key in ("posX", "posY", "shootPosX", "shootPosY")}
+    fields = {"posX": (0, 100), "posY": (0, 100), "shootPosX": (83, 464), "shootPosY": (83, 300)}
+    samples = []
+    for entry in evaluations.values():
+        saved = (entry.get("estimatedShot") or {}).get("input") or {}
+        if all(number(saved.get(key)) is not None and low <= saved[key] <= high for key, (low, high) in fields.items()):
+            samples.append(saved)
+    coordinates = ({key: median(sample[key] for sample in samples) for key in fields} if samples
+                   else {key: record.get(key) for key in fields})
     goal_x = automatic_goal_x(record, recording, coordinates["posX"])
     direction_side = recording.get("fieldSideEx" if record.get("half") in ("H3", "H4") else "fieldSide")
     direction_known = direction_side in ("left", "right") and record.get("half") in ("H1", "H2", "H3", "H4")
@@ -252,8 +279,38 @@ def representative_proposal(analysis, record, recording, points):
             "trajectoryCandidates": modes, "timeToGoal": median(times) if times else None,
             "curveDirectionCounts": direction_counts, "curveDirectionCandidates": direction_candidates,
             "timeSampleCount": len(times), "coordinates": coordinates, "goalX": goal_x,
+            "coordinateSource": "evaluations" if samples else "raw", "coordinateSampleCount": len(samples),
             "directionGoalX": goal_x if direction_known else None, **shot_context(record, analysis=analysis),
             "shotId": (analysis.get("shotx") or {}).get("id")}
+
+
+def automatic_representative_approval(proposal):
+    """Only approve complete, unambiguous proposals; preserve manual decisions."""
+    if number(proposal.get("score")) is None or number(proposal.get("timeToGoal")) is None:
+        raise BackendError("평점 또는 골라인 통과 소요시간이 없습니다.", 422, "goalx_bulk_incomplete")
+    candidates = proposal.get("trajectoryCandidates") or []
+    if len(candidates) != 1:
+        raise BackendError("궤적 유형이 동률이라 직접 검토가 필요합니다.", 422, "goalx_bulk_trajectory_tie")
+    grade = candidates[0]
+    direction = None
+    if grade != "low":
+        directions = (proposal.get("curveDirectionCandidates") or {}).get(grade) or []
+        if len(directions) != 1:
+            raise BackendError("커브 방향이 동률이거나 누락되어 직접 검토가 필요합니다.", 422, "goalx_bulk_direction_tie")
+        direction = directions[0]
+    if proposal.get("shotType") == "H" and proposal.get("playerHeightCm") is None:
+        raise BackendError("헤딩 선수의 신장이 없습니다.", 422, "goalx_heading_height_missing")
+    try:
+        coordinates = EstimatedShotInput.model_validate({**proposal["coordinates"], "goalX": proposal["goalX"],
+            "timeToGoal": proposal["timeToGoal"], "curveDirection": direction,
+            **{key: proposal.get(key) for key in ("shotType", "playerHeightCm", "startHeightM")},
+            "jumpHeightM": proposal.get("jumpHeightM", 0)})
+    except (ValueError, KeyError):
+        raise BackendError("슈팅·골문 좌표가 누락되었거나 유효 범위를 벗어났습니다.", 422, "goalx_bulk_coordinates_invalid") from None
+    if estimate_shot(coordinates, grade)["distance"] <= 0:
+        raise BackendError("유효한 슈팅 거리를 계산할 수 없습니다.", 422, "goalx_bulk_distance_invalid")
+    return RepresentativeApproval(sourceVersion=proposal["sourceVersion"], trajectory=grade,
+                                  curveDirection=direction, coordinates=coordinates)
 
 
 def finalize_representative(analysis, record, recording, points, payload):
@@ -511,7 +568,11 @@ def capture_goalx_delivery(source, scope):
             errors.append(f"{mid}/{rid}: 영문명 누락: {', '.join(missing_names)}. DID 선수·팀 관리의 nameFull(영문 전체 이름) 또는 선수 nameEn을 보완한 뒤 GOALX SEND force=true를 실행하세요. 재평가·대표 재승인은 필요 없습니다.")
             continue
         seen.add(ident)
-        data = {'schemaVersion': 3, **metadata, 'identitySource': 'did_master', 'identityVersion': 1, 'ratingVersion': RATING_VERSION,
+        geometry = coordinate_geometry(shot.get('input') or {})
+        if geometry['height'] is None or geometry['launchAngle'] is None:
+            errors.append(f'{mid}/{rid}: 승인된 슈팅·골문 좌표에서 높이/발사각을 계산할 수 없습니다. 대표 좌표를 확인하세요.')
+            continue
+        data = {'schemaVersion': 4, **metadata, 'identitySource': 'did_master', 'identityVersion': 1, 'ratingVersion': RATING_VERSION,
                 'ratingRulesHash': rating['ratingRulesHash'], 'ratingSourceVersion': rating['ratingSourceVersion'], 'status': 'published',
                 'PlSeason': season, 'leagueId': league, 'gm_id': mid, 'gm_round': match['round'],
                 'H-A': side_out, 'team_type': 'HOME' if side_out == 'H' else 'AWAY',
@@ -526,7 +587,7 @@ def capture_goalx_delivery(source, scope):
                 'score': rating['score'], 'categoryScores': rating['ratingComponents'],
                 'categoryStages': rating['categoryStages'], 'categoryMaxScores': rating['categoryMaxScores'], 'categoryStageCounts': rating['categoryStageCounts'],
                 'analystScore': rating['analystScore'], 'analystCategoryScores': rating['analystCategoryScores'],
-                'metrics': rating['ratingMetrics'], 'trajectory': trajectory,
+                'metrics': {**rating['ratingMetrics'], **geometry}, 'trajectory': trajectory,
                 'goalPoint': shot.get('goalPoint'), 'goalX': (shot.get('input') or {}).get('goalX'),
                 'renderInput': shot.get('input'), 'trajectoryType': representative.get('trajectory'),
                 'flightTime': (shot.get('input') or {}).get('timeToGoal'),
@@ -784,6 +845,7 @@ class GoalAnalysis:
             and record.get("half") in ("H1", "H2", "H3", "H4")
         ) else None
         coordinates.update(self._shot_context(record))
+        coordinates.update(coordinate_geometry(coordinates))
         return coordinates
 
     def _shot_context(self, record):
@@ -1082,6 +1144,27 @@ class GoalAnalysis:
     def representative_preview(self, gm_id, side, record_id):
         ref = self._ref(gm_id, side, record_id)
         return representative_proposal(*self._representative_source(gm_id, side, record_id, ref))
+
+    def approve_representatives(self, goals, user):
+        from backend.system.system_player_requests import require_manager
+        require_manager(user)
+        results, seen = [], set()
+        for goal in goals:
+            key = (goal["gmId"], goal["side"], goal["recordId"])
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                proposal = self.representative_preview(*key)
+                payload = automatic_representative_approval(proposal)
+                analysis = self.approve_representative(*key, user, payload)
+                results.append({**goal, "status": "approved", "analysis": analysis})
+            except BackendError as exc:
+                results.append({**goal, "status": "skipped", "reason": exc.message})
+            except Exception:
+                results.append({**goal, "status": "failed", "reason": "처리 중 오류가 발생했습니다. 다시 조회한 후 확인해 주세요."})
+        return {"total": len(results), **{state: sum(row["status"] == state for row in results)
+                for state in ("approved", "skipped", "failed")}, "results": results}
 
     def approve_representative(self, gm_id, side, record_id, user, payload):
         from backend.system.system_player_requests import require_manager

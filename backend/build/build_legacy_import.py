@@ -6,6 +6,7 @@ import argparse
 import re
 import time
 import logging
+import math
 import pickle
 import sqlite3
 from collections import Counter, defaultdict
@@ -348,6 +349,34 @@ def _literal(token: str, quoted: bool) -> Any:
     if re.fullmatch(r"-?\d+(?:\.\d+)?", token):
         return float(token) if "." in token else int(token)
     return token.replace("\\'", "'").replace('\\"', '"').replace("\\\\", "\\")
+
+
+def legacy_pitch_coordinates(row: dict[str, Any]) -> tuple[int | float | None, int | float | None]:
+    """Recover a marker's center only when independent partial coordinates prove it.
+
+    The old 44px ball marker stored its top-left corner. The half-pitch picker
+    retained normalized center coordinates, rotated on the left half. Accept
+    either half at the 485px seam; never infer a correction from a negative X
+    alone, and never clamp legitimate positions outside the touchline.
+    """
+    x = _number(row['gr_pos_x']) if row.get('gr_pos_x') is not None else None
+    y = _number(row['gr_pos_y']) if row.get('gr_pos_y') is not None else None
+    if x is None or y is None:
+        return x, y
+    try:
+        px, py = float(row['gr_part_pos_x']), float(row['gr_part_pos_y'])
+    except (KeyError, TypeError, ValueError):
+        return x, y
+    cx, cy = x + 22, y + 22
+    candidates = []
+    if cx <= 485:
+        candidates.append((1 - cy / 634, cx / 485))
+    if cx >= 485:
+        candidates.append((cy / 634, (971 - cx) / 486))
+    if any(math.isclose(px, ex, rel_tol=0, abs_tol=0.000002)
+           and math.isclose(py, ey, rel_tol=0, abs_tol=0.000002) for ex, ey in candidates):
+        return cx, cy
+    return x, y
 
 
 def _tuple_values(source: str) -> list[Any]:
@@ -978,8 +1007,9 @@ class BuildLegacyImport:
             record_id = _string(row.get("gr_id"))
             if row.get("gt_id") is not None:
                 path_records[f"{gm_id}:{side}:{_string(row.get('gt_id'))}"].append(record_id)
+            pitch_x, pitch_y = legacy_pitch_coordinates(row)
             legacy_flags = {"tap": bool(_integer(row.get("gr_is_tmp"))), "tapSuccess": bool(_integer(row.get("gr_is_tmp_s"))), "dap": bool(_integer(row.get("gr_is_tap"))), "dapSuccess": bool(_integer(row.get("gr_is_tap_s"))), "ast": bool(_integer(row.get("gr_is_ast"))), "shot": bool(_integer(row.get("gr_is_sht"))), "shotSuccess": bool(_integer(row.get("gr_is_sht_s"))), "goal": bool(_integer(row.get("gr_is_gol"))), "dtb": bool(_integer(row.get("gr_is_ctb"))), "dtm": bool(_integer(row.get("gr_is_ctm"))), "dta": bool(_integer(row.get("gr_is_cta"))), "dts": bool(_integer(row.get("gr_is_cts"))), "gtb": bool(_integer(row.get("gr_is_gtb"))), "gtm": bool(_integer(row.get("gr_is_gtm")))}
-            append((f"matches/{gm_id}/recordings/{side}/records/{record_id}", {"half": half, "halfSeconds": seconds, "seq": seq, "act": _string(row.get("gr_act_code")), "res": _string(row.get("gr_res_code")), "area": _integer(row.get("gr_area_code")), "posX": _number(row.get("gr_pos_x")) / 971 * 100 if row.get("gr_pos_x") is not None else None, "posY": _number(row.get("gr_pos_y")) / 634 * 100 if row.get("gr_pos_y") is not None else None, "shootPosX": _number(row.get("gr_shoot_pos_x")) if row.get("gr_shoot_pos_x") is not None else None, "shootPosY": _number(row.get("gr_shoot_pos_y")) if row.get("gr_shoot_pos_y") is not None else None, "legacyPathId": _string(row.get("gt_id")) or None, "legacyKpiFlags": legacy_flags, "playerId": _string(row.get("p_id")) or None, "createdBy": "legacy-import", "source": "did", "createdAt": _timestamp(row.get("gr_regdt")) or now}, False))
+            append((f"matches/{gm_id}/recordings/{side}/records/{record_id}", {"half": half, "halfSeconds": seconds, "seq": seq, "act": _string(row.get("gr_act_code")), "res": _string(row.get("gr_res_code")), "area": _integer(row.get("gr_area_code")), "posX": pitch_x / 971 * 100 if pitch_x is not None else None, "posY": pitch_y / 634 * 100 if pitch_y is not None else None, "shootPosX": _number(row.get("gr_shoot_pos_x")) if row.get("gr_shoot_pos_x") is not None else None, "shootPosY": _number(row.get("gr_shoot_pos_y")) if row.get("gr_shoot_pos_y") is not None else None, "legacyPathId": _string(row.get("gt_id")) or None, "legacyKpiFlags": legacy_flags, "playerId": _string(row.get("p_id")) or None, "createdBy": "legacy-import", "source": "did", "createdAt": _timestamp(row.get("gr_regdt")) or now}, False))
             record_count += 1
 
         lineups: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)

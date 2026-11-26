@@ -10,6 +10,23 @@ export type EstimatedShot = {
   input: EstimatedShotInput; modelVersion: number; trajectoryGrade: string; curveWeight: number
   trajectory: { x: number; y: number; z: number }[]
   goalPoint: { x: number; y: number; z: number }; distance: number; averageSpeed: number | null
+  height: number | null; launchAngle: number | null
+}
+/** Y_MIN is the crossbar; Y_MAX is the ground. Angle is horizontal, not elevation. */
+export function calculateGoalxGeometry(value: Record<string, unknown>) {
+  const finite = (key: string, min: number, max: number) => typeof value[key] === 'number'
+    && Number.isFinite(value[key]) && (value[key] as number) >= min && (value[key] as number) <= max
+  const height = finite('shootPosY', 83, 300) ? (300 - (value.shootPosY as number)) / 217 * 2.44 : null
+  let launchAngle: number | null = null
+  if (finite('posX', 0, 100) && finite('posY', 0, 100) && finite('shootPosX', 83, 464)) {
+    const goalX = value.goalX === 0 || value.goalX === 105 ? value.goalX : ((value.posX as number) < 50 ? 0 : 105)
+    const dx = goalX - (value.posX as number) * 1.05
+    const centerY = 34 - (value.posY as number) * .68
+    const crossingY = centerY + ((value.shootPosX as number) - 83) / 381 * 7.32 - 3.66
+    if (Math.hypot(dx, centerY) > 1e-9 && Math.hypot(dx, crossingY) > 1e-9)
+      launchAngle = Math.atan2(Math.abs(dx * crossingY - centerY * dx), dx * dx + centerY * crossingY) * 180 / Math.PI
+  }
+  return { height, launchAngle }
 }
 export function validEstimatedCoordinates(value: Record<string, unknown>): boolean {
   return ([['posX', 0, 100], ['posY', 0, 100], ['shootPosX', 83, 464], ['shootPosY', 83, 300]] as const)
@@ -40,7 +57,8 @@ export function estimateGoalShot(input: EstimatedShotInput, grade: 'high' | 'med
   })
   const length = trajectory.slice(1).reduce((sum, point, i) => sum + distance(trajectory[i]!, point), 0)
   return { input, modelVersion: 3, trajectoryGrade: grade, curveWeight, trajectory, goalPoint: end,
-    distance: length, averageSpeed: input.timeToGoal ? length / input.timeToGoal * 3.6 : null }
+    distance: length, averageSpeed: input.timeToGoal ? length / input.timeToGoal * 3.6 : null,
+    ...calculateGoalxGeometry(input) }
 }
 
 type ExportEvaluation = { id: string; analystName?: string; grades?: { trajectory?: string }; curveDirection?: CurveDirection | null; estimatedShot?: EstimatedShot | null }
@@ -64,8 +82,9 @@ export function goalxEstimationSheets(records: GoalxExportRecord[], labels: Map<
   const representatives: unknown[][] = [[...identity, '승인 상태', '승인자 ID', '승인 시각', '예술성 평균', '수비 환경 평균', '궤적 평균',
     '평균 총점', '대표 궤적', '소요시간 중앙값 (초)', '소요시간 측정 건수', 'ShotX ID', '원본 버전', '커브 방향 (슈팅자 기준)']]
   for (const record of records) {
-    const base = labels.get(JSON.stringify([record.gmId, record.side, record.recordId]))
-    if (!base) continue
+    const labelValues = labels.get(JSON.stringify([record.gmId, record.side, record.recordId]))
+    if (!labelValues) continue
+    const base = labelValues
     function addEstimate(kind: string, uid: string, name: string, grade?: string, shot?: EstimatedShot | null, direction?: CurveDirection | null) {
       const input = shot?.input
       estimates.push([...base, kind, uid, name, trajectoryNames[grade ?? ''] ?? '', input?.timeToGoal ?? null,
